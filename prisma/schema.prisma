@@ -1,0 +1,820 @@
+// =============================================================================
+// Duevy — Prisma Schema
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  student
+  rep
+  admin
+}
+
+enum RepApplicationStatus {
+  none
+  pending
+  approved
+  rejected
+}
+
+enum AdminSubRole {
+  super_admin
+  compliance_officer
+  support_lead
+}
+
+enum SpaceKind {
+  department
+  association
+  faculty
+  club
+}
+
+enum SpaceMembershipKind {
+  member
+  guest
+}
+
+enum RepRole {
+  lead
+  co
+}
+
+enum EmblemHue {
+  emerald
+  indigo
+  amber
+  rose
+  slate
+}
+
+enum SpaceTheme {
+  emerald
+  ocean
+  royal
+  crimson
+  tangerine
+}
+
+enum DueCategory {
+  levy
+  dinner
+  handout
+  welfare
+  sport
+}
+
+enum RepDueStatus {
+  draft
+  active
+  closed
+}
+
+enum PayMethod {
+  wallet
+  card
+  online
+}
+
+enum TxnType {
+  due
+  topup
+  referral
+  withdrawal
+  refund
+}
+
+enum TxnStatus {
+  completed
+  pending
+  failed
+}
+
+enum PayoutStatus {
+  processing
+  completed
+  failed
+}
+
+enum PollStatus {
+  draft
+  active
+  closed
+}
+
+enum ReferralStatus {
+  pending
+  joined
+  paid
+}
+
+enum NotificationKind {
+  due_reminder
+  payment_received
+  join_request
+  payout_completed
+  poll_milestone
+  referral_earned
+  system
+}
+
+enum NotificationTone {
+  brand
+  amber
+  rose
+}
+
+enum KycStatus {
+  unverified
+  pending
+  verified
+  rejected
+}
+
+enum DisputeStatus {
+  open
+  under_review
+  resolved
+}
+
+enum DisputeType {
+  payment_not_reflecting
+  non_remittance
+  refund_request
+}
+
+enum RiskTier {
+  low
+  medium
+  high
+}
+
+enum FlagStatus {
+  pending
+  paid
+  voided
+  clawed_back
+}
+
+enum ReportScope {
+  financial_summary
+  space_collection
+  rep_performance
+  full_ledger
+}
+
+enum ReportFormat {
+  csv
+  pdf
+}
+
+enum ReportStatus {
+  generating
+  ready
+  expired
+}
+
+enum SpaceJoinRequestStatus {
+  pending
+  approved
+  rejected
+}
+
+enum AuditAction {
+  payout_requested
+  due_published
+  due_closed
+  poll_created
+  members_approved
+  profile_updated
+  rep_invited
+  rep_removed
+  code_regenerated
+  lead_transferred
+  space_archived
+}
+
+// ---------------------------------------------------------------------------
+// Users & Auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id                    String               @id @default(cuid())
+  name                  String
+  email                 String               @unique
+  emailVerified         Boolean              @default(false)
+  passwordHash          String?
+  phone                 String?
+  avatarUrl             String?
+  role                  Role                 @default(student)
+  repApplicationStatus  RepApplicationStatus @default(none)
+  adminSubRole          AdminSubRole?
+  matricNo              String?
+  level                 String?
+  notificationPrefs     Json?                // §3.4 — email/push toggles; null = defaults
+  walletBalance         Int                  @default(0) // kobo
+  referralCode          String?              @unique
+  kycStatus             KycStatus            @default(unverified)
+  kycDocUrls            String[]             @default([])
+  isSuspended           Boolean              @default(false)
+  suspendedReason       String?
+  isDeactivated         Boolean              @default(false)
+  deactivatedReason     String?
+  termsAcceptedAt       DateTime?
+  termsVersion          String?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  // Relations
+  refreshTokens         RefreshToken[]
+  emailVerifications    EmailVerification[]
+  passwordResets        PasswordReset[]
+  spaceMemberships      SpaceMembership[]
+  spaceReps             SpaceRep[]
+  spaceJoinRequests     SpaceJoinRequest[]
+  duePayments           DuePayment[]
+  transactions          Transaction[]
+  cards                 Card[]
+  notifications         Notification[]
+  pollVotes             PollVote[]
+  referralsMade         Referral[]           @relation("referrer")
+  referralReceived      Referral?            @relation("referred")
+  adminPermissions      AdminPermission?
+  disputes              Dispute[]
+  idempotencyKeys       IdempotencyKey[]
+  sessions              Session[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  device    String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  device    String?
+  ip        String?
+  lastSeenAt DateTime @default(now())
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model EmailVerification {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@map("email_verifications")
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("password_resets")
+}
+
+// ---------------------------------------------------------------------------
+// Spaces
+// ---------------------------------------------------------------------------
+
+model Space {
+  id             String      @id @default(cuid())
+  name           String
+  short          String      // 2-6 chars, monogram
+  kind           SpaceKind
+  hue            EmblemHue   @default(emerald)
+  theme          SpaceTheme  @default(emerald)
+  about          String?
+  faculty        String?
+  school         String
+  joinCode       String      @unique
+  requireApproval Boolean    @default(false)
+  isArchived     Boolean     @default(false)
+  archivedAt     DateTime?
+  archivedReason String?
+  payoutsFrozen  Boolean     @default(false)
+  frozenReason   String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  // Relations
+  memberships    SpaceMembership[]
+  reps           SpaceRep[]
+  joinRequests   SpaceJoinRequest[]
+  dues           Due[]
+  bankAccount    BankAccount?
+  payouts        Payout[]
+  polls          Poll[]
+  auditLogs      SpaceAuditLog[]
+  repApplication RepApplication?
+
+  @@map("spaces")
+}
+
+model SpaceMembership {
+  id         String              @id @default(cuid())
+  userId     String
+  spaceId    String
+  kind       SpaceMembershipKind @default(member)
+  joinedAt   DateTime            @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, spaceId])
+  @@index([spaceId])
+  @@map("space_memberships")
+}
+
+model SpaceRep {
+  id      String  @id @default(cuid())
+  userId  String
+  spaceId String
+  role    RepRole @default(co)
+  addedAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, spaceId])
+  @@index([spaceId])
+  @@map("space_reps")
+}
+
+model SpaceJoinRequest {
+  id        String                 @id @default(cuid())
+  userId    String
+  spaceId   String
+  status    SpaceJoinRequestStatus @default(pending)
+  createdAt DateTime               @default(now())
+  resolvedAt DateTime?
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, spaceId])
+  @@index([spaceId])
+  @@map("space_join_requests")
+}
+
+// Holds pending rep application data (submitted at signup, provisioned on admin approve)
+model RepApplication {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  spaceId         String?   @unique // set once space is provisioned on approval
+  spaceName       String
+  spaceShort      String
+  spaceKind       SpaceKind
+  school          String
+  faculty         String?
+  theme           SpaceTheme
+  requireApproval Boolean
+  coRepInvites    String[]  @default([])
+  referralCode    String?
+  status          RepApplicationStatus @default(pending)
+  reviewNote      String?
+  reviewedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  space Space? @relation(fields: [spaceId], references: [id])
+
+  @@map("rep_applications")
+}
+
+model SpaceAuditLog {
+  id          String      @id @default(cuid())
+  spaceId     String
+  actorId     String
+  actorName   String
+  action      AuditAction
+  description String
+  createdAt   DateTime    @default(now())
+
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@index([spaceId, createdAt])
+  @@map("space_audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Dues
+// ---------------------------------------------------------------------------
+
+model Due {
+  id          String       @id @default(cuid())
+  spaceId     String
+  title       String
+  note        String?
+  amount      Int          // kobo
+  dueDate     DateTime     // YYYY-MM-DD
+  category    DueCategory
+  status      RepDueStatus @default(draft)
+  allowGuests Boolean      @default(false)
+  publishedAt DateTime?
+  closedAt    DateTime?
+  lastRemindedAt DateTime? // §7.7 reminder cooldown
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  space    Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  payments DuePayment[]
+
+  @@index([spaceId])
+  @@map("dues")
+}
+
+model DuePayment {
+  id          String    @id @default(cuid())
+  userId      String
+  dueId       String
+  txnId       String?   @unique
+  paidAt      DateTime  @default(now())
+  reference   String    @unique
+  amountPaid  Int       // kobo — face value (= due.amount)
+  monnifyFee  Int       // kobo — 1.5% of amountPaid
+  duevyFee    Int       // kobo — 1.5% of amountPaid
+  netToSpace  Int       // kobo — amountPaid - monnifyFee - duevyFee
+
+  user        User        @relation(fields: [userId], references: [id])
+  due         Due         @relation(fields: [dueId], references: [id])
+  transaction Transaction? @relation(fields: [txnId], references: [id])
+
+  @@unique([userId, dueId])
+  @@index([dueId])
+  @@map("due_payments")
+}
+
+// ---------------------------------------------------------------------------
+// Wallet, Cards & Transactions
+// ---------------------------------------------------------------------------
+
+model Card {
+  id            String  @id @default(cuid())
+  userId        String
+  providerToken String  @unique
+  brand         String  // Visa | Mastercard | Verve
+  last4         String
+  expiry        String  // MM/YY
+  isDefault     Boolean @default(false)
+  createdAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("cards")
+}
+
+model Transaction {
+  id        String    @id @default(cuid())
+  userId    String
+  type      TxnType
+  title     String
+  detail    String?
+  amount    Int       // kobo, signed
+  method    String    // "Wallet" | "Visa •••• 4242" | "Monnify"
+  status    TxnStatus @default(pending)
+  reference String    @unique
+  spaceId   String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user       User        @relation(fields: [userId], references: [id])
+  duePayment DuePayment?
+
+  @@index([userId, createdAt])
+  @@map("transactions")
+}
+
+model PendingPayment {
+  id        String    @id @default(cuid())
+  reference String    @unique
+  userId    String
+  type      String    // "topup" | "due_payment" | "poll_vote"
+  metadata  Json      // stores dueId, pollId etc.
+  status    String    @default("pending")
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+
+  @@index([reference])
+  @@map("pending_payments")
+}
+
+// ---------------------------------------------------------------------------
+// Payouts & Bank Accounts
+// ---------------------------------------------------------------------------
+
+model BankAccount {
+  id              String   @id @default(cuid())
+  spaceId         String   @unique
+  bankCode        String
+  bankName        String
+  accountNumber   String   // stored encrypted
+  accountNumberMasked String // "•••• 4021"
+  accountName     String
+  cooldownUntil   DateTime? // §10.2 — 24h payout hold after an account change
+  setAt           DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@map("bank_accounts")
+}
+
+model Payout {
+  id            String       @id @default(cuid())
+  spaceId       String
+  amount        Int          // kobo
+  reference     String       @unique
+  status        PayoutStatus @default(processing)
+  accountMasked String       // "GTBank •••• 4021"
+  note          String?
+  failureReason String?
+  requestedAt   DateTime     @default(now())
+  settledAt     DateTime?
+
+  space Space @relation(fields: [spaceId], references: [id])
+
+  @@index([spaceId])
+  @@map("payouts")
+}
+
+// ---------------------------------------------------------------------------
+// Polls & Voting
+// ---------------------------------------------------------------------------
+
+model Poll {
+  id            String     @id @default(cuid())
+  spaceId       String
+  title         String
+  description   String?
+  deadline      DateTime
+  status        PollStatus @default(draft)
+  membersOnly   Boolean    @default(true)
+  paid          Boolean    @default(false)
+  amountPerVote Int        @default(0) // kobo
+  slug          String     @unique
+  totalVotes    Int        @default(0)
+  revenue       Int        @default(0) // kobo
+  publishedAt   DateTime?
+  closedAt      DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  space      Space          @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  categories PollCategory[]
+
+  @@index([spaceId])
+  @@map("polls")
+}
+
+model PollCategory {
+  id      String    @id @default(cuid())
+  pollId  String
+  title   String
+  createdAt DateTime @default(now())
+
+  poll     Poll      @relation(fields: [pollId], references: [id], onDelete: Cascade)
+  nominees Nominee[]
+
+  @@index([pollId])
+  @@map("poll_categories")
+}
+
+model Nominee {
+  id         String @id @default(cuid())
+  categoryId String
+  name       String
+  votes      Int    @default(0)
+
+  category PollCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  pollVotes PollVote[]
+
+  @@index([categoryId])
+  @@map("nominees")
+}
+
+model PollVote {
+  id         String   @id @default(cuid())
+  userId     String
+  nomineeId  String
+  categoryId String
+  quantity   Int      @default(1)
+  amountPaid Int      @default(0) // kobo
+  txnRef     String?
+  createdAt  DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id])
+  nominee Nominee @relation(fields: [nomineeId], references: [id])
+
+  @@index([userId, categoryId])
+  @@map("poll_votes")
+}
+
+// ---------------------------------------------------------------------------
+// Referrals
+// ---------------------------------------------------------------------------
+
+model Referral {
+  id         String         @id @default(cuid())
+  referrerId String
+  referredId String         @unique
+  status     ReferralStatus @default(pending)
+  reward     Int            @default(0) // kobo — 0 until paid
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  referrer User @relation("referrer", fields: [referrerId], references: [id])
+  referred User @relation("referred", fields: [referredId], references: [id])
+
+  @@index([referrerId])
+  @@map("referrals")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  kind      NotificationKind
+  tone      NotificationTone @default(brand)
+  title     String
+  detail    String
+  href      String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Disputes
+// ---------------------------------------------------------------------------
+
+model Dispute {
+  id               String        @id @default(cuid())
+  type             DisputeType
+  openedById       String
+  openedByName     String
+  openedByEmail    String
+  department       String?
+  status           DisputeStatus @default(open)
+  slaDays          Int           @default(3)
+  txnReference     String?
+  description      String
+  studentEvidence  Json?
+  repEvidence      Json?
+  claimedById      String?
+  resolution       String?
+  refundTxnId      String?
+  resolvedAt       DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  openedBy User @relation(fields: [openedById], references: [id])
+
+  @@index([status])
+  @@map("disputes")
+}
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+
+model AdminPermission {
+  id             String  @id @default(cuid())
+  userId         String  @unique
+  userManagement Boolean @default(false)
+  payouts        Boolean @default(false)
+  disputes       Boolean @default(false)
+  overrides      Boolean @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("admin_permissions")
+}
+
+model AdminAuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  actorName String
+  role      String
+  action    String
+  target    String?
+  ip        String?
+  device    String?
+  severity  String   @default("info") // info | warning | critical
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("admin_audit_logs")
+}
+
+model ReferralFlag {
+  id          String     @id @default(cuid())
+  referrerId  String
+  referredId  String
+  referrerName String
+  referredName String
+  label       String     // rule that fired
+  description String
+  amount      Int        // kobo at stake
+  status      FlagStatus @default(pending)
+  note        String?
+  resolvedAt  DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([status])
+  @@map("referral_flags")
+}
+
+model Report {
+  id          String       @id @default(cuid())
+  requestedById String
+  scope       ReportScope
+  format      ReportFormat
+  status      ReportStatus @default(generating)
+  fromDate    DateTime
+  toDate      DateTime
+  spaceId     String?
+  downloadUrl String?
+  fileSize    Int?
+  generatedAt DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime     @default(now())
+
+  @@index([requestedById])
+  @@map("reports")
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
+
+model IdempotencyKey {
+  id             String   @id @default(cuid())
+  key            String   @unique
+  userId         String
+  responseStatus Int
+  responseBody   Json
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
