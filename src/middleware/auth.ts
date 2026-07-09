@@ -32,3 +32,22 @@ export async function authenticate(
     }
   }
 }
+
+/** Attach the user if a valid Bearer token is present, but never reject.
+ *  Used by endpoints that are public yet behave differently when signed in
+ *  (e.g. the poll share link, §11.5). */
+export async function optionalAuthenticate(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const header = req.headers.authorization;
+  if (header?.startsWith('Bearer ')) {
+    try {
+      (req as AuthenticatedRequest).user = await verifyAccessToken(header.slice(7));
+    } catch {
+      // Ignore bad/expired tokens — treat the caller as anonymous.
+    }
+  }
+  next();
+}

@@ -57,6 +57,33 @@ export function requireSpaceRep(leadOnly = false) {
   };
 }
 
+/** Require the caller to be an admin (any sub-role). */
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const user = (req as AuthenticatedRequest).user;
+  if (!user || user.role !== 'admin') {
+    errors.forbidden(res, 'Admin access required');
+    return;
+  }
+  next();
+}
+
+/** Require the caller to be a super_admin (checked against the DB sub-role). */
+export function requireSuperAdmin() {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const user = (req as AuthenticatedRequest).user;
+    if (!user || user.role !== 'admin') {
+      errors.forbidden(res);
+      return;
+    }
+    const record = await db.user.findUnique({ where: { id: user.sub as string }, select: { adminSubRole: true } });
+    if (record?.adminSubRole !== 'super_admin') {
+      errors.forbidden(res, 'Requires super_admin');
+      return;
+    }
+    next();
+  };
+}
+
 /** Require the admin user to have a specific permission. */
 export function requireAdminPermission(
   permission: 'userManagement' | 'payouts' | 'disputes' | 'overrides',

@@ -94,6 +94,7 @@ enum TxnType {
   referral
   withdrawal
   refund
+  vote
 }
 
 enum TxnStatus {

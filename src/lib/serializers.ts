@@ -7,7 +7,20 @@ import {
   type Card,
   type Payout,
   type BankAccount,
+  type Notification,
+  type Poll,
+  type PollCategory,
+  type Nominee,
+  type AdminAuditLog,
+  type Dispute,
 } from '@prisma/client';
+
+type UserWithSpaces = User & {
+  spaceMemberships: { space: { name: string } }[];
+  spaceReps: { space: { name: string } }[];
+};
+
+type PollWithTree = Poll & { categories: (PollCategory & { nominees: Nominee[] })[] };
 
 export type SpaceMembershipView = 'member' | 'guest';
 
@@ -63,6 +76,111 @@ export function serializeBankAccount(a: BankAccount, revealAccountNumber?: strin
     accountNumber: revealAccountNumber ?? a.accountNumberMasked,
     accountName: a.accountName,
     cooldownUntil: a.cooldownUntil?.toISOString() ?? null,
+  };
+}
+
+/** The admin `AppUser` resource (§14.2). */
+export function serializeAppUser(u: UserWithSpaces) {
+  const spaceNames = [
+    ...u.spaceMemberships.map((m) => m.space.name),
+    ...u.spaceReps.map((r) => r.space.name),
+  ];
+  const spaces = [...new Set(spaceNames)];
+  return {
+    id: u.id,
+    role: u.role,
+    name: u.name,
+    email: u.email,
+    department: spaces[0] ?? null,
+    walletBalance: u.walletBalance,
+    isSuspended: u.isSuspended,
+    isDeactivated: u.isDeactivated,
+    kycStatus: u.kycStatus,
+    kycDocs: u.kycDocUrls,
+    spaces,
+  };
+}
+
+/** The `Dispute` resource (§14.6), with derived `ageDays`. */
+export function serializeDispute(d: Dispute) {
+  const ageDays = Math.floor((Date.now() - d.createdAt.getTime()) / (24 * 60 * 60 * 1000));
+  return {
+    id: d.id,
+    type: d.type,
+    openedBy: d.openedByName,
+    email: d.openedByEmail,
+    department: d.department,
+    status: d.status,
+    slaDays: d.slaDays,
+    ageDays,
+    breached: ageDays > d.slaDays,
+    txnReference: d.txnReference,
+    description: d.description,
+    studentEvidence: d.studentEvidence,
+    repEvidence: d.repEvidence,
+    resolution: d.resolution,
+    refundTxnId: d.refundTxnId,
+    resolvedAt: d.resolvedAt?.toISOString() ?? null,
+    createdAt: d.createdAt.toISOString(),
+  };
+}
+
+/** An admin audit-log row (§14.9). */
+export function serializeAdminAuditLog(l: AdminAuditLog) {
+  return {
+    id: l.id,
+    actor: l.actorName,
+    role: l.role,
+    action: l.action,
+    target: l.target,
+    ip: l.ip,
+    device: l.device,
+    severity: l.severity,
+    createdAt: l.createdAt.toISOString(),
+  };
+}
+
+/** The `Notification` resource (§13). */
+export function serializeNotification(n: Notification) {
+  return {
+    id: n.id,
+    kind: n.kind,
+    tone: n.tone,
+    title: n.title,
+    detail: n.detail,
+    href: n.href,
+    read: n.read,
+    createdAt: n.createdAt.toISOString(),
+  };
+}
+
+/**
+ * The `Poll` resource (§11). `showVotes` controls whether nominee tallies are
+ * exposed — always true for reps/results; for voters only after the poll closes.
+ */
+export function serializePoll(poll: PollWithTree, opts: { showVotes: boolean; includeRevenue?: boolean }) {
+  return {
+    id: poll.id,
+    spaceId: poll.spaceId,
+    title: poll.title,
+    description: poll.description,
+    deadline: poll.deadline.toISOString().slice(0, 10),
+    status: poll.status,
+    membersOnly: poll.membersOnly,
+    paid: poll.paid,
+    amountPerVote: poll.amountPerVote,
+    slug: poll.slug,
+    totalVotes: poll.totalVotes,
+    ...(opts.includeRevenue ? { revenue: poll.revenue } : {}),
+    categories: poll.categories.map((c) => ({
+      id: c.id,
+      title: c.title,
+      nominees: c.nominees.map((n) => ({
+        id: n.id,
+        name: n.name,
+        ...(opts.showVotes ? { votes: n.votes } : {}),
+      })),
+    })),
   };
 }
 

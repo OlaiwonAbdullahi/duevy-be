@@ -20,7 +20,7 @@ function uid(req: Request): string {
 // ---------------------------------------------------------------------------
 const listQuery = z.object({
   direction: z.enum(['all', 'in', 'out']).default('all'),
-  type: z.enum(['due', 'topup', 'referral', 'withdrawal', 'refund']).optional(),
+  type: z.enum(['due', 'topup', 'referral', 'withdrawal', 'refund', 'vote']).optional(),
   status: z.enum(['completed', 'pending', 'failed']).optional(),
   from: z.string().optional(),
   to: z.string().optional(),

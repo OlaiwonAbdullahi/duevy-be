@@ -10,6 +10,7 @@ import { serializeSpace, type SpaceMembershipView } from '../lib/serializers';
 import { circleRouter } from './circle';
 import { repDuesRouter } from './repDues';
 import { payoutsRouter } from './payouts';
+import { pollsRepRouter } from './polls';
 
 export const spacesRouter = Router();
 
@@ -258,3 +259,4 @@ spacesRouter.patch(
 spacesRouter.use('/:spaceId', circleRouter);
 spacesRouter.use('/:spaceId', repDuesRouter);
 spacesRouter.use('/:spaceId', payoutsRouter);
+spacesRouter.use('/:spaceId', pollsRepRouter);

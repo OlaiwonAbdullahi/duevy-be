@@ -3,6 +3,14 @@ import { db } from '../config/db';
 import { computeCharge, generateReference } from '../lib/money';
 import { initTransaction } from '../lib/monnify';
 import { notify, notifyMany } from '../lib/notifications';
+import { applyPollVotes, type VoteSelection } from './poll.service';
+import { maybeAwardReferral } from './referral.service';
+
+/** After a space records a payment, pay any pending referral bounty for its lead rep. */
+async function triggerReferralReward(spaceId: string): Promise<void> {
+  const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, select: { userId: true } });
+  if (lead) await maybeAwardReferral(lead.userId).catch(() => {});
+}
 
 /** Generate a transaction reference that isn't already taken. */
 export async function uniqueReference(): Promise<string> {
@@ -63,6 +71,7 @@ export async function settleDueFromWallet(user: User, due: Due & { space: { name
   });
 
   await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
+  await triggerReferralReward(due.spaceId);
   return txn;
 }
 
@@ -223,6 +232,29 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
 
     const payer = await db.user.findUnique({ where: { id: pending.userId }, select: { name: true } });
     await notifyRepsOfPayment(due.spaceId, payer?.name ?? 'A member', due.title, due.amount).catch(() => {});
+    await triggerReferralReward(due.spaceId);
+    return 'fulfilled';
+  }
+
+  if (pending.type === 'poll_vote') {
+    const voteMeta = (pending.metadata ?? {}) as {
+      pollId?: string;
+      amountPerVote?: number;
+      selections?: VoteSelection[];
+    };
+    if (!voteMeta.pollId || !voteMeta.selections) return 'unknown';
+
+    await db.$transaction(async (tx) => {
+      await tx.pendingPayment.update({ where: { reference }, data: { status: 'completed' } });
+      await tx.transaction.updateMany({ where: { reference }, data: { status: 'completed' } });
+      await applyPollVotes(tx, {
+        pollId: voteMeta.pollId as string,
+        userId: pending.userId,
+        selections: voteMeta.selections as VoteSelection[],
+        amountPerVote: voteMeta.amountPerVote ?? 0,
+        reference,
+      });
+    });
     return 'fulfilled';
   }
 

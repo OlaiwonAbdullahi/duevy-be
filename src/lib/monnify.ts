@@ -1,4 +1,4 @@
-import { env } from '../config/env';
+import { env } from "../config/env";
 
 /**
  * Minimal Monnify API client. Handles the Basic-auth login handshake (caching
@@ -18,9 +18,11 @@ async function getAccessToken(): Promise<string> {
     return cachedToken.accessToken;
   }
 
-  const basic = Buffer.from(`${env.MONNIFY_API_KEY}:${env.MONNIFY_SECRET_KEY}`).toString('base64');
+  const basic = Buffer.from(
+    `${env.MONNIFY_API_KEY}:${env.MONNIFY_SECRET_KEY}`,
+  ).toString("base64");
   const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v1/auth/login`, {
-    method: 'POST',
+    method: "POST",
     headers: { Authorization: `Basic ${basic}` },
   });
   const json = (await res.json()) as {
@@ -29,7 +31,9 @@ async function getAccessToken(): Promise<string> {
     responseMessage?: string;
   };
   if (!res.ok || !json.requestSuccessful || !json.responseBody) {
-    throw new Error(`Monnify auth failed: ${json.responseMessage ?? res.status}`);
+    throw new Error(
+      `Monnify auth failed: ${json.responseMessage ?? res.status}`,
+    );
   }
 
   cachedToken = {
@@ -40,8 +44,8 @@ async function getAccessToken(): Promise<string> {
 }
 
 export interface InitTransactionInput {
-  amount: number; // kobo
-  reference: string; // our paymentReference
+  amount: number;
+  reference: string;
   customerName: string;
   customerEmail: string;
   description: string;
@@ -54,31 +58,45 @@ export interface InitTransactionResult {
 }
 
 /** Initialise a hosted-checkout transaction; returns the URL to redirect the payer to. */
-export async function initTransaction(input: InitTransactionInput): Promise<InitTransactionResult> {
+export async function initTransaction(
+  input: InitTransactionInput,
+): Promise<InitTransactionResult> {
   const token = await getAccessToken();
-  const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v1/merchant/transactions/init-transaction`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      // Monnify expects the major unit (naira), not kobo.
-      amount: input.amount / 100,
-      customerName: input.customerName,
-      customerEmail: input.customerEmail,
-      paymentReference: input.reference,
-      paymentDescription: input.description,
-      currencyCode: 'NGN',
-      contractCode: env.MONNIFY_CONTRACT_CODE,
-      redirectUrl: `${env.FRONTEND_URL}/wallet`,
-      paymentMethods: ['CARD', 'ACCOUNT_TRANSFER'],
-    }),
-  });
+  const res = await fetch(
+    `${env.MONNIFY_BASE_URL}/api/v1/merchant/transactions/init-transaction`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        // Monnify expects the major unit (naira), not kobo.
+        amount: input.amount / 100,
+        customerName: input.customerName,
+        customerEmail: input.customerEmail,
+        paymentReference: input.reference,
+        paymentDescription: input.description,
+        currencyCode: "NGN",
+        contractCode: env.MONNIFY_CONTRACT_CODE,
+        redirectUrl: `${env.FRONTEND_URL}/wallet`,
+        paymentMethods: ["CARD", "ACCOUNT_TRANSFER"],
+      }),
+    },
+  );
   const json = (await res.json()) as {
     requestSuccessful: boolean;
-    responseBody?: { checkoutUrl: string; transactionReference: string; paymentReference: string };
+    responseBody?: {
+      checkoutUrl: string;
+      transactionReference: string;
+      paymentReference: string;
+    };
     responseMessage?: string;
   };
   if (!res.ok || !json.requestSuccessful || !json.responseBody) {
-    throw new Error(`Monnify init failed: ${json.responseMessage ?? res.status}`);
+    throw new Error(
+      `Monnify init failed: ${json.responseMessage ?? res.status}`,
+    );
   }
   return json.responseBody;
 }
@@ -95,15 +113,24 @@ export interface MonnifyTxnStatus {
  * null if the disbursement product isn't enabled / the account can't be verified
  * — callers fall back to a client-supplied name in that case.
  */
-export async function verifyAccountName(accountNumber: string, bankCode: string): Promise<string | null> {
+export async function verifyAccountName(
+  accountNumber: string,
+  bankCode: string,
+): Promise<string | null> {
   try {
     const token = await getAccessToken();
     const url = `${env.MONNIFY_BASE_URL}/api/v1/disbursements/account/validate?accountNumber=${encodeURIComponent(
       accountNumber,
     )}&bankCode=${encodeURIComponent(bankCode)}`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    const json = (await res.json()) as { requestSuccessful?: boolean; responseBody?: { accountName?: string } };
-    if (!res.ok || !json.requestSuccessful || !json.responseBody?.accountName) return null;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = (await res.json()) as {
+      requestSuccessful?: boolean;
+      responseBody?: { accountName?: string };
+    };
+    if (!res.ok || !json.requestSuccessful || !json.responseBody?.accountName)
+      return null;
     return json.responseBody.accountName;
   } catch {
     return null;
@@ -111,10 +138,14 @@ export async function verifyAccountName(accountNumber: string, bankCode: string)
 }
 
 /** Read a transaction's status (used by §6.4 polling and the reconciliation job). */
-export async function getTransactionStatus(transactionReference: string): Promise<MonnifyTxnStatus | null> {
+export async function getTransactionStatus(
+  transactionReference: string,
+): Promise<MonnifyTxnStatus | null> {
   const token = await getAccessToken();
   const url = `${env.MONNIFY_BASE_URL}/api/v2/transactions/${encodeURIComponent(transactionReference)}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   const json = (await res.json()) as {
     requestSuccessful: boolean;
     responseBody?: MonnifyTxnStatus;
