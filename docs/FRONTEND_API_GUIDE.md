@@ -75,8 +75,7 @@ Every response follows this structure:
     "kind": "association",
     "school": "University of Lagos",
     "faculty": "Social Sciences",
-    "theme": "ocean",
-    "requireApproval": false
+    "theme": "ocean"
   }
 }
 ```
@@ -85,6 +84,18 @@ Every response follows this structure:
 ### Login
 **POST** `/v1/auth/login`
 **Payload:** `{ "email": "john@example.com", "password": "..." }`
+
+### Google Sign-In
+**POST** `/v1/auth/google`
+**Payload:**
+```json
+{
+  "idToken": "<Google ID token from the OAuth flow>",
+  "matricNo": "190802044",
+  "role": "student"
+}
+```
+*`matricNo` is only required the first time an account is created this way. `role`/`space` follow the same shape as register when signing up as a rep. Returns `501 NOT_IMPLEMENTED` if Google sign-in isn't configured server-side.*
 
 ---
 
@@ -98,21 +109,39 @@ Returns balance, outstanding count, and top 4 open dues.
 **POST** `/v1/dues/{dueId}/pay`
 **Payload:** `{ "method": "wallet" }`
 
+### Pay a Due (Saved Card)
+**POST** `/v1/dues/{dueId}/pay`
+**Payload:** `{ "method": "card", "cardId": "..." }`
+Charges a card saved via `POST /v1/wallet/cards`. Returns `402 CARD_DECLINED` if the charge fails.
+
 ### Pay a Due (Online - Monnify)
 **POST** `/v1/dues/{dueId}/pay`
 **Payload:** `{ "method": "online" }`
 Returns `checkoutUrl` and `reference`. Use `GET /v1/payments/{reference}/status` to poll for completion.
 
+### Download Receipt
+**GET** `/v1/dues/{dueId}/receipt` (also `/v1/transactions/{transactionId}/receipt`)
+Returns a PDF (`Content-Type: application/pdf`) for a settled payment.
+
 ---
 
 ## 4. Wallet & Cards
 
-### Top-Up
+### Top-Up (Online - Monnify)
 **POST** `/v1/wallet/top-up`
 **Payload:** `{ "amount": 100000, "method": "online" }`
 
+### Top-Up (Saved Card)
+**POST** `/v1/wallet/top-up`
+**Payload:** `{ "amount": 100000, "method": "card", "cardId": "..." }`
+
 ### List Saved Cards
 **GET** `/v1/wallet/cards`
+
+### Save a Card
+**POST** `/v1/wallet/cards`
+**Payload:** `{ "providerToken": "...", "brand": "Visa", "last4": "4242", "expiry": "12/28" }`
+`providerToken` comes from the PSP's inline tokenization SDK — raw card numbers never touch this API.
 
 ---
 
@@ -126,6 +155,7 @@ Returns space details before joining.
 ### Join Space
 **POST** `/v1/spaces/{spaceId}/join`
 **Payload:** `{ "code": "ENG101", "as": "member" }`
+Joining is immediate for anyone with a valid code — reps do not approve or gate admission.
 
 ---
 
@@ -146,6 +176,9 @@ Returns collection stats and active dues list.
 ### Request Payout
 **POST** `/v1/spaces/{spaceId}/payout/request`
 **Payload:** `{ "amount": 1000000, "note": "Venue payment" }`
+Returns a `Payout` with `status: "processing"`. The transfer is initiated automatically and the
+payout moves to `completed` or `failed` once the payment provider confirms — poll
+`GET /v1/spaces/{spaceId}/payouts` or listen for the `payout_completed` notification.
 
 ---
 
@@ -154,7 +187,7 @@ Returns collection stats and active dues list.
 ### Get Poll (Public)
 **GET** `/v1/polls/{slug}`
 
-### Cast Vote
+### Cast Vote (Wallet)
 **POST** `/v1/polls/{slug}/votes`
 **Payload:**
 ```json
@@ -163,6 +196,9 @@ Returns collection stats and active dues list.
   "method": "wallet"
 }
 ```
+
+### Cast Vote (Saved Card)
+Same endpoint, with `"method": "card", "cardId": "..."` for paid polls.
 
 ---
 
@@ -188,6 +224,7 @@ Returns paginated alerts + `unreadCount` in `meta`.
 ### Common Error Codes
 - `VALIDATION_ERROR`: Request body failed schema check.
 - `INSUFFICIENT_FUNDS`: Wallet balance too low.
+- `CARD_DECLINED`: Saved-card charge was rejected by the payment provider.
 - `REP_APPROVAL_PENDING`: Rep registered but not yet approved by admin.
 - `DUE_ALREADY_PAID`: Duplicate payment attempt.
 
@@ -253,7 +290,7 @@ interface Poll {
 interface Notification {
   id: string;
   kind: string;
-  tone: 'info' | 'amber' | 'green' | 'red';
+  tone: 'brand' | 'amber' | 'rose';
   title: string;
   detail: string;
   href: string | null;
