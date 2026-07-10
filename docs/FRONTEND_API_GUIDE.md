@@ -178,12 +178,19 @@ Returns collection stats and active dues list.
 Returns `[{ "code": "058", "name": "Guaranty Trust Bank" }, ...]` — the full Monnify-supported
 bank list, for populating the bank picker on the payout-account form. Cached server-side for 24h.
 
+### Preview Payout Account
+**POST** `/v1/spaces/{spaceId}/payout/account/lookup`
+**Payload:** `{ "bankCode": "058", "accountNumber": "0123456789" }`
+Resolves the account name via Monnify name-enquiry **without saving anything** — call this first
+so the rep can see and confirm the name before committing. Returns
+`{ "bankCode", "bankName", "accountNumber", "accountName" }`.
+Returns `422 ACCOUNT_UNVERIFIABLE` if the account can't be resolved.
+
 ### Set Payout Account
 **PUT** `/v1/spaces/{spaceId}/payout/account`
 **Payload:** `{ "bankCode": "058", "accountNumber": "0123456789" }`
-`accountName` is not accepted as input — it's always resolved via Monnify name-enquiry and
-returned in the response. Returns `422 ACCOUNT_UNVERIFIABLE` if the account can't be resolved
-(e.g. wrong account number/bank combination).
+Same shape as the lookup above — re-resolves and then saves. `accountName` is never accepted as
+input, only ever server-resolved.
 
 ### Request Payout
 **POST** `/v1/spaces/{spaceId}/payout/request`

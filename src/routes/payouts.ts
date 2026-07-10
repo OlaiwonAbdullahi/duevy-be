@@ -75,32 +75,66 @@ payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promis
 });
 
 // ---------------------------------------------------------------------------
-// PUT /payout/account (§10.2)
+// Shared bank + account-name resolution (§10.2) — name-enquiry is authoritative
+// and mandatory; the account name is always server-resolved, never client-supplied.
 // ---------------------------------------------------------------------------
-const putAccountSchema = z.object({
+const accountLookupSchema = z.object({
   bankCode: z.string().min(3),
   accountNumber: z.string().regex(/^\d{10}$/, 'must be a 10-digit NUBAN'),
 });
+
+type ResolvedAccount = { bankName: string; accountName: string } | { error: 'UNKNOWN_BANK' | 'UNVERIFIABLE' };
+
+async function resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount> {
+  const banks = await getBanks();
+  const bankName = banks.find((b) => b.code === bankCode)?.name;
+  if (!bankName) return { error: 'UNKNOWN_BANK' };
+
+  const accountName = await verifyAccountName(accountNumber, bankCode);
+  if (!accountName) return { error: 'UNVERIFIABLE' };
+
+  return { bankName, accountName };
+}
+
+function failResolution(res: Response, resolved: { error: 'UNKNOWN_BANK' | 'UNVERIFIABLE' }): void {
+  if (resolved.error === 'UNKNOWN_BANK') {
+    errors.validation(res, [{ field: 'bankCode', issue: 'unknown bank code' }]);
+    return;
+  }
+  fail(res, 422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
+}
+
+// ---------------------------------------------------------------------------
+// POST /payout/account/lookup (§10.2) — preview the resolved account name
+// before saving it, mirroring the join-code lookup pattern (§4.3).
+// ---------------------------------------------------------------------------
+payoutsRouter.post('/payout/account/lookup', validate(accountLookupSchema), async (req: Request, res: Response): Promise<void> => {
+  const { bankCode, accountNumber } = req.body as z.infer<typeof accountLookupSchema>;
+
+  const resolved = await resolveAccount(bankCode, accountNumber);
+  if ('error' in resolved) {
+    failResolution(res, resolved);
+    return;
+  }
+
+  ok(res, { bankCode, bankName: resolved.bankName, accountNumber, accountName: resolved.accountName });
+});
+
+// ---------------------------------------------------------------------------
+// PUT /payout/account (§10.2)
+// ---------------------------------------------------------------------------
+const putAccountSchema = accountLookupSchema;
 
 payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const { bankCode, accountNumber } = req.body as z.infer<typeof putAccountSchema>;
 
-  const banks = await getBanks();
-  const bankName = banks.find((b) => b.code === bankCode)?.name;
-  if (!bankName) {
-    errors.validation(res, [{ field: 'bankCode', issue: 'unknown bank code' }]);
+  const resolved = await resolveAccount(bankCode, accountNumber);
+  if ('error' in resolved) {
+    failResolution(res, resolved);
     return;
   }
-
-  // Name-enquiry is authoritative and mandatory — the account name is always
-  // server-resolved, never client-supplied.
-  const resolvedName = await verifyAccountName(accountNumber, bankCode);
-  if (!resolvedName) {
-    fail(res, 422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
-    return;
-  }
-  const finalName = resolvedName;
+  const { bankName, accountName: finalName } = resolved;
 
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =
