@@ -7,7 +7,6 @@ import { requireSpaceRep } from '../middleware/requireRole';
 import { lookupLimiter } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { serializeSpace, type SpaceMembershipView } from '../lib/serializers';
-import { notifyMany } from '../lib/notifications';
 import { circleRouter } from './circle';
 import { repDuesRouter } from './repDues';
 import { payoutsRouter } from './payouts';
@@ -158,35 +157,7 @@ spacesRouter.post('/:spaceId/join', validate(joinSchema), async (req: Request, r
     return;
   }
 
-  if (space.requireApproval) {
-    const existingRequest = await db.spaceJoinRequest.findUnique({
-      where: { userId_spaceId: { userId: uid, spaceId } },
-    });
-    if (existingRequest?.status === 'pending') {
-      errors.conflict(res, 'JOIN_REQUEST_PENDING', 'You already have a pending join request for this space');
-      return;
-    }
-
-    const request = await db.spaceJoinRequest.upsert({
-      where: { userId_spaceId: { userId: uid, spaceId } },
-      update: { status: 'pending', resolvedAt: null },
-      create: { userId: uid, spaceId },
-    });
-
-    const requester = await db.user.findUnique({ where: { id: uid }, select: { name: true } });
-    const reps = await db.spaceRep.findMany({ where: { spaceId }, select: { userId: true } });
-    await notifyMany(reps.map((r) => r.userId), {
-      kind: 'join_request',
-      title: 'New join request',
-      detail: `${requester?.name ?? 'A student'} requested to join ${space.name}.`,
-      href: '/dashboard/circle',
-    });
-
-    ok(res, { spaceId, status: 'pending', membership: as, joinedAt: null, requestId: request.id }, 201);
-    return;
-  }
-
-  // Anyone with a valid join code joins directly — no rep approval.
+  // Anyone with a valid join code joins directly — reps never gate admission.
   const membership = await db.spaceMembership.create({
     data: { userId: uid, spaceId, kind: as },
   });

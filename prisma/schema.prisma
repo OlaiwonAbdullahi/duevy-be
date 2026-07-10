@@ -415,7 +415,6 @@ model RepApplication {
   school          String
   faculty         String?
   theme           SpaceTheme
-  requireApproval Boolean
   coRepInvites    String[]  @default([])
   referralCode    String?
   status          RepApplicationStatus @default(pending)

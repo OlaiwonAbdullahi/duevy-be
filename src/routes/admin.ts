@@ -338,7 +338,6 @@ function serializeRepApplication(app: RepApplication, user?: { id: string; name:
       school: app.school,
       faculty: app.faculty,
       theme: app.theme,
-      requireApproval: app.requireApproval,
     },
     coRepInvites: app.coRepInvites,
     referralCode: app.referralCode,
@@ -423,7 +422,6 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
           theme: app.theme,
           school: app.school,
           faculty: app.faculty,
-          requireApproval: app.requireApproval,
           joinCode,
         },
       });

@@ -13,7 +13,6 @@ import {
   type Nominee,
   type AdminAuditLog,
   type Dispute,
-  type SpaceJoinRequest,
 } from '@prisma/client';
 
 type UserWithSpaces = User & {
@@ -241,25 +240,6 @@ export function serializeStudent(
     level: user.level,
     email: user.email,
     joinedAt: joinedAt.toISOString(),
-  };
-}
-
-/** A pending join request row (§5.4, rep review queue). */
-export function serializeJoinRequest(
-  req: SpaceJoinRequest & { user: Pick<User, 'id' | 'name' | 'matricNo' | 'level' | 'email'> },
-) {
-  return {
-    id: req.id,
-    status: req.status,
-    student: {
-      id: req.user.id,
-      name: req.user.name,
-      matricNo: req.user.matricNo,
-      level: req.user.level,
-      email: req.user.email,
-    },
-    requestedAt: req.createdAt.toISOString(),
-    resolvedAt: req.resolvedAt?.toISOString() ?? null,
   };
 }
 

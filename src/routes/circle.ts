@@ -7,7 +7,7 @@ import { type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { serializeSpace, serializeStudent, serializeAuditLog, serializeJoinRequest } from '../lib/serializers';
+import { serializeSpace, serializeStudent, serializeAuditLog } from '../lib/serializers';
 import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
@@ -85,97 +85,6 @@ circleRouter.delete('/members/:userId', requireSpaceRep(true), async (req: Reque
   }
 
   await db.spaceMembership.delete({ where: { id: membership.id } });
-  res.status(204).end();
-});
-
-// ---------------------------------------------------------------------------
-// GET /join-requests — pending join requests for approval-gated spaces (§5.4)
-// ---------------------------------------------------------------------------
-circleRouter.get('/join-requests', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
-  const sid = spaceId(req);
-  const { page, perPage, skip, take } = parseListQuery(req);
-  const statusFilter = z.enum(['pending', 'approved', 'rejected']).optional().parse(req.query.status);
-
-  const where = { spaceId: sid, status: statusFilter ?? 'pending' };
-  const [total, requests] = await Promise.all([
-    db.spaceJoinRequest.count({ where }),
-    db.spaceJoinRequest.findMany({
-      where,
-      include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take,
-    }),
-  ]);
-
-  ok(res, requests.map(serializeJoinRequest), 200, buildMeta(page, perPage, total));
-});
-
-// ---------------------------------------------------------------------------
-// POST /join-requests/{requestId}/approve — admit the requester (§5.4)
-// ---------------------------------------------------------------------------
-circleRouter.post('/join-requests/:requestId/approve', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
-  const sid = spaceId(req);
-  const request = await db.spaceJoinRequest.findFirst({
-    where: { id: req.params.requestId as string, spaceId: sid },
-  });
-  if (!request) {
-    errors.notFound(res, 'Join request not found');
-    return;
-  }
-  if (request.status !== 'pending') {
-    errors.conflict(res, 'JOIN_REQUEST_RESOLVED', 'This join request has already been resolved');
-    return;
-  }
-
-  await db.$transaction(async (tx) => {
-    await tx.spaceJoinRequest.update({ where: { id: request.id }, data: { status: 'approved', resolvedAt: new Date() } });
-    await tx.spaceMembership.upsert({
-      where: { userId_spaceId: { userId: request.userId, spaceId: sid } },
-      update: {},
-      create: { userId: request.userId, spaceId: sid, kind: 'member' },
-    });
-    await writeAudit(sid, await actor(uid(req)), 'members_approved', 'Approved a join request', tx);
-  });
-
-  await notify({
-    userId: request.userId,
-    kind: 'system',
-    title: 'Join request approved',
-    detail: 'Your request to join has been approved.',
-    href: '/dashboard/dues',
-  });
-
-  res.status(204).end();
-});
-
-// ---------------------------------------------------------------------------
-// POST /join-requests/{requestId}/reject — decline the requester (§5.4)
-// ---------------------------------------------------------------------------
-circleRouter.post('/join-requests/:requestId/reject', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
-  const sid = spaceId(req);
-  const request = await db.spaceJoinRequest.findFirst({
-    where: { id: req.params.requestId as string, spaceId: sid },
-  });
-  if (!request) {
-    errors.notFound(res, 'Join request not found');
-    return;
-  }
-  if (request.status !== 'pending') {
-    errors.conflict(res, 'JOIN_REQUEST_RESOLVED', 'This join request has already been resolved');
-    return;
-  }
-
-  await db.spaceJoinRequest.update({ where: { id: request.id }, data: { status: 'rejected', resolvedAt: new Date() } });
-
-  await notify({
-    userId: request.userId,
-    kind: 'system',
-    title: 'Join request declined',
-    detail: 'Your request to join was not approved.',
-    href: '/dashboard/dues',
-  });
-
   res.status(204).end();
 });
 

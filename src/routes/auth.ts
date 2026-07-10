@@ -50,7 +50,6 @@ const spaceDraftSchema = z.object({
   theme: z
     .enum(["emerald", "ocean", "royal", "crimson", "tangerine"])
     .default("emerald"),
-  requireApproval: z.boolean().default(false),
   coRepInvites: z.array(z.string().email()).optional(),
 });
 
@@ -122,7 +121,6 @@ authRouter.post(
             school: data.space.school,
             faculty: data.space.faculty,
             theme: data.space.theme,
-            requireApproval: data.space.requireApproval,
             coRepInvites: data.space.coRepInvites || [],
             referralCode: data.referralCode,
           },
@@ -241,7 +239,6 @@ authRouter.post(
               school: data.space.school,
               faculty: data.space.faculty,
               theme: data.space.theme,
-              requireApproval: data.space.requireApproval,
               coRepInvites: data.space.coRepInvites || [],
               referralCode: data.referralCode,
             },
