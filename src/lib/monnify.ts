@@ -153,3 +153,134 @@ export async function getTransactionStatus(
   if (!res.ok || !json.requestSuccessful || !json.responseBody) return null;
   return json.responseBody;
 }
+
+export interface ChargeCardInput {
+  amount: number; // kobo
+  reference: string;
+  customerName: string;
+  customerEmail: string;
+  description: string;
+  cardToken: string;
+}
+
+export interface ChargeCardResult {
+  paid: boolean;
+  transactionReference: string;
+  responseMessage: string;
+}
+
+/**
+ * Charge a previously tokenized card (§8.4). Cards are tokenized once via the
+ * PSP's inline SDK; subsequent charges use the stored token so PANs never
+ * touch this API again. Charges that come back needing further authorization
+ * (OTP/3DS) are treated as declined here — the recurring-token flow assumes
+ * a non-interactive charge, matching how saved cards are meant to be used.
+ */
+export async function chargeCardToken(input: ChargeCardInput): Promise<ChargeCardResult> {
+  const token = await getAccessToken();
+  const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v1/merchant/cards/charge`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      transactionReference: input.reference,
+      cardToken: input.cardToken,
+      amount: input.amount / 100,
+      customerFullName: input.customerName,
+      customerEmail: input.customerEmail,
+      paymentDescription: input.description,
+      currencyCode: 'NGN',
+      contractCode: env.MONNIFY_CONTRACT_CODE,
+      apiKey: env.MONNIFY_API_KEY,
+    }),
+  });
+  const json = (await res.json()) as {
+    requestSuccessful?: boolean;
+    responseBody?: { paymentStatus?: string; transactionReference?: string };
+    responseMessage?: string;
+  };
+  if (!res.ok || !json.requestSuccessful || !json.responseBody) {
+    return {
+      paid: false,
+      transactionReference: input.reference,
+      responseMessage: json.responseMessage ?? `Card charge failed (${res.status})`,
+    };
+  }
+  return {
+    paid: json.responseBody.paymentStatus === 'PAID',
+    transactionReference: json.responseBody.transactionReference ?? input.reference,
+    responseMessage: json.responseMessage ?? '',
+  };
+}
+
+export interface DisbursementInput {
+  amount: number; // kobo
+  reference: string;
+  narration: string;
+  bankCode: string;
+  accountNumber: string;
+  accountName: string;
+}
+
+export interface DisbursementResult {
+  status: 'SUCCESS' | 'PENDING' | 'FAILED';
+  reference: string;
+}
+
+/** Initiate a single bank transfer for a rep payout (§10.3). */
+export async function initiateDisbursement(input: DisbursementInput): Promise<DisbursementResult> {
+  if (!env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT) {
+    throw new Error('MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT is not configured');
+  }
+  const token = await getAccessToken();
+  const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v2/disbursements/single`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      amount: input.amount / 100,
+      reference: input.reference,
+      narration: input.narration,
+      destinationBankCode: input.bankCode,
+      destinationAccountNumber: input.accountNumber,
+      destinationAccountName: input.accountName,
+      currency: 'NGN',
+      sourceAccountNumber: env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT,
+      async: true,
+    }),
+  });
+  const json = (await res.json()) as {
+    requestSuccessful?: boolean;
+    responseBody?: { status?: string };
+    responseMessage?: string;
+  };
+  if (!res.ok || !json.requestSuccessful || !json.responseBody?.status) {
+    throw new Error(`Monnify disbursement failed: ${json.responseMessage ?? res.status}`);
+  }
+  const raw = json.responseBody.status;
+  const status: DisbursementResult['status'] =
+    raw === 'SUCCESS' ? 'SUCCESS' : raw === 'FAILED' || raw === 'REVERSED' ? 'FAILED' : 'PENDING';
+  return { status, reference: input.reference };
+}
+
+/** Poll the status of a previously initiated disbursement (reconciliation job). */
+export async function getDisbursementStatus(reference: string): Promise<DisbursementResult | null> {
+  const token = await getAccessToken();
+  const url = `${env.MONNIFY_BASE_URL}/api/v2/disbursements/single/summary?reference=${encodeURIComponent(reference)}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const json = (await res.json()) as {
+    requestSuccessful?: boolean;
+    responseBody?: { status?: string };
+  };
+  if (!res.ok || !json.requestSuccessful || !json.responseBody?.status) return null;
+  const raw = json.responseBody.status;
+  const status: DisbursementResult['status'] =
+    raw === 'SUCCESS' ? 'SUCCESS' : raw === 'FAILED' || raw === 'REVERSED' ? 'FAILED' : 'PENDING';
+  return { status, reference };
+}

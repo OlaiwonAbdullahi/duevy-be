@@ -6,7 +6,7 @@ import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
-import { renderReceiptHtml } from '../lib/receipt';
+import { renderReceiptPdf } from '../lib/receipt';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -93,7 +93,7 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
   }
 
   const dp = txn.duePayment;
-  const html = renderReceiptHtml({
+  const pdf = await renderReceiptPdf({
     reference: txn.reference,
     title: txn.title,
     spaceName: dp?.due.space.name ?? txn.detail ?? '',
@@ -106,8 +106,9 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
     method: txn.method,
   });
 
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.status(200).send(html);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="receipt-${txn.reference}.pdf"`);
+  res.status(200).send(pdf);
 });
 
 // ---------------------------------------------------------------------------

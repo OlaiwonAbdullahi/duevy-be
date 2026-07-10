@@ -5,8 +5,13 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
-import { serializeCard } from '../lib/serializers';
-import { initOnlineTopUp } from '../services/payment.service';
+import { serializeCard, serializeTransaction } from '../lib/serializers';
+import {
+  initOnlineTopUp,
+  chargeCardForTopUp,
+  CardNotFoundError,
+  CardChargeFailedError,
+} from '../services/payment.service';
 
 export const walletRouter = Router();
 walletRouter.use(authenticate);
@@ -54,7 +59,7 @@ walletRouter.post(
   idempotent,
   validate(topUpSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { amount, method } = req.body as z.infer<typeof topUpSchema>;
+    const { amount, method, cardId } = req.body as z.infer<typeof topUpSchema>;
     const user = await db.user.findUnique({ where: { id: uid(req) } });
     if (!user) {
       errors.notFound(res, 'User not found');
@@ -62,7 +67,20 @@ walletRouter.post(
     }
 
     if (method === 'card') {
-      fail(res, 501, 'NOT_IMPLEMENTED', 'Saved-card charging is not available yet; use online top-up.');
+      try {
+        const transaction = await chargeCardForTopUp(user, amount, cardId as string);
+        ok(res, { transaction: serializeTransaction(transaction) });
+      } catch (err) {
+        if (err instanceof CardNotFoundError) {
+          errors.notFound(res, 'Card not found');
+          return;
+        }
+        if (err instanceof CardChargeFailedError) {
+          fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
+          return;
+        }
+        throw err;
+      }
       return;
     }
 

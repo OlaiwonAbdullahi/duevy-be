@@ -1,6 +1,7 @@
 import { app } from './app';
 import { env } from './config/env';
 import { db } from './config/db';
+import { startReconciliationJob } from './jobs/reconciliation';
 
 async function startServer() {
   try {
@@ -11,9 +12,12 @@ async function startServer() {
       console.log(`🚀 Server ready at http://localhost:${env.PORT}`);
     });
 
+    const reconciliationJob = startReconciliationJob();
+
     // Graceful shutdown
     const shutdown = async () => {
       console.log('Shutting down server...');
+      clearInterval(reconciliationJob);
       server.close();
       await db.$disconnect();
       process.exit(0);

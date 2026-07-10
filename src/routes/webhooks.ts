@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { env } from '../config/env';
 import { fulfilByReference } from '../services/payment.service';
+import { settlePayout } from '../services/payout.service';
 
 export const webhooksRouter = Router();
 
@@ -28,9 +29,35 @@ webhooksRouter.post('/monnify', async (req: Request, res: Response): Promise<voi
 
   const body = req.body as {
     eventType?: string;
-    eventData?: { paymentReference?: string; transactionReference?: string; paymentStatus?: string };
+    eventData?: {
+      paymentReference?: string;
+      transactionReference?: string;
+      paymentStatus?: string;
+      reference?: string;
+      status?: string;
+    };
   };
   const data = body.eventData ?? {};
+
+  // Disbursement events (payouts) carry `reference` + `status` rather than
+  // `paymentReference` + `paymentStatus`; they resolve a Payout, not a PendingPayment.
+  if (body.eventType === 'SUCCESSFUL_DISBURSEMENT' || body.eventType === 'FAILED_DISBURSEMENT') {
+    const payoutRef = data.reference ?? data.transactionReference;
+    if (payoutRef) {
+      try {
+        await settlePayout(
+          payoutRef,
+          body.eventType === 'SUCCESSFUL_DISBURSEMENT',
+          body.eventType === 'FAILED_DISBURSEMENT' ? 'The payment provider reported the transfer failed' : undefined,
+        );
+      } catch (err) {
+        console.error('[webhook] payout settlement error:', err);
+      }
+    }
+    res.status(200).json({ success: true });
+    return;
+  }
+
   const reference = data.paymentReference;
 
   // Acknowledge malformed/irrelevant events quickly so Monnify stops retrying.

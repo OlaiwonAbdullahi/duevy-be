@@ -1,7 +1,7 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { computeCharge, generateReference } from '../lib/money';
-import { initTransaction } from '../lib/monnify';
+import { initTransaction, chargeCardToken } from '../lib/monnify';
 import { notify, notifyMany } from '../lib/notifications';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
@@ -73,6 +73,107 @@ export async function settleDueFromWallet(user: User, due: Due & { space: { name
   await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
   await triggerReferralReward(due.spaceId);
   return txn;
+}
+
+// ---------------------------------------------------------------------------
+// Card — synchronous charge of a saved, tokenized card (§6.3/§8.2/§11.6, method=card)
+// ---------------------------------------------------------------------------
+export interface CardChargeResult {
+  reference: string;
+  methodLabel: string;
+}
+
+/** Charge a saved card for `amount` kobo. Looks up the card, hits Monnify, and
+ * returns a reference the caller can use to write its own ledger rows. */
+export async function chargeSavedCard(
+  userId: string,
+  cardId: string,
+  amount: number,
+  description: string,
+): Promise<CardChargeResult> {
+  const [card, user] = await Promise.all([
+    db.card.findFirst({ where: { id: cardId, userId } }),
+    db.user.findUnique({ where: { id: userId } }),
+  ]);
+  if (!card || !user) throw new CardNotFoundError();
+
+  const reference = await uniqueReference();
+  const result = await chargeCardToken({
+    amount,
+    reference,
+    customerName: user.name,
+    customerEmail: user.email,
+    description,
+    cardToken: card.providerToken,
+  });
+  if (!result.paid) throw new CardChargeFailedError();
+
+  return { reference, methodLabel: `${card.brand} •••• ${card.last4}` };
+}
+
+export async function settleDueFromCard(
+  user: User,
+  due: Due & { space: { name: string } },
+  cardId: string,
+): Promise<Transaction> {
+  const charge = computeCharge(due.amount);
+  const { reference, methodLabel } = await chargeSavedCard(user.id, cardId, charge.totalCharged, due.title);
+
+  const txn = await db.$transaction(async (tx) => {
+    const transaction = await tx.transaction.create({
+      data: {
+        userId: user.id,
+        type: 'due',
+        title: due.title,
+        detail: due.space.name,
+        amount: -charge.totalCharged,
+        method: methodLabel,
+        status: 'completed',
+        reference,
+        spaceId: due.spaceId,
+      },
+    });
+
+    await tx.duePayment.create({
+      data: {
+        userId: user.id,
+        dueId: due.id,
+        txnId: transaction.id,
+        reference,
+        amountPaid: charge.totalCharged,
+        monnifyFee: charge.monnifyFee,
+        duevyFee: charge.duevyFee,
+        netToSpace: charge.netToSpace,
+      },
+    });
+
+    return transaction;
+  });
+
+  await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
+  await triggerReferralReward(due.spaceId);
+  return txn;
+}
+
+export async function chargeCardForTopUp(user: User, amount: number, cardId: string): Promise<Transaction> {
+  const { reference, methodLabel } = await chargeSavedCard(user.id, cardId, amount, 'Wallet top-up');
+
+  return db.$transaction(async (tx) => {
+    const transaction = await tx.transaction.create({
+      data: {
+        userId: user.id,
+        type: 'topup',
+        title: 'Wallet top-up',
+        detail: methodLabel,
+        amount,
+        method: methodLabel,
+        status: 'completed',
+        reference,
+      },
+    });
+    await tx.user.update({ where: { id: user.id }, data: { walletBalance: { increment: amount } } });
+    return transaction;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -279,5 +380,19 @@ export class InsufficientFundsError extends Error {
   constructor() {
     super('Insufficient wallet balance');
     this.name = 'InsufficientFundsError';
+  }
+}
+
+export class CardNotFoundError extends Error {
+  constructor() {
+    super('Card not found');
+    this.name = 'CardNotFoundError';
+  }
+}
+
+export class CardChargeFailedError extends Error {
+  constructor() {
+    super('Card charge was declined');
+    this.name = 'CardChargeFailedError';
   }
 }

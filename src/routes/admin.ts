@@ -15,6 +15,7 @@ import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
+import { renderTablePdf } from '../lib/pdf';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -60,6 +61,37 @@ async function spacesFinancials(spaceIds: string[]) {
   };
 }
 
+/** Count spaces with active dues collecting below 30% of what's expected. */
+async function countLowCollectionSpaces(spaceIds: string[]): Promise<number> {
+  if (spaceIds.length === 0) return 0;
+
+  const [activeDues, memberGroups] = await Promise.all([
+    db.due.findMany({ where: { spaceId: { in: spaceIds }, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
+    db.spaceMembership.groupBy({ by: ['spaceId'], where: { spaceId: { in: spaceIds } }, _count: { _all: true } }),
+  ]);
+  if (activeDues.length === 0) return 0;
+
+  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
+  const paidPerDue = new Map(
+    (await db.duePayment.groupBy({ by: ['dueId'], where: { dueId: { in: activeDues.map((d) => d.id) } }, _sum: { netToSpace: true } }))
+      .map((p) => [p.dueId, p._sum.netToSpace ?? 0]),
+  );
+
+  const bySpace = new Map<string, { expected: number; collected: number }>();
+  for (const d of activeDues) {
+    const agg = bySpace.get(d.spaceId) ?? { expected: 0, collected: 0 };
+    agg.expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
+    agg.collected += paidPerDue.get(d.id) ?? 0;
+    bySpace.set(d.spaceId, agg);
+  }
+
+  let count = 0;
+  for (const { expected, collected } of bySpace.values()) {
+    if (expected > 0 && collected / expected < 0.3) count += 1;
+  }
+  return count;
+}
+
 // ===========================================================================
 // §14.1 Overview
 // ===========================================================================
@@ -71,7 +103,13 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
   ]);
 
   const allSpaces = await db.space.findMany({ where: { isArchived: false }, select: { id: true } });
-  const fin = await spacesFinancials(allSpaces.map((s) => s.id));
+  const spaceIds = allSpaces.map((s) => s.id);
+  const [fin, lowCollectionCount, openDisputes] = await Promise.all([
+    spacesFinancials(spaceIds),
+    countLowCollectionSpaces(spaceIds),
+    db.dispute.findMany({ where: { status: { in: ['open', 'under_review'] } }, select: { slaDays: true, createdAt: true } }),
+  ]);
+  const breachedDisputes = openDisputes.filter((d) => (Date.now() - d.createdAt.getTime()) / (24 * 60 * 60 * 1000) > d.slaDays).length;
 
   // Overdue: active dues past their date, still short of full collection.
   const now = new Date();
@@ -111,6 +149,39 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
       detail: 'New reps cannot collect dues until verified.',
       href: '/admin/reps',
       linkLabel: 'Review reps',
+    });
+  }
+  if (overdueCount > 0) {
+    attention.push({
+      id: 'overdue-dues',
+      tone: 'warning',
+      badge: 'Overdue',
+      title: `${overdueCount} due${overdueCount === 1 ? '' : 's'} past deadline with unpaid balances`,
+      detail: `₦${(overdueAmount / 100).toLocaleString('en-NG')} still outstanding across overdue dues.`,
+      href: '/admin/spaces',
+      linkLabel: 'Review spaces',
+    });
+  }
+  if (lowCollectionCount > 0) {
+    attention.push({
+      id: 'low-collection',
+      tone: 'warning',
+      badge: 'Low collection',
+      title: `${lowCollectionCount} space${lowCollectionCount === 1 ? '' : 's'} collecting below 30% of expected dues`,
+      detail: 'These spaces may need a reminder push or rep follow-up.',
+      href: '/admin/spaces',
+      linkLabel: 'Review spaces',
+    });
+  }
+  if (breachedDisputes > 0) {
+    attention.push({
+      id: 'dispute-sla',
+      tone: 'warning',
+      badge: 'SLA breach',
+      title: `${breachedDisputes} dispute${breachedDisputes === 1 ? '' : 's'} past their SLA window`,
+      detail: 'Open disputes should be claimed and resolved before their SLA expires.',
+      href: '/admin/disputes',
+      linkLabel: 'Review disputes',
     });
   }
 
@@ -595,7 +666,13 @@ adminRouter.get('/transactions', requireAdminPermission('userManagement'), async
 
   const [total, rows] = await Promise.all([
     db.transaction.count({ where }),
-    db.transaction.findMany({ where, include: { user: { select: { name: true, email: true } } }, orderBy: { createdAt: 'desc' }, skip, take }),
+    db.transaction.findMany({
+      where,
+      include: { user: { select: { name: true, email: true } }, refunds: { select: { amount: true } } },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+    }),
   ]);
 
   const spaceIds = [...new Set(rows.map((r) => r.spaceId).filter(Boolean) as string[])];
@@ -604,7 +681,19 @@ adminRouter.get('/transactions', requireAdminPermission('userManagement'), async
 
   ok(
     res,
-    rows.map((t) => ({ ...serializeTransaction(t), type: adminTxnType(t.type), userName: t.user.name, userEmail: t.user.email, spaceName: t.spaceId ? spaceName.get(t.spaceId) ?? null : null })),
+    rows.map((t) => {
+      const refundedTotal = t.refunds.reduce((s, r) => s + r.amount, 0);
+      const fullyRefunded = t.type !== 'refund' && refundedTotal > 0 && refundedTotal >= Math.abs(t.amount);
+      return {
+        ...serializeTransaction(t),
+        type: adminTxnType(t.type),
+        status: fullyRefunded ? 'refunded' : t.status,
+        refundOfTxnId: t.refundOfTxnId,
+        userName: t.user.name,
+        userEmail: t.user.email,
+        spaceName: t.spaceId ? spaceName.get(t.spaceId) ?? null : null,
+      };
+    }),
     200,
     buildMeta(page, perPage, total),
   );
@@ -619,16 +708,46 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
     errors.notFound(res, 'Transaction not found');
     return;
   }
-  const refundAmount = amount ?? Math.abs(original.amount);
-  if (refundAmount > Math.abs(original.amount)) {
-    errors.validation(res, [{ field: 'amount', issue: 'exceeds the original amount' }]);
+  if (original.type === 'refund') {
+    errors.conflict(res, 'NOT_REFUNDABLE', 'Refund transactions cannot themselves be refunded');
+    return;
+  }
+  if (original.status !== 'completed') {
+    errors.conflict(res, 'NOT_REFUNDABLE', 'Only completed transactions can be refunded');
+    return;
+  }
+
+  const alreadyRefunded = await db.transaction.aggregate({
+    where: { refundOfTxnId: original.id },
+    _sum: { amount: true },
+  });
+  const refundable = Math.abs(original.amount) - (alreadyRefunded._sum.amount ?? 0);
+  if (refundable <= 0) {
+    errors.conflict(res, 'ALREADY_REFUNDED', 'This transaction has already been fully refunded');
+    return;
+  }
+
+  const refundAmount = amount ?? refundable;
+  if (refundAmount > refundable) {
+    errors.validation(res, [{ field: 'amount', issue: 'exceeds the remaining refundable amount' }]);
     return;
   }
 
   const reference = await uniqueReference();
   const refund = await db.$transaction(async (tx) => {
     const created = await tx.transaction.create({
-      data: { userId: original.userId, type: 'refund', title: 'Refund', detail: reason, amount: refundAmount, method: original.method, status: 'completed', reference, spaceId: original.spaceId },
+      data: {
+        userId: original.userId,
+        type: 'refund',
+        title: 'Refund',
+        detail: reason,
+        amount: refundAmount,
+        method: original.method,
+        status: 'completed',
+        reference,
+        spaceId: original.spaceId,
+        refundOfTxnId: original.id,
+      },
     });
     await tx.user.update({ where: { id: original.userId }, data: { walletBalance: { increment: refundAmount } } });
     return created;
@@ -965,14 +1084,14 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   }
 
   const range = { gte: report.fromDate, lte: report.toDate };
-  let body = '';
+  let rows: (string | number | null)[][];
 
   if (report.scope === 'full_ledger') {
     const txns = await db.transaction.findMany({ where: { createdAt: range }, include: { user: { select: { name: true, email: true } } }, orderBy: { createdAt: 'desc' } });
-    body = csv([
+    rows = [
       ['Reference', 'Type', 'Title', 'Amount (kobo)', 'Method', 'Status', 'User', 'Email', 'Date'],
       ...txns.map((t) => [t.reference, t.type, t.title, t.amount, t.method, t.status, t.user.name, t.user.email, t.createdAt.toISOString()]),
-    ]);
+    ];
   } else if (report.scope === 'financial_summary') {
     const [collected, fees, topups, refunds, payouts] = await Promise.all([
       db.duePayment.aggregate({ where: { paidAt: range }, _sum: { netToSpace: true } }),
@@ -981,7 +1100,7 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
       db.transaction.aggregate({ where: { type: 'refund', createdAt: range }, _sum: { amount: true } }),
       db.payout.aggregate({ where: { requestedAt: range }, _sum: { amount: true } }),
     ]);
-    body = csv([
+    rows = [
       ['Metric', 'Amount (kobo)'],
       ['Net collected (to spaces)', collected._sum.netToSpace ?? 0],
       ['Monnify fees', fees._sum.monnifyFee ?? 0],
@@ -989,27 +1108,35 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
       ['Wallet top-ups', topups._sum.amount ?? 0],
       ['Refunds issued', refunds._sum.amount ?? 0],
       ['Payouts requested', payouts._sum.amount ?? 0],
-    ]);
+    ];
   } else if (report.scope === 'space_collection') {
     const where = report.spaceId ? { id: report.spaceId } : {};
     const spaces = await db.space.findMany({ where, select: { id: true, name: true } });
-    const rows: (string | number | null)[][] = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
+    rows = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
     for (const s of spaces) {
       const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, monnifyFee: true, duevyFee: true } });
       rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.monnifyFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
     }
-    body = csv(rows);
   } else {
     // rep_performance
     const leads = await db.spaceRep.findMany({ where: { role: 'lead' }, include: { user: { select: { name: true } }, space: { select: { name: true } } } });
-    const rows: (string | number | null)[][] = [['Rep', 'Space', 'Net collected (kobo)']];
+    rows = [['Rep', 'Space', 'Net collected (kobo)']];
     for (const l of leads) {
       const agg = await db.duePayment.aggregate({ where: { due: { spaceId: l.spaceId }, paidAt: range }, _sum: { netToSpace: true } });
       rows.push([l.user.name, l.space.name, agg._sum.netToSpace ?? 0]);
     }
-    body = csv(rows);
   }
 
+  if (report.format === 'pdf') {
+    const pdf = await renderTablePdf(`${report.scope} report`, rows);
+    await db.report.update({ where: { id: report.id }, data: { fileSize: pdf.byteLength } }).catch(() => {});
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${report.scope}-${report.id}.pdf"`);
+    res.status(200).send(pdf);
+    return;
+  }
+
+  const body = csv(rows);
   await db.report.update({ where: { id: report.id }, data: { fileSize: Buffer.byteLength(body) } }).catch(() => {});
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${report.scope}-${report.id}.csv"`);

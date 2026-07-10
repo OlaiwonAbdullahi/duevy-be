@@ -12,7 +12,12 @@ import { serializePoll } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { initTransaction } from '../lib/monnify';
-import { uniqueReference } from '../services/payment.service';
+import {
+  uniqueReference,
+  chargeSavedCard,
+  CardNotFoundError,
+  CardChargeFailedError,
+} from '../services/payment.service';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
 
 const pollInclude = { categories: { include: { nominees: true }, orderBy: { createdAt: 'asc' as const } } };
@@ -287,13 +292,15 @@ pollsPublicRouter.get('/:slug', optionalAuthenticate, async (req: Request, res: 
 });
 
 // POST /polls/:slug/votes — cast votes (§11.6)
-const voteSchema = z.object({
-  selections: z
-    .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
-    .min(1),
-  method: z.enum(['wallet', 'card', 'online']).optional(),
-  cardId: z.string().optional(),
-});
+const voteSchema = z
+  .object({
+    selections: z
+      .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
+      .min(1),
+    method: z.enum(['wallet', 'card', 'online']).optional(),
+    cardId: z.string().optional(),
+  })
+  .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card payments', path: ['cardId'] });
 
 pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = uid(req);
@@ -360,7 +367,37 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
   }
 
   if (body.method === 'card') {
-    fail(res, 501, 'NOT_IMPLEMENTED', 'Saved-card charging is not available yet; use wallet or online.');
+    try {
+      const { reference, methodLabel } = await chargeSavedCard(userId, body.cardId as string, totalCharged, `Votes: ${poll.title}`);
+      const txn = await db.$transaction(async (tx) => {
+        const t = await tx.transaction.create({
+          data: {
+            userId,
+            type: 'vote',
+            title: `Votes: ${poll.title}`,
+            detail: 'Poll',
+            amount: -totalCharged,
+            method: methodLabel,
+            status: 'completed',
+            reference,
+            spaceId: poll.spaceId,
+          },
+        });
+        await applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: poll.amountPerVote, reference });
+        return t;
+      });
+      ok(res, { receiptId: txn.id, totalCharged }, 201);
+    } catch (err) {
+      if (err instanceof CardNotFoundError) {
+        errors.notFound(res, 'Card not found');
+        return;
+      }
+      if (err instanceof CardChargeFailedError) {
+        fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
+        return;
+      }
+      throw err;
+    }
     return;
   }
 

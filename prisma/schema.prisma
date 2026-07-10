@@ -512,23 +512,27 @@ model Card {
 }
 
 model Transaction {
-  id        String    @id @default(cuid())
-  userId    String
-  type      TxnType
-  title     String
-  detail    String?
-  amount    Int       // kobo, signed
-  method    String    // "Wallet" | "Visa •••• 4242" | "Monnify"
-  status    TxnStatus @default(pending)
-  reference String    @unique
-  spaceId   String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  id            String    @id @default(cuid())
+  userId        String
+  type          TxnType
+  title         String
+  detail        String?
+  amount        Int       // kobo, signed
+  method        String    // "Wallet" | "Visa •••• 4242" | "Monnify"
+  status        TxnStatus @default(pending)
+  reference     String    @unique
+  spaceId       String?
+  refundOfTxnId String?   // set on `type: refund` rows — the transaction this refund reverses
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  user       User        @relation(fields: [userId], references: [id])
+  user       User          @relation(fields: [userId], references: [id])
   duePayment DuePayment?
+  refundOf   Transaction?  @relation("TransactionRefunds", fields: [refundOfTxnId], references: [id])
+  refunds    Transaction[] @relation("TransactionRefunds")
 
   @@index([userId, createdAt])
+  @@index([refundOfTxnId])
   @@map("transactions")
 }
 

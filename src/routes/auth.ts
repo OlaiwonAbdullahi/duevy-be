@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { createHash } from "crypto";
+import { type User, type SpaceMembership, type SpaceRep } from "@prisma/client";
 import { db } from "../config/db";
 import { env } from "../config/env";
 import { validate } from "../middleware/validate";
@@ -13,6 +14,7 @@ import {
   sendVerification,
   sendPasswordReset,
 } from "../services/auth.service";
+import { verifyGoogleIdToken } from "../lib/googleAuth";
 import { verifyRefreshToken } from "../lib/jwt";
 import { parseExpiryMs } from "../lib/jwt";
 import { authLimiter } from "../middleware/rateLimiter";
@@ -37,6 +39,21 @@ function clearRefreshCookie(res: Response) {
   res.clearCookie("refreshToken", { path: "/v1/auth/refresh" });
 }
 
+// Shared by /auth/register and /auth/google — the department-setup fields
+// collected when the signer picks the `rep` role (§2.1/§2.3).
+const spaceDraftSchema = z.object({
+  name: z.string(),
+  short: z.string().min(2).max(6),
+  kind: z.enum(["department", "association", "faculty", "club"]),
+  school: z.string(),
+  faculty: z.string().optional(),
+  theme: z
+    .enum(["emerald", "ocean", "royal", "crimson", "tangerine"])
+    .default("emerald"),
+  requireApproval: z.boolean().default(false),
+  coRepInvites: z.array(z.string().email()).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // POST /auth/register
 // ---------------------------------------------------------------------------
@@ -52,20 +69,7 @@ const registerSchema = z
     acceptedTerms: z.literal(true),
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().optional(),
-    space: z
-      .object({
-        name: z.string(),
-        short: z.string().min(2).max(6),
-        kind: z.enum(["department", "association", "faculty", "club"]),
-        school: z.string(),
-        faculty: z.string().optional(),
-        theme: z
-          .enum(["emerald", "ocean", "royal", "crimson", "tangerine"])
-          .default("emerald"),
-        requireApproval: z.boolean().default(false),
-        coRepInvites: z.array(z.string().email()).optional(),
-      })
-      .optional(),
+    space: spaceDraftSchema.optional(),
   })
   .refine(
     (data) => {
@@ -156,6 +160,138 @@ authRouter.post(
     }
 
     ok(res, { user: userSafe, accessToken }, 201);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /auth/google (§2.3)
+// ---------------------------------------------------------------------------
+type UserWithSpaces = User & { spaceMemberships: SpaceMembership[]; spaceReps: SpaceRep[] };
+
+const googleSchema = z
+  .object({
+    idToken: z.string().min(1),
+    matricNo: z.string().min(1).optional(),
+    role: z.enum(["student", "rep"]).default("student"),
+    referralCode: z.string().optional(),
+    space: spaceDraftSchema.optional(),
+  })
+  .refine(
+    (data) => data.role !== "rep" || !!data.space,
+    { message: "space is required when role is rep", path: ["space"] },
+  );
+
+authRouter.post(
+  "/google",
+  authLimiter,
+  validate(googleSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    if (!env.GOOGLE_CLIENT_ID) {
+      fail(res, 501, "NOT_IMPLEMENTED", "Google sign-in is not configured");
+      return;
+    }
+
+    const data = req.body as z.infer<typeof googleSchema>;
+
+    let identity;
+    try {
+      identity = await verifyGoogleIdToken(data.idToken);
+    } catch {
+      fail(res, 401, "INVALID_CREDENTIALS", "Google sign-in could not be verified");
+      return;
+    }
+    if (!identity.emailVerified) {
+      fail(res, 401, "INVALID_CREDENTIALS", "Google account's email is not verified");
+      return;
+    }
+
+    let user: UserWithSpaces | null = await db.user.findUnique({
+      where: { email: identity.email },
+      include: { spaceMemberships: true, spaceReps: true },
+    });
+
+    if (!user) {
+      if (!data.matricNo) {
+        errors.validation(res, [
+          { field: "matricNo", issue: "required on first sign-in" },
+        ]);
+        return;
+      }
+
+      const created = await db.$transaction(async (tx) => {
+        const newUser = await tx.user.create({
+          data: {
+            id: generateId("user"),
+            name: identity!.name,
+            email: identity!.email,
+            emailVerified: true,
+            matricNo: data.matricNo,
+            role: "student", // Everyone starts as a student; reps are provisioned on admin approval
+            repApplicationStatus: data.role === "rep" ? "pending" : "none",
+          },
+        });
+
+        if (data.role === "rep" && data.space) {
+          await tx.repApplication.create({
+            data: {
+              userId: newUser.id,
+              spaceName: data.space.name,
+              spaceShort: data.space.short,
+              spaceKind: data.space.kind,
+              school: data.space.school,
+              faculty: data.space.faculty,
+              theme: data.space.theme,
+              requireApproval: data.space.requireApproval,
+              coRepInvites: data.space.coRepInvites || [],
+              referralCode: data.referralCode,
+            },
+          });
+        }
+
+        return newUser;
+      });
+
+      user = { ...created, spaceMemberships: [], spaceReps: [] };
+    }
+
+    if (user.isSuspended) {
+      fail(res, 403, "ACCOUNT_SUSPENDED", "Your account has been suspended");
+      return;
+    }
+    if (user.isDeactivated) {
+      fail(res, 403, "ACCOUNT_DEACTIVATED", "Your account has been deactivated");
+      return;
+    }
+
+    const spaceIds = [
+      ...user.spaceMemberships.map((m) => m.spaceId),
+      ...user.spaceReps.map((r) => r.spaceId),
+    ];
+
+    const { accessToken, refreshToken } = await createTokens(
+      user.id,
+      user.role,
+      spaceIds,
+      req.headers["user-agent"],
+      req.ip,
+    );
+    setRefreshCookie(res, refreshToken);
+
+    const { passwordHash: _, ...userSafe } = user;
+
+    if (user.repApplicationStatus === "pending") {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: "REP_APPROVAL_PENDING",
+          message: "Rep application is under review",
+        },
+        data: { user: userSafe, accessToken },
+      });
+      return;
+    }
+
+    ok(res, { user: userSafe, accessToken });
   },
 );
 

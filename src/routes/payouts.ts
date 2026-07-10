@@ -14,6 +14,7 @@ import { verifyAccountName } from '../lib/monnify';
 import { generatePayoutReference } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail } from '../lib/email';
+import { initiatePayoutDisbursement } from '../services/payout.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
@@ -214,7 +215,12 @@ payoutsRouter.post(
       `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout`,
     );
 
-    ok(res, serializePayout(payout), 201);
+    // Best-effort: resolves synchronously when the provider responds inline;
+    // otherwise the payout stays `processing` for the webhook/reconciliation job.
+    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
+    const fresh = (await db.payout.findUnique({ where: { id: payout.id } })) ?? payout;
+
+    ok(res, serializePayout(fresh), 201);
   },
 );
 

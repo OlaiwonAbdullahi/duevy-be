@@ -9,11 +9,14 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
-import { renderReceiptHtml } from '../lib/receipt';
+import { renderReceiptPdf } from '../lib/receipt';
 import {
   settleDueFromWallet,
+  settleDueFromCard,
   initOnlineDuePayment,
   InsufficientFundsError,
+  CardNotFoundError,
+  CardChargeFailedError,
 } from '../services/payment.service';
 import { type Due, type DuePayment } from '@prisma/client';
 
@@ -141,7 +144,7 @@ duesRouter.post(
   validate(paySchema),
   async (req: Request, res: Response): Promise<void> => {
     const id = uid(req);
-    const { method } = req.body as z.infer<typeof paySchema>;
+    const { method, cardId } = req.body as z.infer<typeof paySchema>;
 
     const due = await db.due.findUnique({
       where: { id: req.params.dueId as string },
@@ -170,11 +173,6 @@ duesRouter.post(
       return;
     }
 
-    if (method === 'card') {
-      fail(res, 501, 'NOT_IMPLEMENTED', 'Saved-card charging is not available yet; use wallet or online.');
-      return;
-    }
-
     const user = await db.user.findUnique({ where: { id } });
     if (!user) {
       errors.notFound(res, 'User not found');
@@ -191,6 +189,27 @@ duesRouter.post(
       } catch (err) {
         if (err instanceof InsufficientFundsError) {
           fail(res, 402, 'INSUFFICIENT_FUNDS', 'Your wallet balance is too low for this payment');
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    if (method === 'card') {
+      try {
+        const transaction = await settleDueFromCard(user, due, cardId as string);
+        ok(res, {
+          transaction: serializeTransaction(transaction),
+          receiptUrl: `${env.APP_BASE_URL}/v1/dues/${due.id}/receipt`,
+        });
+      } catch (err) {
+        if (err instanceof CardNotFoundError) {
+          errors.notFound(res, 'Card not found');
+          return;
+        }
+        if (err instanceof CardChargeFailedError) {
+          fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
           return;
         }
         throw err;
@@ -224,7 +243,7 @@ duesRouter.get('/:dueId/receipt', async (req: Request, res: Response): Promise<v
     return;
   }
 
-  const html = renderReceiptHtml({
+  const pdf = await renderReceiptPdf({
     reference: payment.reference,
     title: payment.due.title,
     spaceName: payment.due.space.name,
@@ -237,6 +256,7 @@ duesRouter.get('/:dueId/receipt', async (req: Request, res: Response): Promise<v
     method: payment.transaction?.method ?? 'Wallet',
   });
 
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.status(200).send(html);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="receipt-${payment.reference}.pdf"`);
+  res.status(200).send(pdf);
 });

@@ -18,6 +18,9 @@ const envSchema = z.object({
   // Redis
   REDIS_URL: z.string().default('redis://localhost:6379'),
 
+  // Google Sign-In (§2.3). Optional: while unset, POST /auth/google returns 501.
+  GOOGLE_CLIENT_ID: z.string().optional(),
+
   // Resend
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
@@ -28,6 +31,9 @@ const envSchema = z.object({
   MONNIFY_BASE_URL: z.string().url().default('https://sandbox.monnify.com'),
   MONNIFY_CONTRACT_CODE: z.string(),
   MONNIFY_WEBHOOK_SECRET: z.string(),
+  // Wallet account payouts are disbursed from. Optional: while unset, payout
+  // requests are recorded but no transfer is initiated (§10.3 stays manual).
+  MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT: z.string().optional(),
 
   // App
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
