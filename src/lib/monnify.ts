@@ -137,6 +137,43 @@ export async function verifyAccountName(
   }
 }
 
+export interface MonnifyBank {
+  code: string;
+  name: string;
+}
+
+interface BanksCache {
+  banks: MonnifyBank[];
+  expiresAt: number; // epoch ms
+}
+
+let cachedBanks: BanksCache | null = null;
+const BANKS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** List the banks Monnify supports for transfers/name-enquiry (§10.2). Cached for 24h — this rarely changes. */
+export async function getBanks(): Promise<MonnifyBank[]> {
+  if (cachedBanks && cachedBanks.expiresAt > Date.now()) {
+    return cachedBanks.banks;
+  }
+
+  const token = await getAccessToken();
+  const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v1/banks`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const json = (await res.json()) as {
+    requestSuccessful?: boolean;
+    responseBody?: { name: string; code: string }[];
+    responseMessage?: string;
+  };
+  if (!res.ok || !json.requestSuccessful || !json.responseBody) {
+    throw new Error(`Monnify bank list failed: ${json.responseMessage ?? res.status}`);
+  }
+
+  const banks = json.responseBody.map((b) => ({ code: b.code, name: b.name }));
+  cachedBanks = { banks, expiresAt: Date.now() + BANKS_CACHE_TTL_MS };
+  return banks;
+}
+
 /** Read a transaction's status (used by §6.4 polling and the reconciliation job). */
 export async function getTransactionStatus(
   transactionReference: string,

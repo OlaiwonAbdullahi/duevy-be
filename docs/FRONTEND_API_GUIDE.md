@@ -173,6 +173,17 @@ Returns collection stats and active dues list.
 
 ## 7. Payouts (Rep Only)
 
+### List Banks
+**GET** `/v1/banks`
+Returns `[{ "code": "058", "name": "Guaranty Trust Bank" }, ...]` — the full Monnify-supported
+bank list, for populating the bank picker on the payout-account form. Cached server-side for 24h.
+
+### Set Payout Account
+**PUT** `/v1/spaces/{spaceId}/payout/account`
+**Payload:** `{ "bankCode": "058", "accountNumber": "0123456789" }`
+`accountName` is resolved automatically via name-enquiry; only send it if you want to assert a
+name and have the API confirm it matches (`422 ACCOUNT_NAME_MISMATCH` on conflict).
+
 ### Request Payout
 **POST** `/v1/spaces/{spaceId}/payout/request`
 **Payload:** `{ "amount": 1000000, "note": "Venue payment" }`

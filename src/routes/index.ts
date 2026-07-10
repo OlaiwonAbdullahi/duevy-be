@@ -11,6 +11,7 @@ import { pollsPublicRouter } from './polls';
 import { adminRouter } from './admin';
 import { referralsRouter } from './referrals';
 import { disputesRouter } from './disputes';
+import { banksRouter } from './banks';
 
 export const apiRouter = Router();
 
@@ -27,3 +28,4 @@ apiRouter.use('/polls', pollsPublicRouter);
 apiRouter.use('/admin', adminRouter);
 apiRouter.use('/referrals', referralsRouter);
 apiRouter.use('/disputes', disputesRouter);
+apiRouter.use('/banks', banksRouter);

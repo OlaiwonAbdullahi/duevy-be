@@ -9,8 +9,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { resolveBankName } from '../lib/banks';
-import { verifyAccountName } from '../lib/monnify';
+import { getBanks, verifyAccountName } from '../lib/monnify';
 import { generatePayoutReference } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail } from '../lib/email';
@@ -92,7 +91,8 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const sid = spaceId(req);
   const { bankCode, accountNumber, accountName } = req.body as z.infer<typeof putAccountSchema>;
 
-  const bankName = resolveBankName(bankCode);
+  const banks = await getBanks();
+  const bankName = banks.find((b) => b.code === bankCode)?.name;
   if (!bankName) {
     errors.validation(res, [{ field: 'bankCode', issue: 'unknown bank code' }]);
     return;
