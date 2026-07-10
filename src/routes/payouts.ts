@@ -80,16 +80,11 @@ payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promis
 const putAccountSchema = z.object({
   bankCode: z.string().min(3),
   accountNumber: z.string().regex(/^\d{10}$/, 'must be a 10-digit NUBAN'),
-  accountName: z.string().min(2).optional(),
 });
-
-function normalizeName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z]/g, '');
-}
 
 payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const { bankCode, accountNumber, accountName } = req.body as z.infer<typeof putAccountSchema>;
+  const { bankCode, accountNumber } = req.body as z.infer<typeof putAccountSchema>;
 
   const banks = await getBanks();
   const bankName = banks.find((b) => b.code === bankCode)?.name;
@@ -98,19 +93,14 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     return;
   }
 
-  // Name-enquiry is authoritative when available; otherwise fall back to the
-  // client-supplied name (which is then required).
+  // Name-enquiry is authoritative and mandatory — the account name is always
+  // server-resolved, never client-supplied.
   const resolvedName = await verifyAccountName(accountNumber, bankCode);
-  if (resolvedName) {
-    if (accountName && normalizeName(accountName) !== normalizeName(resolvedName)) {
-      fail(res, 422, 'ACCOUNT_NAME_MISMATCH', `Account name does not match: resolved "${resolvedName}"`);
-      return;
-    }
-  } else if (!accountName) {
-    fail(res, 422, 'ACCOUNT_NAME_MISMATCH', 'Could not verify the account; provide the account name');
+  if (!resolvedName) {
+    fail(res, 422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
     return;
   }
-  const finalName = resolvedName ?? (accountName as string);
+  const finalName = resolvedName;
 
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =

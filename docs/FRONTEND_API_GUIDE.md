@@ -181,8 +181,9 @@ bank list, for populating the bank picker on the payout-account form. Cached ser
 ### Set Payout Account
 **PUT** `/v1/spaces/{spaceId}/payout/account`
 **Payload:** `{ "bankCode": "058", "accountNumber": "0123456789" }`
-`accountName` is resolved automatically via name-enquiry; only send it if you want to assert a
-name and have the API confirm it matches (`422 ACCOUNT_NAME_MISMATCH` on conflict).
+`accountName` is not accepted as input — it's always resolved via Monnify name-enquiry and
+returned in the response. Returns `422 ACCOUNT_UNVERIFIABLE` if the account can't be resolved
+(e.g. wrong account number/bank combination).
 
 ### Request Payout
 **POST** `/v1/spaces/{spaceId}/payout/request`
