@@ -649,7 +649,7 @@ interface User {
   email: string;
   role: 'student' | 'rep' | 'admin';
   walletBalance: number; // Kobo
-  spaces: Array<{ id: string; name: string; membership: 'member' | 'rep' }>;
+  spaces: Array<{ id: string; name: string; membership: 'member' | 'rep'; joinCode?: string }>; // joinCode present for rep spaces
 }
 
 interface StudentDue {

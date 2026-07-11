@@ -625,6 +625,7 @@ authRouter.get(
                 short: true,
                 kind: true,
                 hue: true,
+                joinCode: true,
               },
             },
           },
