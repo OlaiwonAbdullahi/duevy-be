@@ -94,10 +94,17 @@ export async function initTransaction(
     responseMessage?: string;
   };
   if (!res.ok || !json.requestSuccessful || !json.responseBody) {
+    console.error(
+      `[monnify] init-transaction failed for ref=${input.reference}:`,
+      JSON.stringify(json),
+    );
     throw new Error(
       `Monnify init failed: ${json.responseMessage ?? res.status}`,
     );
   }
+  console.log(
+    `[monnify] init-transaction ok for ref=${input.reference} -> txnRef=${json.responseBody.transactionReference}`,
+  );
   return json.responseBody;
 }
 
@@ -188,9 +195,66 @@ export async function getTransactionStatus(
   const json = (await res.json()) as {
     requestSuccessful: boolean;
     responseBody?: MonnifyTxnStatus;
+    responseMessage?: string;
   };
-  if (!res.ok || !json.requestSuccessful || !json.responseBody) return null;
+  if (!res.ok || !json.requestSuccessful || !json.responseBody) {
+    console.error(
+      `[monnify] transaction-status lookup failed for ref=${transactionReference}:`,
+      JSON.stringify(json),
+    );
+    return null;
+  }
+  if (json.responseBody.paymentStatus !== 'PAID') {
+    console.log(
+      `[monnify] transaction-status ref=${transactionReference}:`,
+      JSON.stringify(json.responseBody),
+    );
+  }
   return json.responseBody;
+}
+
+export interface MonnifyCardDetails {
+  cardType: string; // VISA | MASTERCARD | VERVE | ...
+  last4: string;
+  expMonth: string;
+  expYear: string;
+  cardToken: string; // reusable token for chargeCardToken
+}
+
+/**
+ * Fetch the tokenized card behind a completed CARD transaction — the redirect
+ * equivalent of the inline SDK handing back a token directly (§8.4 card-save flow).
+ * Best-effort: returns null if the contract doesn't have card tokenization enabled
+ * or the transaction wasn't a card payment. NOTE: verify this path against the
+ * current Monnify API docs for your account — it hasn't been exercised against a
+ * live Monnify contract in this codebase yet.
+ */
+export async function getCardDetails(
+  transactionReference: string,
+): Promise<MonnifyCardDetails | null> {
+  try {
+    const token = await getAccessToken();
+    const url = `${env.MONNIFY_BASE_URL}/api/v1/merchant/cards/${encodeURIComponent(transactionReference)}/card-details`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = (await res.json()) as {
+      requestSuccessful?: boolean;
+      responseBody?: { cardDetails?: MonnifyCardDetails };
+      responseMessage?: string;
+    };
+    if (!res.ok || !json.requestSuccessful || !json.responseBody?.cardDetails) {
+      console.error(
+        `[monnify] card-details lookup failed for ref=${transactionReference}:`,
+        JSON.stringify(json),
+      );
+      return null;
+    }
+    return json.responseBody.cardDetails;
+  } catch (err) {
+    console.error(`[monnify] card-details lookup threw for ref=${transactionReference}:`, err);
+    return null;
+  }
 }
 
 export interface ChargeCardInput {

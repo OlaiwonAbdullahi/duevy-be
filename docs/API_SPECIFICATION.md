@@ -755,15 +755,18 @@ Requires `Idempotency-Key`.
 
 ### 8.4 `POST /wallet/cards`
 
-Card capture is **tokenization-only** — raw PANs never touch the API. The client completes a
-₦50 verification charge through the provider's inline SDK and posts the resulting token.
+Redirect flow, same shape as the `online` payment method elsewhere in this API. Requires
+`Idempotency-Key`.
 
-| Field           | Type    | Required | Notes                                                |
-| --------------- | ------- | -------- | ---------------------------------------------------- |
-| `providerToken` | string  | ✅       | Tokenized card reference from the PSP                |
-| `isDefault`     | boolean | ❌       | Default `false`; `true` demotes the previous default |
+| Field       | Type    | Required | Notes                                                |
+| ----------- | ------- | -------- | ----------------------------------------------------- |
+| `isDefault` | boolean | ❌       | Default `false`; `true` demotes the previous default |
 
-**Response `201`** — `Card` (brand/last4/expiry derived from the token server-side).
+**Response `200`** — `{ checkoutUrl, reference }`. The client redirects to `checkoutUrl`; Monnify
+runs a ₦50 verification charge there and hands the resulting card token back to this API via
+webhook (or the reconciliation sweep, within ~15 min as a fallback) — never through the client.
+Poll `GET /payments/{reference}/status` (§6.4) until `completed`, then re-fetch `GET /wallet/cards`.
+brand/last4/expiry are derived from the token server-side, not client-supplied.
 
 ### 8.5 `PATCH /wallet/cards/{cardId}`
 

@@ -9,6 +9,7 @@ import { serializeCard, serializeTransaction } from '../lib/serializers';
 import {
   initOnlineTopUp,
   chargeCardForTopUp,
+  initCardSave,
   CardNotFoundError,
   CardChargeFailedError,
 } from '../services/payment.service';
@@ -101,48 +102,31 @@ walletRouter.get('/cards', async (req: Request, res: Response): Promise<void> =>
 });
 
 // ---------------------------------------------------------------------------
-// POST /wallet/cards (§8.4) — tokenization only; PANs never touch the API
+// POST /wallet/cards (§8.4) — redirect flow: a ₦50 verification charge on
+// Monnify's hosted checkout tokenizes the card. The token is exchanged for a
+// saved Card once the webhook/reconciliation fulfilment resolves the reference.
 // ---------------------------------------------------------------------------
 const addCardSchema = z.object({
-  providerToken: z.string().min(1),
-  // Card metadata is returned by the PSP inline SDK alongside the token.
-  brand: z.enum(['Visa', 'Mastercard', 'Verve']),
-  last4: z.string().regex(/^\d{4}$/),
-  expiry: z.string().regex(/^(0[1-9]|1[0-2])\/\d{2}$/, 'must be MM/YY'),
   isDefault: z.boolean().default(false),
 });
 
-walletRouter.post('/cards', validate(addCardSchema), async (req: Request, res: Response): Promise<void> => {
-  const id = uid(req);
-  const data = req.body as z.infer<typeof addCardSchema>;
-
-  const existing = await db.card.findUnique({ where: { providerToken: data.providerToken } });
-  if (existing) {
-    errors.conflict(res, 'CARD_EXISTS', 'That card is already saved');
-    return;
-  }
-
-  const count = await db.card.count({ where: { userId: id } });
-  const makeDefault = data.isDefault || count === 0; // first card is always default
-
-  const card = await db.$transaction(async (tx) => {
-    if (makeDefault) {
-      await tx.card.updateMany({ where: { userId: id, isDefault: true }, data: { isDefault: false } });
+walletRouter.post(
+  '/cards',
+  requireIdempotencyKey,
+  idempotent,
+  validate(addCardSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { isDefault } = req.body as z.infer<typeof addCardSchema>;
+    const user = await db.user.findUnique({ where: { id: uid(req) } });
+    if (!user) {
+      errors.notFound(res, 'User not found');
+      return;
     }
-    return tx.card.create({
-      data: {
-        userId: id,
-        providerToken: data.providerToken,
-        brand: data.brand,
-        last4: data.last4,
-        expiry: data.expiry,
-        isDefault: makeDefault,
-      },
-    });
-  });
 
-  ok(res, serializeCard(card), 201);
-});
+    const result = await initCardSave(user, isDefault);
+    ok(res, result);
+  },
+);
 
 // ---------------------------------------------------------------------------
 // PATCH /wallet/cards/{cardId} (§8.5) — promote to default

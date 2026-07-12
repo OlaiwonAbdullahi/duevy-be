@@ -39,6 +39,8 @@ webhooksRouter.post('/monnify', async (req: Request, res: Response): Promise<voi
   };
   const data = body.eventData ?? {};
 
+  console.log(`[webhook] monnify eventType=${body.eventType ?? 'unknown'}:`, JSON.stringify(body));
+
   // Disbursement events (payouts) carry `reference` + `status` rather than
   // `paymentReference` + `paymentStatus`; they resolve a Payout, not a PendingPayment.
   if (body.eventType === 'SUCCESSFUL_DISBURSEMENT' || body.eventType === 'FAILED_DISBURSEMENT') {

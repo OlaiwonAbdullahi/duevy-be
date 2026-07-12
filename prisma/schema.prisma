@@ -95,6 +95,7 @@ enum TxnType {
   withdrawal
   refund
   vote
+  card_verification
 }
 
 enum TxnStatus {

@@ -1,10 +1,21 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { computeCharge, generateReference } from '../lib/money';
-import { initTransaction, chargeCardToken } from '../lib/monnify';
+import { initTransaction, chargeCardToken, getCardDetails } from '../lib/monnify';
 import { notify, notifyMany } from '../lib/notifications';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
+
+// ₦50 verification charge used to tokenize a card during the redirect add-card flow (§8.4).
+const CARD_VERIFICATION_AMOUNT = 5000; // kobo
+
+function normalizeCardBrand(monnifyCardType: string): string {
+  const upper = monnifyCardType.toUpperCase();
+  if (upper.includes('VISA')) return 'Visa';
+  if (upper.includes('MASTERCARD')) return 'Mastercard';
+  if (upper.includes('VERVE')) return 'Verve';
+  return monnifyCardType;
+}
 
 /** After a space records a payment, pay any pending referral bounty for its lead rep. */
 async function triggerReferralReward(spaceId: string): Promise<void> {
@@ -264,6 +275,49 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
 }
 
 // ---------------------------------------------------------------------------
+// Card save — redirect flow (§8.4). The payer completes a small verification
+// charge on Monnify's hosted checkout; the webhook/reconciliation fulfilment
+// path below exchanges the completed transaction for a reusable card token.
+// ---------------------------------------------------------------------------
+export async function initCardSave(user: User, isDefault: boolean): Promise<CheckoutResult> {
+  const reference = await uniqueReference();
+
+  const init = await initTransaction({
+    amount: CARD_VERIFICATION_AMOUNT,
+    reference,
+    customerName: user.name,
+    customerEmail: user.email,
+    description: 'Card verification',
+  });
+
+  await db.$transaction(async (tx) => {
+    await tx.transaction.create({
+      data: {
+        userId: user.id,
+        type: 'card_verification',
+        title: 'Card verification',
+        detail: 'Monnify',
+        amount: -CARD_VERIFICATION_AMOUNT,
+        method: 'Monnify',
+        status: 'pending',
+        reference,
+      },
+    });
+    await tx.pendingPayment.create({
+      data: {
+        reference,
+        userId: user.id,
+        type: 'card_save',
+        metadata: { isDefault, transactionReference: init.transactionReference },
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      },
+    });
+  });
+
+  return { checkoutUrl: init.checkoutUrl, reference };
+}
+
+// ---------------------------------------------------------------------------
 // Fulfilment — invoked by the webhook (§15) and the status poller (§6.4)
 // ---------------------------------------------------------------------------
 export type FulfilOutcome = 'fulfilled' | 'already' | 'failed' | 'unknown';
@@ -356,6 +410,59 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
         reference,
       });
     });
+    return 'fulfilled';
+  }
+
+  if (pending.type === 'card_save') {
+    const cardMeta = (pending.metadata ?? {}) as { isDefault?: boolean; transactionReference?: string };
+    const details = await getCardDetails(cardMeta.transactionReference ?? reference);
+
+    if (!details) {
+      // Verification charge succeeded but we couldn't retrieve a reusable token —
+      // leave the pending row unresolved so reconciliation retries rather than
+      // silently losing the ₦50 charge with no card to show for it.
+      console.error(`[card-save] no card details returned for ref=${reference}; will retry`);
+      return 'unknown';
+    }
+
+    const existing = await db.card.findUnique({ where: { providerToken: details.cardToken } });
+    if (existing) {
+      await db.$transaction([
+        db.pendingPayment.update({ where: { reference }, data: { status: 'completed' } }),
+        db.transaction.updateMany({ where: { reference }, data: { status: 'completed' } }),
+      ]);
+      return 'fulfilled';
+    }
+
+    const count = await db.card.count({ where: { userId: pending.userId } });
+    const makeDefault = !!cardMeta.isDefault || count === 0;
+
+    await db.$transaction(async (tx) => {
+      await tx.pendingPayment.update({ where: { reference }, data: { status: 'completed' } });
+      await tx.transaction.updateMany({ where: { reference }, data: { status: 'completed' } });
+      if (makeDefault) {
+        await tx.card.updateMany({ where: { userId: pending.userId, isDefault: true }, data: { isDefault: false } });
+      }
+      await tx.card.create({
+        data: {
+          userId: pending.userId,
+          providerToken: details.cardToken,
+          brand: normalizeCardBrand(details.cardType),
+          last4: details.last4,
+          expiry: `${details.expMonth.padStart(2, '0')}/${details.expYear.slice(-2)}`,
+          isDefault: makeDefault,
+        },
+      });
+    });
+
+    await notify({
+      userId: pending.userId,
+      kind: 'payment_received',
+      title: 'Card added',
+      detail: `Your ${normalizeCardBrand(details.cardType)} card ending in ${details.last4} was saved.`,
+      href: '/dashboard/wallet',
+    }).catch(() => {});
+
     return 'fulfilled';
   }
 

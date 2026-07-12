@@ -232,8 +232,8 @@ Returns `{ checkoutUrl, reference }`. **Requires `Idempotency-Key`.**
 
 ### Save a Card
 **POST** `/v1/wallet/cards`
-**Payload:** `{ "providerToken": "...", "brand": "Visa" | "Mastercard" | "Verve", "last4": "4242", "expiry": "12/28", "isDefault": false }`
-`providerToken` comes from the PSP's inline tokenization SDK — raw card numbers never touch this API. The first card saved is always made default regardless of `isDefault`. `409 CARD_EXISTS` if the token is already saved.
+**Payload:** `{ "isDefault": false }` (optional, defaults `false`). **Requires `Idempotency-Key`.**
+Redirect flow — returns `{ checkoutUrl, reference }`. Send the user to `checkoutUrl`; Monnify runs a ₦50 verification charge on the card there and this API tokenizes it server-side once the charge completes (via webhook, or reconciliation within ~15 min as a fallback). Poll `GET /v1/payments/{reference}/status` the same way as an online due/top-up; once `status: "completed"`, `GET /v1/wallet/cards` will include the new card. The first card ever saved is always made default regardless of `isDefault`.
 
 ### Set Default Card
 **PATCH** `/v1/wallet/cards/{cardId}`

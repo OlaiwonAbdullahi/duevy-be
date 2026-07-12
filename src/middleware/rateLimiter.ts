@@ -1,13 +1,18 @@
-import { rateLimit } from 'express-rate-limit';
-import { type Request } from 'express';
-import { fail } from '../lib/response';
-import { type AuthenticatedRequest } from './auth';
+import { rateLimit } from "express-rate-limit";
+import { type Request } from "express";
+import { fail } from "../lib/response";
+import { type AuthenticatedRequest } from "./auth";
 
-export const standardLimiter = rateLimit({
+export const xstandardLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
   handler: (req, res) => {
-    fail(res, 429, 'RATE_LIMITED', 'Too many requests, please try again later.');
+    fail(
+      res,
+      429,
+      "RATE_LIMITED",
+      "Too many requests, please try again later.",
+    );
   },
 });
 
@@ -15,7 +20,12 @@ export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20, // stricter limit for auth routes
   handler: (req, res) => {
-    fail(res, 429, 'RATE_LIMITED', 'Too many authentication attempts, please try again later.');
+    fail(
+      res,
+      429,
+      "RATE_LIMITED",
+      "Too many authentication attempts, please try again later.",
+    );
   },
 });
 
@@ -23,8 +33,9 @@ export const authLimiter = rateLimit({
 export const lookupLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
-  keyGenerator: (req: Request) => (req as AuthenticatedRequest).user?.sub ?? req.ip ?? 'anon',
+  keyGenerator: (req: Request) =>
+    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
   handler: (req, res) => {
-    fail(res, 429, 'RATE_LIMITED', 'Too many lookups, please slow down.');
+    fail(res, 429, "RATE_LIMITED", "Too many lookups, please slow down.");
   },
 });
