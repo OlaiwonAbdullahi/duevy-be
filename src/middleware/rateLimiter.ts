@@ -3,7 +3,7 @@ import { type Request } from "express";
 import { fail } from "../lib/response";
 import { type AuthenticatedRequest } from "./auth";
 
-export const xstandardLimiter = rateLimit({
+export const standardLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
   handler: (req, res) => {
