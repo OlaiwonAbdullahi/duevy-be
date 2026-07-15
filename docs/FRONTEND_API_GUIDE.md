@@ -1248,12 +1248,22 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
       "totalVotes": 42,
       "revenue": 840000,
       "categories": [
-        { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "votes": 20 }, { "id": "nom_2", "name": "James", "votes": 22 }] }
+        { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
       ]
     }
   ],
   "meta": { "page": 1, "perPage": 20, "total": 1, "totalPages": 1 }
 }
+```
+
+### Rep: Upload Nominee Image
+**POST** `/v1/spaces/{spaceId}/polls/nominee-image` — `multipart/form-data`, field name `file` (JPEG/PNG/WebP, ≤ 2 MB).
+
+**Flow:** Called from the poll builder as each nominee photo is picked, before the poll itself is created — the returned `imageUrl` is then included on that nominee in the create-poll payload (or sent via the edit-nominee call below for an existing poll).
+
+**Response `200`**
+```json
+{ "success": true, "data": { "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2c3d4.jpg" } }
 ```
 
 ### Rep: Create Poll
@@ -1271,14 +1281,25 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
   "paid": true,
   "amountPerVote": 20000,
   "categories": [
-    { "title": "Male", "nominees": [{ "name": "John" }, { "name": "James" }] }
+    { "title": "Male", "nominees": [{ "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2c3d4.jpg" }, { "name": "James" }] }
   ],
   "publish": false
 }
 ```
-`amountPerVote` is required (and > 0) when `paid: true`. Each category needs at least 2 nominees. `deadline` must be in the future.
+`amountPerVote` is required (and > 0) when `paid: true`. Each category needs at least 2 nominees. `imageUrl` per nominee is optional — omit it for a text-only nominee. `deadline` must be in the future.
 
 **Response `201`** — created poll, same shape as a list row above.
+
+### Rep: Edit Nominee Image
+**PATCH** `/v1/spaces/{spaceId}/polls/{pollId}/nominees/{nomineeId}`
+
+**Flow:** Add or replace a nominee's photo on an existing poll (e.g. from the results/edit screen), or clear it by sending `null`. Cosmetic only, so unlike other structural fields this is allowed at any poll status, including `active`.
+
+**Payload**
+```json
+{ "imageUrl": "https://api.duevy.com/uploads/nominees/e5f6a7b8.jpg" }
+```
+**Response `200`** — updated poll, same shape as a list row above. `404` if the poll or nominee doesn't exist in this space.
 
 ### Rep: Edit Poll
 **PATCH** `/v1/spaces/{spaceId}/polls/{pollId}`
@@ -1311,7 +1332,7 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
     "totalVotes": 42,
     "revenue": 840000,
     "categories": [
-      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "votes": 20 }, { "id": "nom_2", "name": "James", "votes": 22 }] }
+      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
     ]
   }
 }
@@ -1339,7 +1360,7 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
     "slug": "best-dressed-4821",
     "totalVotes": 42,
     "categories": [
-      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John" }, { "id": "nom_2", "name": "James" }], "remaining": 1 }
+      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg" }, { "id": "nom_2", "name": "James", "imageUrl": null }], "remaining": 1 }
     ]
   }
 }
@@ -2024,7 +2045,7 @@ interface Poll {
   categories: Array<{
     id: string;
     title: string;
-    nominees: Array<{ id: string; name: string; votes?: number }>;
+    nominees: Array<{ id: string; name: string; imageUrl: string | null; votes?: number }>;
     remaining?: number | null; // voter view only
   }>;
 }

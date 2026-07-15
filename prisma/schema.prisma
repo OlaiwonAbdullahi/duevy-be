@@ -632,10 +632,11 @@ model PollCategory {
 }
 
 model Nominee {
-  id         String @id @default(cuid())
+  id         String  @id @default(cuid())
   categoryId String
   name       String
-  votes      Int    @default(0)
+  imageUrl   String?
+  votes      Int     @default(0)
 
   category PollCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   pollVotes PollVote[]

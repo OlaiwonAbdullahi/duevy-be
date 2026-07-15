@@ -33,7 +33,7 @@ app.use(
 );
 app.use(cookieParser());
 
-// Uploaded assets (avatars, §3.2)
+// Uploaded assets (avatars §3.2, nominee images §11)
 app.use('/uploads', express.static('uploads'));
 
 // Logging

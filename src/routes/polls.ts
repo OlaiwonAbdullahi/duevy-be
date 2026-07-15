@@ -1,7 +1,12 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { type Poll } from '@prisma/client';
+import multer from 'multer';
+import { randomBytes } from 'crypto';
+import path from 'path';
+import fs from 'fs';
 import { db } from '../config/db';
+import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import { authenticate, optionalAuthenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
@@ -96,7 +101,12 @@ const createPollSchema = z
     paid: z.boolean(),
     amountPerVote: z.number().int().positive().optional(),
     categories: z
-      .array(z.object({ title: z.string().min(1), nominees: z.array(z.object({ name: z.string().min(1) })).min(2) }))
+      .array(
+        z.object({
+          title: z.string().min(1),
+          nominees: z.array(z.object({ name: z.string().min(1), imageUrl: z.string().url().optional() })).min(2),
+        }),
+      )
       .min(1),
     publish: z.boolean().default(false),
   })
@@ -125,7 +135,7 @@ pollsRepRouter.post('/polls', validate(createPollSchema), async (req: Request, r
         categories: {
           create: d.categories.map((c) => ({
             title: c.title,
-            nominees: { create: c.nominees.map((n) => ({ name: n.name })) },
+            nominees: { create: c.nominees.map((n) => ({ name: n.name, imageUrl: n.imageUrl })) },
           })),
         },
       },
@@ -137,6 +147,85 @@ pollsRepRouter.post('/polls', validate(createPollSchema), async (req: Request, r
 
   ok(res, serializePoll(poll, { showVotes: true, includeRevenue: true }), 201);
 });
+
+// POST /polls/nominee-image — multipart upload, returns a URL to attach to a
+// nominee (either inline at poll creation or via PATCH .../nominees/:nomineeId).
+const NOMINEE_IMAGE_DIR = path.join(process.cwd(), 'uploads', 'nominees');
+fs.mkdirSync(NOMINEE_IMAGE_DIR, { recursive: true });
+
+const ALLOWED_NOMINEE_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const NOMINEE_IMAGE_EXT_BY_TYPE: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+};
+
+const nomineeImageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, NOMINEE_IMAGE_DIR),
+    filename: (_req, file, cb) =>
+      cb(null, `${randomBytes(16).toString('hex')}${NOMINEE_IMAGE_EXT_BY_TYPE[file.mimetype] ?? ''}`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
+  fileFilter: (_req, file, cb) => {
+    cb(null, ALLOWED_NOMINEE_IMAGE_TYPES.includes(file.mimetype));
+  },
+}).single('file');
+
+pollsRepRouter.post('/polls/nominee-image', (req: Request, res: Response): void => {
+  nomineeImageUpload(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the 2 MB limit' : err.message;
+      fail(res, 400, 'VALIDATION_ERROR', msg, [{ field: 'file', issue: msg }]);
+      return;
+    }
+    if (err) {
+      fail(res, 400, 'VALIDATION_ERROR', 'Upload failed');
+      return;
+    }
+    if (!req.file) {
+      fail(res, 400, 'VALIDATION_ERROR', 'A JPEG, PNG, or WebP file is required', [
+        { field: 'file', issue: 'required (jpeg/png/webp, ≤ 2 MB)' },
+      ]);
+      return;
+    }
+
+    const imageUrl = `${env.APP_BASE_URL}/uploads/nominees/${req.file.filename}`;
+    ok(res, { imageUrl });
+  });
+});
+
+// PATCH /polls/:pollId/nominees/:nomineeId — attach/update a nominee's image.
+// Cosmetic only (unlike title/structure changes), so it's allowed at any poll status.
+const patchNomineeSchema = z.object({ imageUrl: z.string().url().nullable() });
+
+pollsRepRouter.patch(
+  '/polls/:pollId/nominees/:nomineeId',
+  validate(patchNomineeSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sid = spaceId(req);
+    const poll = await loadPollInSpace(sid, req.params.pollId as string);
+    if (!poll) {
+      errors.notFound(res, 'Poll not found');
+      return;
+    }
+    const nominee = poll.categories.flatMap((c) => c.nominees).find((n) => n.id === req.params.nomineeId);
+    if (!nominee) {
+      errors.notFound(res, 'Nominee not found');
+      return;
+    }
+
+    const { imageUrl } = req.body as z.infer<typeof patchNomineeSchema>;
+    await db.nominee.update({ where: { id: nominee.id }, data: { imageUrl } });
+
+    const updated = await loadPollInSpace(sid, poll.id);
+    if (!updated) {
+      errors.notFound(res, 'Poll not found');
+      return;
+    }
+    ok(res, serializePoll(updated, { showVotes: true, includeRevenue: true }));
+  },
+);
 
 // PATCH /polls/:pollId (§11.3)
 const patchPollSchema = z.object({
