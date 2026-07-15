@@ -175,6 +175,7 @@ export function serializePoll(poll: PollWithTree, opts: { showVotes: boolean; in
     categories: poll.categories.map((c) => ({
       id: c.id,
       title: c.title,
+      imageUrl: c.imageUrl,
       nominees: c.nominees.map((n) => ({
         id: n.id,
         name: n.name,

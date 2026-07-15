@@ -619,9 +619,10 @@ model Poll {
 }
 
 model PollCategory {
-  id      String    @id @default(cuid())
-  pollId  String
-  title   String
+  id        String   @id @default(cuid())
+  pollId    String
+  title     String
+  imageUrl  String?
   createdAt DateTime @default(now())
 
   poll     Poll      @relation(fields: [pollId], references: [id], onDelete: Cascade)

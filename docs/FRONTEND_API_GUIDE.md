@@ -1248,7 +1248,7 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
       "totalVotes": 42,
       "revenue": 840000,
       "categories": [
-        { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
+        { "id": "cat_1", "title": "Male", "imageUrl": "https://api.duevy.com/uploads/polls/c1d2.jpg", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/polls/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
       ]
     }
   ],
@@ -1256,14 +1256,14 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
 }
 ```
 
-### Rep: Upload Nominee Image
-**POST** `/v1/spaces/{spaceId}/polls/nominee-image` — `multipart/form-data`, field name `file` (JPEG/PNG/WebP, ≤ 2 MB).
+### Rep: Upload Poll Image
+**POST** `/v1/spaces/{spaceId}/polls/image` — `multipart/form-data`, field name `file` (JPEG/PNG/WebP, ≤ 2 MB).
 
-**Flow:** Called from the poll builder as each nominee photo is picked, before the poll itself is created — the returned `imageUrl` is then included on that nominee in the create-poll payload (or sent via the edit-nominee call below for an existing poll).
+**Flow:** Called from the poll builder as each category or nominee photo is picked, before the poll itself is created — the returned `imageUrl` is then included on that category/nominee in the create-poll payload (or sent via the edit-category / edit-nominee calls below for an existing poll). Same endpoint serves both — it just uploads and hands back a URL, with no association until you attach it.
 
 **Response `200`**
 ```json
-{ "success": true, "data": { "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2c3d4.jpg" } }
+{ "success": true, "data": { "imageUrl": "https://api.duevy.com/uploads/polls/a1b2c3d4.jpg" } }
 ```
 
 ### Rep: Create Poll
@@ -1281,12 +1281,12 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
   "paid": true,
   "amountPerVote": 20000,
   "categories": [
-    { "title": "Male", "nominees": [{ "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2c3d4.jpg" }, { "name": "James" }] }
+    { "title": "Male", "imageUrl": "https://api.duevy.com/uploads/polls/c1d2.jpg", "nominees": [{ "name": "John", "imageUrl": "https://api.duevy.com/uploads/polls/a1b2c3d4.jpg" }, { "name": "James" }] }
   ],
   "publish": false
 }
 ```
-`amountPerVote` is required (and > 0) when `paid: true`. Each category needs at least 2 nominees. `imageUrl` per nominee is optional — omit it for a text-only nominee. `deadline` must be in the future.
+`amountPerVote` is required (and > 0) when `paid: true`. Each category needs at least 2 nominees. `imageUrl` on a category or nominee is optional — omit it for a text-only entry. `deadline` must be in the future.
 
 **Response `201`** — created poll, same shape as a list row above.
 
@@ -1297,9 +1297,20 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
 
 **Payload**
 ```json
-{ "imageUrl": "https://api.duevy.com/uploads/nominees/e5f6a7b8.jpg" }
+{ "imageUrl": "https://api.duevy.com/uploads/polls/e5f6a7b8.jpg" }
 ```
 **Response `200`** — updated poll, same shape as a list row above. `404` if the poll or nominee doesn't exist in this space.
+
+### Rep: Edit Category Image
+**PATCH** `/v1/spaces/{spaceId}/polls/{pollId}/categories/{categoryId}`
+
+**Flow:** Add or replace an award category's cover photo on an existing poll, or clear it by sending `null`. Cosmetic only, so it's allowed at any poll status, including `active`.
+
+**Payload**
+```json
+{ "imageUrl": "https://api.duevy.com/uploads/polls/f1a2b3c4.jpg" }
+```
+**Response `200`** — updated poll, same shape as a list row above. `404` if the poll or category doesn't exist in this space.
 
 ### Rep: Edit Poll
 **PATCH** `/v1/spaces/{spaceId}/polls/{pollId}`
@@ -1332,7 +1343,7 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
     "totalVotes": 42,
     "revenue": 840000,
     "categories": [
-      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
+      { "id": "cat_1", "title": "Male", "imageUrl": "https://api.duevy.com/uploads/polls/c1d2.jpg", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/polls/a1b2.jpg", "votes": 20 }, { "id": "nom_2", "name": "James", "imageUrl": null, "votes": 22 }] }
     ]
   }
 }
@@ -1360,7 +1371,7 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
     "slug": "best-dressed-4821",
     "totalVotes": 42,
     "categories": [
-      { "id": "cat_1", "title": "Male", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/nominees/a1b2.jpg" }, { "id": "nom_2", "name": "James", "imageUrl": null }], "remaining": 1 }
+      { "id": "cat_1", "title": "Male", "imageUrl": "https://api.duevy.com/uploads/polls/c1d2.jpg", "nominees": [{ "id": "nom_1", "name": "John", "imageUrl": "https://api.duevy.com/uploads/polls/a1b2.jpg" }, { "id": "nom_2", "name": "James", "imageUrl": null }], "remaining": 1 }
     ]
   }
 }
@@ -2045,6 +2056,7 @@ interface Poll {
   categories: Array<{
     id: string;
     title: string;
+    imageUrl: string | null;
     nominees: Array<{ id: string; name: string; imageUrl: string | null; votes?: number }>;
     remaining?: number | null; // voter view only
   }>;
