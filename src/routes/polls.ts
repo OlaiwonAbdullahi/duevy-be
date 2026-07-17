@@ -16,7 +16,7 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { initTransaction } from '../lib/monnify';
+import { initTransaction, GATEWAY_LABEL } from '../lib/paymentGateway';
 import {
   uniqueReference,
   chargeSavedCard,
@@ -568,7 +568,7 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
   const reference = await uniqueReference();
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
-      data: { userId, type: 'vote', title: `Votes: ${poll.title}`, detail: 'Poll', amount: -totalCharged, method: 'Monnify', status: 'pending', reference, spaceId: poll.spaceId },
+      data: { userId, type: 'vote', title: `Votes: ${poll.title}`, detail: 'Poll', amount: -totalCharged, method: GATEWAY_LABEL, status: 'pending', reference, spaceId: poll.spaceId },
     });
     await tx.pendingPayment.create({
       data: {

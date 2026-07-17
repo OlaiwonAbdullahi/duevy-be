@@ -9,7 +9,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccountName } from '../lib/monnify';
+import { getBanks, verifyAccountName } from '../lib/paymentGateway';
 import { generatePayoutReference } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail } from '../lib/email';

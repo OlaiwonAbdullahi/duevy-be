@@ -21,8 +21,9 @@ app.use(cors({
   credentials: true,
 }));
 
-// Request parsing. Capture the raw body so the Monnify webhook (§15) can verify
-// its HMAC signature over the exact bytes received.
+// Request parsing. Capture the raw body so payment-gateway webhooks (§15,
+// both Monnify and Paystack) can verify their HMAC signature over the exact
+// bytes received.
 app.use(
   express.json({
     limit: '100kb',

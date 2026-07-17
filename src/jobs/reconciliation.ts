@@ -1,5 +1,5 @@
 import { db } from '../config/db';
-import { getTransactionStatus } from '../lib/monnify';
+import { getTransactionStatus } from '../lib/paymentGateway';
 import { fulfilByReference } from '../services/payment.service';
 import { reconcileStalePayouts } from '../services/payout.service';
 

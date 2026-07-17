@@ -103,8 +103,8 @@ walletRouter.get('/cards', async (req: Request, res: Response): Promise<void> =>
 
 // ---------------------------------------------------------------------------
 // POST /wallet/cards (§8.4) — redirect flow: a ₦50 verification charge on
-// Monnify's hosted checkout tokenizes the card. The token is exchanged for a
-// saved Card once the webhook/reconciliation fulfilment resolves the reference.
+// the active gateway's hosted checkout tokenizes the card. The token is
+// exchanged for a saved Card once the webhook/reconciliation fulfilment resolves the reference.
 // ---------------------------------------------------------------------------
 const addCardSchema = z.object({
   isDefault: z.boolean().default(false),

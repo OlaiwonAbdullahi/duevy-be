@@ -1,8 +1,7 @@
 import { type Payout } from '@prisma/client';
 import { db } from '../config/db';
-import { env } from '../config/env';
 import { decrypt } from '../lib/encryption';
-import { initiateDisbursement, getDisbursementStatus } from '../lib/monnify';
+import { initiateDisbursement, getDisbursementStatus, isDisbursementConfigured } from '../lib/paymentGateway';
 import { notifyMany } from '../lib/notifications';
 
 const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
@@ -13,7 +12,7 @@ const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
  * the payout simply stays `processing` for the reconciliation job to retry.
  */
 export async function initiatePayoutDisbursement(payout: Payout): Promise<void> {
-  if (!env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT) return;
+  if (!isDisbursementConfigured()) return;
 
   const account = await db.bankAccount.findUnique({ where: { spaceId: payout.spaceId } });
   if (!account) return;
@@ -72,7 +71,7 @@ export async function settlePayout(reference: string, success: boolean, failureR
 
 /** Poll the provider for payouts that have sat in `processing` too long (reconciliation job). */
 export async function reconcileStalePayouts(): Promise<void> {
-  if (!env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT) return;
+  if (!isDisbursementConfigured()) return;
 
   const staleThreshold = new Date(Date.now() - STALE_PAYOUT_AFTER_MS);
   const stale = await db.payout.findMany({

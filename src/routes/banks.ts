@@ -1,13 +1,13 @@
 import { Router, type Request, type Response } from 'express';
 import { authenticate } from '../middleware/auth';
 import { ok, fail } from '../lib/response';
-import { getBanks } from '../lib/monnify';
+import { getBanks } from '../lib/paymentGateway';
 
 export const banksRouter = Router();
 banksRouter.use(authenticate);
 
 // ---------------------------------------------------------------------------
-// GET /banks — Nigerian banks Monnify supports for payouts (§10.2)
+// GET /banks — Nigerian banks the active payment gateway supports for payouts (§10.2)
 // ---------------------------------------------------------------------------
 banksRouter.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {

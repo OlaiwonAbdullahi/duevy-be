@@ -1,7 +1,7 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { computeCharge, generateReference } from '../lib/money';
-import { initTransaction, chargeCardToken, getCardDetails } from '../lib/monnify';
+import { initTransaction, chargeCardToken, getCardDetails, GATEWAY_LABEL } from '../lib/paymentGateway';
 import { notify, notifyMany } from '../lib/notifications';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
@@ -204,9 +204,9 @@ export async function initOnlineTopUp(user: User, amount: number): Promise<Check
         userId: user.id,
         type: 'topup',
         title: 'Wallet top-up',
-        detail: 'Monnify',
+        detail: GATEWAY_LABEL,
         amount,
-        method: 'Monnify',
+        method: GATEWAY_LABEL,
         status: 'pending',
         reference,
       },
@@ -245,7 +245,7 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
         title: due.title,
         detail: due.space.name,
         amount: -charge.totalCharged,
-        method: 'Monnify',
+        method: GATEWAY_LABEL,
         status: 'pending',
         reference,
         spaceId: due.spaceId,
@@ -276,8 +276,8 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
 
 // ---------------------------------------------------------------------------
 // Card save — redirect flow (§8.4). The payer completes a small verification
-// charge on Monnify's hosted checkout; the webhook/reconciliation fulfilment
-// path below exchanges the completed transaction for a reusable card token.
+// charge on the active gateway's hosted checkout; the webhook/reconciliation
+// fulfilment path below exchanges the completed transaction for a reusable card token.
 // ---------------------------------------------------------------------------
 export async function initCardSave(user: User, isDefault: boolean): Promise<CheckoutResult> {
   const reference = await uniqueReference();
@@ -296,9 +296,9 @@ export async function initCardSave(user: User, isDefault: boolean): Promise<Chec
         userId: user.id,
         type: 'card_verification',
         title: 'Card verification',
-        detail: 'Monnify',
+        detail: GATEWAY_LABEL,
         amount: -CARD_VERIFICATION_AMOUNT,
-        method: 'Monnify',
+        method: GATEWAY_LABEL,
         status: 'pending',
         reference,
       },
