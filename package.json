@@ -37,9 +37,7 @@
     "pdfkit": "^0.19.1",
     "resend": "^4.0.0",
     "ulid": "^2.3.0",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
+    "zod": "^3.24.1",
     "@types/bcryptjs": "^2.4.6",
     "@types/cookie-parser": "^1.4.8",
     "@types/cors": "^2.8.17",
@@ -48,13 +46,15 @@
     "@types/multer": "^1.4.12",
     "@types/node": "^22.10.7",
     "@types/pdfkit": "^0.17.6",
+    "prisma": "^5.22.0",
+    "typescript": "^5.7.3"
+  },
+  "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^8.20.0",
     "@typescript-eslint/parser": "^8.20.0",
     "eslint": "^9.18.0",
     "prettier": "^3.4.2",
-    "prisma": "^5.22.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3",
     "vitest": "^2.1.8"
   },
   "engines": {
