@@ -12,6 +12,7 @@ import { adminRouter } from './admin';
 import { referralsRouter } from './referrals';
 import { disputesRouter } from './disputes';
 import { banksRouter } from './banks';
+import { assistantRouter } from './assistant';
 
 export const apiRouter = Router();
 
@@ -29,3 +30,4 @@ apiRouter.use('/admin', adminRouter);
 apiRouter.use('/referrals', referralsRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
+apiRouter.use('/assistant', assistantRouter);

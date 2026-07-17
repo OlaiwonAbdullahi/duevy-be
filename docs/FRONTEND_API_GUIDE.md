@@ -1222,6 +1222,15 @@ Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be
 
 ## 10. Polls & Voting
 
+### Poll & Category/Nominee Images: End-to-End Flow
+Both award categories (e.g. "Best Dressed — Male") and individual nominees can carry a cover photo. The upload step is decoupled from attaching it to anything — you always get a bare `imageUrl` back first, then decide what it belongs to. Three scenarios:
+
+1. **Building a new poll.** As the rep picks a photo for a category or a nominee in the builder, call `POST /polls/image` immediately (before the poll exists) and stash the returned `imageUrl` in local form state against that row. When the form is finally submitted, send it along as `categories[].imageUrl` / `categories[].nominees[].imageUrl` in the `POST /polls` create payload. Rows with no photo picked simply omit `imageUrl`.
+2. **Adding/replacing a photo on an existing poll.** From the results or edit screen, upload the new file the same way (`POST /polls/image`), then attach it with a targeted PATCH: `PATCH /polls/{pollId}/categories/{categoryId}` for a category cover, or `PATCH /polls/{pollId}/nominees/{nomineeId}` for a nominee photo. Both take `{ "imageUrl": "..." }`.
+3. **Removing a photo.** Send the same PATCH with `{ "imageUrl": null }` — the row reverts to text-only.
+
+These edits are cosmetic (unlike `title`/`membersOnly`/`amountPerVote`), so both PATCH routes work at **any** poll status, including `active` — no need to wait for a draft or worry about `POLL_STRUCTURE_LOCKED`. Once attached, the image shows up everywhere that poll is read back: the rep list/results screens and the public voter page (`GET /polls/{slug}`) — no extra step needed to "publish" the image itself.
+
 ### Rep: List Polls
 **GET** `/v1/spaces/{spaceId}/polls`
 

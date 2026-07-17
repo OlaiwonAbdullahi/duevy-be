@@ -50,6 +50,18 @@ const envSchema = z.object({
     .transform((v) => v === 'true')
     .default('false'),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).default('lax'),
+
+  // Duey (AI assistant) — Gemma classification backend. 'ollama' talks to a
+  // local/dev Ollama instance; 'hosted' talks to any OpenAI-chat-compatible
+  // endpoint (Gemini API in OpenAI-compat mode, a self-hosted GPU box, etc.)
+  // without any handler code changing (§ Duey adapter contract).
+  LLM_PROVIDER: z.enum(['ollama', 'hosted']).default('ollama'),
+  OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),
+  OLLAMA_MODEL: z.string().default('gemma2:9b'),
+  LLM_HOSTED_BASE_URL: z.string().url().optional(),
+  LLM_HOSTED_API_KEY: z.string().optional(),
+  LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
+  LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 });
 
 export type Env = z.infer<typeof envSchema>;

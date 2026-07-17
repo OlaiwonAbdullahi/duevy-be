@@ -208,6 +208,20 @@ enum AuditAction {
   space_archived
 }
 
+enum AssistantIntent {
+  pay_dues
+  join_department
+  check_balance
+  view_history
+  contact_rep
+  unknown
+}
+
+enum AssistantRole {
+  user
+  assistant
+}
+
 // ---------------------------------------------------------------------------
 // Users & Auth
 // ---------------------------------------------------------------------------
@@ -257,6 +271,7 @@ model User {
   disputes              Dispute[]
   idempotencyKeys       IdempotencyKey[]
   sessions              Session[]
+  assistantConversations AssistantConversation[]
 
   @@map("users")
 }
@@ -824,4 +839,37 @@ model IdempotencyKey {
   @@index([key])
   @@index([expiresAt])
   @@map("idempotency_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Duey — AI chat assistant
+// ---------------------------------------------------------------------------
+
+model AssistantConversation {
+  id        String   @id @default(cuid())
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages AssistantMessage[]
+
+  @@index([userId, updatedAt])
+  @@map("assistant_conversations")
+}
+
+model AssistantMessage {
+  id             String          @id @default(cuid())
+  conversationId String
+  role           AssistantRole
+  content        String
+  intent         AssistantIntent?
+  params         Json?
+  confidence     Float?
+  createdAt      DateTime        @default(now())
+
+  conversation AssistantConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("assistant_messages")
 }
