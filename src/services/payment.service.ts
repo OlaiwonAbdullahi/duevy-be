@@ -228,6 +228,7 @@ export async function initOnlineTopUp(user: User, amount: number): Promise<Check
     customerName: user.name,
     customerEmail: user.email,
     description: 'Wallet top-up',
+    callbackPath: '/dashboard/wallet/callback',
   });
 
   return { checkoutUrl: init.checkoutUrl, reference };
@@ -269,6 +270,7 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
     customerName: user.name,
     customerEmail: user.email,
     description: due.title,
+    callbackPath: '/dashboard/wallet/callback',
   });
 
   return { checkoutUrl: init.checkoutUrl, reference };
@@ -288,6 +290,7 @@ export async function initCardSave(user: User, isDefault: boolean): Promise<Chec
     customerName: user.name,
     customerEmail: user.email,
     description: 'Card verification',
+    callbackPath: '/dashboard/wallet/callback',
   });
 
   await db.$transaction(async (tx) => {

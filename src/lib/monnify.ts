@@ -49,6 +49,8 @@ export interface InitTransactionInput {
   customerName: string;
   customerEmail: string;
   description: string;
+  /** Frontend path (e.g. "/dashboard/wallet/callback", "/vote/callback") the payer lands on after checkout. Appended to FRONTEND_URL. */
+  callbackPath: string;
 }
 
 export interface InitTransactionResult {
@@ -79,7 +81,7 @@ export async function initTransaction(
         paymentDescription: input.description,
         currencyCode: "NGN",
         contractCode: env.MONNIFY_CONTRACT_CODE,
-        redirectUrl: `${env.FRONTEND_URL}/wallet/callback`,
+        redirectUrl: `${env.FRONTEND_URL}${input.callbackPath}`,
         paymentMethods: ["CARD", "ACCOUNT_TRANSFER"],
       }),
     },

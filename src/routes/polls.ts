@@ -580,6 +580,13 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
       },
     });
   });
-  const init = await initTransaction({ amount: totalCharged, reference, customerName: user.name, customerEmail: user.email, description: `Votes: ${poll.title}` });
+  const init = await initTransaction({
+    amount: totalCharged,
+    reference,
+    customerName: user.name,
+    customerEmail: user.email,
+    description: `Votes: ${poll.title}`,
+    callbackPath: '/vote/callback',
+  });
   ok(res, { checkoutUrl: init.checkoutUrl, reference });
 });

@@ -51,7 +51,7 @@ export async function initTransaction(input: InitTransactionInput): Promise<Init
         email: input.customerEmail,
         amount: input.amount, // Paystack takes kobo directly
         reference: input.reference,
-        callback_url: `${env.FRONTEND_URL}/wallet/callback`,
+        callback_url: `${env.FRONTEND_URL}${input.callbackPath}`,
         metadata: { customerName: input.customerName, description: input.description },
       }),
     },
