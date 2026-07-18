@@ -3,6 +3,7 @@ import { ASSISTANT_SYSTEM_PROMPT } from '../../config/assistantPrompt';
 import { classificationSchema, type ClassificationResult, type ConversationTurn } from '../../types/assistant';
 import { OllamaAdapter } from './ollamaAdapter';
 import { HostedAdapter } from './hostedAdapter';
+import { GeminiAdapter } from './geminiAdapter';
 import { type LLMAdapter } from './types';
 
 let adapter: LLMAdapter | undefined;
@@ -10,7 +11,12 @@ let adapter: LLMAdapter | undefined;
 /** Swappable by LLM_PROVIDER alone — handler code never imports a concrete adapter. */
 export function getLLMAdapter(): LLMAdapter {
   if (adapter) return adapter;
-  adapter = env.LLM_PROVIDER === 'hosted' ? new HostedAdapter() : new OllamaAdapter();
+  adapter =
+    env.LLM_PROVIDER === 'gemini'
+      ? new GeminiAdapter()
+      : env.LLM_PROVIDER === 'hosted'
+        ? new HostedAdapter()
+        : new OllamaAdapter();
   return adapter;
 }
 

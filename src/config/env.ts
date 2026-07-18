@@ -62,13 +62,17 @@ const envSchema = z.object({
     .default('false'),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).default('lax'),
 
-  // Duey (AI assistant) — Gemma classification backend. 'ollama' talks to a
-  // local/dev Ollama instance; 'hosted' talks to any OpenAI-chat-compatible
-  // endpoint (Gemini API in OpenAI-compat mode, a self-hosted GPU box, etc.)
-  // without any handler code changing (§ Duey adapter contract).
-  LLM_PROVIDER: z.enum(['ollama', 'hosted']).default('ollama'),
+  // Duey (AI assistant) classification backend — 'ollama' talks to a local/dev
+  // Ollama instance; 'gemini' talks to Google's Gemini API natively (no
+  // OpenAI-compat shim); 'hosted' talks to any other OpenAI-chat-completions
+  // -compatible endpoint (self-hosted vLLM box, etc.). Handler code never
+  // changes regardless of which is picked (§ Duey adapter contract).
+  LLM_PROVIDER: z.enum(['ollama', 'gemini', 'hosted']).default('ollama'),
   OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),
   OLLAMA_MODEL: z.string().default('gemma2:9b'),
+  GEMINI_BASE_URL: z.string().url().default('https://generativelanguage.googleapis.com'),
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_MODEL: z.string().default('gemini-2.0-flash'),
   LLM_HOSTED_BASE_URL: z.string().url().optional(),
   LLM_HOSTED_API_KEY: z.string().optional(),
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
@@ -79,6 +83,9 @@ const envSchema = z.object({
   }
   if (val.PAYMENT_GATEWAY === 'monnify' && (!val.MONNIFY_API_KEY || !val.MONNIFY_SECRET_KEY || !val.MONNIFY_CONTRACT_CODE || !val.MONNIFY_WEBHOOK_SECRET)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MONNIFY_API_KEY'], message: 'MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE and MONNIFY_WEBHOOK_SECRET are all required when PAYMENT_GATEWAY=monnify' });
+  }
+  if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });
   }
 });
 
