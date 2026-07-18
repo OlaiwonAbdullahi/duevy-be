@@ -33,7 +33,8 @@ export class HostedAdapter implements LLMAdapter {
       });
 
       if (!res.ok) {
-        throw new LLMRequestError(`Hosted LLM responded ${res.status}`);
+        const body = await res.text().catch(() => '');
+        throw new LLMRequestError(`Hosted LLM responded ${res.status}: ${body.slice(0, 500)}`);
       }
 
       const body = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
