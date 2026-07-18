@@ -1,5 +1,5 @@
 import { type Request, type Response, type NextFunction } from 'express';
-import { fail } from '../lib/response';
+import { fail, errors, RequestValidationError } from '../lib/response';
 import { env } from '../config/env';
 
 export function errorHandler(
@@ -8,13 +8,19 @@ export function errorHandler(
   res: Response,
   next: NextFunction,
 ): void {
-  console.error('[error]', err);
-
   if (res.headersSent) {
+    console.error('[error]', err);
     return next(err);
   }
 
-  // Handle known error types (e.g., Prisma errors, Multer errors) here if needed
+  if (err instanceof RequestValidationError) {
+    errors.validation(res, err.details);
+    return;
+  }
+
+  console.error('[error]', err);
+
+  // Handle other known error types (e.g., Prisma errors, Multer errors) here if needed
 
   const message =
     env.NODE_ENV === 'development' ? err.message : 'An unexpected error occurred';

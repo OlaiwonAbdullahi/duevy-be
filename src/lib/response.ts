@@ -1,5 +1,17 @@
 import { type Response } from 'express';
 
+/**
+ * Thrown by shared parsing helpers (e.g. parseListQuery) that don't have a
+ * Response to write to directly. errorHandler.ts catches this and renders it
+ * as a proper 400 VALIDATION_ERROR instead of falling through to a generic 500.
+ */
+export class RequestValidationError extends Error {
+  constructor(public details: Array<{ field: string; issue: string }>) {
+    super('Request validation failed');
+    this.name = 'RequestValidationError';
+  }
+}
+
 export interface Meta {
   page?: number;
   perPage?: number;

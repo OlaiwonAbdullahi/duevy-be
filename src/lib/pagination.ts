@@ -1,6 +1,6 @@
 import { type Request } from 'express';
 import { z } from 'zod';
-import { type Meta } from './response';
+import { type Meta, RequestValidationError } from './response';
 
 /** Query params common to all list endpoints (§1.7). */
 export const listQuerySchema = z.object({
@@ -21,9 +21,17 @@ export interface PageParams {
   sort?: string;
 }
 
-/** Parse pagination/search params off a request query, applying spec defaults. */
+/** Parse pagination/search params off a request query, applying spec defaults.
+ *  Throws RequestValidationError (rendered as a 400 by errorHandler.ts) on
+ *  invalid input, rather than letting a raw ZodError fall through as a 500. */
 export function parseListQuery(req: Request): PageParams {
-  const { page, perPage, sort, q } = listQuerySchema.parse(req.query);
+  const result = listQuerySchema.safeParse(req.query);
+  if (!result.success) {
+    throw new RequestValidationError(
+      result.error.errors.map((e) => ({ field: e.path.join('.'), issue: e.message })),
+    );
+  }
+  const { page, perPage, sort, q } = result.data;
   return { page, perPage, skip: (page - 1) * perPage, take: perPage, sort, q };
 }
 
