@@ -1,5 +1,5 @@
 import { env } from '../../config/env';
-import { ASSISTANT_SYSTEM_PROMPT } from '../../config/assistantPrompt';
+import { buildAssistantSystemPrompt } from '../../config/assistantPrompt';
 import { classificationSchema, type ClassificationResult, type ConversationTurn } from '../../types/assistant';
 import { OllamaAdapter } from './ollamaAdapter';
 import { HostedAdapter } from './hostedAdapter';
@@ -44,7 +44,7 @@ function stripCodeFence(raw: string): string {
 export async function classifyIntent(turns: ConversationTurn[]): Promise<ClassificationResult> {
   let raw: string;
   try {
-    raw = await getLLMAdapter().complete(ASSISTANT_SYSTEM_PROMPT, turns);
+    raw = await getLLMAdapter().complete(buildAssistantSystemPrompt(), turns);
   } catch (err) {
     console.error('[assistant] LLM call failed:', err);
     return UNKNOWN_FALLBACK;

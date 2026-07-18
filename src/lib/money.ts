@@ -2,6 +2,10 @@
  * Money helpers — all amounts are stored and transmitted as kobo (₦1 = 100 kobo).
  */
 
+/** Wallet top-up bounds (§8.2) — shared by the /wallet/top-up route and Duey's fund_wallet intent. */
+export const MIN_TOPUP = 10_000; // ₦100 in kobo
+export const MAX_TOPUP = 50_000_000; // ₦500,000 in kobo
+
 /** Convert kobo to naira (for display / email templates). */
 export function koboToNaira(kobo: number): number {
   return kobo / 100;

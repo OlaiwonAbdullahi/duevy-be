@@ -1,6 +1,6 @@
 # Duey — AI Chat Assistant API Guide
 
-Duey is Duevy's in-app chat assistant. Students and reps type natural-language requests ("pay my handout fee", "join CSSA with code CSSA-7F2K") and Duey routes them to real backend actions — pay dues, join a department, check balance, view history, or find a rep's contact.
+Duey is Duevy's in-app chat assistant. Students and reps type natural-language requests ("pay my handout fee", "join CSSA with code CSSA-7F2K", "top up ₦5,000", rep: "create a handout fee due for Friday") and Duey routes them to real backend actions — pay dues, join a department, check balance, view history, find a rep's contact, fund the wallet, or (reps only) create a due and check a collections summary.
 
 **This is not a general chatbot.** The LLM (Gemma) only classifies intent and extracts parameters into strict JSON — it never generates the chat reply text, never touches the database, and never moves money. A deterministic validation layer checks the LLM's proposed intent against real DB state before anything happens, and a template-string formatter builds the reply the user sees. See [src/services/assistant.service.ts](../src/services/assistant.service.ts) for the full pipeline.
 
@@ -27,7 +27,12 @@ For general API conventions (response envelope, auth, headers), see [FRONTEND_AP
 | `check_balance` | Wallet balance + itemized unpaid dues | Yes (read-only) |
 | `view_history` | Last 5–10 transactions | Yes (read-only) |
 | `contact_rep` | Department rep's name/email/phone | Yes (read-only) |
+| `fund_wallet` | Parses a stated naira amount, validates it against top-up bounds | No — frontend opens the top-up modal, user pays via the existing `POST /wallet/top-up` |
+| `create_due` (rep-only) | Extracts title/amount/date/category, resolves which of the rep's spaces it's for, asks for anything missing | No — requires `POST /assistant/confirm`; created as a **draft** (publish from the dashboard) |
+| `rep_summary` (rep-only) | Per-space totals: dues raised, gross collected, net to space, lifetime payouts | Yes (read-only) |
 | `unknown` | Anything else, or low classifier confidence | Returns a static help message |
+
+Rep-only intents aren't gated by the classifier — Gemma doesn't know the caller's role. The handler checks `SpaceRep` membership itself and returns a plain "you're not a rep of any department" reply for students who try, rather than a permission error.
 
 ---
 
@@ -124,6 +129,79 @@ Sending `"join CSSA-7F2K"` matches the invite-code regex before Gemma is ever in
 }
 ```
 
+### Example — fund_wallet, amount ready
+```json
+{
+  "success": true,
+  "data": {
+    "conversationId": "cnv_9f2k3a1x",
+    "intent": "fund_wallet",
+    "confidence": 0.7,
+    "needsClarification": false,
+    "reply": "Ready to fund your wallet with ₦5,000.00? Tap below to continue.",
+    "quickReplies": [{ "label": "Top up now", "value": "top up now" }],
+    "action": { "type": "open_topup_modal", "amount": 500000 }
+  }
+}
+```
+`amount` on the action is in kobo, ready to hand straight to the existing `POST /wallet/top-up` (which itself still requires an `Idempotency-Key` and a `method`/`cardId` choice — Duey only supplies the amount).
+
+### Example — create_due (rep), missing fields
+```json
+{
+  "success": true,
+  "data": {
+    "conversationId": "cnv_9f2k3a1x",
+    "intent": "create_due",
+    "confidence": 0.7,
+    "needsClarification": false,
+    "reply": "To create this due for Computer Science Student Association I still need: amount, due date. Let me know and I'll set it up.",
+    "quickReplies": [],
+    "action": null
+  }
+}
+```
+The rep's next message (e.g. "₦3,000, next Friday") is classified using the last 5 turns as context, same as the pay_dues clarification flow — Gemma resolves "next Friday" to an absolute date using today's date, which is baked into the system prompt fresh on every call (see [assistantPrompt.ts](../src/config/assistantPrompt.ts)).
+
+### Example — create_due, ready to confirm
+```json
+{
+  "success": true,
+  "data": {
+    "conversationId": "cnv_9f2k3a1x",
+    "intent": "create_due",
+    "confidence": 0.7,
+    "needsClarification": false,
+    "reply": "Create \"Handout Fee\" for Computer Science Student Association: ₦3,000.00, due 2026-07-24? It'll be saved as a draft you can publish from your dashboard.",
+    "quickReplies": [{ "label": "Create due", "value": "yes" }],
+    "action": {
+      "type": "confirm_create_due",
+      "spaceId": "spc_4k2m1x",
+      "title": "Handout Fee",
+      "amount": 300000,
+      "dueDate": "2026-07-24",
+      "category": "handout"
+    }
+  }
+}
+```
+
+### Example — rep_summary
+```json
+{
+  "success": true,
+  "data": {
+    "conversationId": "cnv_9f2k3a1x",
+    "intent": "rep_summary",
+    "confidence": 0.7,
+    "needsClarification": false,
+    "reply": "Here's your collections summary:\nComputer Science Student Association: 4 due(s), ₦412,000.00 collected, ₦400,000.00 net, ₦350,000.00 paid out",
+    "quickReplies": [],
+    "action": null
+  }
+}
+```
+
 ### Example — unknown / low confidence
 ```json
 {
@@ -133,7 +211,7 @@ Sending `"join CSSA-7F2K"` matches the invite-code regex before Gemma is ever in
     "intent": "unknown",
     "confidence": 0,
     "needsClarification": false,
-    "reply": "I can help you pay dues, join a department, check your balance, view your payment history, or find your department rep's contact. What would you like to do?",
+    "reply": "I can help you pay dues, join a department, check your balance, view your payment history, find your department rep's contact, or fund your wallet. Reps can also create dues and check their collections summary. What would you like to do?",
     "quickReplies": [],
     "action": null
   }
@@ -146,11 +224,11 @@ Errors: `429 RATE_LIMITED` if the caller exceeds 20 messages/minute. `400 VALIDA
 
 ## 4. POST /assistant/confirm
 
-**Flow:** Called when the user taps the "Yes, join" quick-reply / button shown after a `join_department` result from `/message`. This is the explicit human-confirmation step the safety rules require — Duey never creates a space membership straight from the LLM's classification. Re-validates the invite code server-side (it may have changed between the two calls) before mutating.
+**Flow:** Called when the user taps the confirm quick-reply / button shown after a `join_department` or `create_due` result from `/message`. This is the explicit human-confirmation step the safety rules require — Duey never creates a space membership or a due straight from the LLM's classification. Branches on which fields are present in the body: `inviteCode` → join a department; `title`+`amount`+`dueDate`+`category` → create a due. Both branches re-validate everything server-side (invite code still active, caller still a rep of the space) before mutating.
 
-`pay_dues` has no equivalent `/confirm` call — the frontend opens the payment modal directly from the `action.dueId` in the `/message` response and charges through the existing `POST /dues/{dueId}/pay`, which already requires an `Idempotency-Key` and is the single source of truth for money movement.
+`pay_dues` and `fund_wallet` have no equivalent `/confirm` call — the frontend opens the payment/top-up modal directly from the `action` in the `/message` response and charges through the existing `POST /dues/{dueId}/pay` / `POST /wallet/top-up`, which already require an `Idempotency-Key` and are the single source of truth for money movement.
 
-**Payload**
+**Payload — join_department**
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `conversationId` | string | ✅ | must belong to the caller |
@@ -176,6 +254,41 @@ Errors: `429 RATE_LIMITED` if the caller exceeds 20 messages/minute. `400 VALIDA
   }
 }
 ```
+
+**Payload — create_due (rep-only)**
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `conversationId` | string | ✅ | must belong to the caller |
+| `spaceId` | string | ✅ | from the preceding `action.spaceId` |
+| `title` | string | ✅ | from `action.title` |
+| `amount` | number | ✅ | kobo, from `action.amount` |
+| `dueDate` | string | ✅ | `YYYY-MM-DD`, from `action.dueDate` |
+| `category` | `"levy"` \| `"dinner"` \| `"handout"` \| `"welfare"` \| `"sport"` | ✅ | from `action.category` |
+
+```json
+{
+  "conversationId": "cnv_9f2k3a1x",
+  "spaceId": "spc_4k2m1x",
+  "title": "Handout Fee",
+  "amount": 300000,
+  "dueDate": "2026-07-24",
+  "category": "handout"
+}
+```
+
+**Response `201`**
+```json
+{
+  "success": true,
+  "data": {
+    "status": "created",
+    "dueId": "due_7h2m9k",
+    "title": "Handout Fee",
+    "spaceName": "Computer Science Student Association"
+  }
+}
+```
+Created as a **draft** (`Due.status = 'draft'`) — same as leaving `publish: false` on the dashboard's `POST /spaces/{spaceId}/dues`. The rep still needs to hit publish from the dashboard before members can pay it; Duey doesn't auto-publish. A `403 FORBIDDEN` comes back if the caller is no longer a rep of that space by the time they confirm.
 
 **Response `200` — already a member** (not an error; the code was valid, there's just nothing to do)
 ```json

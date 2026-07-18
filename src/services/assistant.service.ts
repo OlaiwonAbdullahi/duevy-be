@@ -1,6 +1,8 @@
 import { db } from '../config/db';
 import { classifyIntent } from '../lib/llm';
-import { computeCharge, formatNaira } from '../lib/money';
+import { computeCharge, formatNaira, nairaToKobo, MIN_TOPUP, MAX_TOPUP } from '../lib/money';
+import { generateId } from '../lib/id';
+import { writeAudit } from '../lib/audit';
 import {
   type Intent,
   type ClassificationResult,
@@ -14,6 +16,11 @@ import {
   type CheckBalanceResult,
   type ViewHistoryResult,
   type ContactRepResult,
+  type FundWalletResult,
+  type CreateDueResult,
+  type RepSummaryResult,
+  type CreateDueDraft,
+  type DueCategory,
   type DueOption,
 } from '../types/assistant';
 
@@ -27,7 +34,7 @@ const CONFIDENCE_FLOOR = 0.35;
 const INVITE_CODE_REGEX = /\b([A-Z0-9]{2,6})-([A-Z0-9]{4})\b/i;
 
 const HELP_REPLY =
-  "I can help you pay dues, join a department, check your balance, view your payment history, or find your department rep's contact. What would you like to do?";
+  "I can help you pay dues, join a department, check your balance, view your payment history, find your department rep's contact, or fund your wallet. Reps can also create dues and check their collections summary. What would you like to do?";
 
 // ---------------------------------------------------------------------------
 // 1. Intent classification (regex short-circuit, then Gemma)
@@ -209,6 +216,125 @@ async function handleContactRep(userId: string, spaceName: string | null): Promi
   };
 }
 
+async function handleFundWallet(amountNaira: number | null): Promise<FundWalletResult> {
+  if (amountNaira === null) return { status: 'needs_amount' };
+
+  const amountKobo = nairaToKobo(amountNaira);
+  if (amountKobo < MIN_TOPUP || amountKobo > MAX_TOPUP) {
+    return { status: 'invalid_amount', minKobo: MIN_TOPUP, maxKobo: MAX_TOPUP };
+  }
+  return { status: 'ready', amountKobo };
+}
+
+const DUE_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+async function handleCreateDue(
+  userId: string,
+  params: { spaceName: string | null; title: string | null; amount: number | null; dueDate: string | null; category: DueCategory | null },
+): Promise<CreateDueResult> {
+  const reps = await db.spaceRep.findMany({
+    where: { userId },
+    include: { space: { select: { id: true, name: true, isArchived: true } } },
+  });
+  const activeReps = reps.filter((r) => !r.space.isArchived);
+  if (activeReps.length === 0) return { status: 'not_rep' };
+
+  let target = activeReps[0].space;
+  if (activeReps.length > 1) {
+    const matches = params.spaceName
+      ? activeReps.filter((r) => r.space.name.toLowerCase().includes((params.spaceName as string).toLowerCase()))
+      : [];
+    if (matches.length !== 1) {
+      return {
+        status: 'needs_space',
+        spaces: activeReps.map((r) => ({ spaceId: r.space.id, spaceName: r.space.name })),
+      };
+    }
+    target = matches[0].space;
+  }
+
+  const missing: string[] = [];
+  if (!params.title) missing.push('title');
+  if (params.amount === null) missing.push('amount');
+  if (!params.dueDate) missing.push('due date');
+  if (!params.category) missing.push('category');
+  if (missing.length > 0) {
+    return { status: 'needs_fields', spaceId: target.id, spaceName: target.name, missing };
+  }
+
+  const dueDate = params.dueDate as string;
+  if (!DUE_DATE_REGEX.test(dueDate)) return { status: 'invalid_date' };
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  if (new Date(`${dueDate}T00:00:00Z`) < today) return { status: 'invalid_date' };
+
+  const draft: CreateDueDraft = {
+    title: params.title as string,
+    amountKobo: nairaToKobo(params.amount as number),
+    dueDate,
+    category: params.category as DueCategory,
+  };
+  return { status: 'ready', spaceId: target.id, spaceName: target.name, draft };
+}
+
+async function handleRepSummary(userId: string): Promise<RepSummaryResult> {
+  const reps = await db.spaceRep.findMany({
+    where: { userId },
+    include: { space: { select: { id: true, name: true, isArchived: true } } },
+  });
+  const activeReps = reps.filter((r) => !r.space.isArchived);
+  if (activeReps.length === 0) return { status: 'not_rep' };
+
+  const spaces = await Promise.all(
+    activeReps.map(async (r) => {
+      const sid = r.space.id;
+      const [dueCount, payments, payouts] = await Promise.all([
+        db.due.count({ where: { spaceId: sid } }),
+        db.duePayment.aggregate({ where: { due: { spaceId: sid } }, _sum: { amountPaid: true, netToSpace: true } }),
+        db.payout.aggregate({ where: { spaceId: sid, status: 'completed' }, _sum: { amount: true } }),
+      ]);
+      return {
+        spaceId: sid,
+        spaceName: r.space.name,
+        dueCount,
+        totalCollected: payments._sum.amountPaid ?? 0,
+        totalNet: payments._sum.netToSpace ?? 0,
+        payoutLifetime: payouts._sum.amount ?? 0,
+      };
+    }),
+  );
+
+  return { status: 'ok', spaces };
+}
+
+/** Executes create_due once the frontend has forwarded the rep's explicit confirmation tap (§ safety rules). */
+export async function confirmCreateDue(userId: string, spaceId: string, draft: CreateDueDraft) {
+  const rep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } } });
+  if (!rep) return { status: 'not_rep' as const };
+
+  const space = await db.space.findUnique({ where: { id: spaceId }, select: { name: true, isArchived: true } });
+  if (!space || space.isArchived) return { status: 'not_rep' as const };
+
+  const user = await db.user.findUnique({ where: { id: userId }, select: { name: true } });
+  const due = await db.$transaction(async (tx) => {
+    const created = await tx.due.create({
+      data: {
+        id: generateId('due'),
+        spaceId,
+        title: draft.title,
+        amount: draft.amountKobo,
+        dueDate: new Date(`${draft.dueDate}T00:00:00Z`),
+        category: draft.category,
+        status: 'draft',
+      },
+    });
+    await writeAudit(spaceId, { id: userId, name: user?.name ?? 'Rep' }, 'due_created', `Created due "${created.title}" via Duey`, tx);
+    return created;
+  });
+
+  return { status: 'created' as const, dueId: due.id, title: due.title, spaceName: space.name };
+}
+
 /** Executes join_department once the frontend has forwarded the user's explicit confirmation tap (§ safety rules). */
 export async function confirmJoinDepartment(userId: string, spaceId: string, inviteCode: string) {
   const space = await db.space.findUnique({ where: { id: spaceId } });
@@ -229,6 +355,18 @@ const DISPATCH: Record<Exclude<Intent, 'unknown'>, (userId: string, classificati
   check_balance: async (userId) => ({ intent: 'check_balance', result: await handleCheckBalance(userId) }),
   view_history: async (userId, c) => ({ intent: 'view_history', result: await handleViewHistory(userId, c.params?.limit ?? null) }),
   contact_rep: async (userId, c) => ({ intent: 'contact_rep', result: await handleContactRep(userId, c.params?.spaceName ?? null) }),
+  fund_wallet: async (_userId, c) => ({ intent: 'fund_wallet', result: await handleFundWallet(c.params?.amount ?? null) }),
+  create_due: async (userId, c) => ({
+    intent: 'create_due',
+    result: await handleCreateDue(userId, {
+      spaceName: c.params?.spaceName ?? null,
+      title: c.params?.dueTitle ?? null,
+      amount: c.params?.amount ?? null,
+      dueDate: c.params?.dueDate ?? null,
+      category: c.params?.category ?? null,
+    }),
+  }),
+  rep_summary: async (userId) => ({ intent: 'rep_summary', result: await handleRepSummary(userId) }),
 };
 
 export async function execute(userId: string, classification: ClassificationResult): Promise<HandlerResult> {
@@ -301,6 +439,71 @@ function formatViewHistory(result: ViewHistoryResult): { reply: string; quickRep
   return { reply: `Here's your recent activity:\n${list}`, quickReplies: [], action: null };
 }
 
+function formatFundWallet(result: FundWalletResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
+  if (result.status === 'needs_amount') {
+    return {
+      reply: 'How much would you like to add to your wallet?',
+      quickReplies: [
+        { label: '₦1,000', value: 'top up ₦1,000' },
+        { label: '₦2,000', value: 'top up ₦2,000' },
+        { label: '₦5,000', value: 'top up ₦5,000' },
+      ],
+      action: null,
+    };
+  }
+  if (result.status === 'invalid_amount') {
+    return {
+      reply: `Wallet top-ups must be between ${formatNaira(result.minKobo)} and ${formatNaira(result.maxKobo)}.`,
+      quickReplies: [],
+      action: null,
+    };
+  }
+  return {
+    reply: `Ready to fund your wallet with ${formatNaira(result.amountKobo)}? Tap below to continue.`,
+    quickReplies: [{ label: 'Top up now', value: 'top up now' }],
+    action: { type: 'open_topup_modal', amount: result.amountKobo },
+  };
+}
+
+function formatCreateDue(result: CreateDueResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
+  if (result.status === 'not_rep') {
+    return { reply: "Creating dues is only available to department reps — you're not currently a rep of any department.", quickReplies: [], action: null };
+  }
+  if (result.status === 'needs_space') {
+    return {
+      reply: `Which department is this due for?\n${result.spaces.map((s) => s.spaceName).join('\n')}`,
+      quickReplies: result.spaces.map((s) => ({ label: s.spaceName, value: s.spaceName })),
+      action: null,
+    };
+  }
+  if (result.status === 'invalid_date') {
+    return { reply: "That due date doesn't work — please give a date that's today or later.", quickReplies: [], action: null };
+  }
+  if (result.status === 'needs_fields') {
+    return {
+      reply: `To create this due for ${result.spaceName} I still need: ${result.missing.join(', ')}. Let me know and I'll set it up.`,
+      quickReplies: [],
+      action: null,
+    };
+  }
+  const { draft } = result;
+  return {
+    reply: `Create "${draft.title}" for ${result.spaceName}: ${formatNaira(draft.amountKobo)}, due ${draft.dueDate}? It'll be saved as a draft you can publish from your dashboard.`,
+    quickReplies: [{ label: 'Create due', value: 'yes' }],
+    action: { type: 'confirm_create_due', spaceId: result.spaceId, title: draft.title, amount: draft.amountKobo, dueDate: draft.dueDate, category: draft.category },
+  };
+}
+
+function formatRepSummary(result: RepSummaryResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
+  if (result.status === 'not_rep') {
+    return { reply: "You're not currently a rep of any department.", quickReplies: [], action: null };
+  }
+  const list = result.spaces
+    .map((s) => `${s.spaceName}: ${s.dueCount} due(s), ${formatNaira(s.totalCollected)} collected, ${formatNaira(s.totalNet)} net, ${formatNaira(s.payoutLifetime)} paid out`)
+    .join('\n');
+  return { reply: `Here's your collections summary:\n${list}`, quickReplies: [], action: null };
+}
+
 function formatContactRep(result: ContactRepResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
   if (result.status === 'no_department') {
     return { reply: "You're not a member of any department yet — join one first with an invite code.", quickReplies: [], action: null };
@@ -334,7 +537,13 @@ export function formatResponse(conversationId: string, classification: Classific
           ? formatCheckBalance(handlerResult.result)
           : handlerResult.intent === 'view_history'
             ? formatViewHistory(handlerResult.result)
-            : formatContactRep(handlerResult.result);
+            : handlerResult.intent === 'contact_rep'
+              ? formatContactRep(handlerResult.result)
+              : handlerResult.intent === 'fund_wallet'
+                ? formatFundWallet(handlerResult.result)
+                : handlerResult.intent === 'create_due'
+                  ? formatCreateDue(handlerResult.result)
+                  : formatRepSummary(handlerResult.result);
 
   return {
     conversationId,

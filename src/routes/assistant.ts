@@ -5,8 +5,8 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { assistantLimiter } from '../middleware/rateLimiter';
 import { ok, errors, fail } from '../lib/response';
-import { classify, execute, formatResponse, confirmJoinDepartment } from '../services/assistant.service';
-import { type ConversationTurn } from '../types/assistant';
+import { classify, execute, formatResponse, confirmJoinDepartment, confirmCreateDue } from '../services/assistant.service';
+import { type ConversationTurn, DUE_CATEGORIES } from '../types/assistant';
 
 export const assistantRouter = Router();
 assistantRouter.use(authenticate);
@@ -76,36 +76,63 @@ assistantRouter.post('/message', validate(messageSchema), async (req: Request, r
 });
 
 // ---------------------------------------------------------------------------
-// POST /assistant/confirm — executes join_department only after an explicit
-// frontend button tap. pay_dues never executes here — the frontend opens the
-// real payment modal from the `action` in the /message response and charges
-// through the existing POST /dues/:dueId/pay endpoint (§ safety rules).
+// POST /assistant/confirm — executes join_department or create_due only after
+// an explicit frontend button tap. pay_dues and fund_wallet never execute here
+// — the frontend opens the real payment/top-up modal from the `action` in the
+// /message response and charges through the existing dues/wallet endpoints
+// (§ safety rules).
 // ---------------------------------------------------------------------------
-const confirmSchema = z.object({
-  conversationId: z.string(),
-  spaceId: z.string(),
-  inviteCode: z.string(),
-});
+const confirmSchema = z
+  .object({
+    conversationId: z.string(),
+    spaceId: z.string(),
+    // join_department
+    inviteCode: z.string().optional(),
+    // create_due
+    title: z.string().min(3).max(120).optional(),
+    amount: z.number().int().positive().optional(),
+    dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    category: z.enum(DUE_CATEGORIES).optional(),
+  })
+  .refine((d) => !!d.inviteCode || (!!d.title && !!d.amount && !!d.dueDate && !!d.category), {
+    message: 'either inviteCode, or title+amount+dueDate+category, must be provided',
+  });
 
 assistantRouter.post('/confirm', validate(confirmSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = uid(req);
-  const { conversationId, spaceId, inviteCode } = req.body as z.infer<typeof confirmSchema>;
+  const body = req.body as z.infer<typeof confirmSchema>;
 
-  const conversation = await db.assistantConversation.findFirst({ where: { id: conversationId, userId } });
+  const conversation = await db.assistantConversation.findFirst({ where: { id: body.conversationId, userId } });
   if (!conversation) {
     errors.notFound(res, 'Conversation not found');
     return;
   }
 
-  const result = await confirmJoinDepartment(userId, spaceId, inviteCode);
+  if (body.inviteCode) {
+    const result = await confirmJoinDepartment(userId, body.spaceId, body.inviteCode);
 
-  if (result.status === 'invalid_code') {
-    fail(res, 422, 'JOIN_CODE_INVALID', 'That join code is no longer valid');
+    if (result.status === 'invalid_code') {
+      fail(res, 422, 'JOIN_CODE_INVALID', 'That join code is no longer valid');
+      return;
+    }
+    if (result.status === 'already_member') {
+      ok(res, { status: 'already_member', spaceName: result.spaceName });
+      return;
+    }
+    ok(res, { status: 'joined', spaceName: result.spaceName, joinedAt: result.joinedAt.toISOString() }, 201);
     return;
   }
-  if (result.status === 'already_member') {
-    ok(res, { status: 'already_member', spaceName: result.spaceName });
+
+  const result = await confirmCreateDue(userId, body.spaceId, {
+    title: body.title as string,
+    amountKobo: body.amount as number,
+    dueDate: body.dueDate as string,
+    category: body.category as (typeof DUE_CATEGORIES)[number],
+  });
+
+  if (result.status === 'not_rep') {
+    errors.forbidden(res, 'You are not a rep of this space');
     return;
   }
-  ok(res, { status: 'joined', spaceName: result.spaceName, joinedAt: result.joinedAt.toISOString() }, 201);
+  ok(res, { status: 'created', dueId: result.dueId, title: result.title, spaceName: result.spaceName }, 201);
 });

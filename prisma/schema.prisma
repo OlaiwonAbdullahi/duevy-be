@@ -198,6 +198,7 @@ enum AuditAction {
   payout_requested
   due_published
   due_closed
+  due_created
   poll_created
   members_approved
   profile_updated
@@ -214,6 +215,9 @@ enum AssistantIntent {
   check_balance
   view_history
   contact_rep
+  fund_wallet
+  create_due
+  rep_summary
   unknown
 }
 

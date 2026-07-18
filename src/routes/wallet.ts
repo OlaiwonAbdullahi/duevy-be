@@ -6,6 +6,7 @@ import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
 import { serializeCard, serializeTransaction } from '../lib/serializers';
+import { MIN_TOPUP, MAX_TOPUP } from '../lib/money';
 import {
   initOnlineTopUp,
   chargeCardForTopUp,
@@ -43,9 +44,6 @@ walletRouter.get('/', async (req: Request, res: Response): Promise<void> => {
 // ---------------------------------------------------------------------------
 // POST /wallet/top-up (§8.2) — Idempotency-Key required
 // ---------------------------------------------------------------------------
-const MIN_TOPUP = 10_000; // ₦100 in kobo
-const MAX_TOPUP = 50_000_000; // ₦500,000 in kobo
-
 const topUpSchema = z
   .object({
     amount: z.number().int().min(MIN_TOPUP).max(MAX_TOPUP),

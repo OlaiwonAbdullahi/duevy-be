@@ -9,10 +9,17 @@ export const INTENTS = [
   'check_balance',
   'view_history',
   'contact_rep',
+  'fund_wallet',
+  'create_due',
+  'rep_summary',
   'unknown',
 ] as const;
 
 export type Intent = (typeof INTENTS)[number];
+
+// Must stay in sync with Prisma's DueCategory enum and repDues.ts's categoryField.
+export const DUE_CATEGORIES = ['levy', 'dinner', 'handout', 'welfare', 'sport'] as const;
+export type DueCategory = (typeof DUE_CATEGORIES)[number];
 
 // ---------------------------------------------------------------------------
 // The strict JSON shape Gemma must return. Validated before anything downstream
@@ -24,6 +31,12 @@ export const classificationParamsSchema = z
     inviteCode: z.string().nullable().optional(),
     spaceName: z.string().nullable().optional(),
     limit: z.number().int().positive().nullable().optional(),
+    // fund_wallet — amount as the user stated it, in naira (not kobo).
+    amount: z.number().positive().nullable().optional(),
+    // create_due (rep-only; enforced by the handler, not the model) — dueDate
+    // must be resolved to YYYY-MM-DD using the current date given in the prompt.
+    dueDate: z.string().nullable().optional(),
+    category: z.enum(DUE_CATEGORIES).nullable().optional(),
   })
   .nullable();
 
@@ -61,6 +74,18 @@ export interface ContactRepParams {
 
 export interface ViewHistoryParams {
   limit: number | null;
+}
+
+export interface FundWalletParams {
+  amount: number | null; // naira, as stated by the user
+}
+
+export interface CreateDueParams {
+  spaceName: string | null;
+  title: string | null;
+  amount: number | null; // naira, as stated by the user
+  dueDate: string | null;
+  category: DueCategory | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,12 +136,48 @@ export type ContactRepResult =
   | { status: 'not_found'; spaceName: string }
   | { status: 'found'; reps: Array<{ name: string; email: string; phone: string | null; role: string; spaceName: string }> };
 
+export type FundWalletResult =
+  | { status: 'needs_amount' }
+  | { status: 'invalid_amount'; minKobo: number; maxKobo: number }
+  | { status: 'ready'; amountKobo: number };
+
+export interface CreateDueDraft {
+  title: string;
+  amountKobo: number;
+  dueDate: string; // YYYY-MM-DD
+  category: DueCategory;
+}
+
+export type CreateDueResult =
+  | { status: 'not_rep' }
+  | { status: 'needs_space'; spaces: Array<{ spaceId: string; spaceName: string }> }
+  | { status: 'invalid_date' }
+  | { status: 'needs_fields'; spaceId: string; spaceName: string; missing: string[] }
+  | { status: 'ready'; spaceId: string; spaceName: string; draft: CreateDueDraft };
+
+export type RepSummaryResult =
+  | { status: 'not_rep' }
+  | {
+      status: 'ok';
+      spaces: Array<{
+        spaceId: string;
+        spaceName: string;
+        dueCount: number;
+        totalCollected: number; // kobo, gross paid by students
+        totalNet: number; // kobo, net to space after fees
+        payoutLifetime: number; // kobo, completed payouts to date
+      }>;
+    };
+
 export type HandlerResult =
   | { intent: 'pay_dues'; result: PayDuesResult }
   | { intent: 'join_department'; result: JoinDepartmentResult }
   | { intent: 'check_balance'; result: CheckBalanceResult }
   | { intent: 'view_history'; result: ViewHistoryResult }
   | { intent: 'contact_rep'; result: ContactRepResult }
+  | { intent: 'fund_wallet'; result: FundWalletResult }
+  | { intent: 'create_due'; result: CreateDueResult }
+  | { intent: 'rep_summary'; result: RepSummaryResult }
   | { intent: 'unknown'; result: null };
 
 // ---------------------------------------------------------------------------
@@ -128,10 +189,14 @@ export interface QuickReply {
 }
 
 export interface AssistantAction {
-  type: 'open_payment_modal' | 'confirm_join_department';
+  type: 'open_payment_modal' | 'confirm_join_department' | 'open_topup_modal' | 'confirm_create_due';
   dueId?: string;
   spaceId?: string;
   inviteCode?: string;
+  amount?: number; // kobo — open_topup_modal
+  title?: string; // confirm_create_due
+  dueDate?: string; // confirm_create_due
+  category?: DueCategory; // confirm_create_due
 }
 
 export interface AssistantMessageResponse {
