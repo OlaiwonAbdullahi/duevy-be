@@ -63,6 +63,80 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
 });
 
 // ---------------------------------------------------------------------------
+// GET /payout/breakdown — how the money behind the payout numbers was made:
+// gross collected, fees taken, net to space, itemized per due. Optional
+// from/to (YYYY-MM-DD) to scope it to a period; omit both for all-time.
+// ---------------------------------------------------------------------------
+const breakdownQuery = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD').optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD').optional(),
+});
+
+payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const parsed = breakdownQuery.safeParse(req.query);
+  if (!parsed.success) {
+    errors.validation(res, parsed.error.errors.map((e) => ({ field: e.path.join('.'), issue: e.message })));
+    return;
+  }
+  const { page, perPage, skip, take } = parseListQuery(req);
+
+  const paidAt: { gte?: Date; lte?: Date } = {};
+  if (parsed.data.from) paidAt.gte = new Date(`${parsed.data.from}T00:00:00Z`);
+  if (parsed.data.to) paidAt.lte = new Date(`${parsed.data.to}T23:59:59Z`);
+  const paymentWhere = Object.keys(paidAt).length ? { paidAt } : {};
+
+  const [totals, dueCount, byDueRaw] = await Promise.all([
+    db.duePayment.aggregate({
+      where: { due: { spaceId: sid }, ...paymentWhere },
+      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _count: { _all: true },
+    }),
+    db.due.count({ where: { spaceId: sid, payments: { some: paymentWhere } } }),
+    db.duePayment.groupBy({
+      by: ['dueId'],
+      where: { due: { spaceId: sid }, ...paymentWhere },
+      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _count: { _all: true },
+      orderBy: { _sum: { netToSpace: 'desc' } },
+      skip,
+      take,
+    }),
+  ]);
+
+  const dues = await db.due.findMany({
+    where: { id: { in: byDueRaw.map((d) => d.dueId) } },
+    select: { id: true, title: true, category: true },
+  });
+  const dueById = new Map(dues.map((d) => [d.id, d]));
+
+  const byDue = byDueRaw.map((d) => ({
+    dueId: d.dueId,
+    title: dueById.get(d.dueId)?.title ?? 'Unknown due',
+    category: dueById.get(d.dueId)?.category ?? null,
+    paidCount: d._count._all,
+    collected: d._sum.amountPaid ?? 0,
+    fees: (d._sum.monnifyFee ?? 0) + (d._sum.duevyFee ?? 0),
+    net: d._sum.netToSpace ?? 0,
+  }));
+
+  ok(
+    res,
+    {
+      totals: {
+        collected: totals._sum.amountPaid ?? 0,
+        fees: (totals._sum.monnifyFee ?? 0) + (totals._sum.duevyFee ?? 0),
+        net: totals._sum.netToSpace ?? 0,
+        paidCount: totals._count._all,
+      },
+      byDue,
+    },
+    200,
+    buildMeta(page, perPage, dueCount),
+  );
+});
+
+// ---------------------------------------------------------------------------
 // GET /payout/account (§10.2)
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promise<void> => {
