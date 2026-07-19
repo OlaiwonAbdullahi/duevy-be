@@ -14,6 +14,7 @@ import {
   CardNotFoundError,
   CardChargeFailedError,
 } from '../services/payment.service';
+import { getGatewayLabel } from '../lib/paymentGateway';
 
 export const walletRouter = Router();
 walletRouter.use(authenticate);
@@ -21,6 +22,16 @@ walletRouter.use(authenticate);
 function uid(req: Request): string {
   return (req as AuthenticatedRequest).user.sub as string;
 }
+
+// ---------------------------------------------------------------------------
+// GET /wallet/payment-gateway — which processor is currently live, for
+// dashboard copy like "Pay with Paystack" / "You'll be redirected to Monnify".
+// Read-only label only — no credential/config details (that's admin-only,
+// see GET /admin/settings/payment-gateway).
+// ---------------------------------------------------------------------------
+walletRouter.get('/payment-gateway', async (_req: Request, res: Response): Promise<void> => {
+  ok(res, { active: await getGatewayLabel() });
+});
 
 // ---------------------------------------------------------------------------
 // GET /wallet (§8.1)
