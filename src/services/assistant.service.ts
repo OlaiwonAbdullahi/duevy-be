@@ -118,7 +118,7 @@ async function handlePayDues(userId: string, dueTitle: string | null): Promise<P
 }
 
 async function handleJoinDepartment(userId: string, inviteCode: string | null): Promise<JoinDepartmentResult> {
-  if (!inviteCode) return { status: 'invalid_code' };
+  if (!inviteCode) return { status: 'missing_code' };
   const code = inviteCode.trim().toUpperCase();
 
   const space = await db.space.findFirst({
@@ -259,7 +259,13 @@ async function handleCreateDue(
   if (!params.dueDate) missing.push('due date');
   if (!params.category) missing.push('category');
   if (missing.length > 0) {
-    return { status: 'needs_fields', spaceId: target.id, spaceName: target.name, missing };
+    return {
+      status: 'needs_fields',
+      spaceId: target.id,
+      spaceName: target.name,
+      missing,
+      known: { title: params.title, amount: params.amount, dueDate: params.dueDate, category: params.category },
+    };
   }
 
   const dueDate = params.dueDate as string;
@@ -403,6 +409,9 @@ function formatPayDues(result: PayDuesResult): { reply: string; quickReplies: Qu
 }
 
 function formatJoinDepartment(result: JoinDepartmentResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
+  if (result.status === 'missing_code') {
+    return { reply: "Sure — what's your department's invite code? It usually looks like ABCD-1234.", quickReplies: [], action: null };
+  }
   if (result.status === 'invalid_code') {
     return { reply: "That invite code doesn't look right — double-check it with your department rep and try again.", quickReplies: [], action: null };
   }
@@ -480,8 +489,16 @@ function formatCreateDue(result: CreateDueResult): { reply: string; quickReplies
     return { reply: "That due date doesn't work — please give a date that's today or later.", quickReplies: [], action: null };
   }
   if (result.status === 'needs_fields') {
+    const { known } = result;
+    const captured: string[] = [];
+    if (known.title) captured.push(`title "${known.title}"`);
+    if (known.amount !== null) captured.push(`amount ${formatNaira(nairaToKobo(known.amount))}`);
+    if (known.dueDate) captured.push(`due date ${known.dueDate}`);
+    if (known.category) captured.push(`category ${known.category}`);
+
+    const gotSoFar = captured.length > 0 ? `Got ${captured.join(', ')}. ` : '';
     return {
-      reply: `To create this due for ${result.spaceName} I still need: ${result.missing.join(', ')}. Let me know and I'll set it up.`,
+      reply: `${gotSoFar}To create this due for ${result.spaceName} I still need: ${result.missing.join(', ')}.`,
       quickReplies: [],
       action: null,
     };
@@ -517,12 +534,17 @@ function formatContactRep(result: ContactRepResult): { reply: string; quickRepli
 
 export function formatResponse(conversationId: string, classification: ClassificationResult, handlerResult: HandlerResult): AssistantMessageResponse {
   if (handlerResult.intent === 'unknown') {
+    // Prefer a specific clarifying question the model raised (e.g. answering
+    // "link?" during a pending create_due confirmation) over the generic
+    // help blurb — but only ever the question text, never LLM prose standing
+    // in for a real answer/action.
+    const specific = classification.needs_clarification ? classification.clarification_question?.trim() : null;
     return {
       conversationId,
       intent: 'unknown',
       confidence: classification.confidence,
-      needsClarification: false,
-      reply: HELP_REPLY,
+      needsClarification: !!specific,
+      reply: specific || HELP_REPLY,
       quickReplies: [],
       action: null,
     };

@@ -118,6 +118,34 @@ assistantRouter.post('/message', validate(messageSchema), async (req: Request, r
     .map((m) => ({ role: m.role, content: m.content }));
 
   const classification = await classify(message, history);
+
+  // create_due is filled in over several turns ("what's the title?" → "accoms
+  // due" → "2000" → ...). Don't trust the LLM to re-derive every earlier slot
+  // from raw conversation text each turn — deterministically carry forward
+  // whatever was already extracted for this conversation's in-progress due,
+  // and only let the current turn override fields it actually mentioned.
+  if (classification.intent === 'create_due') {
+    const priorDraft = [...priorMessages].reverse().find((m) => m.role === 'assistant' && m.intent === 'create_due');
+    const priorParams = (priorDraft?.params ?? null) as Partial<{
+      spaceName: string | null;
+      dueTitle: string | null;
+      amount: number | null;
+      dueDate: string | null;
+      category: string | null;
+    }> | null;
+    if (priorParams) {
+      classification.params = {
+        dueTitle: classification.params?.dueTitle ?? priorParams.dueTitle ?? null,
+        inviteCode: classification.params?.inviteCode ?? null,
+        spaceName: classification.params?.spaceName ?? priorParams.spaceName ?? null,
+        limit: classification.params?.limit ?? null,
+        amount: classification.params?.amount ?? priorParams.amount ?? null,
+        dueDate: classification.params?.dueDate ?? priorParams.dueDate ?? null,
+        category: (classification.params?.category ?? priorParams.category ?? null) as never,
+      };
+    }
+  }
+
   const handlerResult = await execute(userId, classification);
   const response = formatResponse(conversation.id, classification, handlerResult);
 

@@ -155,13 +155,13 @@ Sending `"join CSSA-7F2K"` matches the invite-code regex before Gemma is ever in
     "intent": "create_due",
     "confidence": 0.7,
     "needsClarification": false,
-    "reply": "To create this due for Computer Science Student Association I still need: amount, due date. Let me know and I'll set it up.",
+    "reply": "Got title \"Handout Fee\", category handout. To create this due for Computer Science Student Association I still need: amount, due date.",
     "quickReplies": [],
     "action": null
   }
 }
 ```
-The rep's next message (e.g. "₦3,000, next Friday") is classified using the last 5 turns as context, same as the pay_dues clarification flow — Gemma resolves "next Friday" to an absolute date using today's date, which is baked into the system prompt fresh on every call (see [assistantPrompt.ts](../src/config/assistantPrompt.ts)).
+Fields already captured are echoed back (`"Got title ..., category ..."`) rather than re-asking for everything on every turn — the handler deterministically carries forward whatever was already extracted for this conversation's in-progress due, so a partial reply like "accoms due" (just the title) isn't lost on the next turn even if the model doesn't re-derive it from raw history. The rep's next message (e.g. "₦3,000, next Friday") is classified using the last 5 turns as context, same as the pay_dues clarification flow — Gemma resolves "next Friday" to an absolute date using today's date, which is baked into the system prompt fresh on every call (see [assistantPrompt.ts](../src/config/assistantPrompt.ts)).
 
 ### Example — create_due, ready to confirm
 ```json

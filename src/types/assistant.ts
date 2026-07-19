@@ -107,6 +107,7 @@ export type PayDuesResult =
   | { status: 'ready'; due: DueOption };
 
 export type JoinDepartmentResult =
+  | { status: 'missing_code' }
   | { status: 'invalid_code' }
   | { status: 'already_member'; spaceId: string; spaceName: string }
   | { status: 'ready'; spaceId: string; spaceName: string; inviteCode: string; memberCount: number };
@@ -152,7 +153,13 @@ export type CreateDueResult =
   | { status: 'not_rep' }
   | { status: 'needs_space'; spaces: Array<{ spaceId: string; spaceName: string }> }
   | { status: 'invalid_date' }
-  | { status: 'needs_fields'; spaceId: string; spaceName: string; missing: string[] }
+  | {
+      status: 'needs_fields';
+      spaceId: string;
+      spaceName: string;
+      missing: string[];
+      known: { title: string | null; amount: number | null; dueDate: string | null; category: DueCategory | null };
+    }
   | { status: 'ready'; spaceId: string; spaceName: string; draft: CreateDueDraft };
 
 export type RepSummaryResult =
