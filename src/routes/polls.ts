@@ -100,6 +100,8 @@ const createPollSchema = z
     membersOnly: z.boolean(),
     paid: z.boolean(),
     amountPerVote: z.number().int().positive().optional(),
+    coverImageUrl: z.string().url().optional(),
+    themeColor: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).optional(),
     categories: z
       .array(
         z.object({
@@ -130,6 +132,8 @@ pollsRepRouter.post('/polls', validate(createPollSchema), async (req: Request, r
         membersOnly: d.membersOnly,
         paid: d.paid,
         amountPerVote: d.paid ? (d.amountPerVote as number) : 0,
+        coverImageUrl: d.coverImageUrl,
+        themeColor: d.themeColor,
         slug,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
@@ -199,11 +203,18 @@ pollsRepRouter.post('/polls/image', (req: Request, res: Response): void => {
 
 const patchImageSchema = z.object({ imageUrl: z.string().url().nullable() });
 
-// PATCH /polls/:pollId/nominees/:nomineeId — attach/update a nominee's image.
-// Cosmetic only (unlike title/structure changes), so it's allowed at any poll status.
+// PATCH /polls/:pollId/nominees/:nomineeId — attach/update a nominee's image,
+// bio, or vote code. Cosmetic only (unlike title/structure changes), so it's
+// allowed at any poll status.
+const patchNomineeSchema = z.object({
+  imageUrl: z.string().url().nullable().optional(),
+  bio: z.string().max(280).nullable().optional(),
+  code: z.string().max(40).nullable().optional(),
+});
+
 pollsRepRouter.patch(
   '/polls/:pollId/nominees/:nomineeId',
-  validate(patchImageSchema),
+  validate(patchNomineeSchema),
   async (req: Request, res: Response): Promise<void> => {
     const sid = spaceId(req);
     const poll = await loadPollInSpace(sid, req.params.pollId as string);
@@ -217,8 +228,12 @@ pollsRepRouter.patch(
       return;
     }
 
-    const { imageUrl } = req.body as z.infer<typeof patchImageSchema>;
-    await db.nominee.update({ where: { id: nominee.id }, data: { imageUrl } });
+    const d = req.body as z.infer<typeof patchNomineeSchema>;
+    const data: Record<string, unknown> = {};
+    if (d.imageUrl !== undefined) data.imageUrl = d.imageUrl;
+    if (d.bio !== undefined) data.bio = d.bio;
+    if (d.code !== undefined) data.code = d.code;
+    await db.nominee.update({ where: { id: nominee.id }, data });
 
     const updated = await loadPollInSpace(sid, poll.id);
     if (!updated) {
@@ -267,6 +282,8 @@ const patchPollSchema = z.object({
   membersOnly: z.boolean().optional(),
   paid: z.boolean().optional(),
   amountPerVote: z.number().int().positive().optional(),
+  coverImageUrl: z.string().url().nullable().optional(),
+  themeColor: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).nullable().optional(),
 });
 
 pollsRepRouter.patch('/polls/:pollId', validate(patchPollSchema), async (req: Request, res: Response): Promise<void> => {
@@ -308,6 +325,9 @@ pollsRepRouter.patch('/polls/:pollId', validate(patchPollSchema), async (req: Re
     if (d.deadline !== undefined) data.deadline = new Date(`${d.deadline}T23:59:59Z`);
     if (d.amountPerVote !== undefined) data.amountPerVote = d.amountPerVote;
   }
+  // Cover photo and theme colour are cosmetic — editable at any (non-closed) status.
+  if (d.coverImageUrl !== undefined) data.coverImageUrl = d.coverImageUrl;
+  if (d.themeColor !== undefined) data.themeColor = d.themeColor;
 
   const updated = await db.poll.update({ where: { id: poll.id }, data, include: pollInclude });
   ok(res, serializePoll(updated, { showVotes: true, includeRevenue: true }));

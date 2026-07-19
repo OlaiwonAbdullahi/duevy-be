@@ -630,6 +630,8 @@ model Poll {
   slug          String     @unique
   totalVotes    Int        @default(0)
   revenue       Int        @default(0) // kobo
+  coverImageUrl String?
+  themeColor    String?
   publishedAt   DateTime?
   closedAt      DateTime?
   createdAt     DateTime   @default(now())
@@ -661,6 +663,8 @@ model Nominee {
   categoryId String
   name       String
   imageUrl   String?
+  bio        String?
+  code       String?
   votes      Int     @default(0)
 
   category PollCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
