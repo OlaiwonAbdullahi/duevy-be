@@ -12,7 +12,7 @@ import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
 import { computeCharge } from '../lib/money';
-import { sendEmail } from '../lib/email';
+import { sendEmail, renderEmail } from '../lib/email';
 
 // Mounted at /spaces/:spaceId — mergeParams exposes spaceId to these handlers.
 export const circleRouter = Router({ mergeParams: true });
@@ -181,7 +181,10 @@ circleRouter.post('/reps/invite', requireSpaceRep(true), validate(inviteSchema),
   sendEmail({
     to: invitee.email,
     subject: `You're now a co-rep on Duevy`,
-    html: `<p>Hi ${invitee.name}, you've been added as a co-rep of <strong>${space?.name ?? 'a space'}</strong> on Duevy.</p>`,
+    html: renderEmail(`
+      <h1>You're now a co-rep</h1>
+      <p>Hi ${invitee.name}, you've been added as a co-rep of <strong>${space?.name ?? 'a space'}</strong> on Duevy.</p>
+    `),
   }).catch(console.error);
 
   ok(res, { id: invitee.id, name: invitee.name, email: invitee.email, role: 'co' }, 201);

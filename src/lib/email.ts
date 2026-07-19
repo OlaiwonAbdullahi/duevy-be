@@ -29,39 +29,52 @@ export async function sendEmail(options: SendEmailOptions): Promise<void> {
 // Email templates
 // ---------------------------------------------------------------------------
 
-function baseTemplate(content: string, tone = '#0b6e4f'): string {
+export function renderEmail(content: string, tone = '#0b6e4f'): string {
   return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light" />
   <title>Duevy</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap');
-    body { margin: 0; padding: 0; background: #fbfaf7; font-family: 'Manrope', 'Helvetica Neue', Arial, sans-serif; color: #1b2520; }
-    .wrapper { max-width: 560px; margin: 40px auto; background: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
+    body { margin: 0; padding: 0; background: #fbfaf7; font-family: 'Manrope', 'Helvetica Neue', Arial, sans-serif; color: #1b2520; -webkit-font-smoothing: antialiased; }
+    .outer { padding: 32px 16px; }
+    .wrapper { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 24px; overflow: hidden; border: 1px solid #e6f2ec; box-shadow: 0 1px 3px rgba(27,37,32,0.05); }
     .top-bar { height: 4px; background: ${tone}; }
-    .body { padding: 40px 36px; }
-    .logo { font-size: 18px; font-weight: 400; color: #1b2520; margin-bottom: 28px; }
-    .logo span { font-weight: 700; }
-    h1 { font-size: 22px; font-weight: 700; margin: 0 0 12px; color: #1b2520; }
-    p { font-size: 15px; line-height: 1.6; color: #1b2520; margin: 0 0 16px; }
+    .header { padding: 28px 36px 0; }
+    .logo-row { display: flex; align-items: center; }
+    .logo-row img { height: 28px; width: auto; vertical-align: middle; display: inline-block; }
+    .logo-row .wordmark { font-size: 20px; letter-spacing: -0.01em; color: #1b2520; vertical-align: middle; padding-left: 8px; }
+    .body { padding: 24px 36px 40px; }
+    h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 12px; color: #1b2520; }
+    p { font-size: 15px; line-height: 1.65; color: #1b2520; margin: 0 0 16px; }
     p.muted { color: #7a847f; font-size: 13px; }
-    .btn { display: inline-block; background: #0b6e4f; color: #ffffff !important; border-radius: 9999px; padding: 12px 28px; font-size: 14px; font-weight: 600; text-decoration: none; margin: 8px 0 20px; }
-    .divider { border: none; border-top: 1px solid #e6f2ec; margin: 24px 0; }
-    .footer { padding: 20px 36px 32px; text-align: center; font-size: 12px; color: #7a847f; }
+    .callout { background: #f4f2ec; border: 1px solid #e6f2ec; border-radius: 16px; padding: 14px 18px; margin: 0 0 20px; font-size: 14px; color: #1b2520; }
+    .btn { display: inline-block; background: ${tone}; color: #ffffff !important; border-radius: 9999px; padding: 13px 30px; font-size: 14px; font-weight: 600; text-decoration: none; margin: 4px 0 20px; }
+    .divider { border: none; border-top: 1px solid #e6f2ec; margin: 0; }
+    .footer { padding: 22px 36px 32px; text-align: center; font-size: 12px; line-height: 1.6; color: #7a847f; }
+    .footer a { color: #7a847f; text-decoration: underline; }
   </style>
 </head>
 <body>
-  <div class="wrapper">
-    <div class="top-bar"></div>
-    <div class="body">
-      <div class="logo"><span>Duevy.</span></div>
-      ${content}
+  <div class="outer">
+    <div class="wrapper">
+      <div class="top-bar"></div>
+      <div class="header">
+        <div class="logo-row">
+          <img src="https://www.duevy.app/icons/logo2.svg" alt="Duevy" />
+          <span class="wordmark">Duevy.</span>
+        </div>
+      </div>
+      <div class="body">
+        ${content}
+      </div>
+      <hr class="divider" />
+      <div class="footer">Duevy — duevy.app<br />You're receiving this because it relates to your Duevy account.</div>
     </div>
-    <hr class="divider" />
-    <div class="footer">Duevy — duevy.app · @duevyapp</div>
   </div>
 </body>
 </html>`.trim();
@@ -73,7 +86,7 @@ export async function sendVerificationEmail(
   token: string,
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/verify-email?token=${token}`;
-  const html = baseTemplate(`
+  const html = renderEmail(`
     <h1>Verify your email</h1>
     <p>Hi ${name}, thanks for joining Duevy! Click the button below to verify your email address.</p>
     <a href="${link}" class="btn">Verify email</a>
@@ -94,7 +107,7 @@ export async function sendPasswordResetEmail(
   token: string,
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/reset-password?token=${token}`;
-  const html = baseTemplate(
+  const html = renderEmail(
     `
     <h1>Reset your password</h1>
     <p>Hi ${name}, we received a request to reset your Duevy password.</p>
@@ -117,7 +130,7 @@ export async function sendRepApplicationReceivedEmail(
   name: string,
   spaceName: string,
 ): Promise<void> {
-  const html = baseTemplate(`
+  const html = renderEmail(`
     <h1>Application received</h1>
     <p>Hi ${name}, your rep application for <strong>${spaceName}</strong> is under review.</p>
     <p>Our team will verify your application within 1–2 business days. You'll get an email once a decision is made.</p>
@@ -137,7 +150,7 @@ export async function sendRepApprovedEmail(
   spaceName: string,
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/dashboard`;
-  const html = baseTemplate(`
+  const html = renderEmail(`
     <h1>You're approved! 🎉</h1>
     <p>Hi ${name}, your rep application for <strong>${spaceName}</strong> has been approved.</p>
     <p>You can now access your rep dashboard and start managing dues.</p>
@@ -156,11 +169,11 @@ export async function sendRepRejectedEmail(
   name: string,
   reason: string,
 ): Promise<void> {
-  const html = baseTemplate(
+  const html = renderEmail(
     `
     <h1>Application update</h1>
     <p>Hi ${name}, we reviewed your rep application and unfortunately couldn't approve it at this time.</p>
-    <p><strong>Reason:</strong> ${reason}</p>
+    <div class="callout"><strong>Reason:</strong> ${reason}</div>
     <p>Your account has been set up as a student account. If you believe this is a mistake, please contact us at support@duevy.app</p>
   `,
     '#b01e4e',

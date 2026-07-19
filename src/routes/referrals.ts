@@ -6,7 +6,7 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { ok, errors } from '../lib/response';
 import { generateReferralCode, REFERRAL_REWARD_KOBO } from '../lib/referral';
-import { sendEmail } from '../lib/email';
+import { sendEmail, renderEmail } from '../lib/email';
 
 export const referralsRouter = Router();
 referralsRouter.use(authenticate);
@@ -91,9 +91,12 @@ referralsRouter.post('/invites', validate(invitesSchema), async (req: Request, r
     sendEmail({
       to,
       subject: `${user.name} invited you to become a rep on Duevy`,
-      html: `<p>${user.name} thinks you'd make a great department rep on Duevy.</p>
-             <p>Sign up with their link to get started: <a href="${link}">${link}</a></p>
-             <p>Referral code: <strong>${code}</strong></p>`,
+      html: renderEmail(`
+        <h1>You're invited to Duevy</h1>
+        <p>${user.name} thinks you'd make a great department rep on Duevy.</p>
+        <a href="${link}" class="btn">Sign up to get started</a>
+        <div class="callout">Referral code: <strong>${code}</strong></div>
+      `),
     }).catch(console.error);
   }
 

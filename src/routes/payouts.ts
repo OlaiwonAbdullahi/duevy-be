@@ -12,7 +12,7 @@ import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
 import { getBanks, verifyAccountName } from '../lib/paymentGateway';
 import { generatePayoutReference } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { sendEmail } from '../lib/email';
+import { sendEmail, renderEmail } from '../lib/email';
 import { initiatePayoutDisbursement } from '../services/payout.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
@@ -247,7 +247,15 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
       sendEmail({
         to: r.user.email,
         subject: 'Duevy payout account changed',
-        html: `<p>Hi ${r.user.name}, the payout bank account for your space was changed to <strong>${bankName} ${masked}</strong>. Payouts are held for 24 hours as a security measure. If this wasn't you, contact support immediately.</p>`,
+        html: renderEmail(
+          `
+          <h1>Payout account changed</h1>
+          <p>Hi ${r.user.name}, the payout bank account for your space was changed to <strong>${bankName} ${masked}</strong>.</p>
+          <div class="callout">Payouts are held for 24 hours as a security measure.</div>
+          <p class="muted">If this wasn't you, contact support immediately at support@duevy.app</p>
+        `,
+          '#b01e4e',
+        ),
       }).catch(console.error);
     }
   }
