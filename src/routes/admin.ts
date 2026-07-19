@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepApplication } from '@prisma/client';
+import { type Prisma, type RepApplication, type PaymentGatewayName } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
@@ -16,6 +16,7 @@ import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
+import { getGatewayLabel, isGatewayConfigured, invalidateGatewayCache } from '../lib/paymentGateway';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -1140,3 +1141,60 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.setHeader('Content-Disposition', `attachment; filename="${report.scope}-${report.id}.csv"`);
   res.status(200).send(body);
 });
+
+// ---------------------------------------------------------------------------
+// GET /admin/settings/payment-gateway — which processor is live, and which
+// gateways currently have their credentials configured (so the dashboard can
+// grey out/warn before an admin switches to one that isn't set up).
+// ---------------------------------------------------------------------------
+adminRouter.get('/settings/payment-gateway', async (_req: Request, res: Response): Promise<void> => {
+  const active = (await getGatewayLabel()).toLowerCase() as PaymentGatewayName;
+  ok(res, {
+    active,
+    gateways: {
+      paystack: { configured: isGatewayConfigured('paystack') },
+      monnify: { configured: isGatewayConfigured('monnify') },
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PUT /admin/settings/payment-gateway (super_admin only) — switches which
+// processor is live without a redeploy. Refuses to switch to a gateway whose
+// credentials aren't set in env, since that would break payments instantly.
+// ---------------------------------------------------------------------------
+const setGatewaySchema = z.object({ gateway: z.enum(['paystack', 'monnify']) });
+
+adminRouter.put(
+  '/settings/payment-gateway',
+  requireSuperAdmin(),
+  validate(setGatewaySchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { gateway } = req.body as z.infer<typeof setGatewaySchema>;
+
+    if (!isGatewayConfigured(gateway)) {
+      errors.conflict(
+        res,
+        'GATEWAY_NOT_CONFIGURED',
+        `${gateway} is missing required credentials in env — set them before switching`,
+      );
+      return;
+    }
+
+    const actorId = (req as AuthenticatedRequest).user.sub as string;
+    await db.appSettings.upsert({
+      where: { id: 'singleton' },
+      update: { activePaymentGateway: gateway, updatedBy: actorId },
+      create: { id: 'singleton', activePaymentGateway: gateway, updatedBy: actorId },
+    });
+    invalidateGatewayCache();
+
+    await writeAdminAudit(req, 'payment_gateway_changed', {
+      target: gateway,
+      severity: 'critical',
+      metadata: { gateway },
+    });
+
+    ok(res, { active: gateway });
+  },
+);

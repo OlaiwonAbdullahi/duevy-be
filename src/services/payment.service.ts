@@ -1,7 +1,7 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { computeCharge, generateReference } from '../lib/money';
-import { initTransaction, chargeCardToken, getCardDetails, GATEWAY_LABEL } from '../lib/paymentGateway';
+import { initTransaction, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
 import { notify, notifyMany } from '../lib/notifications';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
@@ -197,6 +197,7 @@ export interface CheckoutResult {
 
 export async function initOnlineTopUp(user: User, amount: number): Promise<CheckoutResult> {
   const reference = await uniqueReference();
+  const gatewayLabel = await getGatewayLabel();
 
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
@@ -204,9 +205,9 @@ export async function initOnlineTopUp(user: User, amount: number): Promise<Check
         userId: user.id,
         type: 'topup',
         title: 'Wallet top-up',
-        detail: GATEWAY_LABEL,
+        detail: gatewayLabel,
         amount,
-        method: GATEWAY_LABEL,
+        method: gatewayLabel,
         status: 'pending',
         reference,
       },
@@ -237,6 +238,7 @@ export async function initOnlineTopUp(user: User, amount: number): Promise<Check
 export async function initOnlineDuePayment(user: User, due: Due & { space: { name: string } }): Promise<CheckoutResult> {
   const charge = computeCharge(due.amount);
   const reference = await uniqueReference();
+  const gatewayLabel = await getGatewayLabel();
 
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
@@ -246,7 +248,7 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
         title: due.title,
         detail: due.space.name,
         amount: -charge.totalCharged,
-        method: GATEWAY_LABEL,
+        method: gatewayLabel,
         status: 'pending',
         reference,
         spaceId: due.spaceId,
@@ -283,6 +285,7 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
 // ---------------------------------------------------------------------------
 export async function initCardSave(user: User, isDefault: boolean): Promise<CheckoutResult> {
   const reference = await uniqueReference();
+  const gatewayLabel = await getGatewayLabel();
 
   const init = await initTransaction({
     amount: CARD_VERIFICATION_AMOUNT,
@@ -299,9 +302,9 @@ export async function initCardSave(user: User, isDefault: boolean): Promise<Chec
         userId: user.id,
         type: 'card_verification',
         title: 'Card verification',
-        detail: GATEWAY_LABEL,
+        detail: gatewayLabel,
         amount: -CARD_VERIFICATION_AMOUNT,
-        method: GATEWAY_LABEL,
+        method: gatewayLabel,
         status: 'pending',
         reference,
       },

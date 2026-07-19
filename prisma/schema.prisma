@@ -88,6 +88,11 @@ enum PayMethod {
   online
 }
 
+enum PaymentGatewayName {
+  paystack
+  monnify
+}
+
 enum TxnType {
   due
   topup
@@ -786,6 +791,19 @@ model AdminAuditLog {
   @@index([actorId])
   @@index([createdAt])
   @@map("admin_audit_logs")
+}
+
+// Single settings row, runtime-editable by a super_admin (§ admin payment
+// gateway switch) so moving between Paystack/Monnify never needs a redeploy.
+// PAYMENT_GATEWAY in env is only the fallback used to seed this row and for
+// when it doesn't exist yet — see src/lib/paymentGateway.ts.
+model AppSettings {
+  id                   String             @id @default("singleton")
+  activePaymentGateway PaymentGatewayName @default(paystack)
+  updatedAt            DateTime           @updatedAt
+  updatedBy            String?
+
+  @@map("app_settings")
 }
 
 model ReferralFlag {

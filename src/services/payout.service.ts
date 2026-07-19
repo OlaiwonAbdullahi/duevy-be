@@ -12,7 +12,7 @@ const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
  * the payout simply stays `processing` for the reconciliation job to retry.
  */
 export async function initiatePayoutDisbursement(payout: Payout): Promise<void> {
-  if (!isDisbursementConfigured()) return;
+  if (!(await isDisbursementConfigured())) return;
 
   const account = await db.bankAccount.findUnique({ where: { spaceId: payout.spaceId } });
   if (!account) return;
@@ -71,7 +71,7 @@ export async function settlePayout(reference: string, success: boolean, failureR
 
 /** Poll the provider for payouts that have sat in `processing` too long (reconciliation job). */
 export async function reconcileStalePayouts(): Promise<void> {
-  if (!isDisbursementConfigured()) return;
+  if (!(await isDisbursementConfigured())) return;
 
   const staleThreshold = new Date(Date.now() - STALE_PAYOUT_AFTER_MS);
   const stale = await db.payout.findMany({

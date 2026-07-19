@@ -1,3 +1,5 @@
+import { type PaymentGatewayName } from '@prisma/client';
+import { db } from '../config/db';
 import { env } from '../config/env';
 import * as monnify from './monnify';
 import * as paystack from './paystack';
@@ -17,24 +19,89 @@ export type {
 /**
  * Single switch point for which payment processor is live. Both
  * implementations (src/lib/monnify.ts, src/lib/paystack.ts) are complete and
- * kept working — flipping PAYMENT_GATEWAY is the only change needed to move
- * between them; nothing downstream imports a concrete provider directly.
+ * kept working. The active one is stored in the AppSettings singleton row
+ * (runtime-editable by a super_admin, see src/routes/admin.ts) rather than
+ * baked into env at boot — PAYMENT_GATEWAY is only the fallback used the
+ * first time this is read and if the row is ever missing. Nothing downstream
+ * imports a concrete provider directly.
  */
-const active = env.PAYMENT_GATEWAY === 'monnify' ? monnify : paystack;
+const CACHE_TTL_MS = 15_000;
+let cached: { value: PaymentGatewayName; expiresAt: number } | null = null;
+
+function moduleFor(name: PaymentGatewayName) {
+  return name === 'monnify' ? monnify : paystack;
+}
+
+/** Drop the cached gateway choice — called right after an admin changes it, so the new value takes effect immediately rather than after CACHE_TTL_MS. */
+export function invalidateGatewayCache(): void {
+  cached = null;
+}
+
+async function getActiveGatewayName(): Promise<PaymentGatewayName> {
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const row = await db.appSettings.findUnique({ where: { id: 'singleton' } });
+  const value = row?.activePaymentGateway ?? env.PAYMENT_GATEWAY;
+  cached = { value, expiresAt: Date.now() + CACHE_TTL_MS };
+  return value;
+}
 
 /** Human-readable label for the active gateway — used on transaction/method fields. */
-export const GATEWAY_LABEL = env.PAYMENT_GATEWAY === 'monnify' ? 'Monnify' : 'Paystack';
+export async function getGatewayLabel(): Promise<'Paystack' | 'Monnify'> {
+  const name = await getActiveGatewayName();
+  return name === 'monnify' ? 'Monnify' : 'Paystack';
+}
 
-export const initTransaction = active.initTransaction;
-export const verifyAccountName = active.verifyAccountName;
-export const getBanks = active.getBanks;
-export const getTransactionStatus = active.getTransactionStatus;
-export const getCardDetails = active.getCardDetails;
-export const chargeCardToken = active.chargeCardToken;
-export const initiateDisbursement = active.initiateDisbursement;
-export const getDisbursementStatus = active.getDisbursementStatus;
+export async function initTransaction(...args: Parameters<typeof paystack.initTransaction>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).initTransaction(...args);
+}
+
+export async function verifyAccountName(...args: Parameters<typeof paystack.verifyAccountName>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).verifyAccountName(...args);
+}
+
+export async function getBanks(...args: Parameters<typeof paystack.getBanks>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).getBanks(...args);
+}
+
+export async function getTransactionStatus(...args: Parameters<typeof paystack.getTransactionStatus>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).getTransactionStatus(...args);
+}
+
+export async function getCardDetails(...args: Parameters<typeof paystack.getCardDetails>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).getCardDetails(...args);
+}
+
+export async function chargeCardToken(...args: Parameters<typeof paystack.chargeCardToken>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).chargeCardToken(...args);
+}
+
+export async function initiateDisbursement(...args: Parameters<typeof paystack.initiateDisbursement>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).initiateDisbursement(...args);
+}
+
+export async function getDisbursementStatus(...args: Parameters<typeof paystack.getDisbursementStatus>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).getDisbursementStatus(...args);
+}
 
 /** Whether payout disbursement is configured for whichever gateway is active. */
-export function isDisbursementConfigured(): boolean {
-  return env.PAYMENT_GATEWAY === 'monnify' ? !!env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT : !!env.PAYSTACK_SECRET_KEY;
+export async function isDisbursementConfigured(): Promise<boolean> {
+  const name = await getActiveGatewayName();
+  return name === 'monnify' ? !!env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT : !!env.PAYSTACK_SECRET_KEY;
+}
+
+/** Whether a given gateway has its required credentials present in env — checked before an admin is allowed to switch to it. */
+export function isGatewayConfigured(name: PaymentGatewayName): boolean {
+  if (name === 'monnify') {
+    return !!(env.MONNIFY_API_KEY && env.MONNIFY_SECRET_KEY && env.MONNIFY_CONTRACT_CODE && env.MONNIFY_WEBHOOK_SECRET);
+  }
+  return !!env.PAYSTACK_SECRET_KEY;
 }
