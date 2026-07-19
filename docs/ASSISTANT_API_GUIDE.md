@@ -311,3 +311,53 @@ Created as a **draft** (`Due.status = 'draft'`) — same as leaving `publish: fa
 `conversationId` scopes a running chat so multi-turn clarification works (Duey asks "which due item?" → user replies "handout fee" → the follow-up is classified using the last 5 turns as context, not just the bare word "handout fee"). Conversations and their messages live in Postgres (`assistant_conversations` / `assistant_messages`) — there's no client-side history to manage beyond holding onto the `conversationId` string between calls.
 
 Start a new conversation any time by omitting `conversationId` — useful for a "new chat" button in the UI.
+
+---
+
+## 6. GET /assistant/conversations
+
+**Flow:** Powers a chat-history list ("previous conversations" sidebar, ChatGPT-style) — every conversation the caller has ever had with Duey, most recently active first, with a one-line preview (the last message in that conversation, whichever side sent it). Paginated like every other list endpoint — see [FRONTEND_API_GUIDE.md §1.7](./FRONTEND_API_GUIDE.md#1-core-concepts) for the shared `page`/`perPage` query params.
+
+**Response `200`**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "cnv_9f2k3a1x",
+      "preview": "Ready to pay \"Handout Fee\" (₦5,150.00) to Economics Student Association? Tap below to continue.",
+      "createdAt": "2026-07-17T10:00:00.000Z",
+      "updatedAt": "2026-07-17T10:00:05.000Z"
+    },
+    {
+      "id": "cnv_2j8h5k",
+      "preview": "Your wallet balance is ₦12,000.00. You owe ₦5,150.00 across 1 due(s):\nHandout Fee — ₦5,150.00 (CSSA)",
+      "createdAt": "2026-07-15T09:30:00.000Z",
+      "updatedAt": "2026-07-15T09:31:00.000Z"
+    }
+  ],
+  "meta": { "page": 1, "perPage": 20, "total": 2, "totalPages": 1 }
+}
+```
+`preview` is `null` for a conversation that was created but never actually got a message persisted (shouldn't normally happen, but the field is nullable defensively). Only the caller's own conversations are ever returned — scoped by `userId`, same as everything else in this API.
+
+---
+
+## 7. GET /assistant/conversations/{id}/messages
+
+**Flow:** Called when the user taps into a conversation from the history list — returns the full transcript in chronological order so the chat UI can render it exactly as it originally happened, including which intent/confidence each of Duey's replies resolved to (useful if you ever build an internal debug view, not just the end-user chat).
+
+**Response `200`**
+```json
+{
+  "success": true,
+  "data": {
+    "conversationId": "cnv_9f2k3a1x",
+    "messages": [
+      { "id": "msg_1", "role": "user", "content": "pay my handout fee", "intent": null, "confidence": null, "createdAt": "2026-07-17T10:00:00.000Z" },
+      { "id": "msg_2", "role": "assistant", "content": "Ready to pay \"Handout Fee\" (₦5,150.00) to Economics Student Association? Tap below to continue.", "intent": "pay_dues", "confidence": 0.7, "createdAt": "2026-07-17T10:00:01.000Z" }
+    ]
+  }
+}
+```
+`intent`/`confidence` are only ever populated on `role: "assistant"` rows (the classification that produced that reply) — always `null` on `role: "user"` rows. `404` if the conversation doesn't exist or doesn't belong to the caller.

@@ -5,6 +5,8 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { assistantLimiter } from '../middleware/rateLimiter';
 import { ok, errors, fail } from '../lib/response';
+import { parseListQuery, buildMeta } from '../lib/pagination';
+import { serializeAssistantConversation, serializeAssistantMessage } from '../lib/serializers';
 import { classify, execute, formatResponse, confirmJoinDepartment, confirmCreateDue } from '../services/assistant.service';
 import { type ConversationTurn, DUE_CATEGORIES } from '../types/assistant';
 
@@ -26,6 +28,71 @@ async function loadConversation(userId: string, conversationId: string | undefin
   }
   return db.assistantConversation.create({ data: { userId } });
 }
+
+// ---------------------------------------------------------------------------
+// GET /assistant/conversations — Duey chat history, most recently active
+// first. Preview only (last message) — fetch the full transcript via
+// GET /assistant/conversations/{id}/messages.
+// ---------------------------------------------------------------------------
+assistantRouter.get('/conversations', async (req: Request, res: Response): Promise<void> => {
+  const userId = uid(req);
+  const { page, perPage, skip, take } = parseListQuery(req);
+
+  const [total, conversations] = await Promise.all([
+    db.assistantConversation.count({ where: { userId } }),
+    db.assistantConversation.findMany({
+      where: { userId },
+      orderBy: { updatedAt: 'desc' },
+      skip,
+      take,
+    }),
+  ]);
+
+  const ids = conversations.map((c) => c.id);
+  const recentMessages = ids.length
+    ? await db.assistantMessage.findMany({
+        where: { conversationId: { in: ids } },
+        orderBy: { createdAt: 'desc' },
+        select: { conversationId: true, content: true, createdAt: true },
+      })
+    : [];
+  // Messages come back newest-first across all conversations on the page — the
+  // first one seen per conversationId is that conversation's latest message.
+  const previewByConversation = new Map<string, { content: string; createdAt: Date }>();
+  for (const m of recentMessages) {
+    if (!previewByConversation.has(m.conversationId)) {
+      previewByConversation.set(m.conversationId, { content: m.content, createdAt: m.createdAt });
+    }
+  }
+
+  ok(
+    res,
+    conversations.map((c) => serializeAssistantConversation(c, previewByConversation.get(c.id) ?? null)),
+    200,
+    buildMeta(page, perPage, total),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// GET /assistant/conversations/{id}/messages — full transcript for one chat.
+// ---------------------------------------------------------------------------
+assistantRouter.get('/conversations/:id/messages', async (req: Request, res: Response): Promise<void> => {
+  const userId = uid(req);
+  const conversationId = req.params.id as string;
+
+  const conversation = await db.assistantConversation.findFirst({ where: { id: conversationId, userId } });
+  if (!conversation) {
+    errors.notFound(res, 'Conversation not found');
+    return;
+  }
+
+  const messages = await db.assistantMessage.findMany({
+    where: { conversationId },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  ok(res, { conversationId, messages: messages.map(serializeAssistantMessage) });
+});
 
 // ---------------------------------------------------------------------------
 // POST /assistant/message — classify + validate + (read-only) execute

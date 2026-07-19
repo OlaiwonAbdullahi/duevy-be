@@ -13,6 +13,8 @@ import {
   type Nominee,
   type AdminAuditLog,
   type Dispute,
+  type AssistantConversation,
+  type AssistantMessage,
 } from '@prisma/client';
 
 type UserWithSpaces = User & {
@@ -253,5 +255,30 @@ export function serializeAuditLog(log: SpaceAuditLog) {
     description: log.description,
     actor: { id: log.actorId, name: log.actorName },
     createdAt: log.createdAt.toISOString(),
+  };
+}
+
+/** A Duey conversation row for the history list — preview only, not the full transcript. */
+export function serializeAssistantConversation(
+  c: AssistantConversation,
+  preview: { content: string; createdAt: Date } | null,
+) {
+  return {
+    id: c.id,
+    preview: preview?.content ?? null,
+    createdAt: c.createdAt.toISOString(),
+    updatedAt: c.updatedAt.toISOString(),
+  };
+}
+
+/** A single turn within a Duey conversation transcript. */
+export function serializeAssistantMessage(m: AssistantMessage) {
+  return {
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    intent: m.intent,
+    confidence: m.confidence,
+    createdAt: m.createdAt.toISOString(),
   };
 }
