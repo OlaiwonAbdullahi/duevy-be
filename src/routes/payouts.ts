@@ -9,7 +9,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccountName, createSubaccount, updateSubaccount } from '../lib/paymentGateway';
+import { getBanks, verifyAccountName, createSubaccount, updateSubaccount, getActiveGatewayName } from '../lib/paymentGateway';
 import { generatePayoutReference, PLATFORM_PERCENTAGE_CHARGE } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
@@ -234,10 +234,16 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     await updateSubaccount(subaccountCode, { bankCode, accountNumber });
   }
 
+  // Resolved fresh via the active gateway's own bank list above, so it's
+  // current as of right now — tag it so resolveActiveBankCode() can skip
+  // re-resolving until the active gateway actually changes again.
+  const bankCodeGateway = await getActiveGatewayName();
+
   const account = await db.bankAccount.upsert({
     where: { spaceId: sid },
     update: {
       bankCode,
+      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,
@@ -247,6 +253,7 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     create: {
       spaceId: sid,
       bankCode,
+      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,

@@ -1,10 +1,62 @@
-import { type Payout } from '@prisma/client';
+import { type Payout, type BankAccount } from '@prisma/client';
 import { db } from '../config/db';
 import { decrypt } from '../lib/encryption';
-import { initiateDisbursement, getDisbursementStatus, isDisbursementConfigured } from '../lib/paymentGateway';
+import {
+  initiateDisbursement,
+  getDisbursementStatus,
+  isDisbursementConfigured,
+  getActiveGatewayName,
+  getBanks,
+  verifyAccountName,
+} from '../lib/paymentGateway';
 import { notifyMany } from '../lib/notifications';
 
 const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
+
+/** Strips generic suffixes ("Bank", "MFB", "Plc", ...) so the same institution matches across providers' differently-formatted names. */
+function normalizeBankName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/\b(bank|mfb|microfinance|plc|limited|ltd)\b/gi, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Bank codes are gateway-specific — Monnify and Paystack number the same
+ * bank differently (e.g. Kuda is `090267` on one and `50211` on the other).
+ * `BankAccount.bankCodeGateway` records which scheme `bankCode` currently
+ * matches; if the active gateway has since changed, re-resolve the code by
+ * matching `bankName` against the active gateway's own bank list, re-verify
+ * the account still checks out (never trust a name-match alone with real
+ * money), and persist the correction so this is a one-time cost per switch.
+ */
+export async function resolveActiveBankCode(account: BankAccount): Promise<string> {
+  const activeGateway = await getActiveGatewayName();
+  if (account.bankCodeGateway === activeGateway) return account.bankCode;
+
+  const banks = await getBanks();
+  const target = normalizeBankName(account.bankName);
+  const match =
+    banks.find((b) => normalizeBankName(b.name) === target) ??
+    banks.find((b) => normalizeBankName(b.name).includes(target) || target.includes(normalizeBankName(b.name)));
+  if (!match) {
+    throw new Error(`[bank-code] no match for "${account.bankName}" in the ${activeGateway} bank list — resolve manually`);
+  }
+
+  const accountNumber = decrypt(account.accountNumber);
+  const resolvedName = await verifyAccountName(accountNumber, match.code);
+  if (!resolvedName) {
+    throw new Error(`[bank-code] "${account.bankName}" (${match.code}) didn't verify under ${activeGateway} — resolve manually`);
+  }
+
+  await db.bankAccount.update({
+    where: { spaceId: account.spaceId },
+    data: { bankCode: match.code, bankCodeGateway: activeGateway, accountName: resolvedName },
+  });
+  console.log(`[bank-code] re-resolved "${account.bankName}" for space ${account.spaceId}: ${account.bankCode} -> ${match.code} (${activeGateway})`);
+
+  return match.code;
+}
 
 /**
  * Kick off the actual bank transfer for a freshly-created payout (§10.3).
@@ -18,11 +70,12 @@ export async function initiatePayoutDisbursement(payout: Payout): Promise<void> 
   if (!account) return;
 
   try {
+    const bankCode = await resolveActiveBankCode(account);
     const result = await initiateDisbursement({
       amount: payout.amount,
       reference: payout.reference,
       narration: `Duevy payout ${payout.reference}`,
-      bankCode: account.bankCode,
+      bankCode,
       accountNumber: decrypt(account.accountNumber),
       accountName: account.accountName,
     });

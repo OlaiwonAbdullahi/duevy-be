@@ -587,6 +587,11 @@ model BankAccount {
   id              String   @id @default(cuid())
   spaceId         String   @unique
   bankCode        String
+  // Bank codes are gateway-specific (Monnify and Paystack number the same
+  // bank differently) — this records which gateway's scheme `bankCode`
+  // currently matches, so a gateway switch can be detected and the code
+  // re-resolved on demand rather than silently misrouting a disbursement.
+  bankCodeGateway PaymentGatewayName?
   bankName        String
   accountNumber   String   // stored encrypted
   accountNumberMasked String // "•••• 4021"

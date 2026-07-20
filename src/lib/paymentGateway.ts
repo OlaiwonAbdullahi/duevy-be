@@ -43,7 +43,8 @@ export function invalidateGatewayCache(): void {
   cached = null;
 }
 
-async function getActiveGatewayName(): Promise<PaymentGatewayName> {
+/** Which gateway is live right now — exported so callers can tag/compare stored gateway-specific data (e.g. BankAccount.bankCodeGateway) against it. */
+export async function getActiveGatewayName(): Promise<PaymentGatewayName> {
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
   const row = await db.appSettings.findUnique({ where: { id: 'singleton' } });

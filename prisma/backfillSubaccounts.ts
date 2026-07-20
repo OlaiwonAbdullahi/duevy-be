@@ -3,11 +3,17 @@
  * has a BankAccount on file but no paystackSubaccountCode yet — reps who set
  * up payouts before the payment architecture migration. Safe to re-run
  * (skips spaces that already have a code). Run with: npx tsx prisma/backfillSubaccounts.ts
+ *
+ * Self-healing: a stored bankCode may have been resolved under a different
+ * gateway than the one currently active (Monnify and Paystack number the
+ * same bank differently) — resolveActiveBankCode() re-verifies and corrects
+ * it before use, rather than blindly trusting a possibly-stale code.
  */
 import { db } from '../src/config/db';
 import { decrypt } from '../src/lib/encryption';
 import { createSubaccount } from '../src/lib/paymentGateway';
 import { PLATFORM_PERCENTAGE_CHARGE } from '../src/lib/money';
+import { resolveActiveBankCode } from '../src/services/payout.service';
 
 async function main() {
   const spaces = await db.space.findMany({
@@ -20,9 +26,10 @@ async function main() {
   for (const space of spaces) {
     if (!space.bankAccount) continue;
     try {
+      const bankCode = await resolveActiveBankCode(space.bankAccount);
       const { subaccountCode } = await createSubaccount({
         businessName: space.name,
-        bankCode: space.bankAccount.bankCode,
+        bankCode,
         accountNumber: decrypt(space.bankAccount.accountNumber),
         percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
       });
