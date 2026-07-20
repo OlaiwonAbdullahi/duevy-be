@@ -94,7 +94,6 @@ export function serializeAppUser(u: UserWithSpaces) {
     name: u.name,
     email: u.email,
     department: spaces[0] ?? null,
-    walletBalance: u.walletBalance,
     isSuspended: u.isSuspended,
     isDeactivated: u.isDeactivated,
     kycStatus: u.kycStatus,

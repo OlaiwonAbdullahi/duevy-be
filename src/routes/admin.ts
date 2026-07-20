@@ -5,7 +5,7 @@ import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireAdmin, requireSuperAdmin, requireAdminPermission } from '../middleware/requireRole';
-import { ok, errors } from '../lib/response';
+import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTransaction } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
@@ -16,7 +16,7 @@ import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getGatewayLabel, isGatewayConfigured, invalidateGatewayCache } from '../lib/paymentGateway';
+import { getGatewayLabel, isGatewayConfigured, invalidateGatewayCache, refundTransaction } from '../lib/paymentGateway';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -732,9 +732,21 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
     return;
   }
 
+  // Reverse to the payer's original source (card/bank) via the gateway's real
+  // refund API — there's no wallet to credit anymore (payment architecture
+  // migration). Do this before writing any DB rows: if Paystack rejects the
+  // refund, nothing here should look like it succeeded.
+  try {
+    await refundTransaction({ reference: original.reference, amount: refundAmount });
+  } catch (err) {
+    console.error(`[admin] refund failed for txn=${original.id}:`, err);
+    fail(res, 502, 'REFUND_FAILED', 'The payment provider rejected this refund');
+    return;
+  }
+
   const reference = await uniqueReference();
-  const refund = await db.$transaction(async (tx) => {
-    const created = await tx.transaction.create({
+  const refund = await db.$transaction(async (tx) =>
+    tx.transaction.create({
       data: {
         userId: original.userId,
         type: 'refund',
@@ -747,14 +759,12 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
         spaceId: original.spaceId,
         refundOfTxnId: original.id,
       },
-    });
-    await tx.user.update({ where: { id: original.userId }, data: { walletBalance: { increment: refundAmount } } });
-    return created;
-  });
+    }),
+  );
 
   await Promise.all([
     writeAdminAudit(req, 'transaction.refund', { target: original.id, severity: 'critical', metadata: { refundAmount, reason } }),
-    notify({ userId: original.userId, kind: 'system', tone: 'brand', title: 'Refund issued', detail: `₦${(refundAmount / 100).toLocaleString('en-NG')} was refunded to your wallet.`, href: '/dashboard/wallet' }).catch(() => {}),
+    notify({ userId: original.userId, kind: 'system', tone: 'brand', title: 'Refund issued', detail: `₦${(refundAmount / 100).toLocaleString('en-NG')} was refunded to your original payment method.`, href: '/dashboard/transactions' }).catch(() => {}),
   ]);
   ok(res, serializeTransaction(refund), 201);
 });

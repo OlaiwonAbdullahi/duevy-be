@@ -7,6 +7,8 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
+import { getTransactionStatus } from '../lib/paymentGateway';
+import { fulfilByReference } from '../services/payment.service';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -122,13 +124,33 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const id = uid(req);
   const reference = req.params.reference as string;
 
-  const pending = await db.pendingPayment.findUnique({ where: { reference } });
+  let pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending || pending.userId !== id) {
     errors.notFound(res, 'Payment not found');
     return;
   }
 
-  const status = pending.status === 'completed' ? 'completed' : pending.status === 'failed' ? 'failed' : 'pending';
+  // "I've made payment" tap (§ in-app invoice flow) — actively check with the
+  // gateway instead of just reading our own possibly-stale DB row, so the UI
+  // can reflect success without waiting on the webhook round-trip. The
+  // webhook remains the actual source of truth; fulfilByReference is
+  // idempotent, so this racing with the webhook is safe by construction.
+  if (pending.status === 'pending') {
+    try {
+      const live = await getTransactionStatus(reference);
+      if (live?.paymentStatus === 'PAID') {
+        await fulfilByReference(reference, true);
+        pending = await db.pendingPayment.findUnique({ where: { reference } });
+      } else if (live && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(live.paymentStatus)) {
+        await fulfilByReference(reference, false);
+        pending = await db.pendingPayment.findUnique({ where: { reference } });
+      }
+    } catch (err) {
+      console.error(`[payments] status check failed for ref=${reference}:`, err);
+    }
+  }
+
+  const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
   const txn = await db.transaction.findUnique({ where: { reference } });
 
   ok(res, {

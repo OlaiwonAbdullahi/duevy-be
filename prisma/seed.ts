@@ -1,6 +1,6 @@
 /**
  * Demo data seed — a rep account, a student account, and a full slate of
- * data (dues, wallet activity, a payout, a poll, notifications) so Duey and
+ * data (dues, a settled payment, a payout, a poll, notifications) so Duey and
  * the rest of the API can be exercised end-to-end without a real signup flow.
  *
  * Idempotent: safe to re-run. Existing rows are upserted/reused rather than
@@ -37,7 +37,6 @@ async function main() {
       repApplicationStatus: 'approved',
       matricNo: '190802044',
       level: '400',
-      walletBalance: 0,
       referralCode: await generateReferralCode('Tunde Okafor'),
       kycStatus: 'verified',
       termsAcceptedAt: new Date(),
@@ -111,7 +110,6 @@ async function main() {
       role: 'student',
       matricNo: '210805019',
       level: '300',
-      walletBalance: 1_200_000, // ₦12,000 — matches docs/ASSISTANT_API_GUIDE.md's check_balance example
       referralCode: await generateReferralCode('Aisha Bello'),
       kycStatus: 'verified',
       termsAcceptedAt: new Date(),
@@ -148,24 +146,7 @@ async function main() {
   const handoutFee = await upsertDue('Handout Fee', 500_000, new Date('2026-08-15')); // ₦5,000 face → ₦5,150 payable
   const dinnerLevy = await upsertDue('Dinner Levy', 1_000_000, new Date('2026-09-01')); // ₦10,000 face → ₦10,300 payable
 
-  // Wallet top-up transaction — sets up realistic history alongside the due payment below.
-  await db.transaction.upsert({
-    where: { reference: 'DVY-DEMO-0001' },
-    update: {},
-    create: {
-      userId: student.id,
-      type: 'topup',
-      title: 'Wallet top-up',
-      detail: 'Monnify',
-      amount: 1_200_000,
-      method: 'Monnify',
-      status: 'completed',
-      reference: 'DVY-DEMO-0001',
-    },
-  });
-
-  // Dinner Levy already settled (via card/online, not wallet — wallet balance
-  // stays at the ₦12,000 the check_balance example expects).
+  // Dinner Levy already settled (via card) — sets up realistic history for view_history.
   const dinnerCharge = computeCharge(dinnerLevy.amount);
   const dinnerTxn = await db.transaction.upsert({
     where: { reference: 'DVY-DEMO-0002' },

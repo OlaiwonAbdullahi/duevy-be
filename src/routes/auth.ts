@@ -600,7 +600,6 @@ authRouter.get(
         repApplicationStatus: true,
         matricNo: true,
         level: true,
-        walletBalance: true,
         referralCode: true,
         createdAt: true,
         spaceMemberships: {

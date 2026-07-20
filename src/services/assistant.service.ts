@@ -1,6 +1,6 @@
 import { db } from '../config/db';
 import { classifyIntent } from '../lib/llm';
-import { computeCharge, formatNaira, nairaToKobo, MIN_TOPUP, MAX_TOPUP } from '../lib/money';
+import { computeCharge, formatNaira, nairaToKobo } from '../lib/money';
 import { generateId } from '../lib/id';
 import { writeAudit } from '../lib/audit';
 import {
@@ -16,7 +16,6 @@ import {
   type CheckBalanceResult,
   type ViewHistoryResult,
   type ContactRepResult,
-  type FundWalletResult,
   type CreateDueResult,
   type RepSummaryResult,
   type CreateDueDraft,
@@ -34,7 +33,7 @@ const CONFIDENCE_FLOOR = 0.35;
 const INVITE_CODE_REGEX = /\b([A-Z0-9]{2,6})-([A-Z0-9]{4})\b/i;
 
 const HELP_REPLY =
-  "I can help you pay dues, join a department, check your balance, view your payment history, find your department rep's contact, or fund your wallet. Reps can also create dues and check their collections summary. What would you like to do?";
+  "I can help you pay dues, join a department, check your balance, or view your payment history and department rep's contact. Reps can also create dues and check their collections summary. What would you like to do?";
 
 // ---------------------------------------------------------------------------
 // 1. Intent classification (regex short-circuit, then Gemma)
@@ -140,10 +139,7 @@ async function handleJoinDepartment(userId: string, inviteCode: string | null): 
 }
 
 async function handleCheckBalance(userId: string): Promise<CheckBalanceResult> {
-  const [user, dues] = await Promise.all([
-    db.user.findUnique({ where: { id: userId }, select: { walletBalance: true } }),
-    unpaidDuesFor(userId, null),
-  ]);
+  const dues = await unpaidDuesFor(userId, null);
 
   const duesOwed = dues.map((d) => {
     const charge = computeCharge(d.amount);
@@ -158,7 +154,6 @@ async function handleCheckBalance(userId: string): Promise<CheckBalanceResult> {
   });
 
   return {
-    walletBalance: user?.walletBalance ?? 0,
     duesOwed,
     totalOwed: duesOwed.reduce((sum, d) => sum + d.payableAmount, 0),
   };
@@ -214,16 +209,6 @@ async function handleContactRep(userId: string, spaceName: string | null): Promi
       spaceName: r.space.name,
     })),
   };
-}
-
-async function handleFundWallet(amountNaira: number | null): Promise<FundWalletResult> {
-  if (amountNaira === null) return { status: 'needs_amount' };
-
-  const amountKobo = nairaToKobo(amountNaira);
-  if (amountKobo < MIN_TOPUP || amountKobo > MAX_TOPUP) {
-    return { status: 'invalid_amount', minKobo: MIN_TOPUP, maxKobo: MAX_TOPUP };
-  }
-  return { status: 'ready', amountKobo };
 }
 
 const DUE_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -361,7 +346,6 @@ const DISPATCH: Record<Exclude<Intent, 'unknown'>, (userId: string, classificati
   check_balance: async (userId) => ({ intent: 'check_balance', result: await handleCheckBalance(userId) }),
   view_history: async (userId, c) => ({ intent: 'view_history', result: await handleViewHistory(userId, c.params?.limit ?? null) }),
   contact_rep: async (userId, c) => ({ intent: 'contact_rep', result: await handleContactRep(userId, c.params?.spaceName ?? null) }),
-  fund_wallet: async (_userId, c) => ({ intent: 'fund_wallet', result: await handleFundWallet(c.params?.amount ?? null) }),
   create_due: async (userId, c) => ({
     intent: 'create_due',
     result: await handleCreateDue(userId, {
@@ -426,13 +410,12 @@ function formatJoinDepartment(result: JoinDepartmentResult): { reply: string; qu
 }
 
 function formatCheckBalance(result: CheckBalanceResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
-  const base = `Your wallet balance is ${formatNaira(result.walletBalance)}.`;
   if (result.duesOwed.length === 0) {
-    return { reply: `${base} You have no outstanding dues.`, quickReplies: [], action: null };
+    return { reply: "You have no outstanding dues.", quickReplies: [], action: null };
   }
   const list = result.duesOwed.map((d) => `${d.title} — ${formatNaira(d.payableAmount)} (${d.spaceName})`).join('\n');
   return {
-    reply: `${base} You owe ${formatNaira(result.totalOwed)} across ${result.duesOwed.length} due(s):\n${list}`,
+    reply: `You owe ${formatNaira(result.totalOwed)} across ${result.duesOwed.length} due(s):\n${list}`,
     quickReplies: [],
     action: null,
   };
@@ -448,31 +431,6 @@ function formatViewHistory(result: ViewHistoryResult): { reply: string; quickRep
   return { reply: `Here's your recent activity:\n${list}`, quickReplies: [], action: null };
 }
 
-function formatFundWallet(result: FundWalletResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
-  if (result.status === 'needs_amount') {
-    return {
-      reply: 'How much would you like to add to your wallet?',
-      quickReplies: [
-        { label: '₦1,000', value: 'top up ₦1,000' },
-        { label: '₦2,000', value: 'top up ₦2,000' },
-        { label: '₦5,000', value: 'top up ₦5,000' },
-      ],
-      action: null,
-    };
-  }
-  if (result.status === 'invalid_amount') {
-    return {
-      reply: `Wallet top-ups must be between ${formatNaira(result.minKobo)} and ${formatNaira(result.maxKobo)}.`,
-      quickReplies: [],
-      action: null,
-    };
-  }
-  return {
-    reply: `Ready to fund your wallet with ${formatNaira(result.amountKobo)}? Tap below to continue.`,
-    quickReplies: [{ label: 'Top up now', value: 'top up now' }],
-    action: { type: 'open_topup_modal', amount: result.amountKobo },
-  };
-}
 
 function formatCreateDue(result: CreateDueResult): { reply: string; quickReplies: QuickReply[]; action: AssistantAction | null } {
   if (result.status === 'not_rep') {
@@ -561,11 +519,9 @@ export function formatResponse(conversationId: string, classification: Classific
             ? formatViewHistory(handlerResult.result)
             : handlerResult.intent === 'contact_rep'
               ? formatContactRep(handlerResult.result)
-              : handlerResult.intent === 'fund_wallet'
-                ? formatFundWallet(handlerResult.result)
-                : handlerResult.intent === 'create_due'
-                  ? formatCreateDue(handlerResult.result)
-                  : formatRepSummary(handlerResult.result);
+              : handlerResult.intent === 'create_due'
+                ? formatCreateDue(handlerResult.result)
+                : formatRepSummary(handlerResult.result);
 
   return {
     conversationId,

@@ -16,10 +16,10 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { initTransaction, getGatewayLabel } from '../lib/paymentGateway';
 import {
   uniqueReference,
   chargeSavedCard,
+  initOnlinePollVote,
   CardNotFoundError,
   CardChargeFailedError,
 } from '../services/payment.service';
@@ -439,7 +439,7 @@ const voteSchema = z
     selections: z
       .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
       .min(1),
-    method: z.enum(['wallet', 'card', 'online']).optional(),
+    method: z.enum(['card', 'online']).optional(),
     cardId: z.string().optional(),
   })
   .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card payments', path: ['cardId'] });
@@ -448,7 +448,10 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
   const userId = uid(req);
   const body = req.body as z.infer<typeof voteSchema>;
 
-  const poll = await db.poll.findUnique({ where: { slug: req.params.slug as string }, include: pollInclude });
+  const poll = await db.poll.findUnique({
+    where: { slug: req.params.slug as string },
+    include: { ...pollInclude, space: { select: { paystackSubaccountCode: true } } },
+  });
   if (!poll || poll.status === 'draft') {
     errors.notFound(res, 'Poll not found');
     return;
@@ -543,71 +546,12 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
     return;
   }
 
-  if (body.method === 'wallet') {
-    const reference = await uniqueReference();
-    try {
-      const txn = await db.$transaction(async (tx) => {
-        const debit = await tx.user.updateMany({
-          where: { id: userId, walletBalance: { gte: totalCharged } },
-          data: { walletBalance: { decrement: totalCharged } },
-        });
-        if (debit.count === 0) throw new Error('INSUFFICIENT_FUNDS');
-        const t = await tx.transaction.create({
-          data: {
-            userId,
-            type: 'vote',
-            title: `Votes: ${poll.title}`,
-            detail: 'Poll',
-            amount: -totalCharged,
-            method: 'Wallet',
-            status: 'completed',
-            reference,
-            spaceId: poll.spaceId,
-          },
-        });
-        await applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: poll.amountPerVote, reference });
-        return t;
-      });
-      ok(res, { receiptId: txn.id, totalCharged }, 201);
-    } catch (err) {
-      if (err instanceof Error && err.message === 'INSUFFICIENT_FUNDS') {
-        fail(res, 402, 'INSUFFICIENT_FUNDS', 'Your wallet balance is too low for these votes');
-        return;
-      }
-      throw err;
-    }
-    return;
-  }
-
-  // method === 'online'
+  // method === 'online' — in-app bank-transfer invoice (§ payment architecture migration)
   const user = await db.user.findUnique({ where: { id: userId } });
   if (!user) {
     errors.notFound(res, 'User not found');
     return;
   }
-  const reference = await uniqueReference();
-  const gatewayLabel = await getGatewayLabel();
-  await db.$transaction(async (tx) => {
-    await tx.transaction.create({
-      data: { userId, type: 'vote', title: `Votes: ${poll.title}`, detail: 'Poll', amount: -totalCharged, method: gatewayLabel, status: 'pending', reference, spaceId: poll.spaceId },
-    });
-    await tx.pendingPayment.create({
-      data: {
-        reference,
-        userId,
-        type: 'poll_vote',
-        metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections },
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-      },
-    });
-  });
-  const init = await initTransaction({
-    amount: totalCharged,
-    reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description: `Votes: ${poll.title}`,
-    callbackPath: '/vote/callback',
-  });
-  ok(res, { checkoutUrl: init.checkoutUrl, reference });
+  const result = await initOnlinePollVote(user, poll, selections, totalCharged);
+  ok(res, result);
 });

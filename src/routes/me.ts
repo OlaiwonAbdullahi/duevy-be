@@ -42,7 +42,7 @@ const patchMeSchema = z.object({
 });
 
 // School/rep-controlled fields are rejected before validation strips them.
-const READ_ONLY_FIELDS = ['matricNo', 'level', 'department', 'role', 'walletBalance', 'emailVerified'];
+const READ_ONLY_FIELDS = ['matricNo', 'level', 'department', 'role', 'emailVerified'];
 
 function rejectReadOnly(req: Request, res: Response, next: () => void): void {
   const body = (req.body ?? {}) as Record<string, unknown>;
@@ -230,15 +230,7 @@ meRouter.put('/notification-preferences', validate(prefsSchema), async (req: Req
 meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => {
   const uid = userId(req);
 
-  const [user, memberships] = await Promise.all([
-    db.user.findUnique({ where: { id: uid }, select: { walletBalance: true } }),
-    db.spaceMembership.findMany({ where: { userId: uid }, select: { spaceId: true } }),
-  ]);
-
-  if (!user) {
-    errors.notFound(res, 'User not found');
-    return;
-  }
+  const memberships = await db.spaceMembership.findMany({ where: { userId: uid }, select: { spaceId: true } });
 
   const spaceIds = memberships.map((m) => m.spaceId);
   const now = new Date();
@@ -281,7 +273,6 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
   });
 
   ok(res, {
-    walletBalance: user.walletBalance,
     outstanding: { amount: outstandingAmount, count: openDuesAll.length },
     paidThisSession: paidAgg._sum.amountPaid ?? 0,
     openDues: openDuesAll.slice(0, 4).map((d) => ({
@@ -373,11 +364,6 @@ meRouter.delete('/', validate(deleteMeSchema), async (req: Request, res: Respons
     fail(res, 400, 'INVALID_CREDENTIALS', 'Password is incorrect', [
       { field: 'password', issue: 'incorrect' },
     ]);
-    return;
-  }
-
-  if (user.walletBalance > 0) {
-    errors.conflict(res, 'WALLET_NOT_EMPTY', 'Withdraw your wallet balance before deleting your account');
     return;
   }
 

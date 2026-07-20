@@ -9,7 +9,6 @@ export const INTENTS = [
   'check_balance',
   'view_history',
   'contact_rep',
-  'fund_wallet',
   'create_due',
   'rep_summary',
   'unknown',
@@ -31,7 +30,7 @@ export const classificationParamsSchema = z
     inviteCode: z.string().nullable().optional(),
     spaceName: z.string().nullable().optional(),
     limit: z.number().int().positive().nullable().optional(),
-    // fund_wallet — amount as the user stated it, in naira (not kobo).
+    // create_due — amount as the user stated it, in naira (not kobo).
     amount: z.number().positive().nullable().optional(),
     // create_due (rep-only; enforced by the handler, not the model) — dueDate
     // must be resolved to YYYY-MM-DD using the current date given in the prompt.
@@ -76,10 +75,6 @@ export interface ViewHistoryParams {
   limit: number | null;
 }
 
-export interface FundWalletParams {
-  amount: number | null; // naira, as stated by the user
-}
-
 export interface CreateDueParams {
   spaceName: string | null;
   title: string | null;
@@ -113,7 +108,6 @@ export type JoinDepartmentResult =
   | { status: 'ready'; spaceId: string; spaceName: string; inviteCode: string; memberCount: number };
 
 export interface CheckBalanceResult {
-  walletBalance: number;
   duesOwed: Array<{ dueId: string; title: string; amount: number; payableAmount: number; spaceName: string; dueDate: string }>;
   totalOwed: number;
 }
@@ -136,11 +130,6 @@ export type ContactRepResult =
   | { status: 'no_department' }
   | { status: 'not_found'; spaceName: string }
   | { status: 'found'; reps: Array<{ name: string; email: string; phone: string | null; role: string; spaceName: string }> };
-
-export type FundWalletResult =
-  | { status: 'needs_amount' }
-  | { status: 'invalid_amount'; minKobo: number; maxKobo: number }
-  | { status: 'ready'; amountKobo: number };
 
 export interface CreateDueDraft {
   title: string;
@@ -182,7 +171,6 @@ export type HandlerResult =
   | { intent: 'check_balance'; result: CheckBalanceResult }
   | { intent: 'view_history'; result: ViewHistoryResult }
   | { intent: 'contact_rep'; result: ContactRepResult }
-  | { intent: 'fund_wallet'; result: FundWalletResult }
   | { intent: 'create_due'; result: CreateDueResult }
   | { intent: 'rep_summary'; result: RepSummaryResult }
   | { intent: 'unknown'; result: null };
@@ -196,11 +184,11 @@ export interface QuickReply {
 }
 
 export interface AssistantAction {
-  type: 'open_payment_modal' | 'confirm_join_department' | 'open_topup_modal' | 'confirm_create_due';
+  type: 'open_payment_modal' | 'confirm_join_department' | 'confirm_create_due';
   dueId?: string;
   spaceId?: string;
   inviteCode?: string;
-  amount?: number; // kobo — open_topup_modal
+  amount?: number; // kobo — confirm_create_due
   title?: string; // confirm_create_due
   dueDate?: string; // confirm_create_due
   category?: DueCategory; // confirm_create_due

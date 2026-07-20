@@ -9,6 +9,12 @@ import type {
   ChargeCardResult,
   DisbursementInput,
   DisbursementResult,
+  CreateSubaccountInput,
+  SubaccountResult,
+  BankTransferChargeInput,
+  BankTransferChargeResult,
+  RefundInput,
+  RefundResult,
 } from './monnify';
 
 /**
@@ -150,7 +156,14 @@ export async function getCardDetails(transactionReference: string): Promise<Monn
   };
 }
 
-/** Charge a previously tokenized card via Paystack's charge_authorization (§8.4). */
+/**
+ * Charge a previously tokenized card via Paystack's charge_authorization (§8.4).
+ * When `input.subaccount` is set (payment architecture migration — reps settle
+ * directly instead of via manual payout), the split is passed straight through.
+ * UNVERIFIED — confirm `subaccount`/`transaction_charge`/`bearer` field names
+ * and semantics against Paystack's live docs before relying on this in prod;
+ * see computeSubaccountSplit() in src/lib/money.ts for the same caveat.
+ */
 export async function chargeCardToken(input: ChargeCardInput): Promise<ChargeCardResult> {
   const json = await paystackFetch<{ status?: string; reference?: string }>('/transaction/charge_authorization', {
     method: 'POST',
@@ -159,6 +172,13 @@ export async function chargeCardToken(input: ChargeCardInput): Promise<ChargeCar
       email: input.customerEmail,
       amount: input.amount,
       reference: input.reference,
+      ...(input.subaccount
+        ? {
+            subaccount: input.subaccount.code,
+            transaction_charge: input.amount - input.subaccount.shareKobo,
+            bearer: input.subaccount.bearer,
+          }
+        : {}),
     }),
   });
 
@@ -217,4 +237,127 @@ export async function getDisbursementStatus(reference: string): Promise<Disburse
   const json = await paystackFetch<{ status?: string }>(`/transfer/verify/${encodeURIComponent(reference)}`);
   if (!json.status || !json.data) return null;
   return { status: mapTransferStatus(json.data.status), reference };
+}
+
+// ---------------------------------------------------------------------------
+// Subaccounts (payment architecture migration) — a rep's space settles
+// directly into one of these at charge time instead of via manual payout.
+// UNVERIFIED — confirm exact field names (business_name/settlement_bank/
+// account_number/percentage_charge are best recollection, not confirmed)
+// against Paystack's live API docs before relying on this in prod.
+// ---------------------------------------------------------------------------
+
+export async function createSubaccount(input: CreateSubaccountInput): Promise<SubaccountResult> {
+  const json = await paystackFetch<{ subaccount_code?: string }>('/subaccount', {
+    method: 'POST',
+    body: JSON.stringify({
+      business_name: input.businessName,
+      settlement_bank: input.bankCode,
+      account_number: input.accountNumber,
+      percentage_charge: input.percentageCharge,
+    }),
+  });
+  if (!json.status || !json.data?.subaccount_code) {
+    throw new Error(`Paystack subaccount creation failed: ${json.message}`);
+  }
+  return { subaccountCode: json.data.subaccount_code };
+}
+
+export async function updateSubaccount(
+  subaccountCode: string,
+  input: Partial<CreateSubaccountInput>,
+): Promise<SubaccountResult> {
+  const json = await paystackFetch<{ subaccount_code?: string }>(`/subaccount/${encodeURIComponent(subaccountCode)}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      ...(input.businessName ? { business_name: input.businessName } : {}),
+      ...(input.bankCode ? { settlement_bank: input.bankCode } : {}),
+      ...(input.accountNumber ? { account_number: input.accountNumber } : {}),
+      ...(input.percentageCharge !== undefined ? { percentage_charge: input.percentageCharge } : {}),
+    }),
+  });
+  if (!json.status) {
+    throw new Error(`Paystack subaccount update failed: ${json.message}`);
+  }
+  return { subaccountCode: json.data?.subaccount_code ?? subaccountCode };
+}
+
+/**
+ * In-app "invoice" flow (payment architecture migration) — forces Paystack's
+ * Charge API onto the bank_transfer channel so the payer sees a dedicated
+ * virtual account inline instead of being redirected to a hosted page.
+ * UNVERIFIED — confirm against Paystack's live docs before relying on this in
+ * prod: exact request shape for forcing the bank_transfer channel, exact
+ * response field names/nesting for the returned virtual account, and whether
+ * this is a genuine one-time NUBAN per charge or a persistent DVA needing
+ * separate charge-matching logic.
+ */
+export async function createBankTransferCharge(input: BankTransferChargeInput): Promise<BankTransferChargeResult> {
+  const json = await paystackFetch<{
+    reference?: string;
+    bank_transfer?: {
+      account_number?: string;
+      account_name?: string;
+      bank_name?: string;
+      account_expires_at?: string;
+    };
+  }>('/charge', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: input.customerEmail,
+      amount: input.amount,
+      reference: input.reference,
+      bank_transfer: {},
+      ...(input.subaccountCode
+        ? {
+            subaccount: input.subaccountCode,
+            transaction_charge: input.subaccountShareKobo !== undefined ? input.amount - input.subaccountShareKobo : undefined,
+            bearer: 'account',
+          }
+        : {}),
+    }),
+  });
+  if (!json.status || !json.data?.bank_transfer?.account_number) {
+    throw new Error(`Paystack bank-transfer charge failed: ${json.message}`);
+  }
+
+  const bt = json.data.bank_transfer;
+  return {
+    reference: json.data.reference ?? input.reference,
+    bankTransfer: {
+      accountNumber: bt.account_number as string,
+      bankName: bt.bank_name ?? '',
+      accountName: bt.account_name ?? '',
+      expiresAt: bt.account_expires_at ?? null,
+    },
+  };
+}
+
+/**
+ * Reverse a transaction via Paystack's refund API, returning money to the
+ * payer's original source (card/bank) rather than an internal wallet credit.
+ * UNVERIFIED — confirm against Paystack's live docs before relying on this in
+ * prod: exact request shape (is `transaction` the reference string or a
+ * numeric Paystack transaction ID?), whether partial refunds by kobo amount
+ * are supported, and whether refunds confirm synchronously or asynchronously
+ * via a `refund.processed` webhook event (would need a new webhooks.ts
+ * branch if so — none exists yet). Also unverified: whether refunding a
+ * subaccount-split payment automatically claws back the rep's settled share,
+ * or whether that needs a separate reversal — check before this ships for
+ * real money.
+ */
+export async function refundTransaction(input: RefundInput): Promise<RefundResult> {
+  const json = await paystackFetch<{ status?: string }>('/refund', {
+    method: 'POST',
+    body: JSON.stringify({
+      transaction: input.reference,
+      ...(input.amount !== undefined ? { amount: input.amount } : {}),
+    }),
+  });
+  if (!json.status) {
+    throw new Error(`Paystack refund failed: ${json.message}`);
+  }
+  const raw = json.data?.status;
+  const status: RefundResult['status'] = raw === 'processed' ? 'processed' : raw === 'failed' ? 'failed' : 'pending';
+  return { status };
 }

@@ -266,6 +266,8 @@ export interface ChargeCardInput {
   customerEmail: string;
   description: string;
   cardToken: string;
+  /** Paystack subaccount split (payment architecture migration) — ignored by Monnify, which has no equivalent. */
+  subaccount?: { code: string; shareKobo: number; bearer: 'account' };
 }
 
 export interface ChargeCardResult {
@@ -413,4 +415,83 @@ export async function getDisbursementStatus(
         ? "FAILED"
         : "PENDING";
   return { status, reference };
+}
+
+// ---------------------------------------------------------------------------
+// Paystack subaccounts (payment architecture migration) — Paystack-only.
+// Monnify has no equivalent product wired up here; these stubs exist purely
+// so paymentGateway.ts's facade pattern holds (nothing downstream imports a
+// concrete provider directly) and fails loud instead of silently no-op'ing
+// if the active gateway is ever toggled to Monnify.
+// ---------------------------------------------------------------------------
+
+export interface CreateSubaccountInput {
+  businessName: string;
+  bankCode: string;
+  accountNumber: string;
+  percentageCharge: number;
+}
+
+export interface SubaccountResult {
+  subaccountCode: string;
+}
+
+export async function createSubaccount(_input: CreateSubaccountInput): Promise<SubaccountResult> {
+  throw new Error("Subaccounts are not implemented for Monnify — switch PAYMENT_GATEWAY to paystack");
+}
+
+export async function updateSubaccount(
+  _subaccountCode: string,
+  _input: Partial<CreateSubaccountInput>,
+): Promise<SubaccountResult> {
+  throw new Error("Subaccounts are not implemented for Monnify — switch PAYMENT_GATEWAY to paystack");
+}
+
+// ---------------------------------------------------------------------------
+// In-app bank-transfer "invoice" charge (payment architecture migration) —
+// Paystack-only (its Charge API's bank_transfer channel). Monnify has no
+// equivalent wired up here; fails loud rather than silently misbehaving.
+// ---------------------------------------------------------------------------
+
+export interface BankTransferChargeInput {
+  amount: number; // kobo
+  reference: string;
+  customerEmail: string;
+  customerName: string;
+  description: string;
+  subaccountCode?: string;
+  subaccountShareKobo?: number;
+}
+
+export interface BankTransferChargeResult {
+  reference: string;
+  bankTransfer: {
+    accountNumber: string;
+    bankName: string;
+    accountName: string;
+    expiresAt: string | null;
+  };
+}
+
+export async function createBankTransferCharge(_input: BankTransferChargeInput): Promise<BankTransferChargeResult> {
+  throw new Error("In-app bank-transfer charges are not implemented for Monnify — switch PAYMENT_GATEWAY to paystack");
+}
+
+// ---------------------------------------------------------------------------
+// Refunds (payment architecture migration) — Paystack-only. Reverses money to
+// the payer's original source (card/bank) instead of an internal wallet
+// credit, which no longer exists.
+// ---------------------------------------------------------------------------
+
+export interface RefundInput {
+  reference: string;
+  amount?: number; // kobo — partial refund; omit for the full remaining amount
+}
+
+export interface RefundResult {
+  status: 'processed' | 'pending' | 'failed';
+}
+
+export async function refundTransaction(_input: RefundInput): Promise<RefundResult> {
+  throw new Error("Refunds are not implemented for Monnify — switch PAYMENT_GATEWAY to paystack");
 }

@@ -14,6 +14,12 @@ export type {
   ChargeCardResult,
   DisbursementInput,
   DisbursementResult,
+  CreateSubaccountInput,
+  SubaccountResult,
+  BankTransferChargeInput,
+  BankTransferChargeResult,
+  RefundInput,
+  RefundResult,
 } from './monnify';
 
 /**
@@ -90,6 +96,29 @@ export async function initiateDisbursement(...args: Parameters<typeof paystack.i
 export async function getDisbursementStatus(...args: Parameters<typeof paystack.getDisbursementStatus>) {
   const name = await getActiveGatewayName();
   return moduleFor(name).getDisbursementStatus(...args);
+}
+
+/** Paystack-only — throws on Monnify (see monnify.ts's stub) rather than silently no-op'ing. */
+export async function createSubaccount(...args: Parameters<typeof paystack.createSubaccount>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).createSubaccount(...args);
+}
+
+export async function updateSubaccount(...args: Parameters<typeof paystack.updateSubaccount>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).updateSubaccount(...args);
+}
+
+/** Paystack-only — throws on Monnify (see monnify.ts's stub). */
+export async function createBankTransferCharge(...args: Parameters<typeof paystack.createBankTransferCharge>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).createBankTransferCharge(...args);
+}
+
+/** Paystack-only — throws on Monnify (see monnify.ts's stub). */
+export async function refundTransaction(...args: Parameters<typeof paystack.refundTransaction>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).refundTransaction(...args);
 }
 
 /** Whether payout disbursement is configured for whichever gateway is active. */

@@ -249,7 +249,6 @@ model User {
   matricNo              String?
   level                 String?
   notificationPrefs     Json?                // §3.4 — email/push toggles; null = defaults
-  walletBalance         Int                  @default(0) // kobo
   referralCode          String?              @unique
   kycStatus             KycStatus            @default(unverified)
   kycDocUrls            String[]             @default([])
@@ -276,6 +275,7 @@ model User {
   pollVotes             PollVote[]
   referralsMade         Referral[]           @relation("referrer")
   referralReceived      Referral?            @relation("referred")
+  discountCodes         DiscountCode[]
   adminPermissions      AdminPermission?
   disputes              Dispute[]
   idempotencyKeys       IdempotencyKey[]
@@ -366,6 +366,11 @@ model Space {
   archivedReason String?
   payoutsFrozen  Boolean     @default(false)
   frozenReason   String?
+  // Paystack subaccount reps settle into directly at charge time (payment
+  // architecture migration — see PUT /payout/account, which creates/updates
+  // this alongside the BankAccount it's derived from). Null until a bank
+  // account has been resolved and the subaccount created.
+  paystackSubaccountCode String? @unique
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -709,6 +714,27 @@ model Referral {
 
   @@index([referrerId])
   @@map("referrals")
+}
+
+// Referral reward as a redeemable discount, replacing the old wallet-credit
+// model. Owned by exactly one user (the referrer); redeemable only against
+// their own due payments. `amountKobo` reduces what the payer is charged —
+// capped at the due's own fee (see POST /dues/:dueId/pay) so Duevy never
+// pays out of pocket beyond its own platform cut; the rep's netToSpace is
+// always untouched by a discount.
+model DiscountCode {
+  id          String    @id @default(cuid())
+  code        String    @unique
+  userId      String
+  amountKobo  Int
+  redeemedAt  DateTime?
+  dueId       String? // which due it was redeemed against, once used
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("discount_codes")
 }
 
 // ---------------------------------------------------------------------------

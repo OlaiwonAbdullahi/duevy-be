@@ -1,7 +1,7 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
-import { computeCharge, generateReference } from '../lib/money';
-import { initTransaction, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
+import { computeCharge, computeSubaccountSplit, generateReference } from '../lib/money';
+import { initTransaction, createBankTransferCharge, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
 import { notify, notifyMany } from '../lib/notifications';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
@@ -32,58 +32,6 @@ export async function uniqueReference(): Promise<string> {
   }
   // Astronomically unlikely; fall back to a timestamped ref.
   return `DVY-${Date.now()}`;
-}
-
-// ---------------------------------------------------------------------------
-// Wallet — synchronous due settlement (§6.3, method=wallet)
-// ---------------------------------------------------------------------------
-export async function settleDueFromWallet(user: User, due: Due & { space: { name: string } }): Promise<Transaction> {
-  const charge = computeCharge(due.amount);
-  const reference = await uniqueReference();
-
-  const txn = await db.$transaction(async (tx) => {
-    // Debit the payer the full charge (face + fee), only if covered (guards races).
-    const updated = await tx.user.updateMany({
-      where: { id: user.id, walletBalance: { gte: charge.totalCharged } },
-      data: { walletBalance: { decrement: charge.totalCharged } },
-    });
-    if (updated.count === 0) {
-      throw new InsufficientFundsError();
-    }
-
-    const transaction = await tx.transaction.create({
-      data: {
-        userId: user.id,
-        type: 'due',
-        title: due.title,
-        detail: due.space.name,
-        amount: -charge.totalCharged,
-        method: 'Wallet',
-        status: 'completed',
-        reference,
-        spaceId: due.spaceId,
-      },
-    });
-
-    await tx.duePayment.create({
-      data: {
-        userId: user.id,
-        dueId: due.id,
-        txnId: transaction.id,
-        reference,
-        amountPaid: charge.totalCharged,
-        monnifyFee: charge.monnifyFee,
-        duevyFee: charge.duevyFee,
-        netToSpace: charge.netToSpace,
-      },
-    });
-
-    return transaction;
-  });
-
-  await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
-  await triggerReferralReward(due.spaceId);
-  return txn;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,12 +70,18 @@ export async function chargeSavedCard(
   return { reference, methodLabel: `${card.brand} •••• ${card.last4}` };
 }
 
+export interface RedeemedDiscount {
+  id: string;
+  amountKobo: number;
+}
+
 export async function settleDueFromCard(
   user: User,
   due: Due & { space: { name: string } },
   cardId: string,
+  discount?: RedeemedDiscount,
 ): Promise<Transaction> {
-  const charge = computeCharge(due.amount);
+  const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
   const { reference, methodLabel } = await chargeSavedCard(user.id, cardId, charge.totalCharged, due.title);
 
   const txn = await db.$transaction(async (tx) => {
@@ -158,6 +112,10 @@ export async function settleDueFromCard(
       },
     });
 
+    if (discount) {
+      await tx.discountCode.update({ where: { id: discount.id }, data: { redeemedAt: new Date(), dueId: due.id } });
+    }
+
     return transaction;
   });
 
@@ -166,77 +124,33 @@ export async function settleDueFromCard(
   return txn;
 }
 
-export async function chargeCardForTopUp(user: User, amount: number, cardId: string): Promise<Transaction> {
-  const { reference, methodLabel } = await chargeSavedCard(user.id, cardId, amount, 'Wallet top-up');
-
-  return db.$transaction(async (tx) => {
-    const transaction = await tx.transaction.create({
-      data: {
-        userId: user.id,
-        type: 'topup',
-        title: 'Wallet top-up',
-        detail: methodLabel,
-        amount,
-        method: methodLabel,
-        status: 'completed',
-        reference,
-      },
-    });
-    await tx.user.update({ where: { id: user.id }, data: { walletBalance: { increment: amount } } });
-    return transaction;
-  });
-}
-
 // ---------------------------------------------------------------------------
-// Online — hosted checkout (§6.3 method=online, §8.2 method=online)
+// Online — in-app invoice (§6.3 method=online) / hosted checkout (card-save only)
 // ---------------------------------------------------------------------------
 export interface CheckoutResult {
   checkoutUrl: string;
   reference: string;
 }
 
-export async function initOnlineTopUp(user: User, amount: number): Promise<CheckoutResult> {
-  const reference = await uniqueReference();
-  const gatewayLabel = await getGatewayLabel();
-
-  await db.$transaction(async (tx) => {
-    await tx.transaction.create({
-      data: {
-        userId: user.id,
-        type: 'topup',
-        title: 'Wallet top-up',
-        detail: gatewayLabel,
-        amount,
-        method: gatewayLabel,
-        status: 'pending',
-        reference,
-      },
-    });
-    await tx.pendingPayment.create({
-      data: {
-        reference,
-        userId: user.id,
-        type: 'topup',
-        metadata: { amount },
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-      },
-    });
-  });
-
-  const init = await initTransaction({
-    amount,
-    reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description: 'Wallet top-up',
-    callbackPath: '/dashboard/wallet/callback',
-  });
-
-  return { checkoutUrl: init.checkoutUrl, reference };
+export interface InvoiceResult {
+  reference: string;
+  amount: number; // kobo, totalCharged
+  bankTransfer: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null };
 }
 
-export async function initOnlineDuePayment(user: User, due: Due & { space: { name: string } }): Promise<CheckoutResult> {
-  const charge = computeCharge(due.amount);
+/**
+ * In-app "invoice" flow (payment architecture migration) — replaces the old
+ * hosted-checkout redirect. Shows the payer a dedicated bank-transfer account
+ * inline; the frontend polls/lets the payer tap "I've made payment" against
+ * GET /payments/:reference/status, but the charge.success webhook (routed
+ * through fulfilByReference below, unchanged) remains the source of truth.
+ */
+export async function initOnlineDuePayment(
+  user: User,
+  due: Due & { space: { name: string; paystackSubaccountCode: string | null } },
+  discount?: RedeemedDiscount,
+): Promise<InvoiceResult> {
+  const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
   const reference = await uniqueReference();
   const gatewayLabel = await getGatewayLabel();
 
@@ -259,23 +173,92 @@ export async function initOnlineDuePayment(user: User, due: Due & { space: { nam
         reference,
         userId: user.id,
         type: 'due_payment',
-        metadata: { dueId: due.id, amount: charge.totalCharged },
+        // discountCodeId is only redeemed once this actually completes (fulfilByReference)
+        // — a failed/expired/abandoned charge leaves the code untouched for reuse.
+        // discountAmountKobo is snapshotted here (not re-looked-up) so fulfilment
+        // recomputes the exact same totalCharged that was actually invoiced.
+        metadata: {
+          dueId: due.id,
+          amount: charge.totalCharged,
+          discountCodeId: discount?.id ?? null,
+          discountAmountKobo: discount?.amountKobo ?? 0,
+        },
         expiresAt: new Date(Date.now() + 60 * 60 * 1000),
       },
     });
   });
 
+  const split = computeSubaccountSplit(due.amount);
   // The payer is charged the full amount (face + fee) at checkout.
-  const init = await initTransaction({
+  const charged = await createBankTransferCharge({
     amount: charge.totalCharged,
     reference,
     customerName: user.name,
     customerEmail: user.email,
     description: due.title,
-    callbackPath: '/dashboard/wallet/callback',
+    ...(due.space.paystackSubaccountCode
+      ? { subaccountCode: due.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
+      : {}),
   });
 
-  return { checkoutUrl: init.checkoutUrl, reference };
+  return { reference, amount: charge.totalCharged, bankTransfer: charged.bankTransfer };
+}
+
+/**
+ * Same in-app invoice flow as `initOnlineDuePayment`, for a paid poll vote.
+ * Extracted out of routes/polls.ts (which used to duplicate this pending/init
+ * logic inline against the old hosted-checkout call) so both payment surfaces
+ * share one bank-transfer-charge + subaccount-split implementation.
+ */
+export async function initOnlinePollVote(
+  user: User,
+  poll: { id: string; title: string; spaceId: string; amountPerVote: number; space: { paystackSubaccountCode: string | null } },
+  selections: VoteSelection[],
+  totalCharged: number,
+): Promise<InvoiceResult> {
+  const reference = await uniqueReference();
+  const gatewayLabel = await getGatewayLabel();
+
+  await db.$transaction(async (tx) => {
+    await tx.transaction.create({
+      data: {
+        userId: user.id,
+        type: 'vote',
+        title: `Votes: ${poll.title}`,
+        detail: 'Poll',
+        amount: -totalCharged,
+        method: gatewayLabel,
+        status: 'pending',
+        reference,
+        spaceId: poll.spaceId,
+      },
+    });
+    await tx.pendingPayment.create({
+      data: {
+        reference,
+        userId: user.id,
+        type: 'poll_vote',
+        metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections },
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      },
+    });
+  });
+
+  // Gross face value (before the payer's 3% charge) drives the subaccount split, same as a due.
+  const grossFace = poll.amountPerVote * selections.reduce((s, sel) => s + sel.quantity, 0);
+  const split = computeSubaccountSplit(grossFace);
+  const charged = await createBankTransferCharge({
+    amount: totalCharged,
+    reference,
+    customerName: user.name,
+    customerEmail: user.email,
+    description: `Votes: ${poll.title}`,
+    ...(poll.space.paystackSubaccountCode
+      ? { subaccountCode: poll.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
+      : {}),
+  });
+
+  return { reference, amount: totalCharged, bankTransfer: charged.bankTransfer };
 }
 
 // ---------------------------------------------------------------------------
@@ -342,23 +325,12 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
     return 'failed';
   }
 
-  const meta = (pending.metadata ?? {}) as { amount?: number; dueId?: string };
-
-  if (pending.type === 'topup') {
-    await db.$transaction([
-      db.pendingPayment.update({ where: { reference }, data: { status: 'completed' } }),
-      db.transaction.updateMany({ where: { reference }, data: { status: 'completed' } }),
-      db.user.update({ where: { id: pending.userId }, data: { walletBalance: { increment: meta.amount ?? 0 } } }),
-    ]);
-    await notify({
-      userId: pending.userId,
-      kind: 'payment_received',
-      title: 'Wallet funded',
-      detail: `₦${((meta.amount ?? 0) / 100).toLocaleString('en-NG')} was added to your wallet.`,
-      href: '/dashboard/wallet',
-    }).catch(() => {});
-    return 'fulfilled';
-  }
+  const meta = (pending.metadata ?? {}) as {
+    amount?: number;
+    dueId?: string;
+    discountCodeId?: string | null;
+    discountAmountKobo?: number;
+  };
 
   if (pending.type === 'due_payment' && meta.dueId) {
     const due = await db.due.findUnique({ where: { id: meta.dueId }, include: { space: { select: { name: true } } } });
@@ -369,7 +341,7 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
       where: { userId_dueId: { userId: pending.userId, dueId: due.id } },
     });
 
-    const charge = computeCharge(due.amount);
+    const charge = computeCharge(due.amount, meta.discountAmountKobo ?? 0);
     const txn = await db.transaction.findUnique({ where: { reference } });
 
     await db.$transaction(async (tx) => {
@@ -388,6 +360,9 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
             netToSpace: charge.netToSpace,
           },
         });
+        if (meta.discountCodeId) {
+          await tx.discountCode.update({ where: { id: meta.discountCodeId }, data: { redeemedAt: new Date(), dueId: due.id } });
+        }
       }
     });
 
@@ -487,13 +462,6 @@ async function notifyRepsOfPayment(spaceId: string, payerName: string, dueTitle:
       href: '/dashboard/collections',
     },
   );
-}
-
-export class InsufficientFundsError extends Error {
-  constructor() {
-    super('Insufficient wallet balance');
-    this.name = 'InsufficientFundsError';
-  }
 }
 
 export class CardNotFoundError extends Error {

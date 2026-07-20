@@ -4,18 +4,18 @@ import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
-import { ok, fail, errors } from '../lib/response';
-import { serializeCard, serializeTransaction } from '../lib/serializers';
-import { MIN_TOPUP, MAX_TOPUP } from '../lib/money';
-import {
-  initOnlineTopUp,
-  chargeCardForTopUp,
-  initCardSave,
-  CardNotFoundError,
-  CardChargeFailedError,
-} from '../services/payment.service';
+import { ok, errors } from '../lib/response';
+import { serializeCard } from '../lib/serializers';
+import { initCardSave } from '../services/payment.service';
 import { getGatewayLabel } from '../lib/paymentGateway';
 
+// Saved cards + the active-gateway label. The wallet balance/top-up system
+// was removed in the payment architecture migration (float custody risk) —
+// every payment now goes through a saved card or the in-app bank-transfer
+// invoice flow (see POST /dues/:dueId/pay, POST /payments), never a stored
+// balance. This router kept its historical mount path (/wallet) so existing
+// card-management clients don't need to change; only the balance/top-up
+// endpoints that used to live here are gone.
 export const walletRouter = Router();
 walletRouter.use(authenticate);
 
@@ -34,72 +34,6 @@ walletRouter.get('/payment-gateway', async (_req: Request, res: Response): Promi
 });
 
 // ---------------------------------------------------------------------------
-// GET /wallet (§8.1)
-// ---------------------------------------------------------------------------
-walletRouter.get('/', async (req: Request, res: Response): Promise<void> => {
-  const id = uid(req);
-  const [user, pending] = await Promise.all([
-    db.user.findUnique({ where: { id }, select: { walletBalance: true } }),
-    db.transaction.aggregate({
-      where: { userId: id, type: 'topup', status: 'pending' },
-      _sum: { amount: true },
-    }),
-  ]);
-  if (!user) {
-    errors.notFound(res, 'User not found');
-    return;
-  }
-  ok(res, { balance: user.walletBalance, pendingBalance: pending._sum.amount ?? 0 });
-});
-
-// ---------------------------------------------------------------------------
-// POST /wallet/top-up (§8.2) — Idempotency-Key required
-// ---------------------------------------------------------------------------
-const topUpSchema = z
-  .object({
-    amount: z.number().int().min(MIN_TOPUP).max(MAX_TOPUP),
-    method: z.enum(['card', 'online']),
-    cardId: z.string().optional(),
-  })
-  .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card top-ups', path: ['cardId'] });
-
-walletRouter.post(
-  '/top-up',
-  requireIdempotencyKey,
-  idempotent,
-  validate(topUpSchema),
-  async (req: Request, res: Response): Promise<void> => {
-    const { amount, method, cardId } = req.body as z.infer<typeof topUpSchema>;
-    const user = await db.user.findUnique({ where: { id: uid(req) } });
-    if (!user) {
-      errors.notFound(res, 'User not found');
-      return;
-    }
-
-    if (method === 'card') {
-      try {
-        const transaction = await chargeCardForTopUp(user, amount, cardId as string);
-        ok(res, { transaction: serializeTransaction(transaction) });
-      } catch (err) {
-        if (err instanceof CardNotFoundError) {
-          errors.notFound(res, 'Card not found');
-          return;
-        }
-        if (err instanceof CardChargeFailedError) {
-          fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
-          return;
-        }
-        throw err;
-      }
-      return;
-    }
-
-    const result = await initOnlineTopUp(user, amount);
-    ok(res, result);
-  },
-);
-
-// ---------------------------------------------------------------------------
 // GET /wallet/cards (§8.3)
 // ---------------------------------------------------------------------------
 walletRouter.get('/cards', async (req: Request, res: Response): Promise<void> => {
@@ -112,8 +46,10 @@ walletRouter.get('/cards', async (req: Request, res: Response): Promise<void> =>
 
 // ---------------------------------------------------------------------------
 // POST /wallet/cards (§8.4) — redirect flow: a ₦50 verification charge on
-// the active gateway's hosted checkout tokenizes the card. The token is
-// exchanged for a saved Card once the webhook/reconciliation fulfilment resolves the reference.
+// the active gateway's hosted checkout tokenizes the card. Deliberately kept
+// on the redirect (a bank-transfer invoice can't mint a reusable card token)
+// — see initCardSave's own comment. The token is exchanged for a saved Card
+// once the webhook/reconciliation fulfilment resolves the reference.
 // ---------------------------------------------------------------------------
 const addCardSchema = z.object({
   isDefault: z.boolean().default(false),
@@ -182,29 +118,4 @@ walletRouter.delete('/cards/:cardId', async (req: Request, res: Response): Promi
   });
 
   res.status(204).end();
-});
-
-// ---------------------------------------------------------------------------
-// GET /wallet/activity (§8.7) — compact projection of wallet-touching rows
-// ---------------------------------------------------------------------------
-walletRouter.get('/activity', async (req: Request, res: Response): Promise<void> => {
-  const rows = await db.transaction.findMany({
-    where: {
-      userId: uid(req),
-      OR: [{ method: 'Wallet' }, { type: { in: ['topup', 'withdrawal', 'refund', 'referral'] } }],
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 10,
-  });
-
-  ok(
-    res,
-    rows.map((t) => ({
-      id: t.id,
-      label: t.title,
-      detail: t.detail,
-      amount: t.amount,
-      createdAt: t.createdAt.toISOString(),
-    })),
-  );
 });

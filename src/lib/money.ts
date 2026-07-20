@@ -2,10 +2,6 @@
  * Money helpers — all amounts are stored and transmitted as kobo (₦1 = 100 kobo).
  */
 
-/** Wallet top-up bounds (§8.2) — shared by the /wallet/top-up route and Duey's fund_wallet intent. */
-export const MIN_TOPUP = 10_000; // ₦100 in kobo
-export const MAX_TOPUP = 50_000_000; // ₦500,000 in kobo
-
 /** Convert kobo to naira (for display / email templates). */
 export function koboToNaira(kobo: number): number {
   return kobo / 100;
@@ -37,24 +33,65 @@ export function formatNaira(kobo: number): string {
  * Note: `netToSpace === totalCharged - totalFee` still holds, so the DuePayment
  * invariant (net = amountPaid − fees) is preserved.
  */
-export function computeCharge(faceKobo: number): {
+/** Total processing-fee rate (both halves combined) — also what a rep's Paystack subaccount is created with as its default `percentage_charge`, per-transaction overrides aside. */
+export const PLATFORM_PERCENTAGE_CHARGE = 3;
+
+/**
+ * `discountKobo` (a redeemed referral DiscountCode, see referral.service.ts)
+ * reduces what the payer is charged, capped at `totalFee` — Duevy's own
+ * platform cut absorbs the discount; the rep's `netToSpace` is always the
+ * untouched face value regardless of any discount applied.
+ */
+export function computeCharge(faceKobo: number, discountKobo = 0): {
   face: number;
   monnifyFee: number;
   duevyFee: number;
   totalFee: number;
   totalCharged: number;
   netToSpace: number;
+  discountApplied: number;
 } {
   const monnifyFee = Math.round(faceKobo * 0.015);
   const duevyFee = Math.round(faceKobo * 0.015);
   const totalFee = monnifyFee + duevyFee;
+  const discountApplied = Math.max(0, Math.min(discountKobo, totalFee));
   return {
     face: faceKobo,
     monnifyFee,
     duevyFee,
     totalFee,
-    totalCharged: faceKobo + totalFee,
+    totalCharged: faceKobo + totalFee - discountApplied,
     netToSpace: faceKobo,
+    discountApplied,
+  };
+}
+
+/**
+ * Split config to pass into a Paystack subaccount charge so the rep's space
+ * settles `netToSpace` directly and Duevy keeps the fee — kept separate from
+ * `computeCharge()`, which stays authoritative for what the payer is charged
+ * and what gets recorded on `DuePayment`. This function only describes what
+ * to *tell Paystack*.
+ *
+ * UNVERIFIED — confirm against Paystack's live API docs before wiring this
+ * into a real charge call:
+ *  - whether a flat `transaction_charge` (kobo) lets the platform take an
+ *    exact amount with the subaccount getting the remainder, vs. being
+ *    locked into `percentage_charge` fixed at subaccount-creation time
+ *  - whether `bearer` should be 'account' (Duevy) or 'subaccount' (rep) —
+ *    determines whether the rep nets exactly `netToSpace` or slightly less
+ *  - whether split config can be overridden per-transaction at all
+ */
+export function computeSubaccountSplit(faceKobo: number): {
+  subaccountShareKobo: number; // what the rep's subaccount should receive — always netToSpace
+  platformShareKobo: number; // what Duevy keeps — always totalFee
+  bearer: 'account'; // Duevy absorbs Paystack's own processing fee, not the rep — VERIFY this is actually configurable this way
+} {
+  const { totalFee, netToSpace } = computeCharge(faceKobo);
+  return {
+    subaccountShareKobo: netToSpace,
+    platformShareKobo: totalFee,
+    bearer: 'account',
   };
 }
 

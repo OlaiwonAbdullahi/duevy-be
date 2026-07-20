@@ -9,8 +9,8 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccountName } from '../lib/paymentGateway';
-import { generatePayoutReference } from '../lib/money';
+import { getBanks, verifyAccountName, createSubaccount, updateSubaccount } from '../lib/paymentGateway';
+import { generatePayoutReference, PLATFORM_PERCENTAGE_CHARGE } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
 import { initiatePayoutDisbursement } from '../services/payout.service';
@@ -210,12 +210,29 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   }
   const { bankName, accountName: finalName } = resolved;
 
+  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, paystackSubaccountCode: true } });
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =
     !!existing && (decrypt(existing.accountNumber) !== accountNumber || existing.bankCode !== bankCode);
 
   const masked = maskAccountNumber(accountNumber);
   const cooldownUntil = changed ? new Date(Date.now() + ACCOUNT_COOLDOWN_MS) : existing?.cooldownUntil ?? null;
+
+  // Create or update the Paystack subaccount this space settles into directly
+  // (payment architecture migration) as one step with saving the bank account
+  // — a rep shouldn't have to complete two separate "where my money goes" flows.
+  let subaccountCode = space?.paystackSubaccountCode ?? null;
+  if (!subaccountCode) {
+    const created = await createSubaccount({
+      businessName: space?.name ?? finalName,
+      bankCode,
+      accountNumber,
+      percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
+    });
+    subaccountCode = created.subaccountCode;
+  } else if (changed) {
+    await updateSubaccount(subaccountCode, { bankCode, accountNumber });
+  }
 
   const account = await db.bankAccount.upsert({
     where: { spaceId: sid },
@@ -236,6 +253,8 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
       accountName: finalName,
     },
   });
+
+  await db.space.update({ where: { id: sid }, data: { paystackSubaccountCode: subaccountCode } });
 
   // Security notice to all reps when an existing account is changed.
   if (changed) {

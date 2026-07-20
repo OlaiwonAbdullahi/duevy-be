@@ -172,10 +172,9 @@ assistantRouter.post('/message', validate(messageSchema), async (req: Request, r
 
 // ---------------------------------------------------------------------------
 // POST /assistant/confirm — executes join_department or create_due only after
-// an explicit frontend button tap. pay_dues and fund_wallet never execute here
-// — the frontend opens the real payment/top-up modal from the `action` in the
-// /message response and charges through the existing dues/wallet endpoints
-// (§ safety rules).
+// an explicit frontend button tap. pay_dues never executes here — the
+// frontend opens the real payment modal from the `action` in the /message
+// response and charges through the existing dues endpoint (§ safety rules).
 // ---------------------------------------------------------------------------
 const confirmSchema = z
   .object({

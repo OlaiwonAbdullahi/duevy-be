@@ -11,10 +11,8 @@ import { serializeTransaction } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { renderReceiptPdf } from '../lib/receipt';
 import {
-  settleDueFromWallet,
   settleDueFromCard,
   initOnlineDuePayment,
-  InsufficientFundsError,
   CardNotFoundError,
   CardChargeFailedError,
 } from '../services/payment.service';
@@ -132,8 +130,10 @@ duesRouter.get('/:dueId', async (req: Request, res: Response): Promise<void> => 
 // ---------------------------------------------------------------------------
 const paySchema = z
   .object({
-    method: z.enum(['wallet', 'card', 'online']),
+    method: z.enum(['card', 'online']),
     cardId: z.string().optional(),
+    // Referral reward, redeemable only by its owner against one of their own dues (§ payment architecture migration).
+    discountCode: z.string().optional(),
   })
   .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card payments', path: ['cardId'] });
 
@@ -144,11 +144,11 @@ duesRouter.post(
   validate(paySchema),
   async (req: Request, res: Response): Promise<void> => {
     const id = uid(req);
-    const { method, cardId } = req.body as z.infer<typeof paySchema>;
+    const { method, cardId, discountCode } = req.body as z.infer<typeof paySchema>;
 
     const due = await db.due.findUnique({
       where: { id: req.params.dueId as string },
-      include: { space: { select: { name: true } } },
+      include: { space: { select: { name: true, paystackSubaccountCode: true } } },
     });
     if (!due) {
       errors.notFound(res, 'Due not found');
@@ -179,26 +179,20 @@ duesRouter.post(
       return;
     }
 
-    if (method === 'wallet') {
-      try {
-        const transaction = await settleDueFromWallet(user, due);
-        ok(res, {
-          transaction: serializeTransaction(transaction),
-          receiptUrl: `${env.APP_BASE_URL}/v1/dues/${due.id}/receipt`,
-        });
-      } catch (err) {
-        if (err instanceof InsufficientFundsError) {
-          fail(res, 402, 'INSUFFICIENT_FUNDS', 'Your wallet balance is too low for this payment');
-          return;
-        }
-        throw err;
+    // Referral-reward discount code (§ payment architecture migration).
+    let discount: { id: string; amountKobo: number } | undefined;
+    if (discountCode) {
+      const code = await db.discountCode.findUnique({ where: { code: discountCode } });
+      if (!code || code.userId !== id || code.redeemedAt) {
+        fail(res, 422, 'DISCOUNT_CODE_INVALID', 'This discount code is invalid, already used, or not yours');
+        return;
       }
-      return;
+      discount = { id: code.id, amountKobo: code.amountKobo };
     }
 
     if (method === 'card') {
       try {
-        const transaction = await settleDueFromCard(user, due, cardId as string);
+        const transaction = await settleDueFromCard(user, due, cardId as string, discount);
         ok(res, {
           transaction: serializeTransaction(transaction),
           receiptUrl: `${env.APP_BASE_URL}/v1/dues/${due.id}/receipt`,
@@ -218,7 +212,7 @@ duesRouter.post(
     }
 
     // method === 'online'
-    const result = await initOnlineDuePayment(user, due);
+    const result = await initOnlineDuePayment(user, due, discount);
     ok(res, result);
   },
 );
