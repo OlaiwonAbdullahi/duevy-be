@@ -366,11 +366,18 @@ model Space {
   archivedReason String?
   payoutsFrozen  Boolean     @default(false)
   frozenReason   String?
-  // Paystack subaccount reps settle into directly at charge time (payment
-  // architecture migration — see PUT /payout/account, which creates/updates
-  // this alongside the BankAccount it's derived from). Null until a bank
-  // account has been resolved and the subaccount created.
+  // Subaccount reps settle into directly at charge time (payment architecture
+  // migration — see PUT /payout/account, which creates/updates this alongside
+  // the BankAccount it's derived from). Null until a bank account has been
+  // resolved and the subaccount created. Subaccount codes are gateway-specific
+  // (a Paystack ACCT_... code means nothing to Monnify and vice versa) —
+  // subaccountGateway records which gateway this code belongs to, mirroring
+  // BankAccount.bankCodeGateway. If it doesn't match the currently active
+  // gateway, treat as if no subaccount exists (safe fallback: the payment
+  // routes to Duevy's main account instead of erroring) rather than sending a
+  // stale code to a provider that's never heard of it.
   paystackSubaccountCode String? @unique
+  subaccountGateway      PaymentGatewayName?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 

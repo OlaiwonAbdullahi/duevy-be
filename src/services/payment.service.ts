@@ -6,6 +6,7 @@ import { notify, notifyMany } from '../lib/notifications';
 import { sendDuePaymentReceiptEmail } from '../lib/email';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
+import { resolveActiveSubaccountCode } from './payout.service';
 
 // ₦50 verification charge used to tokenize a card during the redirect add-card flow (§8.4).
 const CARD_VERIFICATION_AMOUNT = 5000; // kobo
@@ -161,7 +162,7 @@ const INVOICE_EXPIRY_MS = 60 * 60 * 1000; // 1h
  */
 export async function initOnlineDuePayment(
   user: User,
-  due: Due & { space: { name: string; paystackSubaccountCode: string | null } },
+  due: Due & { space: { name: string; paystackSubaccountCode: string | null; subaccountGateway: string | null } },
   discount?: RedeemedDiscount,
 ): Promise<InvoiceResult> {
   const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
@@ -203,6 +204,7 @@ export async function initOnlineDuePayment(
   });
 
   const split = computeSubaccountSplit(due.amount);
+  const subaccountCode = await resolveActiveSubaccountCode(due.space);
   // The payer is charged the full amount (face + fee) at checkout.
   const charged = await createInvoice({
     amount: charge.totalCharged,
@@ -212,9 +214,7 @@ export async function initOnlineDuePayment(
     description: due.title,
     callbackPath: `/dashboard/pay/${reference}?dueId=${due.id}`,
     expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
-    ...(due.space.paystackSubaccountCode
-      ? { subaccountCode: due.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
-      : {}),
+    ...(subaccountCode ? { subaccountCode, subaccountShareKobo: split.subaccountShareKobo } : {}),
   });
 
   // Persist so GET /payments/:reference/status (and a reload of the dedicated
@@ -245,7 +245,7 @@ export async function initOnlineDuePayment(
  */
 export async function initOnlinePollVote(
   user: User,
-  poll: { id: string; title: string; spaceId: string; amountPerVote: number; space: { paystackSubaccountCode: string | null } },
+  poll: { id: string; title: string; spaceId: string; amountPerVote: number; space: { paystackSubaccountCode: string | null; subaccountGateway: string | null } },
   selections: VoteSelection[],
   totalCharged: number,
 ): Promise<InvoiceResult> {
@@ -280,6 +280,7 @@ export async function initOnlinePollVote(
   // Gross face value (before the payer's 3% charge) drives the subaccount split, same as a due.
   const grossFace = poll.amountPerVote * selections.reduce((s, sel) => s + sel.quantity, 0);
   const split = computeSubaccountSplit(grossFace);
+  const subaccountCode = await resolveActiveSubaccountCode(poll.space);
   const charged = await createInvoice({
     amount: totalCharged,
     reference,
@@ -288,8 +289,8 @@ export async function initOnlinePollVote(
     description: `Votes: ${poll.title}`,
     callbackPath: `/dashboard/pay/${reference}`,
     expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
-    ...(poll.space.paystackSubaccountCode
-      ? { subaccountCode: poll.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
+    ...(subaccountCode
+      ? { subaccountCode, subaccountShareKobo: split.subaccountShareKobo }
       : {}),
   });
 

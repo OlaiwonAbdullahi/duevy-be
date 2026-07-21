@@ -59,6 +59,24 @@ export async function resolveActiveBankCode(account: BankAccount): Promise<strin
 }
 
 /**
+ * Subaccount codes are gateway-specific and, unlike bank codes, can't be
+ * auto-translated — a subaccount is a real object that only exists on the
+ * gateway it was created on (Monnify's equivalent additionally requires
+ * manually requesting activation from Monnify support before it can be
+ * created at all). If the space's stored code belongs to a different gateway
+ * than the one currently active, treat it as absent — the payment falls back
+ * to routing through Duevy's main account (same as a space with no subaccount
+ * configured yet) instead of sending a stale code to a provider that's never
+ * heard of it.
+ */
+export async function resolveActiveSubaccountCode(space: { paystackSubaccountCode: string | null; subaccountGateway: string | null }): Promise<string | null> {
+  if (!space.paystackSubaccountCode) return null;
+  const activeGateway = await getActiveGatewayName();
+  if (space.subaccountGateway !== activeGateway) return null;
+  return space.paystackSubaccountCode;
+}
+
+/**
  * Kick off the actual bank transfer for a freshly-created payout (§10.3).
  * Best-effort: if disbursement isn't configured or the provider call fails,
  * the payout simply stays `processing` for the reconciliation job to retry.

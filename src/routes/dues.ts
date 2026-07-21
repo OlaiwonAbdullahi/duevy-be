@@ -148,7 +148,7 @@ duesRouter.post(
 
     const due = await db.due.findUnique({
       where: { id: req.params.dueId as string },
-      include: { space: { select: { name: true, paystackSubaccountCode: true } } },
+      include: { space: { select: { name: true, paystackSubaccountCode: true, subaccountGateway: true } } },
     });
     if (!due) {
       errors.notFound(res, 'Due not found');

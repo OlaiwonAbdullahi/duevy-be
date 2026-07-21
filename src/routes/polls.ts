@@ -450,7 +450,7 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
 
   const poll = await db.poll.findUnique({
     where: { slug: req.params.slug as string },
-    include: { ...pollInclude, space: { select: { paystackSubaccountCode: true } } },
+    include: { ...pollInclude, space: { select: { paystackSubaccountCode: true, subaccountGateway: true } } },
   });
   if (!poll || poll.status === 'draft') {
     errors.notFound(res, 'Poll not found');

@@ -210,7 +210,7 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   }
   const { bankName, accountName: finalName } = resolved;
 
-  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, paystackSubaccountCode: true } });
+  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, paystackSubaccountCode: true, subaccountGateway: true } });
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =
     !!existing && (decrypt(existing.accountNumber) !== accountNumber || existing.bankCode !== bankCode);
@@ -218,26 +218,44 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const masked = maskAccountNumber(accountNumber);
   const cooldownUntil = changed ? new Date(Date.now() + ACCOUNT_COOLDOWN_MS) : existing?.cooldownUntil ?? null;
 
-  // Create or update the Paystack subaccount this space settles into directly
-  // (payment architecture migration) as one step with saving the bank account
-  // — a rep shouldn't have to complete two separate "where my money goes" flows.
-  let subaccountCode = space?.paystackSubaccountCode ?? null;
-  if (!subaccountCode) {
-    const created = await createSubaccount({
-      businessName: space?.name ?? finalName,
-      bankCode,
-      accountNumber,
-      percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
-    });
-    subaccountCode = created.subaccountCode;
-  } else if (changed) {
-    await updateSubaccount(subaccountCode, { bankCode, accountNumber });
-  }
-
   // Resolved fresh via the active gateway's own bank list above, so it's
   // current as of right now — tag it so resolveActiveBankCode() can skip
   // re-resolving until the active gateway actually changes again.
   const bankCodeGateway = await getActiveGatewayName();
+
+  // Create or update this space's subaccount for the *currently active*
+  // gateway, as one step with saving the bank account — a rep shouldn't have
+  // to complete two separate "where my money goes" flows. Subaccount codes
+  // are gateway-specific (a Paystack ACCT_... code means nothing to Monnify),
+  // so a stored code only counts as reusable if it belongs to this gateway —
+  // see resolveActiveSubaccountCode() for the read-side of this same rule.
+  let subaccountCode = space?.subaccountGateway === bankCodeGateway ? space.paystackSubaccountCode : null;
+  let subaccountGateway = space?.subaccountGateway ?? null;
+  try {
+    if (!subaccountCode) {
+      const created = await createSubaccount({
+        businessName: space?.name ?? finalName,
+        bankCode,
+        accountNumber,
+        percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
+      });
+      subaccountCode = created.subaccountCode;
+      subaccountGateway = bankCodeGateway;
+    } else if (changed) {
+      await updateSubaccount(subaccountCode, { bankCode, accountNumber });
+    }
+  } catch (err) {
+    // Best-effort: a gateway that isn't set up for subaccounts yet (e.g.
+    // Monnify's sub-account API requires activation from Monnify support
+    // before it can be used at all) shouldn't block saving the bank account
+    // itself — payments simply fall back to routing through Duevy's main
+    // account until a subaccount exists for this gateway. Leave whatever was
+    // previously stored untouched rather than clobbering it with null, so a
+    // working code from a *different* gateway survives a failed attempt here.
+    console.error(`[payouts] subaccount create/update failed for space ${sid}:`, err);
+    subaccountCode = space?.paystackSubaccountCode ?? null;
+    subaccountGateway = space?.subaccountGateway ?? null;
+  }
 
   const account = await db.bankAccount.upsert({
     where: { spaceId: sid },
@@ -261,7 +279,7 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     },
   });
 
-  await db.space.update({ where: { id: sid }, data: { paystackSubaccountCode: subaccountCode } });
+  await db.space.update({ where: { id: sid }, data: { paystackSubaccountCode: subaccountCode, subaccountGateway } });
 
   // Security notice to all reps when an existing account is changed.
   if (changed) {
