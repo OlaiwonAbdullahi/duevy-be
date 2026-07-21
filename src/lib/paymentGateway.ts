@@ -16,8 +16,8 @@ export type {
   DisbursementResult,
   CreateSubaccountInput,
   SubaccountResult,
-  BankTransferChargeInput,
-  BankTransferChargeResult,
+  CreateInvoiceInput,
+  CreateInvoiceResult,
   RefundInput,
   RefundResult,
 } from './monnify';
@@ -110,10 +110,10 @@ export async function updateSubaccount(...args: Parameters<typeof paystack.updat
   return moduleFor(name).updateSubaccount(...args);
 }
 
-/** Paystack-only — throws on Monnify (see monnify.ts's stub). */
-export async function createBankTransferCharge(...args: Parameters<typeof paystack.createBankTransferCharge>) {
+/** Both gateways implement this — Monnify's dynamic Create Invoice, Paystack's Initialize Transaction + subaccount. */
+export async function createInvoice(...args: Parameters<typeof paystack.createInvoice>) {
   const name = await getActiveGatewayName();
-  return moduleFor(name).createBankTransferCharge(...args);
+  return moduleFor(name).createInvoice(...args);
 }
 
 /** Paystack-only — throws on Monnify (see monnify.ts's stub). */

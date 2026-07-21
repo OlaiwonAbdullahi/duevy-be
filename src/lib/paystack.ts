@@ -11,8 +11,8 @@ import type {
   DisbursementResult,
   CreateSubaccountInput,
   SubaccountResult,
-  BankTransferChargeInput,
-  BankTransferChargeResult,
+  CreateInvoiceInput,
+  CreateInvoiceResult,
   RefundInput,
   RefundResult,
 } from './monnify';
@@ -283,58 +283,38 @@ export async function updateSubaccount(
 }
 
 /**
- * In-app "invoice" flow (payment architecture migration) — forces Paystack's
- * Charge API onto the bank_transfer channel so the payer sees a dedicated
- * virtual account inline instead of being redirected to a hosted page.
- * UNVERIFIED — confirm against Paystack's live docs before relying on this in
- * prod: exact request shape for forcing the bank_transfer channel, exact
- * response field names/nesting for the returned virtual account, and whether
- * this is a genuine one-time NUBAN per charge or a persistent DVA needing
- * separate charge-matching logic.
+ * "Invoice" flow (payment architecture migration) — Paystack's equivalent of
+ * Monnify's Create Invoice is just Initialize Transaction with a subaccount
+ * attached: there's no separate raw account-number field like Monnify's
+ * dynamic invoice, since transfer/card/USSD all live on the one hosted
+ * checkout page. (A true "account number in our own UI" would mean Dedicated
+ * Virtual Accounts, which need a Customer object and carry a KYC tier — out
+ * of scope here.) bearer: 'account' — Duevy's main balance absorbs Paystack's
+ * own processing fee, not the subaccount, so the rep's settlement matches
+ * netToSpace exactly as computeCharge() records it.
  */
-export async function createBankTransferCharge(input: BankTransferChargeInput): Promise<BankTransferChargeResult> {
-  // Paystack requires account_expires_at explicitly on the bank_transfer
-  // channel — it 400s with "date field is required" if omitted. 1h matches
-  // the PendingPayment expiry window used elsewhere for online payments.
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
-  const json = await paystackFetch<{
-    reference?: string;
-    bank_transfer?: {
-      account_number?: string;
-      account_name?: string;
-      bank_name?: string;
-      account_expires_at?: string;
-    };
-  }>('/charge', {
-    method: 'POST',
-    body: JSON.stringify({
-      email: input.customerEmail,
-      amount: input.amount,
-      reference: input.reference,
-      bank_transfer: { account_expires_at: expiresAt },
-      ...(input.subaccountCode
-        ? {
-            subaccount: input.subaccountCode,
-            transaction_charge: input.subaccountShareKobo !== undefined ? input.amount - input.subaccountShareKobo : undefined,
-            bearer: 'account',
-          }
-        : {}),
-    }),
-  });
-  if (!json.status || !json.data?.bank_transfer?.account_number) {
-    throw new Error(`Paystack bank-transfer charge failed: ${json.message}`);
-  }
-
-  const bt = json.data.bank_transfer;
-  return {
-    reference: json.data.reference ?? input.reference,
-    bankTransfer: {
-      accountNumber: bt.account_number as string,
-      bankName: bt.bank_name ?? '',
-      accountName: bt.account_name ?? '',
-      expiresAt: bt.account_expires_at ?? expiresAt,
+export async function createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult> {
+  const json = await paystackFetch<{ authorization_url: string; reference: string }>(
+    '/transaction/initialize',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        email: input.customerEmail,
+        amount: input.amount,
+        reference: input.reference,
+        callback_url: `${env.FRONTEND_URL}${input.callbackPath}`,
+        metadata: { customerName: input.customerName, description: input.description },
+        ...(input.subaccountCode ? { subaccount: input.subaccountCode, bearer: 'account' } : {}),
+      }),
     },
+  );
+  if (!json.status || !json.data) {
+    throw new Error(`Paystack invoice creation failed: ${json.message}`);
+  }
+  return {
+    reference: json.data.reference,
+    checkoutUrl: json.data.authorization_url,
+    bankTransfer: null,
   };
 }
 

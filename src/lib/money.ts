@@ -67,25 +67,23 @@ export function computeCharge(faceKobo: number, discountKobo = 0): {
 }
 
 /**
- * Split config to pass into a Paystack subaccount charge so the rep's space
- * settles `netToSpace` directly and Duevy keeps the fee — kept separate from
- * `computeCharge()`, which stays authoritative for what the payer is charged
- * and what gets recorded on `DuePayment`. This function only describes what
- * to *tell Paystack*.
+ * Split config to pass into a Paystack subaccount charge (Initialize
+ * Transaction + `subaccount`, or Monnify's `incomeSplitConfig`) so the rep's
+ * space settles `netToSpace` directly and Duevy keeps the fee — kept separate
+ * from `computeCharge()`, which stays authoritative for what the payer is
+ * charged and what gets recorded on `DuePayment`. This function only
+ * describes what to *tell the gateway*.
  *
- * UNVERIFIED — confirm against Paystack's live API docs before wiring this
- * into a real charge call:
- *  - whether a flat `transaction_charge` (kobo) lets the platform take an
- *    exact amount with the subaccount getting the remainder, vs. being
- *    locked into `percentage_charge` fixed at subaccount-creation time
- *  - whether `bearer` should be 'account' (Duevy) or 'subaccount' (rep) —
- *    determines whether the rep nets exactly `netToSpace` or slightly less
- *  - whether split config can be overridden per-transaction at all
+ * Confirmed against Paystack's docs: `subaccount` is created with a fixed
+ * `percentage_charge` (see createSubaccount in paystack.ts) rather than a
+ * per-transaction flat override — `bearer: 'account'` makes Duevy's main
+ * balance absorb Paystack's own processing fee so the rep nets exactly
+ * `netToSpace`, not slightly less.
  */
 export function computeSubaccountSplit(faceKobo: number): {
   subaccountShareKobo: number; // what the rep's subaccount should receive — always netToSpace
   platformShareKobo: number; // what Duevy keeps — always totalFee
-  bearer: 'account'; // Duevy absorbs Paystack's own processing fee, not the rep — VERIFY this is actually configurable this way
+  bearer: 'account'; // Duevy absorbs Paystack's own processing fee, not the rep
 } {
   const { totalFee, netToSpace } = computeCharge(faceKobo);
   return {

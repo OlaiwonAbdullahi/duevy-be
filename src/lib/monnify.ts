@@ -448,33 +448,116 @@ export async function updateSubaccount(
 }
 
 // ---------------------------------------------------------------------------
-// In-app bank-transfer "invoice" charge (payment architecture migration) —
-// Paystack-only (its Charge API's bank_transfer channel). Monnify has no
-// equivalent wired up here; fails loud rather than silently misbehaving.
+// Dynamic invoice (payment architecture migration) — Monnify's Create Invoice
+// endpoint, which (unlike its plain init-transaction) returns *both* a
+// transfer-to-this-account pair (accountNumber/bankName) and a checkoutUrl
+// for card, in the same response. incomeSplitConfig is mandatory whenever a
+// subaccount is set — omitting it lands the whole payment in Duevy's account.
 // ---------------------------------------------------------------------------
 
-export interface BankTransferChargeInput {
+export interface CreateInvoiceInput {
   amount: number; // kobo
   reference: string;
   customerEmail: string;
   customerName: string;
   description: string;
+  callbackPath: string;
+  expiresAt: Date;
   subaccountCode?: string;
-  subaccountShareKobo?: number;
+  subaccountShareKobo?: number; // out of `amount` — what the subaccount should receive
 }
 
-export interface BankTransferChargeResult {
+export interface CreateInvoiceResult {
   reference: string;
+  checkoutUrl: string;
   bankTransfer: {
     accountNumber: string;
     bankName: string;
     accountName: string;
     expiresAt: string | null;
-  };
+  } | null;
 }
 
-export async function createBankTransferCharge(_input: BankTransferChargeInput): Promise<BankTransferChargeResult> {
-  throw new Error("In-app bank-transfer charges are not implemented for Monnify — switch PAYMENT_GATEWAY to paystack");
+/** yyyy-MM-dd HH:mm:ss in the server's local time, per Monnify's expiryDate format. */
+function formatMonnifyExpiry(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export async function createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult> {
+  const token = await getAccessToken();
+
+  // Duevy's platform cut is a flat PLATFORM_PERCENTAGE_CHARGE% regardless of
+  // amount, so splitPercentage/feePercentage are constant, not per-transaction.
+  // feeBearer: false is our best-effort read of "does the sub-account bear
+  // Monnify's own processing fee" — set false so the rep still nets the full
+  // face amount, matching the netToSpace invariant computeCharge() records.
+  // UNVERIFIED — confirm feeBearer's actual semantics against Monnify's live
+  // docs/support before this is relied on in production (Monnify is not the
+  // active gateway today, so this hasn't been exercised against a real payment).
+  const splitPercentage = input.subaccountCode && input.subaccountShareKobo !== undefined
+    ? Math.round((input.subaccountShareKobo / input.amount) * 10000) / 100
+    : undefined;
+
+  const res = await fetch(`${env.MONNIFY_BASE_URL}/api/v1/invoice/create`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      amount: input.amount / 100, // Monnify expects naira, not kobo
+      invoiceReference: input.reference,
+      description: input.description,
+      currencyCode: 'NGN',
+      contractCode: env.MONNIFY_CONTRACT_CODE,
+      customerEmail: input.customerEmail,
+      customerName: input.customerName,
+      expiryDate: formatMonnifyExpiry(input.expiresAt),
+      paymentMethods: ['ACCOUNT_TRANSFER', 'CARD'],
+      redirectUrl: `${env.FRONTEND_URL}${input.callbackPath}`,
+      ...(input.subaccountCode && splitPercentage !== undefined
+        ? {
+            incomeSplitConfig: [
+              {
+                subAccountCode: input.subaccountCode,
+                splitPercentage,
+                feePercentage: Math.round((100 - splitPercentage) * 100) / 100,
+                feeBearer: false,
+              },
+            ],
+          }
+        : {}),
+    }),
+  });
+  const json = (await res.json()) as {
+    requestSuccessful: boolean;
+    responseBody?: {
+      invoiceReference: string;
+      checkoutUrl: string;
+      accountNumber: string;
+      accountName: string;
+      bankName: string;
+      expiryDate: string;
+    };
+    responseMessage?: string;
+  };
+  if (!res.ok || !json.requestSuccessful || !json.responseBody) {
+    console.error(`[monnify] invoice-create failed for ref=${input.reference}:`, JSON.stringify(json));
+    throw new Error(`Monnify invoice creation failed: ${json.responseMessage ?? res.status}`);
+  }
+
+  const body = json.responseBody;
+  return {
+    reference: body.invoiceReference,
+    checkoutUrl: body.checkoutUrl,
+    bankTransfer: {
+      accountNumber: body.accountNumber,
+      bankName: body.bankName,
+      accountName: body.accountName,
+      expiresAt: body.expiryDate,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

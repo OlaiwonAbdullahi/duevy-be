@@ -1,7 +1,7 @@
 import { type Due, type Transaction, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { computeCharge, computeSubaccountSplit, generateReference } from '../lib/money';
-import { initTransaction, createBankTransferCharge, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
+import { initTransaction, createInvoice, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
 import { notify, notifyMany } from '../lib/notifications';
 import { sendDuePaymentReceiptEmail } from '../lib/email';
 import { applyPollVotes, type VoteSelection } from './poll.service';
@@ -143,15 +143,21 @@ export interface CheckoutResult {
 export interface InvoiceResult {
   reference: string;
   amount: number; // kobo, totalCharged
-  bankTransfer: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null };
+  checkoutUrl: string;
+  /** Only Monnify's Create Invoice returns this directly; null on Paystack (transfer lives on the hosted checkout page instead). */
+  bankTransfer: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null } | null;
 }
 
+const INVOICE_EXPIRY_MS = 60 * 60 * 1000; // 1h
+
 /**
- * In-app "invoice" flow (payment architecture migration) — replaces the old
- * hosted-checkout redirect. Shows the payer a dedicated bank-transfer account
- * inline; the frontend polls/lets the payer tap "I've made payment" against
- * GET /payments/:reference/status, but the charge.success webhook (routed
- * through fulfilByReference below, unchanged) remains the source of truth.
+ * "Invoice" flow (payment architecture migration) — Monnify's Create Invoice
+ * returns a transfer account *and* a checkoutUrl in one response; Paystack's
+ * equivalent is Initialize Transaction with a subaccount attached (transfer
+ * lives on that hosted page, not as a separate field — see createInvoice()
+ * in paystack.ts). Either way the payer lands on callbackPath after paying,
+ * but the charge.success webhook (routed through fulfilByReference below)
+ * remains the actual source of truth, not the redirect itself.
  */
 export async function initOnlineDuePayment(
   user: User,
@@ -191,40 +197,51 @@ export async function initOnlineDuePayment(
           discountCodeId: discount?.id ?? null,
           discountAmountKobo: discount?.amountKobo ?? 0,
         },
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
       },
     });
   });
 
   const split = computeSubaccountSplit(due.amount);
   // The payer is charged the full amount (face + fee) at checkout.
-  const charged = await createBankTransferCharge({
+  const charged = await createInvoice({
     amount: charge.totalCharged,
     reference,
     customerName: user.name,
     customerEmail: user.email,
     description: due.title,
+    callbackPath: `/dashboard/pay/${reference}?dueId=${due.id}`,
+    expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
     ...(due.space.paystackSubaccountCode
       ? { subaccountCode: due.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
       : {}),
   });
 
-  // Persist the bank-transfer details so GET /payments/:reference/status can
-  // render the full invoice from the reference alone (e.g. a page reload, or
-  // navigating to a dedicated payment page rather than a same-session modal).
+  // Persist so GET /payments/:reference/status (and a reload of the dedicated
+  // payment page) can render the same invoice without needing this closure —
+  // notably bankTransfer, which only Monnify's Create Invoice returns.
   await db.pendingPayment.update({
     where: { reference },
-    data: { metadata: { dueId: due.id, amount: charge.totalCharged, discountCodeId: discount?.id ?? null, discountAmountKobo: discount?.amountKobo ?? 0, bankTransfer: charged.bankTransfer } },
+    data: {
+      metadata: {
+        dueId: due.id,
+        amount: charge.totalCharged,
+        discountCodeId: discount?.id ?? null,
+        discountAmountKobo: discount?.amountKobo ?? 0,
+        checkoutUrl: charged.checkoutUrl,
+        bankTransfer: charged.bankTransfer,
+      },
+    },
   });
 
-  return { reference, amount: charge.totalCharged, bankTransfer: charged.bankTransfer };
+  return { reference, amount: charge.totalCharged, checkoutUrl: charged.checkoutUrl, bankTransfer: charged.bankTransfer };
 }
 
 /**
  * Same in-app invoice flow as `initOnlineDuePayment`, for a paid poll vote.
  * Extracted out of routes/polls.ts (which used to duplicate this pending/init
  * logic inline against the old hosted-checkout call) so both payment surfaces
- * share one bank-transfer-charge + subaccount-split implementation.
+ * share one invoice + subaccount-split implementation.
  */
 export async function initOnlinePollVote(
   user: User,
@@ -255,7 +272,7 @@ export async function initOnlinePollVote(
         userId: user.id,
         type: 'poll_vote',
         metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections },
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
       },
     });
   });
@@ -263,12 +280,14 @@ export async function initOnlinePollVote(
   // Gross face value (before the payer's 3% charge) drives the subaccount split, same as a due.
   const grossFace = poll.amountPerVote * selections.reduce((s, sel) => s + sel.quantity, 0);
   const split = computeSubaccountSplit(grossFace);
-  const charged = await createBankTransferCharge({
+  const charged = await createInvoice({
     amount: totalCharged,
     reference,
     customerName: user.name,
     customerEmail: user.email,
     description: `Votes: ${poll.title}`,
+    callbackPath: `/dashboard/pay/${reference}`,
+    expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
     ...(poll.space.paystackSubaccountCode
       ? { subaccountCode: poll.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
       : {}),
@@ -277,10 +296,19 @@ export async function initOnlinePollVote(
   // See initOnlineDuePayment's identical follow-up update for why this exists.
   await db.pendingPayment.update({
     where: { reference },
-    data: { metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections, amount: totalCharged, bankTransfer: charged.bankTransfer } },
+    data: {
+      metadata: {
+        pollId: poll.id,
+        amountPerVote: poll.amountPerVote,
+        selections,
+        amount: totalCharged,
+        checkoutUrl: charged.checkoutUrl,
+        bankTransfer: charged.bankTransfer,
+      },
+    },
   });
 
-  return { reference, amount: totalCharged, bankTransfer: charged.bankTransfer };
+  return { reference, amount: totalCharged, checkoutUrl: charged.checkoutUrl, bankTransfer: charged.bankTransfer };
 }
 
 // ---------------------------------------------------------------------------
