@@ -101,6 +101,9 @@ export async function getTransactionStatus(reference: string): Promise<MonnifyTx
   };
 }
 
+/** Paystack's "invoice" (createInvoice) is the same /transaction/initialize call as a plain transaction, so status is checked identically — unlike Monnify, which has a genuinely separate Create Invoice product with its own status endpoint. */
+export const getInvoiceStatus = getTransactionStatus;
+
 /** Resolve a NUBAN to its account name (§10.2). Returns null if unverifiable. */
 export async function verifyAccountName(accountNumber: string, bankCode: string): Promise<string | null> {
   try {

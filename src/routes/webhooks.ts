@@ -32,6 +32,11 @@ webhooksRouter.post('/monnify', async (req: Request, res: Response): Promise<voi
     eventData?: {
       paymentReference?: string;
       transactionReference?: string;
+      // Present on transactions that originated from Create Invoice — this is
+      // the invoiceReference we specified (== our PendingPayment.reference),
+      // distinct from paymentReference/transactionReference, which are
+      // Monnify's own auto-generated IDs for the underlying transaction.
+      invoiceReference?: string;
       paymentStatus?: string;
       reference?: string;
       status?: string;
@@ -60,7 +65,10 @@ webhooksRouter.post('/monnify', async (req: Request, res: Response): Promise<voi
     return;
   }
 
-  const reference = data.paymentReference;
+  // invoiceReference matches our PendingPayment.reference for Create Invoice
+  // payments; paymentReference is the equivalent for a plain init-transaction
+  // charge. Try both — whichever this event actually is, one of them matches.
+  const reference = data.invoiceReference ?? data.paymentReference;
 
   // Acknowledge malformed/irrelevant events quickly so Monnify stops retrying.
   if (!reference) {

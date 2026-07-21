@@ -79,6 +79,12 @@ export async function getTransactionStatus(...args: Parameters<typeof paystack.g
   return moduleFor(name).getTransactionStatus(...args);
 }
 
+/** Checks an invoice's status (due/vote payments, always via createInvoice) — distinct from getTransactionStatus on Monnify, aliased to it on Paystack. */
+export async function getInvoiceStatus(...args: Parameters<typeof paystack.getInvoiceStatus>) {
+  const name = await getActiveGatewayName();
+  return moduleFor(name).getInvoiceStatus(...args);
+}
+
 export async function getCardDetails(...args: Parameters<typeof paystack.getCardDetails>) {
   const name = await getActiveGatewayName();
   return moduleFor(name).getCardDetails(...args);

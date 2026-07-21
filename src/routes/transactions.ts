@@ -7,7 +7,7 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { getTransactionStatus } from '../lib/paymentGateway';
+import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
 import { fulfilByReference } from '../services/payment.service';
 
 export const transactionsRouter = Router();
@@ -137,7 +137,11 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   // idempotent, so this racing with the webhook is safe by construction.
   if (pending.status === 'pending') {
     try {
-      const live = await getTransactionStatus(reference);
+      // due_payment/poll_vote always go through createInvoice() now — Monnify
+      // needs its dedicated invoice-status endpoint for those (an
+      // invoiceReference isn't a transactionReference); card_save is still a
+      // plain init-transaction, so it keeps using getTransactionStatus.
+      const live = pending.type === 'card_save' ? await getTransactionStatus(reference) : await getInvoiceStatus(reference);
       if (live?.paymentStatus === 'PAID') {
         await fulfilByReference(reference, true);
         pending = await db.pendingPayment.findUnique({ where: { reference } });

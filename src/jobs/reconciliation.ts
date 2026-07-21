@@ -1,5 +1,5 @@
 import { db } from '../config/db';
-import { getTransactionStatus } from '../lib/paymentGateway';
+import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
 import { fulfilByReference } from '../services/payment.service';
 import { reconcileStalePayouts } from '../services/payout.service';
 
@@ -22,7 +22,10 @@ export async function reconcilePendingPayments(): Promise<void> {
 
   for (const p of pending) {
     try {
-      const status = await getTransactionStatus(p.reference);
+      // See transactions.ts's identical dispatch for why: due_payment/poll_vote
+      // always go through createInvoice(), which needs Monnify's dedicated
+      // invoice-status endpoint rather than the plain transaction one.
+      const status = p.type === 'card_save' ? await getTransactionStatus(p.reference) : await getInvoiceStatus(p.reference);
       if (!status) {
         if (p.createdAt <= giveUpThreshold) {
           await fulfilByReference(p.reference, false);
