@@ -153,8 +153,14 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
   const txn = await db.transaction.findUnique({ where: { reference } });
 
+  // Bank-transfer invoice details, snapshotted onto the PendingPayment at
+  // creation — lets a dedicated payment page render the full invoice from
+  // just the reference (e.g. on reload), not only the session that opened it.
+  const meta = pending?.metadata as { amount?: number; bankTransfer?: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null } } | undefined;
+
   ok(res, {
     status,
+    ...(meta?.amount !== undefined && meta.bankTransfer ? { amount: meta.amount, bankTransfer: meta.bankTransfer } : {}),
     ...(txn && status === 'completed' ? { transaction: serializeTransaction(txn) } : {}),
   });
 });

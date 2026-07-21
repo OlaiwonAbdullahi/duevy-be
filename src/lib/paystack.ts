@@ -293,6 +293,11 @@ export async function updateSubaccount(
  * separate charge-matching logic.
  */
 export async function createBankTransferCharge(input: BankTransferChargeInput): Promise<BankTransferChargeResult> {
+  // Paystack requires account_expires_at explicitly on the bank_transfer
+  // channel — it 400s with "date field is required" if omitted. 1h matches
+  // the PendingPayment expiry window used elsewhere for online payments.
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
   const json = await paystackFetch<{
     reference?: string;
     bank_transfer?: {
@@ -307,7 +312,7 @@ export async function createBankTransferCharge(input: BankTransferChargeInput): 
       email: input.customerEmail,
       amount: input.amount,
       reference: input.reference,
-      bank_transfer: {},
+      bank_transfer: { account_expires_at: expiresAt },
       ...(input.subaccountCode
         ? {
             subaccount: input.subaccountCode,
@@ -328,7 +333,7 @@ export async function createBankTransferCharge(input: BankTransferChargeInput): 
       accountNumber: bt.account_number as string,
       bankName: bt.bank_name ?? '',
       accountName: bt.account_name ?? '',
-      expiresAt: bt.account_expires_at ?? null,
+      expiresAt: bt.account_expires_at ?? expiresAt,
     },
   };
 }

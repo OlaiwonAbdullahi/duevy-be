@@ -201,6 +201,14 @@ export async function initOnlineDuePayment(
       : {}),
   });
 
+  // Persist the bank-transfer details so GET /payments/:reference/status can
+  // render the full invoice from the reference alone (e.g. a page reload, or
+  // navigating to a dedicated payment page rather than a same-session modal).
+  await db.pendingPayment.update({
+    where: { reference },
+    data: { metadata: { dueId: due.id, amount: charge.totalCharged, discountCodeId: discount?.id ?? null, discountAmountKobo: discount?.amountKobo ?? 0, bankTransfer: charged.bankTransfer } },
+  });
+
   return { reference, amount: charge.totalCharged, bankTransfer: charged.bankTransfer };
 }
 
@@ -256,6 +264,12 @@ export async function initOnlinePollVote(
     ...(poll.space.paystackSubaccountCode
       ? { subaccountCode: poll.space.paystackSubaccountCode, subaccountShareKobo: split.subaccountShareKobo }
       : {}),
+  });
+
+  // See initOnlineDuePayment's identical follow-up update for why this exists.
+  await db.pendingPayment.update({
+    where: { reference },
+    data: { metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections, amount: totalCharged, bankTransfer: charged.bankTransfer } },
   });
 
   return { reference, amount: totalCharged, bankTransfer: charged.bankTransfer };
