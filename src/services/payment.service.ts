@@ -3,6 +3,7 @@ import { db } from '../config/db';
 import { computeCharge, computeSubaccountSplit, generateReference } from '../lib/money';
 import { initTransaction, createBankTransferCharge, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
 import { notify, notifyMany } from '../lib/notifications';
+import { sendDuePaymentReceiptEmail } from '../lib/email';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
 
@@ -120,6 +121,13 @@ export async function settleDueFromCard(
   });
 
   await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
+  await sendDuePaymentReceiptEmail(user.email, user.name, {
+    dueTitle: due.title,
+    spaceName: due.space.name,
+    amountPaidKobo: charge.totalCharged,
+    reference,
+    dueId: due.id,
+  }).catch(() => {});
   await triggerReferralReward(due.spaceId);
   return txn;
 }
@@ -380,8 +388,17 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
       }
     });
 
-    const payer = await db.user.findUnique({ where: { id: pending.userId }, select: { name: true } });
+    const payer = await db.user.findUnique({ where: { id: pending.userId }, select: { name: true, email: true } });
     await notifyRepsOfPayment(due.spaceId, payer?.name ?? 'A member', due.title, due.amount).catch(() => {});
+    if (payer) {
+      await sendDuePaymentReceiptEmail(payer.email, payer.name, {
+        dueTitle: due.title,
+        spaceName: due.space.name,
+        amountPaidKobo: charge.totalCharged,
+        reference,
+        dueId: due.id,
+      }).catch(() => {});
+    }
     await triggerReferralReward(due.spaceId);
     return 'fulfilled';
   }

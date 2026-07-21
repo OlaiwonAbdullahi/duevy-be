@@ -125,6 +125,32 @@ export async function sendPasswordResetEmail(
   });
 }
 
+export async function sendDuePaymentReceiptEmail(
+  to: string,
+  name: string,
+  input: { dueTitle: string; spaceName: string; amountPaidKobo: number; reference: string; dueId: string },
+): Promise<void> {
+  const amount = `₦${(input.amountPaidKobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+  const receiptLink = `${env.APP_BASE_URL}/v1/dues/${input.dueId}/receipt`;
+  const html = renderEmail(`
+    <h1>Payment confirmed</h1>
+    <p>Hi ${name}, your payment for <strong>${input.dueTitle}</strong> (${input.spaceName}) went through.</p>
+    <div class="callout">
+      <strong>${amount}</strong> paid<br />
+      Reference: ${input.reference}
+    </div>
+    <a href="${receiptLink}" class="btn">View receipt</a>
+    <p class="muted">Keep this email as proof of payment. Questions? Reply here or reach us at support@duevy.app</p>
+  `);
+
+  await sendEmail({
+    to,
+    subject: `Payment confirmed — ${input.dueTitle}`,
+    html,
+    text: `Hi ${name},\n\nYour payment of ${amount} for ${input.dueTitle} (${input.spaceName}) is confirmed.\nReference: ${input.reference}\n\nView your receipt: ${receiptLink}`,
+  });
+}
+
 export async function sendRepApplicationReceivedEmail(
   to: string,
   name: string,
