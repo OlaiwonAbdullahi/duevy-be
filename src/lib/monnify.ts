@@ -478,10 +478,18 @@ export interface CreateInvoiceResult {
   } | null;
 }
 
-/** yyyy-MM-dd HH:mm:ss in the server's local time, per Monnify's expiryDate format. */
+/**
+ * yyyy-MM-dd HH:mm:ss in Africa/Lagos (WAT, UTC+1) — what Monnify expects,
+ * with no offset marker in the string. Computed via a shifted instant read
+ * with UTC getters rather than `date.getHours()` etc., so this is correct
+ * regardless of the server process's own configured timezone (Render runs
+ * UTC, and using local getters there previously sent WAT-1h digits, which
+ * made a 1h-out expiry land right at/before the real current time).
+ */
 function formatMonnifyExpiry(date: Date): string {
+  const wat = new Date(date.getTime() + 60 * 60 * 1000);
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${wat.getUTCFullYear()}-${pad(wat.getUTCMonth() + 1)}-${pad(wat.getUTCDate())} ${pad(wat.getUTCHours())}:${pad(wat.getUTCMinutes())}:${pad(wat.getUTCSeconds())}`;
 }
 
 export async function createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult> {
