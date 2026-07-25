@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
+import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -10,7 +11,7 @@ import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { notifyMany } from '../lib/notifications';
+import { notify, notifyMany } from '../lib/notifications';
 
 // Mounted at /spaces/:spaceId — every route is rep-gated.
 export const repDuesRouter = Router({ mergeParams: true });
@@ -22,9 +23,11 @@ function uid(req: Request): string {
 function spaceId(req: Request): string {
   return req.params.spaceId as string;
 }
-async function actor(id: string): Promise<{ id: string; name: string }> {
+async function actor(req: Request): Promise<{ id: string; name: string; role: RepRole | null }> {
+  const id = uid(req);
   const u = await db.user.findUnique({ where: { id }, select: { name: true } });
-  return { id, name: u?.name ?? 'Rep' };
+  const role = (req as AuthenticatedRequest).spaceRep?.role ?? null;
+  return { id, name: u?.name ?? 'Rep', role };
 }
 
 /** Load a due and confirm it belongs to the space in the path. */
@@ -121,10 +124,11 @@ repDuesRouter.post('/dues', validate(createDueSchema), async (req: Request, res:
         allowGuests: data.allowGuests,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
+        assignedRepId: uid(req),
       },
     });
     if (publishing) {
-      await writeAudit(sid, await actor(uid(req)), 'due_published', `Published due "${created.title}"`, tx);
+      await writeAudit(sid, await actor(req),'due_published', `Published due "${created.title}"`, tx);
     }
     return created;
   });
@@ -203,7 +207,7 @@ repDuesRouter.post('/dues/:dueId/publish', async (req: Request, res: Response): 
 
   const updated = await db.$transaction(async (tx) => {
     const u = await tx.due.update({ where: { id: due.id }, data: { status: 'active', publishedAt: new Date() } });
-    await writeAudit(sid, await actor(uid(req)), 'due_published', `Published due "${u.title}"`, tx);
+    await writeAudit(sid, await actor(req),'due_published', `Published due "${u.title}"`, tx);
     return u;
   });
 
@@ -224,7 +228,7 @@ repDuesRouter.post('/dues/:dueId/close', async (req: Request, res: Response): Pr
 
   const updated = await db.$transaction(async (tx) => {
     const u = await tx.due.update({ where: { id: due.id }, data: { status: 'closed', closedAt: new Date() } });
-    await writeAudit(sid, await actor(uid(req)), 'due_closed', `Closed due "${u.title}"`, tx);
+    await writeAudit(sid, await actor(req),'due_closed', `Closed due "${u.title}"`, tx);
     return u;
   });
 
@@ -249,6 +253,65 @@ repDuesRouter.delete('/dues/:dueId', async (req: Request, res: Response): Promis
   await db.due.delete({ where: { id: due.id } });
   res.status(204).end();
 });
+
+// ---------------------------------------------------------------------------
+// POST /dues/{dueId}/reassign — lead-only. Hands this due's payout-scoping
+// off to a different co-rep. A lead is never a valid target: they already
+// have unrestricted space-wide payout access regardless of assignment.
+// ---------------------------------------------------------------------------
+const reassignSchema = z.object({ userId: z.string().min(1) });
+
+repDuesRouter.post(
+  '/dues/:dueId/reassign',
+  requireSpaceRep(true),
+  validate(reassignSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sid = spaceId(req);
+    const { userId: targetId } = req.body as z.infer<typeof reassignSchema>;
+
+    const due = await loadDue(sid, req.params.dueId as string);
+    if (!due) {
+      errors.notFound(res, 'Due not found');
+      return;
+    }
+
+    const targetRep = await db.spaceRep.findUnique({
+      where: { userId_spaceId: { userId: targetId, spaceId: sid } },
+    });
+    if (!targetRep || targetRep.role !== 'co') {
+      errors.validation(res, [{ field: 'userId', issue: 'must be an existing co-rep of this space' }]);
+      return;
+    }
+    if (due.assignedRepId === targetId) {
+      errors.conflict(res, 'ALREADY_ASSIGNED', 'This due is already assigned to that rep');
+      return;
+    }
+
+    const target = await db.user.findUnique({ where: { id: targetId }, select: { name: true } });
+
+    const updated = await db.$transaction(async (tx) => {
+      const u = await tx.due.update({ where: { id: due.id }, data: { assignedRepId: targetId } });
+      await writeAudit(
+        sid,
+        await actor(req),
+        'due_reassigned',
+        `Reassigned due "${u.title}" to ${target?.name ?? 'a rep'}`,
+        tx,
+      );
+      return u;
+    });
+
+    await notify({
+      userId: targetId,
+      kind: 'system',
+      title: 'A due was assigned to you',
+      detail: `"${updated.title}" is now assigned to you — you can request payout against its collected funds.`,
+      href: '/dashboard/dues',
+    });
+
+    ok(res, await repDuePayload(sid, updated));
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Collections roster — shared builder for §7.6 (JSON) and §7.8 (CSV)

@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
+import { type RepRole, type PayoutStatus } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -13,7 +14,7 @@ import { getBanks, verifyAccountName, createSubaccount, updateSubaccount, getAct
 import { generatePayoutReference, PLATFORM_PERCENTAGE_CHARGE } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
-import { initiatePayoutDisbursement } from '../services/payout.service';
+import { castPayoutApproval, getApprovalStatus } from '../services/payoutApproval.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
@@ -21,6 +22,10 @@ payoutsRouter.use(requireSpaceRep());
 
 const CLEARING_WINDOW_MS = 24 * 60 * 60 * 1000; // funds clear 24h after payment
 const ACCOUNT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h hold after an account change
+// A payout awaiting votes already reserves its funds, same as one that's
+// processing/completed — otherwise a second concurrent request could see
+// the same money as still "available" while the first is mid-approval.
+const RESERVED_STATUSES: PayoutStatus[] = ['pending_approval', 'processing', 'completed'];
 
 function uid(req: Request): string {
   return (req as AuthenticatedRequest).user.sub as string;
@@ -28,24 +33,45 @@ function uid(req: Request): string {
 function spaceId(req: Request): string {
   return req.params.spaceId as string;
 }
-async function actor(id: string): Promise<{ id: string; name: string }> {
+async function actor(req: Request): Promise<{ id: string; name: string; role: RepRole | null }> {
+  const id = uid(req);
   const u = await db.user.findUnique({ where: { id }, select: { name: true } });
-  return { id, name: u?.name ?? 'Rep' };
+  const role = (req as AuthenticatedRequest).spaceRep?.role ?? null;
+  return { id, name: u?.name ?? 'Rep', role };
+}
+
+/** Unique payout reference, retrying on the rare collision. */
+async function uniquePayoutReference(): Promise<string> {
+  let reference = generatePayoutReference();
+  for (let i = 0; i < 5; i++) {
+    if (!(await db.payout.findUnique({ where: { reference } }))) break;
+    reference = generatePayoutReference();
+  }
+  return reference;
 }
 
 /**
  * Payout balances, all net of the 3% charge (fees are taken at collection).
- *  available = cleared collections − (processing + completed payouts)
+ *  available = cleared collections − (reserved payouts)
  *  pending   = collections still inside the clearing window
  *  lifetime  = total ever completed
+ * Pass `dueId` to scope every figure to a single due's own payments/payouts.
  */
-async function computeBalances(sid: string) {
+async function computeBalances(sid: string, dueId?: string) {
   const clearedThreshold = new Date(Date.now() - CLEARING_WINDOW_MS);
+  const paymentWhere = dueId ? { due: { spaceId: sid }, dueId } : { due: { spaceId: sid } };
+  const payoutWhere = dueId
+    ? { spaceId: sid, dueId, status: { in: RESERVED_STATUSES } }
+    : { spaceId: sid, status: { in: RESERVED_STATUSES } };
+  const lifetimeWhere = dueId
+    ? { spaceId: sid, dueId, status: 'completed' as const }
+    : { spaceId: sid, status: 'completed' as const };
+
   const [cleared, pending, reserved, lifetime] = await Promise.all([
-    db.duePayment.aggregate({ where: { due: { spaceId: sid }, paidAt: { lte: clearedThreshold } }, _sum: { netToSpace: true } }),
-    db.duePayment.aggregate({ where: { due: { spaceId: sid }, paidAt: { gt: clearedThreshold } }, _sum: { netToSpace: true } }),
-    db.payout.aggregate({ where: { spaceId: sid, status: { in: ['processing', 'completed'] } }, _sum: { amount: true } }),
-    db.payout.aggregate({ where: { spaceId: sid, status: 'completed' }, _sum: { amount: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { lte: clearedThreshold } }, _sum: { netToSpace: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { gt: clearedThreshold } }, _sum: { netToSpace: true } }),
+    db.payout.aggregate({ where: payoutWhere, _sum: { amount: true } }),
+    db.payout.aggregate({ where: lifetimeWhere, _sum: { amount: true } }),
   ]);
   const clearedNet = cleared._sum.netToSpace ?? 0;
   return {
@@ -317,6 +343,7 @@ const requestSchema = z.object({
 
 payoutsRouter.post(
   '/payout/request',
+  requireSpaceRep(true), // space-wide payout access is lead-only; co-reps use the due-scoped endpoint below
   requireIdempotencyKey,
   idempotent,
   validate(requestSchema),
@@ -346,33 +373,224 @@ payoutsRouter.post(
       return;
     }
 
-    // Unique payout reference.
-    let reference = generatePayoutReference();
-    for (let i = 0; i < 5; i++) {
-      if (!(await db.payout.findUnique({ where: { reference } }))) break;
-      reference = generatePayoutReference();
-    }
-
+    const reference = await uniquePayoutReference();
     const accountMasked = `${account.bankName} ${account.accountNumberMasked}`;
-    const payout = await db.payout.create({
-      data: { spaceId: sid, amount, reference, status: 'processing', accountMasked, note },
+    const actorInfo = await actor(req);
+
+    const payout = await db.$transaction(async (tx) => {
+      const created = await tx.payout.create({
+        data: { spaceId: sid, amount, reference, status: 'pending_approval', accountMasked, note, requestedById: uid(req) },
+      });
+      await writeAudit(sid, actorInfo, 'payout_requested', `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout`, tx);
+      return created;
     });
 
-    await writeAudit(
-      sid,
-      await actor(uid(req)),
-      'payout_requested',
-      `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout`,
-    );
-
-    // Best-effort: resolves synchronously when the provider responds inline;
-    // otherwise the payout stays `processing` for the webhook/reconciliation job.
-    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
-    const fresh = (await db.payout.findUnique({ where: { id: payout.id } })) ?? payout;
-
-    ok(res, serializePayout(fresh), 201);
+    // The requester's own request counts as an implicit "yes" vote — a
+    // solo-rep space (no co-reps) reaches 70% immediately, same as before.
+    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    ok(res, serializePayout(final), 201);
   },
 );
+
+// ---------------------------------------------------------------------------
+// GET /dues/{dueId}/payout/summary — balance available against a single due
+// ---------------------------------------------------------------------------
+payoutsRouter.get('/dues/:dueId/payout/summary', async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const due = await db.due.findUnique({ where: { id: req.params.dueId as string } });
+  if (!due || due.spaceId !== sid) {
+    errors.notFound(res, 'Due not found');
+    return;
+  }
+  ok(res, await computeBalances(sid, due.id));
+});
+
+// ---------------------------------------------------------------------------
+// POST /dues/{dueId}/payout/request — the lead, or the due's assigned co-rep,
+// can request a payout scoped to just that due's collected funds.
+// ---------------------------------------------------------------------------
+payoutsRouter.post(
+  '/dues/:dueId/payout/request',
+  requireIdempotencyKey,
+  idempotent,
+  validate(requestSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sid = spaceId(req);
+    const { amount, note } = req.body as z.infer<typeof requestSchema>;
+
+    const due = await db.due.findUnique({ where: { id: req.params.dueId as string } });
+    if (!due || due.spaceId !== sid) {
+      errors.notFound(res, 'Due not found');
+      return;
+    }
+
+    const rep = (req as AuthenticatedRequest).spaceRep!; // guaranteed by the router-level requireSpaceRep()
+    if (rep.role !== 'lead' && due.assignedRepId !== uid(req)) {
+      errors.forbidden(res, "Only the lead or this due's assigned rep can request a payout against it");
+      return;
+    }
+
+    const space = await db.space.findUnique({ where: { id: sid }, select: { payoutsFrozen: true } });
+    if (space?.payoutsFrozen) {
+      fail(res, 423, 'PAYOUTS_FROZEN', 'Payouts for this space are currently frozen');
+      return;
+    }
+
+    const account = await db.bankAccount.findUnique({ where: { spaceId: sid } });
+    if (!account) {
+      errors.conflict(res, 'NO_PAYOUT_ACCOUNT', 'Set a payout account before requesting a payout');
+      return;
+    }
+    if (account.cooldownUntil && account.cooldownUntil > new Date()) {
+      errors.conflict(res, 'ACCOUNT_COOLDOWN', 'Payouts are on hold after a recent account change');
+      return;
+    }
+
+    // A due-scoped balance only sees that due's own payments/payouts — clamp
+    // against the space-wide available too, so two dues can't collectively
+    // overcommit the space's one real bank balance.
+    const [dueScoped, spaceWide] = await Promise.all([computeBalances(sid, due.id), computeBalances(sid)]);
+    const available = Math.min(dueScoped.available, spaceWide.available);
+    if (amount > available) {
+      fail(res, 402, 'INSUFFICIENT_PAYOUT_BALANCE', 'Requested amount exceeds the available balance for this due');
+      return;
+    }
+
+    const reference = await uniquePayoutReference();
+    const accountMasked = `${account.bankName} ${account.accountNumberMasked}`;
+    const actorInfo = await actor(req);
+
+    const payout = await db.$transaction(async (tx) => {
+      const created = await tx.payout.create({
+        data: {
+          spaceId: sid,
+          dueId: due.id,
+          amount,
+          reference,
+          status: 'pending_approval',
+          accountMasked,
+          note,
+          requestedById: uid(req),
+        },
+      });
+      await writeAudit(
+        sid,
+        actorInfo,
+        'payout_requested',
+        `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout against due "${due.title}"`,
+        tx,
+      );
+      return created;
+    });
+
+    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    ok(res, serializePayout(final), 201);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /payout/{payoutId}/approve — any rep casts/changes their vote
+// ---------------------------------------------------------------------------
+const approveSchema = z.object({ decision: z.enum(['approved', 'rejected']) });
+
+payoutsRouter.post(
+  '/payout/:payoutId/approve',
+  validate(approveSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sid = spaceId(req);
+    const payoutId = req.params.payoutId as string;
+    const { decision } = req.body as z.infer<typeof approveSchema>;
+
+    const payout = await db.payout.findUnique({ where: { id: payoutId } });
+    if (!payout || payout.spaceId !== sid) {
+      errors.notFound(res, 'Payout not found');
+      return;
+    }
+    if (payout.status !== 'pending_approval') {
+      errors.conflict(res, 'NOT_PENDING_APPROVAL', 'This payout is no longer awaiting approval');
+      return;
+    }
+
+    const actorInfo = await actor(req);
+    await writeAudit(
+      sid,
+      actorInfo,
+      'payout_approval_cast',
+      `${decision === 'approved' ? 'Approved' : 'Rejected'} payout ${payout.reference}`,
+    );
+
+    const { payout: updated, status } = await castPayoutApproval(payoutId, actorInfo, decision);
+    ok(res, { payout: serializePayout(updated), approval: status });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /payout/{payoutId}/cancel — the requester or the lead, only while
+// still pending_approval (a rejected-heavy vote otherwise has no exit path)
+// ---------------------------------------------------------------------------
+const cancelSchema = z.object({ reason: z.string().max(300).optional() });
+
+payoutsRouter.post(
+  '/payout/:payoutId/cancel',
+  validate(cancelSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const sid = spaceId(req);
+    const payout = await db.payout.findUnique({ where: { id: req.params.payoutId as string } });
+    if (!payout || payout.spaceId !== sid) {
+      errors.notFound(res, 'Payout not found');
+      return;
+    }
+    if (payout.status !== 'pending_approval') {
+      errors.conflict(res, 'NOT_PENDING_APPROVAL', 'Only a payout still awaiting approval can be cancelled');
+      return;
+    }
+
+    const rep = (req as AuthenticatedRequest).spaceRep!;
+    if (rep.role !== 'lead' && payout.requestedById !== uid(req)) {
+      errors.forbidden(res, 'Only the requester or the lead can cancel this payout');
+      return;
+    }
+
+    const { reason } = req.body as z.infer<typeof cancelSchema>;
+    const updated = await db.$transaction(async (tx) => {
+      const u = await tx.payout.update({ where: { id: payout.id }, data: { status: 'cancelled', cancelledAt: new Date() } });
+      await writeAudit(sid, await actor(req), 'payout_cancelled', `Cancelled payout ${payout.reference}${reason ? `: ${reason}` : ''}`, tx);
+      return u;
+    });
+
+    ok(res, serializePayout(updated));
+  },
+);
+
+// ---------------------------------------------------------------------------
+// GET /payout/{payoutId} — a single payout with its approval progress, so a
+// pending_approval payout isn't a black box while reps are voting on it.
+// ---------------------------------------------------------------------------
+payoutsRouter.get('/payout/:payoutId', async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const payout = await db.payout.findUnique({ where: { id: req.params.payoutId as string } });
+  if (!payout || payout.spaceId !== sid) {
+    errors.notFound(res, 'Payout not found');
+    return;
+  }
+
+  const [status, decisions] = await Promise.all([
+    getApprovalStatus(payout.id, sid),
+    db.payoutApproval.findMany({
+      where: { payoutId: payout.id },
+      include: { rep: { select: { name: true } } },
+      orderBy: { decidedAt: 'asc' },
+    }),
+  ]);
+
+  ok(res, {
+    ...serializePayout(payout),
+    approval: {
+      ...status,
+      decisions: decisions.map((d) => ({ repUserId: d.repUserId, repName: d.rep.name, decision: d.decision, decidedAt: d.decidedAt.toISOString() })),
+    },
+  });
+});
 
 // ---------------------------------------------------------------------------
 // GET /payouts (§10.4)

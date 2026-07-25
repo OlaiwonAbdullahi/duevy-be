@@ -1,4 +1,4 @@
-import { type Prisma, type AuditAction } from '@prisma/client';
+import { type Prisma, type AuditAction, type RepRole } from '@prisma/client';
 import { db } from '../config/db';
 
 /**
@@ -7,12 +7,19 @@ import { db } from '../config/db';
  */
 export async function writeAudit(
   spaceId: string,
-  actor: { id: string; name: string },
+  actor: { id: string; name: string; role?: RepRole | null },
   action: AuditAction,
   description: string,
   client: Prisma.TransactionClient | typeof db = db,
 ): Promise<void> {
   await client.spaceAuditLog.create({
-    data: { spaceId, actorId: actor.id, actorName: actor.name, action, description },
+    data: {
+      spaceId,
+      actorId: actor.id,
+      actorName: actor.name,
+      actorRole: actor.role ?? null,
+      action,
+      description,
+    },
   });
 }

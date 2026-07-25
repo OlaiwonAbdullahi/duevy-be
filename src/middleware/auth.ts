@@ -1,10 +1,15 @@
 import { type Request, type Response, type NextFunction } from 'express';
+import { type SpaceRep } from '@prisma/client';
 import { errors } from '../lib/response';
 import { verifyAccessToken, type AccessTokenPayload } from '../lib/jwt';
 import { JWTExpired } from 'jose/errors';
 
 export interface AuthenticatedRequest extends Request {
   user: AccessTokenPayload;
+  /** Set by requireSpaceRep() the first time it resolves the caller's rep
+   *  row for a request — reused across stacked guards and by handlers so
+   *  the lookup only ever costs one query per request. */
+  spaceRep?: SpaceRep;
 }
 
 /** Require a valid Bearer access token on the request. */

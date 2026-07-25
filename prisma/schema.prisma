@@ -110,9 +110,16 @@ enum TxnStatus {
 }
 
 enum PayoutStatus {
+  pending_approval
   processing
   completed
   failed
+  cancelled
+}
+
+enum PayoutApprovalDecision {
+  approved
+  rejected
 }
 
 enum PollStatus {
@@ -212,6 +219,10 @@ enum AuditAction {
   code_regenerated
   lead_transferred
   space_archived
+  due_reassigned
+  payout_approval_cast
+  payout_disbursement_started
+  payout_cancelled
 }
 
 enum AssistantIntent {
@@ -281,6 +292,9 @@ model User {
   idempotencyKeys       IdempotencyKey[]
   sessions              Session[]
   assistantConversations AssistantConversation[]
+  assignedDues          Due[]                    @relation("DueAssignedRep")
+  requestedPayouts      Payout[]                 @relation("PayoutRequestedBy")
+  payoutApprovals       PayoutApproval[]
 
   @@map("users")
 }
@@ -469,6 +483,7 @@ model SpaceAuditLog {
   spaceId     String
   actorId     String
   actorName   String
+  actorRole   RepRole?    // the actor's SpaceRep role at write time; null for historical rows
   action      AuditAction
   description String
   createdAt   DateTime    @default(now())
@@ -496,13 +511,17 @@ model Due {
   publishedAt DateTime?
   closedAt    DateTime?
   lastRemindedAt DateTime? // §7.7 reminder cooldown
+  assignedRepId String?    // the rep whose due-scoped payout access this due is scoped to
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
-  space    Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
-  payments DuePayment[]
+  space       Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  payments    DuePayment[]
+  payouts     Payout[]
+  assignedRep User?        @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
 
   @@index([spaceId])
+  @@index([assignedRepId])
   @@map("dues")
 }
 
@@ -615,19 +634,41 @@ model BankAccount {
 model Payout {
   id            String       @id @default(cuid())
   spaceId       String
+  dueId         String?      // null = space-wide (lead-only); set = due-scoped
   amount        Int          // kobo
   reference     String       @unique
-  status        PayoutStatus @default(processing)
+  status        PayoutStatus @default(pending_approval)
   accountMasked String       // "GTBank •••• 4021"
   note          String?
+  requestedById String?      // who requested it — needed to authorize cancellation
   failureReason String?
   requestedAt   DateTime     @default(now())
+  cancelledAt   DateTime?
   settledAt     DateTime?
 
-  space Space @relation(fields: [spaceId], references: [id])
+  space       Space            @relation(fields: [spaceId], references: [id])
+  due         Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
+  requestedBy User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  approvals   PayoutApproval[]
 
   @@index([spaceId])
+  @@index([dueId])
   @@map("payouts")
+}
+
+model PayoutApproval {
+  id        String                  @id @default(cuid())
+  payoutId  String
+  repUserId String
+  decision  PayoutApprovalDecision
+  decidedAt DateTime                @default(now())
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  rep    User   @relation(fields: [repUserId], references: [id], onDelete: Cascade)
+
+  @@unique([payoutId, repUserId])
+  @@index([payoutId])
+  @@map("payout_approvals")
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,8 @@ export function requireSpaceRep(leadOnly = false) {
     res: Response,
     next: NextFunction,
   ): Promise<void> => {
-    const user = (req as AuthenticatedRequest).user;
+    const authedReq = req as AuthenticatedRequest;
+    const user = authedReq.user;
     // Express 5 types params as string | string[]; a single named param is a string.
     const spaceId = req.params.spaceId as string;
 
@@ -39,9 +40,16 @@ export function requireSpaceRep(leadOnly = false) {
       return;
     }
 
-    const rep = await db.spaceRep.findUnique({
-      where: { userId_spaceId: { userId: user.sub as string, spaceId } },
-    });
+    // Reuse a previously-resolved rep row from earlier in the same request
+    // (e.g. the router-level requireSpaceRep() stacked with a route-level
+    // requireSpaceRep(true)) so this only ever costs one query per request.
+    let rep = authedReq.spaceRep;
+    if (!rep || rep.spaceId !== spaceId) {
+      rep = (await db.spaceRep.findUnique({
+        where: { userId_spaceId: { userId: user.sub as string, spaceId } },
+      })) ?? undefined;
+      authedReq.spaceRep = rep;
+    }
 
     if (!rep) {
       errors.forbidden(res, 'You are not a rep of this space');

@@ -56,12 +56,15 @@ export function serializeCard(c: Card) {
 export function serializePayout(p: Payout) {
   return {
     id: p.id,
+    dueId: p.dueId,
     amount: p.amount,
     reference: p.reference,
     status: p.status,
     account: p.accountMasked,
     note: p.note,
+    requestedById: p.requestedById,
     requestedAt: p.requestedAt.toISOString(),
+    cancelledAt: p.cancelledAt?.toISOString() ?? null,
     settledAt: p.settledAt?.toISOString() ?? null,
     failureReason: p.failureReason,
   };
@@ -227,6 +230,7 @@ export function serializeRepDue(due: Due, opts: { paidCount: number; memberCount
     category: due.category,
     status: due.status,
     allowGuests: due.allowGuests,
+    assignedRepId: due.assignedRepId,
     paidCount: opts.paidCount,
     memberCount: opts.memberCount,
     publishedAt: due.publishedAt?.toISOString() ?? null,
@@ -256,7 +260,7 @@ export function serializeAuditLog(log: SpaceAuditLog) {
     id: log.id,
     action: log.action,
     description: log.description,
-    actor: { id: log.actorId, name: log.actorName },
+    actor: { id: log.actorId, name: log.actorName, role: log.actorRole },
     createdAt: log.createdAt.toISOString(),
   };
 }

@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
+import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -23,9 +24,11 @@ function uid(req: Request): string {
 function spaceId(req: Request): string {
   return req.params.spaceId as string;
 }
-async function actor(id: string): Promise<{ id: string; name: string }> {
+async function actor(req: Request): Promise<{ id: string; name: string; role: RepRole | null }> {
+  const id = uid(req);
   const u = await db.user.findUnique({ where: { id }, select: { name: true } });
-  return { id, name: u?.name ?? 'Rep' };
+  const role = (req as AuthenticatedRequest).spaceRep?.role ?? null;
+  return { id, name: u?.name ?? 'Rep', role };
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +111,7 @@ circleRouter.post('/join-code/regenerate', requireSpaceRep(), async (req: Reques
   }
 
   await db.space.update({ where: { id: sid }, data: { joinCode: code } });
-  await writeAudit(sid, await actor(uid(req)), 'code_regenerated', 'Regenerated the join code');
+  await writeAudit(sid, await actor(req),'code_regenerated', 'Regenerated the join code');
 
   ok(res, { code });
 });
@@ -167,7 +170,7 @@ circleRouter.post('/reps/invite', requireSpaceRep(true), validate(inviteSchema),
       update: {},
       create: { userId: invitee.id, spaceId: sid, kind: 'member' },
     });
-    await writeAudit(sid, await actor(uid(req)), 'rep_invited', `Invited ${invitee.name} as a co-rep`, tx);
+    await writeAudit(sid, await actor(req),'rep_invited', `Invited ${invitee.name} as a co-rep`, tx);
   });
 
   await notify({
@@ -214,7 +217,7 @@ circleRouter.delete('/reps/:userId', requireSpaceRep(true), async (req: Request,
   const target = await db.user.findUnique({ where: { id: targetId }, select: { name: true } });
   await db.$transaction(async (tx) => {
     await tx.spaceRep.delete({ where: { id: rep.id } });
-    await writeAudit(sid, await actor(uid(req)), 'rep_removed', `Removed ${target?.name ?? 'a rep'} as a rep`, tx);
+    await writeAudit(sid, await actor(req),'rep_removed', `Removed ${target?.name ?? 'a rep'} as a rep`, tx);
   });
 
   res.status(204).end();
@@ -344,7 +347,7 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
   await db.$transaction(async (tx) => {
     await tx.spaceRep.update({ where: { id: targetRep.id }, data: { role: 'lead' } });
     if (callerRep) await tx.spaceRep.update({ where: { id: callerRep.id }, data: { role: 'co' } });
-    await writeAudit(sid, { id: callerId, name: caller.name }, 'lead_transferred', `Transferred lead to ${target?.name ?? 'a rep'}`, tx);
+    await writeAudit(sid, { id: callerId, name: caller.name, role: 'lead' }, 'lead_transferred', `Transferred lead to ${target?.name ?? 'a rep'}`, tx);
   });
 
   await Promise.all([
@@ -381,9 +384,9 @@ circleRouter.post('/archive', requireSpaceRep(true), validate(archiveSchema), as
     return;
   }
 
-  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: 'processing' } });
+  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: { in: ['pending_approval', 'processing'] } } });
   if (pendingPayout > 0) {
-    errors.conflict(res, 'PENDING_PAYOUT', 'Wait for processing payouts to settle before archiving');
+    errors.conflict(res, 'PENDING_PAYOUT', 'Wait for pending/processing payouts to settle before archiving');
     return;
   }
 
@@ -403,7 +406,7 @@ circleRouter.post('/archive', requireSpaceRep(true), validate(archiveSchema), as
       where: { id: sid },
       data: { isArchived: true, archivedAt: new Date(), archivedReason: reason ?? null },
     });
-    await writeAudit(sid, { id: callerId, name: caller.name }, 'space_archived', 'Archived the space', tx);
+    await writeAudit(sid, { id: callerId, name: caller.name, role: 'lead' }, 'space_archived', 'Archived the space', tx);
   });
 
   res.status(204).end();
