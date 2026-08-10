@@ -10,19 +10,14 @@ import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import { authenticate, optionalAuthenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
+import { requireFeature } from '../middleware/requireFeature';
 import { idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import {
-  uniqueReference,
-  chargeSavedCard,
-  initOnlinePollVote,
-  CardNotFoundError,
-  CardChargeFailedError,
-} from '../services/payment.service';
+import { uniqueReference, initOnlinePollVote } from '../services/payment.service';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
 
 const pollInclude = { categories: { include: { nominees: true }, orderBy: { createdAt: 'asc' as const } } };
@@ -64,6 +59,7 @@ async function actor(id: string): Promise<{ id: string; name: string }> {
 // Rep-facing router — mounted at /spaces/:spaceId
 // ===========================================================================
 export const pollsRepRouter = Router({ mergeParams: true });
+pollsRepRouter.use(requireFeature('polls'));
 pollsRepRouter.use(requireSpaceRep());
 
 function spaceId(req: Request): string {
@@ -393,6 +389,7 @@ pollsRepRouter.get('/polls/:pollId/results', async (req: Request, res: Response)
 // Public / voter-facing router — mounted at /polls
 // ===========================================================================
 export const pollsPublicRouter = Router();
+pollsPublicRouter.use(requireFeature('polls'));
 
 // GET /polls/:slug — voter view (§11.5)
 pollsPublicRouter.get('/:slug', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
@@ -434,15 +431,12 @@ pollsPublicRouter.get('/:slug', optionalAuthenticate, async (req: Request, res: 
 });
 
 // POST /polls/:slug/votes — cast votes (§11.6)
-const voteSchema = z
-  .object({
-    selections: z
-      .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
-      .min(1),
-    method: z.enum(['card', 'online']).optional(),
-    cardId: z.string().optional(),
-  })
-  .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card payments', path: ['cardId'] });
+const voteSchema = z.object({
+  selections: z
+    .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
+    .min(1),
+  method: z.enum(['online']).optional(),
+});
 
 pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = uid(req);
@@ -450,7 +444,7 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
 
   const poll = await db.poll.findUnique({
     where: { slug: req.params.slug as string },
-    include: { ...pollInclude, space: { select: { paystackSubaccountCode: true, subaccountGateway: true } } },
+    include: pollInclude,
   });
   if (!poll || poll.status === 'draft') {
     errors.notFound(res, 'Poll not found');
@@ -498,7 +492,7 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
   }
 
   // Paid poll. The space keeps the full face; the voter pays the 3% charge on
-  // top (1.5% Duevy + 1.5% Monnify), mirroring dues (§1.5).
+  // top (1.5% processing + 1.5% Duevy), mirroring dues (§1.5).
   const totalQuantity = selections.reduce((s, sel) => s + sel.quantity, 0);
   const gross = totalQuantity * poll.amountPerVote; // space's cut
   const charge = computeCharge(gross);
@@ -511,42 +505,7 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
     return;
   }
 
-  if (body.method === 'card') {
-    try {
-      const { reference, methodLabel } = await chargeSavedCard(userId, body.cardId as string, totalCharged, `Votes: ${poll.title}`);
-      const txn = await db.$transaction(async (tx) => {
-        const t = await tx.transaction.create({
-          data: {
-            userId,
-            type: 'vote',
-            title: `Votes: ${poll.title}`,
-            detail: 'Poll',
-            amount: -totalCharged,
-            method: methodLabel,
-            status: 'completed',
-            reference,
-            spaceId: poll.spaceId,
-          },
-        });
-        await applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: poll.amountPerVote, reference });
-        return t;
-      });
-      ok(res, { receiptId: txn.id, totalCharged }, 201);
-    } catch (err) {
-      if (err instanceof CardNotFoundError) {
-        errors.notFound(res, 'Card not found');
-        return;
-      }
-      if (err instanceof CardChargeFailedError) {
-        fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
-        return;
-      }
-      throw err;
-    }
-    return;
-  }
-
-  // method === 'online' — in-app bank-transfer invoice (§ payment architecture migration)
+  // in-app Bachs checkout (§ payment architecture migration)
   const user = await db.user.findUnique({ where: { id: userId } });
   if (!user) {
     errors.notFound(res, 'User not found');

@@ -7,7 +7,7 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
+import { getCheckoutSession } from '../lib/bachs';
 import { fulfilByReference } from '../services/payment.service';
 
 export const transactionsRouter = Router();
@@ -101,7 +101,7 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
     spaceName: dp?.due.space.name ?? txn.detail ?? '',
     payerName: txn.user.name,
     amountPaid: dp?.amountPaid ?? Math.abs(txn.amount),
-    monnifyFee: dp?.monnifyFee ?? 0,
+    processingFee: dp?.processingFee ?? 0,
     duevyFee: dp?.duevyFee ?? 0,
     netToSpace: dp?.netToSpace ?? Math.abs(txn.amount),
     paidAt: txn.createdAt,
@@ -137,15 +137,11 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   // idempotent, so this racing with the webhook is safe by construction.
   if (pending.status === 'pending') {
     try {
-      // due_payment/poll_vote always go through createInvoice() now — Monnify
-      // needs its dedicated invoice-status endpoint for those (an
-      // invoiceReference isn't a transactionReference); card_save is still a
-      // plain init-transaction, so it keeps using getTransactionStatus.
-      const live = pending.type === 'card_save' ? await getTransactionStatus(reference) : await getInvoiceStatus(reference);
-      if (live?.paymentStatus === 'PAID') {
+      const live = await getCheckoutSession(reference);
+      if (live?.status === 'PAID') {
         await fulfilByReference(reference, true);
         pending = await db.pendingPayment.findUnique({ where: { reference } });
-      } else if (live && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(live.paymentStatus)) {
+      } else if (live && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(live.status)) {
         await fulfilByReference(reference, false);
         pending = await db.pendingPayment.findUnique({ where: { reference } });
       }
@@ -157,19 +153,16 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
   const txn = await db.transaction.findUnique({ where: { reference } });
 
-  // Invoice details, snapshotted onto the PendingPayment at creation — lets a
-  // dedicated payment page render the full invoice from just the reference
-  // (e.g. on reload or the callback redirect landing), not only the session
-  // that opened it. bankTransfer is only ever present for Monnify.
-  const meta = pending?.metadata as
-    | { amount?: number; checkoutUrl?: string; bankTransfer?: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null } | null }
-    | undefined;
+  // Checkout details, snapshotted onto the PendingPayment at creation — lets
+  // a dedicated payment page render the full checkout from just the
+  // reference (e.g. on reload or the callback redirect landing), not only
+  // the session that opened it.
+  const meta = pending?.metadata as { amount?: number; checkoutUrl?: string } | undefined;
 
   ok(res, {
     status,
     ...(meta?.amount !== undefined ? { amount: meta.amount } : {}),
     ...(meta?.checkoutUrl ? { checkoutUrl: meta.checkoutUrl } : {}),
-    ...(meta?.bankTransfer ? { bankTransfer: meta.bankTransfer } : {}),
     ...(txn && status === 'completed' ? { transaction: serializeTransaction(txn) } : {}),
   });
 });

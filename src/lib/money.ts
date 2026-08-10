@@ -27,13 +27,12 @@ export function formatNaira(kobo: number): string {
  * The rep sets the face amount and receives it in full; the payer covers the
  * charge. e.g. face ₦5,000 → payer is charged ₦5,150, space nets ₦5,000.
  *
- *  - 1.5% Monnify fee + 1.5% Duevy platform fee, each rounded half-up on the face.
+ *  - 1.5% processing fee + 1.5% Duevy platform fee, each rounded half-up on the face.
  *  - `totalCharged` is what the payer pays; `netToSpace` is the untouched face.
  *
  * Note: `netToSpace === totalCharged - totalFee` still holds, so the DuePayment
  * invariant (net = amountPaid − fees) is preserved.
  */
-/** Total processing-fee rate (both halves combined) — also what a rep's Paystack subaccount is created with as its default `percentage_charge`, per-transaction overrides aside. */
 export const PLATFORM_PERCENTAGE_CHARGE = 3;
 
 /**
@@ -44,52 +43,25 @@ export const PLATFORM_PERCENTAGE_CHARGE = 3;
  */
 export function computeCharge(faceKobo: number, discountKobo = 0): {
   face: number;
-  monnifyFee: number;
+  processingFee: number;
   duevyFee: number;
   totalFee: number;
   totalCharged: number;
   netToSpace: number;
   discountApplied: number;
 } {
-  const monnifyFee = Math.round(faceKobo * 0.015);
+  const processingFee = Math.round(faceKobo * 0.015);
   const duevyFee = Math.round(faceKobo * 0.015);
-  const totalFee = monnifyFee + duevyFee;
+  const totalFee = processingFee + duevyFee;
   const discountApplied = Math.max(0, Math.min(discountKobo, totalFee));
   return {
     face: faceKobo,
-    monnifyFee,
+    processingFee,
     duevyFee,
     totalFee,
     totalCharged: faceKobo + totalFee - discountApplied,
     netToSpace: faceKobo,
     discountApplied,
-  };
-}
-
-/**
- * Split config to pass into a Paystack subaccount charge (Initialize
- * Transaction + `subaccount`, or Monnify's `incomeSplitConfig`) so the rep's
- * space settles `netToSpace` directly and Duevy keeps the fee — kept separate
- * from `computeCharge()`, which stays authoritative for what the payer is
- * charged and what gets recorded on `DuePayment`. This function only
- * describes what to *tell the gateway*.
- *
- * Confirmed against Paystack's docs: `subaccount` is created with a fixed
- * `percentage_charge` (see createSubaccount in paystack.ts) rather than a
- * per-transaction flat override — `bearer: 'account'` makes Duevy's main
- * balance absorb Paystack's own processing fee so the rep nets exactly
- * `netToSpace`, not slightly less.
- */
-export function computeSubaccountSplit(faceKobo: number): {
-  subaccountShareKobo: number; // what the rep's subaccount should receive — always netToSpace
-  platformShareKobo: number; // what Duevy keeps — always totalFee
-  bearer: 'account'; // Duevy absorbs Paystack's own processing fee, not the rep
-} {
-  const { totalFee, netToSpace } = computeCharge(faceKobo);
-  return {
-    subaccountShareKobo: netToSpace,
-    platformShareKobo: totalFee,
-    bearer: 'account',
   };
 }
 
@@ -107,4 +79,24 @@ export function generatePayoutReference(): string {
     .toString()
     .padStart(4, '0');
   return `PAY-${year}-${seq}`;
+}
+
+/**
+ * Kobo <-> decimal-naira-string conversion for the Bachs API, which takes
+ * amounts as decimal strings at currency precision ("7000.00"), never a JS
+ * number (see .claude/skills/bachs-connect/SKILL.md's non-negotiables).
+ * Integer-only arithmetic throughout — no parseFloat/toFixed float rounding.
+ */
+export function koboToDecimalString(kobo: number): string {
+  const naira = Math.trunc(kobo / 100);
+  const remainderKobo = Math.abs(kobo % 100);
+  return `${kobo < 0 && naira === 0 ? '-0' : naira}.${remainderKobo.toString().padStart(2, '0')}`;
+}
+
+export function decimalStringToKobo(value: string): number {
+  const match = /^(-?)(\d+)\.(\d{2})$/.exec(value.trim());
+  if (!match) throw new Error(`decimalStringToKobo: "${value}" is not a valid decimal amount string`);
+  const [, sign, naira, kobo] = match;
+  const magnitude = Number(naira) * 100 + Number(kobo);
+  return sign === '-' ? -magnitude : magnitude;
 }

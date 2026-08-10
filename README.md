@@ -1,6 +1,6 @@
 # Duevy Backend
 
-REST API powering **Duevy** — a dues collection platform for Nigerian university departments/classes. Handles auth, spaces (departments/classes), dues collection, payments (Paystack/Monnify), payouts to reps, polls, referrals, disputes, notifications, and an AI chat assistant ("Duey").
+REST API powering **Duevy** — a dues collection platform for Nigerian university departments/classes. Handles auth, spaces (departments/classes), dues collection, payments (Bachs Connect), payouts to reps, polls, referrals, disputes, notifications, and an AI chat assistant ("Duey").
 
 ## Tech Stack
 
@@ -9,7 +9,7 @@ REST API powering **Duevy** — a dues collection platform for Nigerian universi
 - **Database**: PostgreSQL via Prisma ORM (designed for Supabase)
 - **Cache/Queue**: Redis (via BullMQ / reconciliation jobs), run through Docker Compose
 - **Auth**: JWT (access + refresh tokens via `jose`), bcrypt password hashing
-- **Payments**: Paystack and Monnify (both fully implemented, toggled via env var)
+- **Payments**: Bachs Connect (bachs.io) — departments are connected accounts, onboarded in-app
 - **Email**: Resend
 - **AI Assistant**: pluggable LLM provider — Ollama (local), Gemini, or any OpenAI-compatible hosted endpoint
 - **Validation**: Zod
@@ -21,7 +21,7 @@ REST API powering **Duevy** — a dues collection platform for Nigerian universi
 - Docker (for local Redis) — or a reachable Redis instance
 - A PostgreSQL database (the project is set up for [Supabase](https://supabase.com), but any Postgres works)
 - A [Resend](https://resend.com) API key (required — used for transactional email)
-- A [Paystack](https://paystack.com) or [Monnify](https://monnify.com) account (test/sandbox keys are fine for local dev)
+- A [Bachs](https://bachs.io) account (sandbox keys are fine for local dev)
 - (Optional) [Ollama](https://ollama.com) running locally if you want to use the AI assistant with the default `ollama` provider
 
 ## Setup
@@ -49,9 +49,7 @@ Then fill in `.env`. At minimum you need:
 | `DATABASE_URL` / `DIRECT_URL` | Postgres connection strings. `DIRECT_URL` is used for migrations (non-pooled). |
 | `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` | Min 32 chars each. Generate with `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"` |
 | `RESEND_API_KEY` | Required — from [resend.com/api-keys](https://resend.com/api-keys) |
-| `PAYMENT_GATEWAY` | `paystack` (default) or `monnify` |
-| `PAYSTACK_SECRET_KEY` | Required if `PAYMENT_GATEWAY=paystack` |
-| `MONNIFY_API_KEY`, `MONNIFY_SECRET_KEY`, `MONNIFY_CONTRACT_CODE`, `MONNIFY_WEBHOOK_SECRET` | Required if `PAYMENT_GATEWAY=monnify` |
+| `BACHS_SECRET_KEY`, `BACHS_WEBHOOK_SECRET` | Required — from your [Bachs](https://bachs.io) dashboard (sandbox keys for local dev) |
 | `REDIS_URL` | Defaults to `redis://localhost:6379` (matches `docker-compose.yml`) |
 
 Everything else in `.env.example` has a sensible default or is optional (Google Sign-In, encryption key overrides, LLM provider config, etc.) — see the inline comments in `.env.example` for details. Env vars are validated on boot via Zod (`src/config/env.ts`); the server refuses to start if something required is missing or malformed.
@@ -98,7 +96,7 @@ The API starts at `http://localhost:3000`, with all routes mounted under `/v1` (
 | `npm run db:studio` | Open Prisma Studio |
 | `npm run db:seed` | Run `prisma/seed.ts` |
 
-There's also `scripts/create-admin.mjs` for provisioning an admin user, and one-off scripts under `prisma/` (`backfillSubaccounts.ts`, `convertWalletBalances.ts`, `notifyBalanceConversion.ts`) for data migrations — run with `tsx prisma/<script>.ts`.
+There's also `scripts/create-admin.mjs` for provisioning an admin user, and one-off scripts under `prisma/` (`convertWalletBalances.ts`, `notifyBalanceConversion.ts`) for data migrations — run with `tsx prisma/<script>.ts`.
 
 ## Project Structure
 
@@ -110,7 +108,7 @@ src/
 ├── routes/               # one file per resource (auth, dues, payouts, polls, ...)
 ├── services/             # business logic (auth, payments, payouts, polls, referrals, assistant)
 ├── middleware/            # auth guard, rate limiting, error handling
-├── lib/                   # gateway clients (Paystack/Monnify), email, PDF, LLM adapters
+├── lib/                   # Bachs client, email, PDF, LLM adapters
 ├── jobs/                  # background jobs (payment reconciliation)
 └── types/                 # shared TypeScript types
 
@@ -118,7 +116,7 @@ prisma/
 └── schema.prisma          # data model (users, spaces, dues, payments, payouts, polls, ...)
 ```
 
-Key domain concepts: a **Space** is a department/class; a **SpaceRep** collects **Dues** from members via **DuePayment**s; payments flow through Paystack or Monnify and reconcile into **Transaction**s; reps request **Payout**s to their **BankAccount**.
+Key domain concepts: a **Space** is a department/class, and also a Bachs connected account (`bachsAccountId`) once its reps complete onboarding; a **SpaceRep** collects **Dues** from members via **DuePayment**s; payments are collected on Duevy's own Bachs account and reconcile into **Transaction**s; the department's share transfers into its own Bachs balance once a payment clears; reps request **Payout**s, disbursed as a Bachs withdrawal to their **BankAccount**.
 
 ## API Documentation
 
@@ -127,6 +125,6 @@ Key domain concepts: a **Space** is a department/class; a **SpaceRep** collects 
 
 ## Notes
 
-- Payment gateway is swappable via `PAYMENT_GATEWAY` env var — both Paystack and Monnify implementations are kept fully working (`src/lib/paystack.ts`, `src/lib/monnify.ts`, selected in `src/lib/paymentGateway.ts`).
+- Bachs Connect (bachs.io) is the sole, non-switchable payment provider (`src/lib/bachs.ts`) — see `.claude/skills/bachs-connect/SKILL.md` for the integration reference.
 - The AI assistant (`src/services/assistant.service.ts`) is provider-agnostic — switch between `ollama`, `gemini`, and any OpenAI-compatible `hosted` endpoint via `LLM_PROVIDER` with no code changes.
 - Uploaded files (avatars, nominee images) are served statically from `/uploads`.

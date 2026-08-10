@@ -25,26 +25,11 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Which processor actually moves money — see src/lib/paymentGateway.ts.
-  // Both providers' code is fully implemented; this just picks which one is
-  // live. Switching back to 'monnify' needs no code changes, only env vars.
-  PAYMENT_GATEWAY: z.enum(['monnify', 'paystack']).default('paystack'),
-
-  // Monnify — kept fully working, just not the active gateway by default.
-  // Optional now (rather than required) so a Paystack-only deploy doesn't
-  // need dummy Monnify credentials just to pass env validation.
-  MONNIFY_API_KEY: z.string().optional(),
-  MONNIFY_SECRET_KEY: z.string().optional(),
-  MONNIFY_BASE_URL: z.string().url().default('https://sandbox.monnify.com'),
-  MONNIFY_CONTRACT_CODE: z.string().optional(),
-  MONNIFY_WEBHOOK_SECRET: z.string().optional(),
-  // Wallet account payouts are disbursed from. Optional: while unset, payout
-  // requests are recorded but no transfer is initiated (§10.3 stays manual).
-  MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT: z.string().optional(),
-
-  // Paystack
-  PAYSTACK_SECRET_KEY: z.string().optional(),
-  PAYSTACK_BASE_URL: z.string().url().default('https://api.paystack.co'),
+  // Bachs Connect (bachs.io) — the sole payment processor. See src/lib/bachs.ts.
+  BACHS_SECRET_KEY: z.string(),
+  BACHS_BASE_URL: z.string().url().default('https://sandbox-api.bachs.io'),
+  // HMAC secret for verifying POST /webhooks/bachs signatures.
+  BACHS_WEBHOOK_SECRET: z.string(),
 
   // App
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
@@ -62,6 +47,13 @@ const envSchema = z.object({
     .default('false'),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).default('lax'),
 
+  // Pilot feature gates — these ship fully built but are cut from the MVP
+  // pilot scope. Off by default; flip to 'true' (no code change) to re-enable
+  // for Phase 2. See src/middleware/requireFeature.ts.
+  FEATURE_POLLS: z.string().transform((v) => v === 'true').default('false'),
+  FEATURE_ASSISTANT: z.string().transform((v) => v === 'true').default('false'),
+  FEATURE_REFERRALS: z.string().transform((v) => v === 'true').default('false'),
+
   // Duey (AI assistant) classification backend — 'ollama' talks to a local/dev
   // Ollama instance; 'gemini' talks to Google's Gemini API natively (no
   // OpenAI-compat shim); 'hosted' talks to any other OpenAI-chat-completions
@@ -78,12 +70,6 @@ const envSchema = z.object({
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
-  if (val.PAYMENT_GATEWAY === 'paystack' && !val.PAYSTACK_SECRET_KEY) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYSTACK_SECRET_KEY'], message: 'required when PAYMENT_GATEWAY=paystack' });
-  }
-  if (val.PAYMENT_GATEWAY === 'monnify' && (!val.MONNIFY_API_KEY || !val.MONNIFY_SECRET_KEY || !val.MONNIFY_CONTRACT_CODE || !val.MONNIFY_WEBHOOK_SECRET)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MONNIFY_API_KEY'], message: 'MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE and MONNIFY_WEBHOOK_SECRET are all required when PAYMENT_GATEWAY=monnify' });
-  }
   if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });
   }

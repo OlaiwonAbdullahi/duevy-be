@@ -1,21 +1,14 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { db } from '../config/db';
-import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { serializeTransaction } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { renderReceiptPdf } from '../lib/receipt';
-import {
-  settleDueFromCard,
-  initOnlineDuePayment,
-  CardNotFoundError,
-  CardChargeFailedError,
-} from '../services/payment.service';
+import { initOnlineDuePayment } from '../services/payment.service';
 import { type Due, type DuePayment } from '@prisma/client';
 
 export const duesRouter = Router();
@@ -128,14 +121,11 @@ duesRouter.get('/:dueId', async (req: Request, res: Response): Promise<void> => 
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/pay — settle a due (§6.3) — Idempotency-Key required
 // ---------------------------------------------------------------------------
-const paySchema = z
-  .object({
-    method: z.enum(['card', 'online']),
-    cardId: z.string().optional(),
-    // Referral reward, redeemable only by its owner against one of their own dues (§ payment architecture migration).
-    discountCode: z.string().optional(),
-  })
-  .refine((d) => d.method !== 'card' || !!d.cardId, { message: 'cardId is required for card payments', path: ['cardId'] });
+const paySchema = z.object({
+  method: z.enum(['online']),
+  // Referral reward, redeemable only by its owner against one of their own dues (§ payment architecture migration).
+  discountCode: z.string().optional(),
+});
 
 duesRouter.post(
   '/:dueId/pay',
@@ -144,11 +134,11 @@ duesRouter.post(
   validate(paySchema),
   async (req: Request, res: Response): Promise<void> => {
     const id = uid(req);
-    const { method, cardId, discountCode } = req.body as z.infer<typeof paySchema>;
+    const { discountCode } = req.body as z.infer<typeof paySchema>;
 
     const due = await db.due.findUnique({
       where: { id: req.params.dueId as string },
-      include: { space: { select: { name: true, paystackSubaccountCode: true, subaccountGateway: true } } },
+      include: { space: { select: { name: true } } },
     });
     if (!due) {
       errors.notFound(res, 'Due not found');
@@ -190,28 +180,6 @@ duesRouter.post(
       discount = { id: code.id, amountKobo: code.amountKobo };
     }
 
-    if (method === 'card') {
-      try {
-        const transaction = await settleDueFromCard(user, due, cardId as string, discount);
-        ok(res, {
-          transaction: serializeTransaction(transaction),
-          receiptUrl: `${env.APP_BASE_URL}/v1/dues/${due.id}/receipt`,
-        });
-      } catch (err) {
-        if (err instanceof CardNotFoundError) {
-          errors.notFound(res, 'Card not found');
-          return;
-        }
-        if (err instanceof CardChargeFailedError) {
-          fail(res, 402, 'CARD_DECLINED', 'Your card was declined');
-          return;
-        }
-        throw err;
-      }
-      return;
-    }
-
-    // method === 'online'
     const result = await initOnlineDuePayment(user, due, discount);
     ok(res, result);
   },
@@ -243,7 +211,7 @@ duesRouter.get('/:dueId/receipt', async (req: Request, res: Response): Promise<v
     spaceName: payment.due.space.name,
     payerName: payment.user.name,
     amountPaid: payment.amountPaid,
-    monnifyFee: payment.monnifyFee,
+    processingFee: payment.processingFee,
     duevyFee: payment.duevyFee,
     netToSpace: payment.netToSpace,
     paidAt: payment.paidAt,

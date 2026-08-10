@@ -429,9 +429,9 @@ All routes below require authentication and operate on the caller's own account.
         "id": "txn_44df",
         "type": "topup",
         "title": "Wallet top-up",
-        "detail": "Monnify",
+        "detail": "Bachs",
         "amount": 500000,
-        "method": "Monnify",
+        "method": "Bachs",
         "status": "completed",
         "reference": "DVY-2201-8834",
         "createdAt": "2026-07-10T08:30:00.000Z"
@@ -521,7 +521,7 @@ All routes below require authentication and operate on the caller's own account.
 ### Pay a Due
 **POST** `/v1/dues/{dueId}/pay` — **Requires `Idempotency-Key`.**
 
-**Flow:** Triggered from the "Pay" button on a due. The `method` the user picks in a payment-method sheet decides which of the three payloads to send. `wallet`/`card` settle synchronously in the response; `online` hands back a redirect URL — send the user there, then poll `GET /payments/{reference}/status` on return.
+**Flow:** Triggered from the "Pay" button on a due. `online` is the only payment method — it hands back a Bachs checkout URL; send the user there, then poll `GET /payments/{reference}/status` on return. (`wallet` is a legacy method left in the enum for historical transactions; there's no wallet balance to pay from anymore.)
 
 **Wallet**
 ```json
@@ -549,23 +549,17 @@ All routes below require authentication and operate on the caller's own account.
 ```
 `402 INSUFFICIENT_FUNDS` if the wallet balance is too low.
 
-**Saved Card**
-```json
-{ "method": "card", "cardId": "card_9x2k1" }
-```
-**Response `200`** — same shape as wallet, `method: "Visa •••• 4242"`. Charges a card saved via `POST /v1/wallet/cards`. `404` if the card doesn't belong to the caller. `402 CARD_DECLINED` if the charge fails.
-
-**Online (Monnify)**
+**Online (Bachs)**
 ```json
 { "method": "online" }
 ```
 **Response `200`**
 ```json
-{ "success": true, "data": { "checkoutUrl": "https://sandbox.monnify.com/checkout/...", "reference": "DVY-4821-7735" } }
+{ "success": true, "data": { "checkoutUrl": "https://sandbox-checkout.bachs.io/...", "reference": "DVY-4821-7735" } }
 ```
 Redirect the browser to `checkoutUrl`; the payer completes checkout there. Poll `GET /v1/payments/{reference}/status` afterward.
 
-All three return `409 DUE_ALREADY_PAID` on a duplicate attempt and `409 DUE_NOT_PAYABLE` if the due isn't active.
+Returns `409 DUE_ALREADY_PAID` on a duplicate attempt and `409 DUE_NOT_PAYABLE` if the due isn't active.
 
 ### Download Receipt
 **GET** `/v1/dues/{dueId}/receipt` (also `/v1/transactions/{transactionId}/receipt`)
@@ -589,98 +583,19 @@ All three return `409 DUE_ALREADY_PAID` on a duplicate attempt and `409 DUE_NOT_
 ### Top-Up
 **POST** `/v1/wallet/top-up` — **Requires `Idempotency-Key`.**
 
-**Flow:** From the "Add money" flow. Amount must be between ₦100 and ₦500,000 (kobo). `card` settles synchronously; `online` redirects.
+**Flow:** From the "Add money" flow. Amount must be between ₦100 and ₦500,000 (kobo). Redirects to a Bachs checkout session.
 
-**Saved Card**
-```json
-{ "amount": 500000, "method": "card", "cardId": "card_9x2k1" }
-```
-**Response `200`**
-```json
-{
-  "success": true,
-  "data": {
-    "transaction": {
-      "id": "txn_77qq",
-      "type": "topup",
-      "title": "Wallet top-up",
-      "detail": "Visa •••• 4242",
-      "amount": 500000,
-      "method": "Visa •••• 4242",
-      "status": "completed",
-      "reference": "DVY-2201-8834",
-      "createdAt": "2026-07-15T10:00:00.000Z"
-    }
-  }
-}
-```
-`404` if the card isn't found. `402 CARD_DECLINED` if the charge fails.
-
-**Online (Monnify)**
+**Online (Bachs)**
 ```json
 { "amount": 500000, "method": "online" }
 ```
 **Response `200`**
 ```json
-{ "success": true, "data": { "checkoutUrl": "https://sandbox.monnify.com/checkout/...", "reference": "DVY-2201-8834" } }
+{ "success": true, "data": { "checkoutUrl": "https://sandbox-checkout.bachs.io/...", "reference": "DVY-2201-8834" } }
 ```
 Redirect, then poll `GET /v1/payments/{reference}/status`.
 
-### List Saved Cards
-**GET** `/v1/wallet/cards`
-
-**Flow:** Payment-method picker and the wallet "Cards" tab. Call before showing the pay/top-up sheet so the user can pick a saved card.
-
-**Response `200`**
-```json
-{
-  "success": true,
-  "data": [
-    { "id": "card_9x2k1", "brand": "Visa", "last4": "4242", "expiry": "12/28", "isDefault": true },
-    { "id": "card_4m8p2", "brand": "Mastercard", "last4": "5588", "expiry": "03/27", "isDefault": false }
-  ]
-}
-```
-
-### Save a Card
-**POST** `/v1/wallet/cards` — **Requires `Idempotency-Key`.**
-
-**Flow:** Redirect flow, same pattern as an online payment. Click "Add card" → call this → redirect the user to `checkoutUrl` → Monnify runs a ₦50 verification charge and tokenizes the card there → poll `GET /v1/payments/{reference}/status` on return → once `status: "completed"`, re-fetch `GET /v1/wallet/cards` to show the new card. The first card ever saved is always made default regardless of `isDefault`.
-
-**Payload**
-```json
-{ "isDefault": false }
-```
-(optional, defaults `false`)
-
-**Response `200`**
-```json
-{ "success": true, "data": { "checkoutUrl": "https://sandbox.monnify.com/checkout/...", "reference": "DVY-5512-0091" } }
-```
-
-### Set Default Card
-**PATCH** `/v1/wallet/cards/{cardId}`
-
-**Flow:** "Make default" action on a card row.
-
-**Payload**
-```json
-{ "isDefault": true }
-```
-(this is the only accepted value)
-
-**Response `200`**
-```json
-{ "success": true, "data": { "id": "card_4m8p2", "brand": "Mastercard", "last4": "5588", "expiry": "03/27", "isDefault": true } }
-```
-`404` if the card isn't found.
-
-### Delete Card
-**DELETE** `/v1/wallet/cards/{cardId}`
-
-**Flow:** "Remove" action on a card row, usually behind a confirm dialog. If the deleted card was the default, the most recently added remaining card is promoted automatically — refresh the card list after this call to reflect that.
-
-**Response `204`** — no body. `404` if not found.
+Saved-card charging and card management (`GET/POST /v1/wallet/cards`, etc.) have been removed — Bachs has no documented token-charge API. Every payment goes through a fresh Bachs checkout session.
 
 ### Wallet Activity
 **GET** `/v1/wallet/activity`
@@ -1107,9 +1022,9 @@ All routes require the caller to be a rep of the space (lead or co).
 All routes require the caller to be a rep of the space.
 
 ### List Banks
-**GET** `/v1/banks`
+**GET** `/v1/banks?spaceId={spaceId}`
 
-**Flow:** Populate the bank picker before setting/previewing a payout account.
+**Flow:** Populate the bank picker before setting/previewing a payout account. Bank lists are scoped per Bachs connected account, so `spaceId` is required — the caller must be a rep of that space. `403` if not.
 
 **Response `200`**
 ```json
@@ -1121,7 +1036,7 @@ All routes require the caller to be a rep of the space.
   ]
 }
 ```
-Cached server-side for 24h. `502 PROVIDER_ERROR` if Monnify's bank list can't be fetched.
+Cached server-side for 24h. `502 PROVIDER_ERROR` if Bachs's bank list can't be fetched.
 
 ### Payout Summary
 **GET** `/v1/spaces/{spaceId}/payout/summary`
@@ -1424,11 +1339,11 @@ Nominee vote counts (`votes`) are only included once the poll is `closed`. `404`
 ```
 **Response `200`**
 ```json
-{ "success": true, "data": { "checkoutUrl": "https://sandbox.monnify.com/checkout/...", "reference": "DVY-6621-0099" } }
+{ "success": true, "data": { "checkoutUrl": "https://sandbox-checkout.bachs.io/...", "reference": "DVY-6621-0099" } }
 ```
 Redirect, then poll `GET /v1/payments/{reference}/status`.
 
-Paid votes charge the same 3% fee structure as dues (1.5% Duevy + 1.5% Monnify) on top of `amountPerVote × quantity`.
+Paid votes charge the same 3% fee structure as dues (1.5% Duevy + 1.5% processing) on top of `amountPerVote × quantity`.
 
 ---
 
@@ -1600,7 +1515,7 @@ Fires an invite email per address containing the caller's referral link/code.
   "success": true,
   "data": {
     "status": "completed",
-    "transaction": { "id": "txn_44df", "type": "due", "title": "Dept levy", "detail": "Engineering 101", "amount": -515000, "method": "Monnify", "status": "completed", "reference": "DVY-4821-7735", "createdAt": "2026-07-15T09:20:00.000Z" }
+    "transaction": { "id": "txn_44df", "type": "due", "title": "Dept levy", "detail": "Engineering 101", "amount": -515000, "method": "Bachs", "status": "completed", "reference": "DVY-4821-7735", "createdAt": "2026-07-15T09:20:00.000Z" }
   }
 }
 ```
@@ -1996,7 +1911,7 @@ Auto-generates a join code.
 - `FIELD_READ_ONLY`: Attempted to edit a server-controlled field via `PATCH /me`.
 - `EMAIL_IN_USE`: New email on `PATCH /me` is already registered to another account.
 - `NOT_IMPLEMENTED`: Feature not configured server-side (e.g. Google sign-in).
-- `PROVIDER_ERROR`: An upstream provider (e.g. Monnify bank list) failed.
+- `PROVIDER_ERROR`: An upstream provider (e.g. Bachs bank list) failed.
 - `UNAUTHENTICATED` / `TOKEN_EXPIRED` / `FORBIDDEN` / `NOT_FOUND` / `INTERNAL_ERROR`: Generic envelope errors.
 
 ---
@@ -2160,8 +2075,8 @@ interface Session {
 ## 17. Useful Tips
 - **Kobo:** All `amount` fields are in Kobo. (₦1 = 100 Kobo).
 - **Themes:** Use the `hue` field from a Space to apply primary colors to the UI.
-- **Fees:** The API automatically adds a 3% processing fee (1.5% Duevy + 1.5% Monnify) to the `payableAmount` of any due, and to paid poll votes. Reps always receive the full face amount they set — the fee is added on top for the payer, not deducted from the collector.
-- **Redirect flows:** `checkoutUrl` responses (due/top-up/poll `method: "online"`, and `POST /wallet/cards`) all follow the same pattern — redirect the browser there, then poll `GET /payments/{reference}/status` on return until it's no longer `pending`.
-- **204 responses:** Many mutating endpoints (suspend, archive, remove-member, mark-read, delete-card, etc.) return `204 No Content` on success — don't expect a `data` body.
+- **Fees:** The API automatically adds a 3% processing fee (1.5% Duevy + 1.5% processing) to the `payableAmount` of any due, and to paid poll votes. Reps always receive the full face amount they set — the fee is added on top for the payer, not deducted from the collector.
+- **Redirect flows:** `checkoutUrl` responses (due/top-up/poll `method: "online"`) all follow the same pattern — redirect the browser there, then poll `GET /payments/{reference}/status` on return until it's no longer `pending`.
+- **204 responses:** Many mutating endpoints (suspend, archive, remove-member, mark-read, etc.) return `204 No Content` on success — don't expect a `data` body.
 - **Idempotency:** Always send a fresh `Idempotency-Key` (UUID) per user action, not per retry — retries of the same logical request should reuse the same key so the server can dedupe.
 - **Pagination:** List endpoints accept `page` and `perPage` query params and return `meta.total` / `meta.totalPages`; endpoints without explicit pagination notes above still accept these params.

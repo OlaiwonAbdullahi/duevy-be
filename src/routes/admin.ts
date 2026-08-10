@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepApplication, type PaymentGatewayName } from '@prisma/client';
+import { type Prisma, type RepApplication } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
@@ -10,13 +10,13 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTransaction } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
 import { uniqueReference } from '../services/payment.service';
+import { computeCharge } from '../lib/money';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getGatewayLabel, isGatewayConfigured, invalidateGatewayCache, refundTransaction } from '../lib/paymentGateway';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -732,42 +732,125 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
     return;
   }
 
-  // Reverse to the payer's original source (card/bank) via the gateway's real
-  // refund API — there's no wallet to credit anymore (payment architecture
-  // migration). Do this before writing any DB rows: if Paystack rejects the
-  // refund, nothing here should look like it succeeded.
-  try {
-    await refundTransaction({ reference: original.reference, amount: refundAmount });
-  } catch (err) {
-    console.error(`[admin] refund failed for txn=${original.id}:`, err);
-    fail(res, 502, 'REFUND_FAILED', 'The payment provider rejected this refund');
-    return;
-  }
-
-  const reference = await uniqueReference();
-  const refund = await db.$transaction(async (tx) =>
-    tx.transaction.create({
-      data: {
-        userId: original.userId,
-        type: 'refund',
-        title: 'Refund',
-        detail: reason,
-        amount: refundAmount,
-        method: original.method,
-        status: 'completed',
-        reference,
-        spaceId: original.spaceId,
-        refundOfTxnId: original.id,
-      },
-    }),
-  );
-
-  await Promise.all([
-    writeAdminAudit(req, 'transaction.refund', { target: original.id, severity: 'critical', metadata: { refundAmount, reason } }),
-    notify({ userId: original.userId, kind: 'system', tone: 'brand', title: 'Refund issued', detail: `₦${(refundAmount / 100).toLocaleString('en-NG')} was refunded to your original payment method.`, href: '/dashboard/transactions' }).catch(() => {}),
-  ]);
-  ok(res, serializeTransaction(refund), 201);
+  // Refunding a platform-collected Bachs charge isn't yet supported — nothing
+  // in the Bachs Connect skill covers reversing a checkout session, so this
+  // is stubbed rather than guessed at for real money (see the plan's
+  // decision to stub refunds instead of an unverified endpoint). Process the
+  // reversal manually with the payer for now.
+  fail(res, 501, 'REFUND_NOT_SUPPORTED', 'Refunds are not yet supported — process manually with the payer for now');
 });
+
+// ---------------------------------------------------------------------------
+// Manual credit — fixes a payment that genuinely happened (e.g. a webhook
+// that never landed) but never got recorded, so it doesn't show as paid.
+// Unlike refund, this has no prior Transaction to act on: it creates one, plus
+// the DuePayment and LedgerEntry a normal successful payment would have
+// produced, tagged as a manual override for auditability (§ ledger, admin
+// manual-credit tool).
+// ---------------------------------------------------------------------------
+const manualCreditSchema = z.object({
+  userId: z.string().min(1),
+  reference: z.string().min(1).max(60).optional(),
+  reason: z.string().min(1).max(500),
+});
+
+adminRouter.post(
+  '/dues/:dueId/credit',
+  requireAdminPermission('overrides'),
+  validate(manualCreditSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { userId, reference: suppliedReference, reason } = req.body as z.infer<typeof manualCreditSchema>;
+    const due = await db.due.findUnique({
+      where: { id: req.params.dueId as string },
+      include: { space: { select: { id: true, name: true } } },
+    });
+    if (!due) {
+      errors.notFound(res, 'Due not found');
+      return;
+    }
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      errors.notFound(res, 'User not found');
+      return;
+    }
+
+    const existing = await db.duePayment.findUnique({
+      where: { userId_dueId: { userId, dueId: due.id } },
+    });
+    if (existing) {
+      errors.conflict(res, 'DUE_ALREADY_PAID', 'This due has already been settled for this user');
+      return;
+    }
+
+    const charge = computeCharge(due.amount);
+    const reference = suppliedReference ?? (await uniqueReference());
+    const actorId = (req as AuthenticatedRequest).user.sub as string;
+
+    const transaction = await db.$transaction(async (tx) => {
+      const txn = await tx.transaction.create({
+        data: {
+          userId,
+          type: 'due',
+          title: due.title,
+          detail: due.space.name,
+          amount: -charge.totalCharged,
+          method: 'Manual (admin)',
+          status: 'completed',
+          reference,
+          spaceId: due.spaceId,
+        },
+      });
+      const duePayment = await tx.duePayment.create({
+        data: {
+          userId,
+          dueId: due.id,
+          txnId: txn.id,
+          reference,
+          amountPaid: charge.totalCharged,
+          processingFee: charge.processingFee,
+          duevyFee: charge.duevyFee,
+          netToSpace: charge.netToSpace,
+        },
+      });
+      await tx.ledgerEntry.create({
+        data: {
+          spaceId: due.spaceId,
+          dueId: due.id,
+          txnId: txn.id,
+          duePaymentId: duePayment.id,
+          type: 'manual_credit',
+          direction: 'credit',
+          amountKobo: charge.netToSpace,
+          grossKobo: charge.totalCharged,
+          feeKobo: charge.totalFee,
+          netKobo: charge.netToSpace,
+          reference,
+          description: reason,
+          actorId,
+        },
+      });
+      return txn;
+    });
+
+    await Promise.all([
+      writeAdminAudit(req, 'due.manual_credit', {
+        target: due.id,
+        severity: 'critical',
+        metadata: { userId, amount: charge.totalCharged, reason, reference },
+      }),
+      notify({
+        userId,
+        kind: 'payment_received',
+        title: 'Payment recorded',
+        detail: `${due.title} was marked as paid by an admin.`,
+        href: '/dashboard/dues',
+      }).catch(() => {}),
+    ]);
+
+    ok(res, serializeTransaction(transaction), 201);
+  },
+);
 
 // ===========================================================================
 // §14.6 Disputes
@@ -1104,7 +1187,7 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   } else if (report.scope === 'financial_summary') {
     const [collected, fees, topups, refunds, payouts] = await Promise.all([
       db.duePayment.aggregate({ where: { paidAt: range }, _sum: { netToSpace: true } }),
-      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { monnifyFee: true, duevyFee: true } }),
+      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { processingFee: true, duevyFee: true } }),
       db.transaction.aggregate({ where: { type: 'topup', status: 'completed', createdAt: range }, _sum: { amount: true } }),
       db.transaction.aggregate({ where: { type: 'refund', createdAt: range }, _sum: { amount: true } }),
       db.payout.aggregate({ where: { requestedAt: range }, _sum: { amount: true } }),
@@ -1112,7 +1195,7 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
     rows = [
       ['Metric', 'Amount (kobo)'],
       ['Net collected (to spaces)', collected._sum.netToSpace ?? 0],
-      ['Monnify fees', fees._sum.monnifyFee ?? 0],
+      ['Processing fees', fees._sum.processingFee ?? 0],
       ['Duevy revenue (fees)', fees._sum.duevyFee ?? 0],
       ['Wallet top-ups', topups._sum.amount ?? 0],
       ['Refunds issued', refunds._sum.amount ?? 0],
@@ -1123,8 +1206,8 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
     const spaces = await db.space.findMany({ where, select: { id: true, name: true } });
     rows = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
     for (const s of spaces) {
-      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, monnifyFee: true, duevyFee: true } });
-      rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.monnifyFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
+      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, processingFee: true, duevyFee: true } });
+      rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
     }
   } else {
     // rep_performance
@@ -1152,59 +1235,6 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.status(200).send(body);
 });
 
-// ---------------------------------------------------------------------------
-// GET /admin/settings/payment-gateway — which processor is live, and which
-// gateways currently have their credentials configured (so the dashboard can
-// grey out/warn before an admin switches to one that isn't set up).
-// ---------------------------------------------------------------------------
-adminRouter.get('/settings/payment-gateway', async (_req: Request, res: Response): Promise<void> => {
-  const active = (await getGatewayLabel()).toLowerCase() as PaymentGatewayName;
-  ok(res, {
-    active,
-    gateways: {
-      paystack: { configured: isGatewayConfigured('paystack') },
-      monnify: { configured: isGatewayConfigured('monnify') },
-    },
-  });
-});
-
-// ---------------------------------------------------------------------------
-// PUT /admin/settings/payment-gateway (super_admin only) — switches which
-// processor is live without a redeploy. Refuses to switch to a gateway whose
-// credentials aren't set in env, since that would break payments instantly.
-// ---------------------------------------------------------------------------
-const setGatewaySchema = z.object({ gateway: z.enum(['paystack', 'monnify']) });
-
-adminRouter.put(
-  '/settings/payment-gateway',
-  requireSuperAdmin(),
-  validate(setGatewaySchema),
-  async (req: Request, res: Response): Promise<void> => {
-    const { gateway } = req.body as z.infer<typeof setGatewaySchema>;
-
-    if (!isGatewayConfigured(gateway)) {
-      errors.conflict(
-        res,
-        'GATEWAY_NOT_CONFIGURED',
-        `${gateway} is missing required credentials in env — set them before switching`,
-      );
-      return;
-    }
-
-    const actorId = (req as AuthenticatedRequest).user.sub as string;
-    await db.appSettings.upsert({
-      where: { id: 'singleton' },
-      update: { activePaymentGateway: gateway, updatedBy: actorId },
-      create: { id: 'singleton', activePaymentGateway: gateway, updatedBy: actorId },
-    });
-    invalidateGatewayCache();
-
-    await writeAdminAudit(req, 'payment_gateway_changed', {
-      target: gateway,
-      severity: 'critical',
-      metadata: { gateway },
-    });
-
-    ok(res, { active: gateway });
-  },
-);
+// Bachs is the sole, non-switchable payment provider — the admin gateway-
+// switch endpoints that used to live here (GET/PUT /settings/payment-gateway)
+// are gone along with Paystack/Monnify.

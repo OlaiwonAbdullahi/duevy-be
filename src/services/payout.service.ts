@@ -1,108 +1,75 @@
-import { type Payout, type BankAccount } from '@prisma/client';
+import { type Payout } from '@prisma/client';
 import { db } from '../config/db';
-import { decrypt } from '../lib/encryption';
 import {
-  initiateDisbursement,
-  getDisbursementStatus,
-  isDisbursementConfigured,
-  getActiveGatewayName,
-  getBanks,
-  verifyAccountName,
-} from '../lib/paymentGateway';
+  BachsApiError,
+  getConnectedAccountCapabilities,
+  createTransfer,
+  createWithdrawal,
+  getWithdrawal,
+} from '../lib/bachs';
 import { notifyMany } from '../lib/notifications';
 
 const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
+// Funds clear 24h after payment, then become eligible for the split-transfer
+// sweep below — same window computeBalances() used to gate "available" on
+// directly; now "available" gates on transferredAt instead (see payouts.ts),
+// so this constant only controls when the sweep fires.
+const CLEARING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-/** Strips generic suffixes ("Bank", "MFB", "Plc", ...) so the same institution matches across providers' differently-formatted names. */
-function normalizeBankName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/\b(bank|mfb|microfinance|plc|limited|ltd)\b/gi, '')
-    .replace(/[^a-z0-9]/g, '');
-}
-
-/**
- * Bank codes are gateway-specific — Monnify and Paystack number the same
- * bank differently (e.g. Kuda is `090267` on one and `50211` on the other).
- * `BankAccount.bankCodeGateway` records which scheme `bankCode` currently
- * matches; if the active gateway has since changed, re-resolve the code by
- * matching `bankName` against the active gateway's own bank list, re-verify
- * the account still checks out (never trust a name-match alone with real
- * money), and persist the correction so this is a one-time cost per switch.
- */
-export async function resolveActiveBankCode(account: BankAccount): Promise<string> {
-  const activeGateway = await getActiveGatewayName();
-  if (account.bankCodeGateway === activeGateway) return account.bankCode;
-
-  const banks = await getBanks();
-  const target = normalizeBankName(account.bankName);
-  const match =
-    banks.find((b) => normalizeBankName(b.name) === target) ??
-    banks.find((b) => normalizeBankName(b.name).includes(target) || target.includes(normalizeBankName(b.name)));
-  if (!match) {
-    throw new Error(`[bank-code] no match for "${account.bankName}" in the ${activeGateway} bank list — resolve manually`);
+/** Who to notify a withdrawal's outcome to — the requester, falling back to the space's lead rep. */
+async function resolveNotificationEmail(spaceId: string, payout: Payout): Promise<string | null> {
+  if (payout.requestedById) {
+    const user = await db.user.findUnique({ where: { id: payout.requestedById }, select: { email: true } });
+    if (user) return user.email;
   }
-
-  const accountNumber = decrypt(account.accountNumber);
-  const resolvedName = await verifyAccountName(accountNumber, match.code);
-  if (!resolvedName) {
-    throw new Error(`[bank-code] "${account.bankName}" (${match.code}) didn't verify under ${activeGateway} — resolve manually`);
-  }
-
-  await db.bankAccount.update({
-    where: { spaceId: account.spaceId },
-    data: { bankCode: match.code, bankCodeGateway: activeGateway, accountName: resolvedName },
-  });
-  console.log(`[bank-code] re-resolved "${account.bankName}" for space ${account.spaceId}: ${account.bankCode} -> ${match.code} (${activeGateway})`);
-
-  return match.code;
+  const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: { select: { email: true } } } });
+  return lead?.user.email ?? null;
 }
 
 /**
- * Subaccount codes are gateway-specific and, unlike bank codes, can't be
- * auto-translated — a subaccount is a real object that only exists on the
- * gateway it was created on (Monnify's equivalent additionally requires
- * manually requesting activation from Monnify support before it can be
- * created at all). If the space's stored code belongs to a different gateway
- * than the one currently active, treat it as absent — the payment falls back
- * to routing through Duevy's main account (same as a space with no subaccount
- * configured yet) instead of sending a stale code to a provider that's never
- * heard of it.
- */
-export async function resolveActiveSubaccountCode(space: { paystackSubaccountCode: string | null; subaccountGateway: string | null }): Promise<string | null> {
-  if (!space.paystackSubaccountCode) return null;
-  const activeGateway = await getActiveGatewayName();
-  if (space.subaccountGateway !== activeGateway) return null;
-  return space.paystackSubaccountCode;
-}
-
-/**
- * Kick off the actual bank transfer for a freshly-created payout (§10.3).
- * Best-effort: if disbursement isn't configured or the provider call fails,
- * the payout simply stays `processing` for the reconciliation job to retry.
+ * Kick off the actual Bachs withdrawal for a freshly-created payout (§10.3).
+ * Called AS the connected account (X-Connected-Account-ID) — the withdrawal
+ * draws from the department's own Bachs balance, funded by the split
+ * transfers below. Capability is re-read live rather than trusting the
+ * cached `bachsPayoutsActive` flag, per the skill's non-negotiable: never
+ * trust a cached capability for a money-moving call. Best-effort: if the
+ * account isn't ready or the call fails, the payout simply stays
+ * `processing` for the reconciliation job to retry.
  */
 export async function initiatePayoutDisbursement(payout: Payout): Promise<void> {
-  if (!(await isDisbursementConfigured())) return;
-
-  const account = await db.bankAccount.findUnique({ where: { spaceId: payout.spaceId } });
-  if (!account) return;
+  const space = await db.space.findUnique({
+    where: { id: payout.spaceId },
+    select: { bachsAccountId: true, bachsPayoutDestinationId: true },
+  });
+  if (!space?.bachsAccountId || !space.bachsPayoutDestinationId) return;
 
   try {
-    const bankCode = await resolveActiveBankCode(account);
-    const result = await initiateDisbursement({
-      amount: payout.amount,
-      reference: payout.reference,
-      narration: `Duevy payout ${payout.reference}`,
-      bankCode,
-      accountNumber: decrypt(account.accountNumber),
-      accountName: account.accountName,
-    });
-    if (result.status === 'SUCCESS') {
-      await settlePayout(payout.reference, true);
-    } else if (result.status === 'FAILED') {
-      await settlePayout(payout.reference, false, 'Disbursement was rejected by the payment provider');
+    const capabilities = await getConnectedAccountCapabilities(space.bachsAccountId);
+    if (capabilities.payouts?.status !== 'active') {
+      console.error(`[payout] withdrawal skipped for ${payout.reference} — payouts capability not active`);
+      return;
     }
-    // PENDING — leave `processing`; the webhook or reconciliation job resolves it.
+
+    const email = await resolveNotificationEmail(payout.spaceId, payout);
+    if (!email) return;
+
+    const result = await createWithdrawal(
+      space.bachsAccountId,
+      {
+        amountKobo: payout.amount,
+        reference: payout.reference,
+        email,
+        payoutDestinationId: space.bachsPayoutDestinationId,
+      },
+      `WD-${payout.reference}`,
+    );
+
+    if (result.status === 'COMPLETED') {
+      await settlePayout(payout.reference, true);
+    } else if (result.status === 'FAILED' || result.status === 'REJECTED') {
+      await settlePayout(payout.reference, false, 'The payout was rejected by the payment provider');
+    }
+    // REQUESTED/PENDING/APPROVED/PROCESSING — leave `processing`; the webhook or reconciliation job resolves it.
   } catch (err) {
     console.error(`[payout] disbursement init failed for ${payout.reference}:`, err);
   }
@@ -113,11 +80,28 @@ export async function settlePayout(reference: string, success: boolean, failureR
   const payout = await db.payout.findUnique({ where: { reference } });
   if (!payout || payout.status !== 'processing') return;
 
-  const updated = await db.payout.update({
-    where: { reference },
-    data: success
-      ? { status: 'completed', settledAt: new Date() }
-      : { status: 'failed', failureReason: failureReason ?? 'The payout could not be completed' },
+  const updated = await db.$transaction(async (tx) => {
+    const u = await tx.payout.update({
+      where: { reference },
+      data: success
+        ? { status: 'completed', settledAt: new Date() }
+        : { status: 'failed', failureReason: failureReason ?? 'The payout could not be completed' },
+    });
+    if (success) {
+      await tx.ledgerEntry.create({
+        data: {
+          spaceId: u.spaceId,
+          dueId: u.dueId,
+          payoutId: u.id,
+          type: 'payout',
+          direction: 'debit',
+          amountKobo: u.amount,
+          reference: u.reference,
+          description: `Payout to ${u.accountMasked}`,
+        },
+      });
+    }
+    return u;
   });
 
   const reps = await db.spaceRep.findMany({ where: { spaceId: updated.spaceId }, select: { userId: true } });
@@ -140,10 +124,8 @@ export async function settlePayout(reference: string, success: boolean, failureR
   );
 }
 
-/** Poll the provider for payouts that have sat in `processing` too long (reconciliation job). */
+/** Poll Bachs for payouts that have sat in `processing` too long (reconciliation job). */
 export async function reconcileStalePayouts(): Promise<void> {
-  if (!(await isDisbursementConfigured())) return;
-
   const staleThreshold = new Date(Date.now() - STALE_PAYOUT_AFTER_MS);
   const stale = await db.payout.findMany({
     where: { status: 'processing', requestedAt: { lte: staleThreshold } },
@@ -151,13 +133,56 @@ export async function reconcileStalePayouts(): Promise<void> {
   });
 
   for (const payout of stale) {
+    const space = await db.space.findUnique({ where: { id: payout.spaceId }, select: { bachsAccountId: true } });
+    if (!space?.bachsAccountId) continue;
+
     try {
-      const status = await getDisbursementStatus(payout.reference);
+      const status = await getWithdrawal(space.bachsAccountId, payout.reference);
       if (!status) continue;
-      if (status.status === 'SUCCESS') await settlePayout(payout.reference, true);
-      else if (status.status === 'FAILED') await settlePayout(payout.reference, false);
+      if (status.status === 'COMPLETED') await settlePayout(payout.reference, true);
+      else if (status.status === 'FAILED' || status.status === 'REJECTED') await settlePayout(payout.reference, false);
     } catch (err) {
       console.error(`[payout] reconciliation failed for ${payout.reference}:`, err);
+    }
+  }
+}
+
+/**
+ * The split — transfers each cleared DuePayment's face amount into its
+ * department's Bachs connected-account balance, replacing the old at-charge
+ * subaccount split. Fires once the same 24h clearing window today's payout
+ * balance used to gate on has passed; on INSUFFICIENT_BALANCE (settlement
+ * lag) it's simply left for the next sweep tick.
+ */
+export async function sweepSettledDuePayments(): Promise<void> {
+  const clearedThreshold = new Date(Date.now() - CLEARING_WINDOW_MS);
+  const pending = await db.duePayment.findMany({
+    where: { paidAt: { lte: clearedThreshold }, transferredAt: null },
+    include: { due: { include: { space: { select: { bachsAccountId: true } } } } },
+    take: 50,
+  });
+
+  for (const payment of pending) {
+    const accountId = payment.due.space.bachsAccountId;
+    if (!accountId) continue; // department hasn't onboarded yet — leave for the next tick
+
+    try {
+      const transfer = await createTransfer(
+        {
+          destinationAccountId: accountId,
+          amountKobo: payment.netToSpace,
+          transferGroup: payment.reference,
+          description: `Payment for "${payment.due.title}"`,
+        },
+        `SPLIT-${payment.reference}`,
+      );
+      await db.duePayment.update({
+        where: { id: payment.id },
+        data: { transferredAt: new Date(), splitTransferId: transfer.id },
+      });
+    } catch (err) {
+      if (err instanceof BachsApiError && err.code === 'INSUFFICIENT_BALANCE') continue;
+      console.error(`[payout] split-transfer failed for ${payment.reference}:`, err);
     }
   }
 }

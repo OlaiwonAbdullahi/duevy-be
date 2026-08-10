@@ -4,7 +4,6 @@ import {
   type User,
   type SpaceAuditLog,
   type Transaction,
-  type Card,
   type Payout,
   type BankAccount,
   type Notification,
@@ -38,17 +37,6 @@ export function serializeTransaction(t: Transaction) {
     status: t.status,
     reference: t.reference,
     createdAt: t.createdAt.toISOString(),
-  };
-}
-
-/** The `Card` payment-method resource (§8.3). */
-export function serializeCard(c: Card) {
-  return {
-    id: c.id,
-    brand: c.brand,
-    last4: c.last4,
-    expiry: c.expiry,
-    isDefault: c.isDefault,
   };
 }
 

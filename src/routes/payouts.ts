@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
+import multer from 'multer';
 import { type RepRole, type PayoutStatus } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
@@ -10,21 +11,34 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccountName, createSubaccount, updateSubaccount, getActiveGatewayName } from '../lib/paymentGateway';
-import { generatePayoutReference, PLATFORM_PERCENTAGE_CHARGE } from '../lib/money';
+import { getBanksForAccount, resolveAccountName, createPayoutDestination } from '../lib/bachs';
+import { generatePayoutReference } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
 import { castPayoutApproval, getApprovalStatus } from '../services/payoutApproval.service';
+import { initiatePayoutDisbursement } from '../services/payout.service';
+import {
+  ensureConnectedAccount,
+  getOnboardingChecklist,
+  uploadOnboardingDocument,
+  submitOnboarding,
+  getOnboardingIdentityMethods,
+  submitOnboardingNin,
+  getOnboardingIdentityStatus,
+  NoConnectedAccountError,
+} from '../services/connectAccount.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
 payoutsRouter.use(requireSpaceRep());
 
-const CLEARING_WINDOW_MS = 24 * 60 * 60 * 1000; // funds clear 24h after payment
 const ACCOUNT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h hold after an account change
 // A payout awaiting votes already reserves its funds, same as one that's
 // processing/completed — otherwise a second concurrent request could see
 // the same money as still "available" while the first is mid-approval.
+// `pending_approval` no longer occurs going forward (quorum bypassed for
+// MVP — see POST /payout/request below) but is kept here so any lingering
+// historical row still reserves correctly.
 const RESERVED_STATUSES: PayoutStatus[] = ['pending_approval', 'processing', 'completed'];
 
 function uid(req: Request): string {
@@ -50,15 +64,24 @@ async function uniquePayoutReference(): Promise<string> {
   return reference;
 }
 
+function handleConnectAccountError(res: Response, err: unknown): boolean {
+  if (err instanceof NoConnectedAccountError) {
+    errors.conflict(res, 'NO_CONNECTED_ACCOUNT', err.message);
+    return true;
+  }
+  return false;
+}
+
 /**
  * Payout balances, all net of the 3% charge (fees are taken at collection).
- *  available = cleared collections − (reserved payouts)
- *  pending   = collections still inside the clearing window
+ *  available = cleared collections (already transferred into this space's own
+ *              Bachs connected-account balance — see sweepSettledDuePayments())
+ *              − reserved payouts
+ *  pending   = collections not yet transferred
  *  lifetime  = total ever completed
  * Pass `dueId` to scope every figure to a single due's own payments/payouts.
  */
 async function computeBalances(sid: string, dueId?: string) {
-  const clearedThreshold = new Date(Date.now() - CLEARING_WINDOW_MS);
   const paymentWhere = dueId ? { due: { spaceId: sid }, dueId } : { due: { spaceId: sid } };
   const payoutWhere = dueId
     ? { spaceId: sid, dueId, status: { in: RESERVED_STATUSES } }
@@ -68,8 +91,8 @@ async function computeBalances(sid: string, dueId?: string) {
     : { spaceId: sid, status: 'completed' as const };
 
   const [cleared, pending, reserved, lifetime] = await Promise.all([
-    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { lte: clearedThreshold } }, _sum: { netToSpace: true } }),
-    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { gt: clearedThreshold } }, _sum: { netToSpace: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, transferredAt: { not: null } }, _sum: { netToSpace: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, transferredAt: null }, _sum: { netToSpace: true } }),
     db.payout.aggregate({ where: payoutWhere, _sum: { amount: true } }),
     db.payout.aggregate({ where: lifetimeWhere, _sum: { amount: true } }),
   ]);
@@ -115,14 +138,14 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
   const [totals, dueCount, byDueRaw] = await Promise.all([
     db.duePayment.aggregate({
       where: { due: { spaceId: sid }, ...paymentWhere },
-      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
       _count: { _all: true },
     }),
     db.due.count({ where: { spaceId: sid, payments: { some: paymentWhere } } }),
     db.duePayment.groupBy({
       by: ['dueId'],
       where: { due: { spaceId: sid }, ...paymentWhere },
-      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
       _count: { _all: true },
       orderBy: { _sum: { netToSpace: 'desc' } },
       skip,
@@ -142,7 +165,7 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
     category: dueById.get(d.dueId)?.category ?? null,
     paidCount: d._count._all,
     collected: d._sum.amountPaid ?? 0,
-    fees: (d._sum.monnifyFee ?? 0) + (d._sum.duevyFee ?? 0),
+    fees: (d._sum.processingFee ?? 0) + (d._sum.duevyFee ?? 0),
     net: d._sum.netToSpace ?? 0,
   }));
 
@@ -151,7 +174,7 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
     {
       totals: {
         collected: totals._sum.amountPaid ?? 0,
-        fees: (totals._sum.monnifyFee ?? 0) + (totals._sum.duevyFee ?? 0),
+        fees: (totals._sum.processingFee ?? 0) + (totals._sum.duevyFee ?? 0),
         net: totals._sum.netToSpace ?? 0,
         paidCount: totals._count._all,
       },
@@ -175,8 +198,9 @@ payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promis
 });
 
 // ---------------------------------------------------------------------------
-// Shared bank + account-name resolution (§10.2) — name-enquiry is authoritative
-// and mandatory; the account name is always server-resolved, never client-supplied.
+// Shared bank + account-name resolution (§10.2) — scoped to the space's own
+// Bachs connected account; name-enquiry is authoritative and mandatory, the
+// account name is always server-resolved, never client-supplied.
 // ---------------------------------------------------------------------------
 const accountLookupSchema = z.object({
   bankCode: z.string().min(3),
@@ -185,12 +209,12 @@ const accountLookupSchema = z.object({
 
 type ResolvedAccount = { bankName: string; accountName: string } | { error: 'UNKNOWN_BANK' | 'UNVERIFIABLE' };
 
-async function resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount> {
-  const banks = await getBanks();
+async function resolveBankDetails(accountId: string, bankCode: string, accountNumber: string): Promise<ResolvedAccount> {
+  const banks = await getBanksForAccount(accountId);
   const bankName = banks.find((b) => b.code === bankCode)?.name;
   if (!bankName) return { error: 'UNKNOWN_BANK' };
 
-  const accountName = await verifyAccountName(accountNumber, bankCode);
+  const accountName = await resolveAccountName(accountId, accountNumber, bankCode);
   if (!accountName) return { error: 'UNVERIFIABLE' };
 
   return { bankName, accountName };
@@ -206,18 +230,28 @@ function failResolution(res: Response, resolved: { error: 'UNKNOWN_BANK' | 'UNVE
 
 // ---------------------------------------------------------------------------
 // POST /payout/account/lookup (§10.2) — preview the resolved account name
-// before saving it, mirroring the join-code lookup pattern (§4.3).
+// before saving it, mirroring the join-code lookup pattern (§4.3). Ensures
+// the space has a Bachs connected account first (harmless, no financial
+// commitment — just a contact-email registration) since bank lookup is
+// scoped per connected account under Bachs.
 // ---------------------------------------------------------------------------
 payoutsRouter.post('/payout/account/lookup', validate(accountLookupSchema), async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
   const { bankCode, accountNumber } = req.body as z.infer<typeof accountLookupSchema>;
 
-  const resolved = await resolveAccount(bankCode, accountNumber);
-  if ('error' in resolved) {
-    failResolution(res, resolved);
-    return;
+  const actorUser = await db.user.findUnique({ where: { id: uid(req) }, select: { email: true } });
+  try {
+    const accountId = await ensureConnectedAccount(sid, actorUser?.email ?? '');
+    const resolved = await resolveBankDetails(accountId, bankCode, accountNumber);
+    if ('error' in resolved) {
+      failResolution(res, resolved);
+      return;
+    }
+    ok(res, { bankCode, bankName: resolved.bankName, accountNumber, accountName: resolved.accountName });
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
   }
-
-  ok(res, { bankCode, bankName: resolved.bankName, accountNumber, accountName: resolved.accountName });
 });
 
 // ---------------------------------------------------------------------------
@@ -229,14 +263,19 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const sid = spaceId(req);
   const { bankCode, accountNumber } = req.body as z.infer<typeof putAccountSchema>;
 
-  const resolved = await resolveAccount(bankCode, accountNumber);
+  const [space, actorUser] = await Promise.all([
+    db.space.findUnique({ where: { id: sid }, select: { name: true, bachsPayoutDestinationId: true } }),
+    db.user.findUnique({ where: { id: uid(req) }, select: { email: true } }),
+  ]);
+
+  const accountId = await ensureConnectedAccount(sid, actorUser?.email ?? '');
+  const resolved = await resolveBankDetails(accountId, bankCode, accountNumber);
   if ('error' in resolved) {
     failResolution(res, resolved);
     return;
   }
   const { bankName, accountName: finalName } = resolved;
 
-  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, paystackSubaccountCode: true, subaccountGateway: true } });
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =
     !!existing && (decrypt(existing.accountNumber) !== accountNumber || existing.bankCode !== bankCode);
@@ -244,50 +283,24 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const masked = maskAccountNumber(accountNumber);
   const cooldownUntil = changed ? new Date(Date.now() + ACCOUNT_COOLDOWN_MS) : existing?.cooldownUntil ?? null;
 
-  // Resolved fresh via the active gateway's own bank list above, so it's
-  // current as of right now — tag it so resolveActiveBankCode() can skip
-  // re-resolving until the active gateway actually changes again.
-  const bankCodeGateway = await getActiveGatewayName();
-
-  // Create or update this space's subaccount for the *currently active*
-  // gateway, as one step with saving the bank account — a rep shouldn't have
-  // to complete two separate "where my money goes" flows. Subaccount codes
-  // are gateway-specific (a Paystack ACCT_... code means nothing to Monnify),
-  // so a stored code only counts as reusable if it belongs to this gateway —
-  // see resolveActiveSubaccountCode() for the read-side of this same rule.
-  let subaccountCode = space?.subaccountGateway === bankCodeGateway ? space.paystackSubaccountCode : null;
-  let subaccountGateway = space?.subaccountGateway ?? null;
-  try {
-    if (!subaccountCode) {
-      const created = await createSubaccount({
-        businessName: space?.name ?? finalName,
-        bankCode,
-        accountNumber,
-        percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
-      });
-      subaccountCode = created.subaccountCode;
-      subaccountGateway = bankCodeGateway;
-    } else if (changed) {
-      await updateSubaccount(subaccountCode, { bankCode, accountNumber });
+  // Bachs has no documented "update destination" endpoint — a changed bank
+  // detail always registers a fresh payout destination rather than mutating
+  // the old one. Best-effort: a failure here shouldn't block saving the bank
+  // account itself; leave whatever destination id was previously stored.
+  let payoutDestinationId = space?.bachsPayoutDestinationId ?? null;
+  if (!payoutDestinationId || changed) {
+    try {
+      const destination = await createPayoutDestination(accountId, { bankCode, accountNumber, accountName: finalName });
+      payoutDestinationId = destination.id;
+    } catch (err) {
+      console.error(`[payouts] payout-destination create failed for space ${sid}:`, err);
     }
-  } catch (err) {
-    // Best-effort: a gateway that isn't set up for subaccounts yet (e.g.
-    // Monnify's sub-account API requires activation from Monnify support
-    // before it can be used at all) shouldn't block saving the bank account
-    // itself — payments simply fall back to routing through Duevy's main
-    // account until a subaccount exists for this gateway. Leave whatever was
-    // previously stored untouched rather than clobbering it with null, so a
-    // working code from a *different* gateway survives a failed attempt here.
-    console.error(`[payouts] subaccount create/update failed for space ${sid}:`, err);
-    subaccountCode = space?.paystackSubaccountCode ?? null;
-    subaccountGateway = space?.subaccountGateway ?? null;
   }
 
   const account = await db.bankAccount.upsert({
     where: { spaceId: sid },
     update: {
       bankCode,
-      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,
@@ -297,7 +310,6 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     create: {
       spaceId: sid,
       bankCode,
-      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,
@@ -305,7 +317,7 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     },
   });
 
-  await db.space.update({ where: { id: sid }, data: { paystackSubaccountCode: subaccountCode, subaccountGateway } });
+  await db.space.update({ where: { id: sid }, data: { bachsPayoutDestinationId: payoutDestinationId } });
 
   // Security notice to all reps when an existing account is changed.
   if (changed) {
@@ -334,7 +346,123 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
 });
 
 // ---------------------------------------------------------------------------
-// POST /payout/request (§10.3) — Idempotency-Key required
+// In-app Bachs onboarding (Tasks/checklist/uploads/submit + identity) — no
+// redirect to a Bachs-hosted page; the frontend renders its own form off
+// these proxies.
+// ---------------------------------------------------------------------------
+
+payoutsRouter.get('/payout/onboarding/checklist', async (req: Request, res: Response): Promise<void> => {
+  try {
+    ok(res, await getOnboardingChecklist(spaceId(req)));
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
+  }
+});
+
+const onboardingUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+}).single('file');
+
+payoutsRouter.post('/payout/onboarding/documents', (req: Request, res: Response): void => {
+  onboardingUpload(req, res, async (err: unknown) => {
+    if (err instanceof multer.MulterError) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the 10 MB limit' : err.message;
+      fail(res, 400, 'VALIDATION_ERROR', msg, [{ field: 'file', issue: msg }]);
+      return;
+    }
+    if (err) {
+      fail(res, 400, 'VALIDATION_ERROR', 'Upload failed');
+      return;
+    }
+    if (!req.file) {
+      errors.validation(res, [{ field: 'file', issue: 'file is required' }]);
+      return;
+    }
+    const scope = typeof req.body?.scope === 'string' ? req.body.scope : 'document';
+    try {
+      const result = await uploadOnboardingDocument(
+        spaceId(req),
+        { buffer: req.file.buffer, filename: req.file.originalname, mimetype: req.file.mimetype },
+        scope,
+      );
+      ok(res, result);
+    } catch (e) {
+      if (handleConnectAccountError(res, e)) return;
+      throw e;
+    }
+  });
+});
+
+const submitOnboardingSchema = z.object({
+  draft: z.boolean().default(false),
+  data: z.record(z.unknown()),
+});
+
+payoutsRouter.post('/payout/onboarding/submit', validate(submitOnboardingSchema), async (req: Request, res: Response): Promise<void> => {
+  const { draft, data } = req.body as z.infer<typeof submitOnboardingSchema>;
+  try {
+    ok(res, await submitOnboarding(spaceId(req), data, draft));
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
+  }
+});
+
+payoutsRouter.get('/payout/onboarding/identity/methods', async (req: Request, res: Response): Promise<void> => {
+  try {
+    ok(res, await getOnboardingIdentityMethods(spaceId(req)));
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
+  }
+});
+
+const ninSchema = z.object({
+  nin: z.string().min(10).max(11),
+  consent: z.literal(true),
+  selfie: z.string().optional(),
+});
+
+payoutsRouter.post('/payout/onboarding/identity/nin', validate(ninSchema), async (req: Request, res: Response): Promise<void> => {
+  const { nin, consent, selfie } = req.body as z.infer<typeof ninSchema>;
+  try {
+    ok(res, await submitOnboardingNin(spaceId(req), nin, consent, selfie));
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
+  }
+});
+
+payoutsRouter.get('/payout/onboarding/identity/status', async (req: Request, res: Response): Promise<void> => {
+  try {
+    ok(res, await getOnboardingIdentityStatus(spaceId(req)));
+  } catch (err) {
+    if (handleConnectAccountError(res, err)) return;
+    throw err;
+  }
+});
+
+// Simple status badge off the webhook-populated Space row, without re-fetching the full checklist.
+payoutsRouter.get('/payout/onboarding-status', async (req: Request, res: Response): Promise<void> => {
+  const space = await db.space.findUnique({
+    where: { id: spaceId(req) },
+    select: { bachsSetupStatus: true, bachsTransfersActive: true, bachsPayoutsActive: true },
+  });
+  ok(res, {
+    setupStatus: space?.bachsSetupStatus ?? 'incomplete',
+    transfersActive: space?.bachsTransfersActive ?? false,
+    payoutsActive: space?.bachsPayoutsActive ?? false,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /payout/request (§10.3) — Idempotency-Key required. Quorum bypassed
+// for MVP (see plan) — disburses immediately rather than waiting on
+// castPayoutApproval(); re-enabling quorum later is routing this back
+// through that function instead of calling initiatePayoutDisbursement()
+// directly.
 // ---------------------------------------------------------------------------
 const requestSchema = z.object({
   amount: z.number().int().positive(),
@@ -379,15 +507,14 @@ payoutsRouter.post(
 
     const payout = await db.$transaction(async (tx) => {
       const created = await tx.payout.create({
-        data: { spaceId: sid, amount, reference, status: 'pending_approval', accountMasked, note, requestedById: uid(req) },
+        data: { spaceId: sid, amount, reference, status: 'processing', accountMasked, note, requestedById: uid(req) },
       });
       await writeAudit(sid, actorInfo, 'payout_requested', `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout`, tx);
       return created;
     });
 
-    // The requester's own request counts as an implicit "yes" vote — a
-    // solo-rep space (no co-reps) reaches 70% immediately, same as before.
-    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
+    const final = (await db.payout.findUnique({ where: { id: payout.id } }))!;
     ok(res, serializePayout(final), 201);
   },
 );
@@ -407,7 +534,8 @@ payoutsRouter.get('/dues/:dueId/payout/summary', async (req: Request, res: Respo
 
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/payout/request — the lead, or the due's assigned co-rep,
-// can request a payout scoped to just that due's collected funds.
+// can request a payout scoped to just that due's collected funds. Quorum
+// bypassed for MVP, same as the space-wide request above.
 // ---------------------------------------------------------------------------
 payoutsRouter.post(
   '/dues/:dueId/payout/request',
@@ -467,7 +595,7 @@ payoutsRouter.post(
           dueId: due.id,
           amount,
           reference,
-          status: 'pending_approval',
+          status: 'processing',
           accountMasked,
           note,
           requestedById: uid(req),
@@ -483,13 +611,16 @@ payoutsRouter.post(
       return created;
     });
 
-    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
+    const final = (await db.payout.findUnique({ where: { id: payout.id } }))!;
     ok(res, serializePayout(final), 201);
   },
 );
 
 // ---------------------------------------------------------------------------
-// POST /payout/{payoutId}/approve — any rep casts/changes their vote
+// POST /payout/{payoutId}/approve — dormant for MVP (payouts no longer land
+// in `pending_approval`, see POST /payout/request above), kept in place so
+// re-enabling quorum later is a small flip rather than a rebuild.
 // ---------------------------------------------------------------------------
 const approveSchema = z.object({ decision: z.enum(['approved', 'rejected']) });
 

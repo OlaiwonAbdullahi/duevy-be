@@ -1,15 +1,15 @@
 import { db } from '../config/db';
-import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
+import { getCheckoutSession } from '../lib/bachs';
 import { fulfilByReference } from '../services/payment.service';
-import { reconcileStalePayouts } from '../services/payout.service';
+import { reconcileStalePayouts, sweepSettledDuePayments } from '../services/payout.service';
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // §15.1 — check with the provider after 15 minutes
 const GIVE_UP_AFTER_MS = 48 * 60 * 60 * 1000; // stop polling an unresolvable reference after 48h
 
 /**
- * Resolve hosted-checkout payments (top-ups, due payments, paid votes) whose
- * webhook never arrived. Runs alongside the webhook, not instead of it — the
- * webhook is the fast path, this is the self-healing fallback (§15.1, §6.4).
+ * Resolve checkout payments (due payments, paid votes) whose webhook never
+ * arrived. Runs alongside the webhook, not instead of it — the webhook is
+ * the fast path, this is the self-healing fallback (§15.1, §6.4).
  */
 export async function reconcilePendingPayments(): Promise<void> {
   const staleThreshold = new Date(Date.now() - STALE_AFTER_MS);
@@ -22,19 +22,16 @@ export async function reconcilePendingPayments(): Promise<void> {
 
   for (const p of pending) {
     try {
-      // See transactions.ts's identical dispatch for why: due_payment/poll_vote
-      // always go through createInvoice(), which needs Monnify's dedicated
-      // invoice-status endpoint rather than the plain transaction one.
-      const status = p.type === 'card_save' ? await getTransactionStatus(p.reference) : await getInvoiceStatus(p.reference);
+      const status = await getCheckoutSession(p.reference);
       if (!status) {
         if (p.createdAt <= giveUpThreshold) {
           await fulfilByReference(p.reference, false);
         }
         continue;
       }
-      if (status.paymentStatus === 'PAID') {
+      if (status.status === 'PAID') {
         await fulfilByReference(p.reference, true);
-      } else if (['FAILED', 'CANCELLED', 'EXPIRED'].includes(status.paymentStatus)) {
+      } else if (['FAILED', 'CANCELLED', 'EXPIRED'].includes(status.status)) {
         await fulfilByReference(p.reference, false);
       }
       // Still pending upstream — leave it for the next tick.
@@ -46,6 +43,7 @@ export async function reconcilePendingPayments(): Promise<void> {
 
 async function runOnce(): Promise<void> {
   await reconcilePendingPayments().catch((err) => console.error('[reconciliation] pending payments run failed:', err));
+  await sweepSettledDuePayments().catch((err) => console.error('[reconciliation] split-transfer sweep failed:', err));
   await reconcileStalePayouts().catch((err) => console.error('[reconciliation] payouts run failed:', err));
 }
 

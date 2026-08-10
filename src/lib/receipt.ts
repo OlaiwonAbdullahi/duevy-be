@@ -7,7 +7,7 @@ interface ReceiptData {
   spaceName: string;
   payerName: string;
   amountPaid: number;
-  monnifyFee: number;
+  processingFee: number;
   duevyFee: number;
   netToSpace: number;
   paidAt: Date;
@@ -60,7 +60,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
     row('Date', d.paidAt.toISOString());
     row('Method', d.method);
     row('Due amount', formatNaira(d.netToSpace));
-    row('Processing fee (3%)', formatNaira(d.monnifyFee + d.duevyFee));
+    row('Processing fee (3%)', formatNaira(d.processingFee + d.duevyFee));
     row('Total paid', formatNaira(d.amountPaid));
 
     doc.moveDown(1);
@@ -68,7 +68,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
       .fontSize(9)
       .fillColor(muted)
       .text(
-        `Processing fee breakdown: Monnify ${formatNaira(d.monnifyFee)} · Duevy ${formatNaira(d.duevyFee)}. ` +
+        `Processing fee breakdown: processing ${formatNaira(d.processingFee)} · Duevy ${formatNaira(d.duevyFee)}. ` +
           `The department receives the full ${formatNaira(d.netToSpace)}.`,
       );
 

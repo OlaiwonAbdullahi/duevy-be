@@ -88,11 +88,6 @@ enum PayMethod {
   online
 }
 
-enum PaymentGatewayName {
-  paystack
-  monnify
-}
-
 enum TxnType {
   due
   topup
@@ -120,6 +115,18 @@ enum PayoutStatus {
 enum PayoutApprovalDecision {
   approved
   rejected
+}
+
+enum LedgerEntryType {
+  due_payment
+  refund
+  payout
+  manual_credit
+}
+
+enum LedgerDirection {
+  credit
+  debit
 }
 
 enum PollStatus {
@@ -281,7 +288,6 @@ model User {
   spaceJoinRequests     SpaceJoinRequest[]
   duePayments           DuePayment[]
   transactions          Transaction[]
-  cards                 Card[]
   notifications         Notification[]
   pollVotes             PollVote[]
   referralsMade         Referral[]           @relation("referrer")
@@ -380,18 +386,17 @@ model Space {
   archivedReason String?
   payoutsFrozen  Boolean     @default(false)
   frozenReason   String?
-  // Subaccount reps settle into directly at charge time (payment architecture
-  // migration — see PUT /payout/account, which creates/updates this alongside
-  // the BankAccount it's derived from). Null until a bank account has been
-  // resolved and the subaccount created. Subaccount codes are gateway-specific
-  // (a Paystack ACCT_... code means nothing to Monnify and vice versa) —
-  // subaccountGateway records which gateway this code belongs to, mirroring
-  // BankAccount.bankCodeGateway. If it doesn't match the currently active
-  // gateway, treat as if no subaccount exists (safe fallback: the payment
-  // routes to Duevy's main account instead of erroring) rather than sending a
-  // stale code to a provider that's never heard of it.
-  paystackSubaccountCode String? @unique
-  subaccountGateway      PaymentGatewayName?
+  // Bachs connected account this department onboards into (see
+  // ensureConnectedAccount() / PUT /payout/account) — null until the space's
+  // first bank-account save creates one. transfersActive/payoutsActive are
+  // driven only by `capability.updated` webhooks, never assumed sticky — a
+  // capability can move back to `restricted`, and every money-moving call
+  // re-checks the live value rather than trusting these cached flags.
+  bachsAccountId            String?  @unique
+  bachsSetupStatus          String?  // incomplete | awaiting_review | complete
+  bachsTransfersActive      Boolean  @default(false)
+  bachsPayoutsActive        Boolean  @default(false)
+  bachsPayoutDestinationId  String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -405,6 +410,7 @@ model Space {
   polls          Poll[]
   auditLogs      SpaceAuditLog[]
   repApplication RepApplication?
+  ledgerEntries  LedgerEntry[]
 
   @@map("spaces")
 }
@@ -519,6 +525,7 @@ model Due {
   payments    DuePayment[]
   payouts     Payout[]
   assignedRep User?        @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
+  ledgerEntries LedgerEntry[]
 
   @@index([spaceId])
   @@index([assignedRepId])
@@ -533,13 +540,19 @@ model DuePayment {
   paidAt      DateTime  @default(now())
   reference   String    @unique
   amountPaid  Int       // kobo — face value (= due.amount)
-  monnifyFee  Int       // kobo — 1.5% of amountPaid
+  processingFee Int     // kobo — 1.5% of amountPaid
   duevyFee    Int       // kobo — 1.5% of amountPaid
-  netToSpace  Int       // kobo — amountPaid - monnifyFee - duevyFee
+  netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee
+  // Set once the split-transfer sweep has moved netToSpace into the space's
+  // Bachs connected-account balance (see sweepSettledDuePayments()) — the
+  // gate computeBalances() uses for "available to pay out", not just time.
+  transferredAt   DateTime?
+  splitTransferId String?   // tr_... from Bachs
 
   user        User        @relation(fields: [userId], references: [id])
   due         Due         @relation(fields: [dueId], references: [id])
   transaction Transaction? @relation(fields: [txnId], references: [id])
+  ledgerEntries LedgerEntry[]
 
   @@unique([userId, dueId])
   @@index([dueId])
@@ -547,24 +560,8 @@ model DuePayment {
 }
 
 // ---------------------------------------------------------------------------
-// Wallet, Cards & Transactions
+// Wallet & Transactions
 // ---------------------------------------------------------------------------
-
-model Card {
-  id            String  @id @default(cuid())
-  userId        String
-  providerToken String  @unique
-  brand         String  // Visa | Mastercard | Verve
-  last4         String
-  expiry        String  // MM/YY
-  isDefault     Boolean @default(false)
-  createdAt     DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@map("cards")
-}
 
 model Transaction {
   id            String    @id @default(cuid())
@@ -573,7 +570,7 @@ model Transaction {
   title         String
   detail        String?
   amount        Int       // kobo, signed
-  method        String    // "Wallet" | "Visa •••• 4242" | "Monnify"
+  method        String    // "Wallet" | "Bachs"
   status        TxnStatus @default(pending)
   reference     String    @unique
   spaceId       String?
@@ -585,6 +582,7 @@ model Transaction {
   duePayment DuePayment?
   refundOf   Transaction?  @relation("TransactionRefunds", fields: [refundOfTxnId], references: [id])
   refunds    Transaction[] @relation("TransactionRefunds")
+  ledgerEntries LedgerEntry[]
 
   @@index([userId, createdAt])
   @@index([refundOfTxnId])
@@ -613,11 +611,6 @@ model BankAccount {
   id              String   @id @default(cuid())
   spaceId         String   @unique
   bankCode        String
-  // Bank codes are gateway-specific (Monnify and Paystack number the same
-  // bank differently) — this records which gateway's scheme `bankCode`
-  // currently matches, so a gateway switch can be detected and the code
-  // re-resolved on demand rather than silently misrouting a disbursement.
-  bankCodeGateway PaymentGatewayName?
   bankName        String
   accountNumber   String   // stored encrypted
   accountNumberMasked String // "•••• 4021"
@@ -650,6 +643,7 @@ model Payout {
   due         Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
   requestedBy User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
   approvals   PayoutApproval[]
+  ledgerEntries LedgerEntry[]
 
   @@index([spaceId])
   @@index([dueId])
@@ -669,6 +663,42 @@ model PayoutApproval {
   @@unique([payoutId, repUserId])
   @@index([payoutId])
   @@map("payout_approvals")
+}
+
+// Append-only double-entry ledger — the audit-grade source of truth for every
+// kobo that moves. Additive to DuePayment's fee columns (kept as the
+// fast-read summary), written alongside the existing Transaction/DuePayment
+// writes at each money-movement site. No .update()/.delete() call on this
+// model exists anywhere in application code — same discipline already relied
+// on for SpaceAuditLog/AdminAuditLog.
+model LedgerEntry {
+  id           String          @id @default(cuid())
+  spaceId      String
+  dueId        String?
+  txnId        String?
+  duePaymentId String?
+  payoutId     String?
+  type         LedgerEntryType
+  direction    LedgerDirection
+  amountKobo   Int             // always positive; direction gives the sign
+  grossKobo    Int?
+  feeKobo      Int?
+  netKobo      Int?
+  reference    String          // Transaction.reference / Payout.reference — traceability
+  description  String
+  actorId      String?         // set for refund / manual_credit (the admin who acted)
+  createdAt    DateTime        @default(now())
+
+  space      Space       @relation(fields: [spaceId], references: [id])
+  due        Due?        @relation(fields: [dueId], references: [id])
+  txn        Transaction? @relation(fields: [txnId], references: [id])
+  duePayment DuePayment? @relation(fields: [duePaymentId], references: [id])
+  payout     Payout?     @relation(fields: [payoutId], references: [id])
+
+  @@index([spaceId, createdAt])
+  @@index([dueId])
+  @@index([reference])
+  @@map("ledger_entries")
 }
 
 // ---------------------------------------------------------------------------
@@ -874,19 +904,6 @@ model AdminAuditLog {
   @@index([actorId])
   @@index([createdAt])
   @@map("admin_audit_logs")
-}
-
-// Single settings row, runtime-editable by a super_admin (§ admin payment
-// gateway switch) so moving between Paystack/Monnify never needs a redeploy.
-// PAYMENT_GATEWAY in env is only the fallback used to seed this row and for
-// when it doesn't exist yet — see src/lib/paymentGateway.ts.
-model AppSettings {
-  id                   String             @id @default("singleton")
-  activePaymentGateway PaymentGatewayName @default(paystack)
-  updatedAt            DateTime           @updatedAt
-  updatedBy            String?
-
-  @@map("app_settings")
 }
 
 model ReferralFlag {
