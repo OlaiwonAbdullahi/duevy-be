@@ -55,6 +55,14 @@ export function serializePayout(p: Payout) {
     cancelledAt: p.cancelledAt?.toISOString() ?? null,
     settledAt: p.settledAt?.toISOString() ?? null,
     failureReason: p.failureReason,
+    // The fee breakdown (PRD §7.3). `amount` is the gross debit against the
+    // space's balance; `netSent` is what actually reaches the rep's bank, and is
+    // the figure to show as "amount received". The rep-facing "₦100 flat" is
+    // Duevy's margin plus Anchor's NIP fee, so they are surfaced as one line;
+    // stamp duty stays separate because it is a statutory charge, not ours.
+    duevyFee: p.duevyFeeKobo + p.anchorFeeKobo,
+    stampDuty: p.stampDutyKobo,
+    netSent: p.netSentKobo,
   };
 }
 

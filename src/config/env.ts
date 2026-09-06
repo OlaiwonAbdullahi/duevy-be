@@ -25,11 +25,26 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Bachs Connect (bachs.io) — the sole payment processor. See src/lib/bachs.ts.
-  BACHS_SECRET_KEY: z.string(),
-  BACHS_BASE_URL: z.string().url().default('https://sandbox-api.bachs.io'),
-  // HMAC secret for verifying POST /webhooks/bachs signatures.
-  BACHS_WEBHOOK_SECRET: z.string(),
+  // Anchor (getanchor.co) — the sole payment processor. See src/lib/anchor.ts.
+  ANCHOR_SECRET_KEY: z.string(),
+  ANCHOR_BASE_URL: z.string().url().default('https://api.sandbox.getanchor.co'),
+  // Webhook token for verifying POST /webhooks/anchor signatures. Anchor caps
+  // the token it will accept at 10 characters, so a longer secret can never be
+  // registered with them and would fail every signature check.
+  ANCHOR_WEBHOOK_SECRET: z.string().min(1).max(10),
+  // Duevy Labs' own Anchor deposit account — where the 2% service charge is
+  // swept to (see sweepServiceCharges() in payout.service.ts).
+  ANCHOR_REVENUE_ACCOUNT_ID: z.string(),
+  // How long a checkout's virtual account stays open. PRD §5.2 puts this at 30
+  // minutes; the countdown the payer sees is driven by the value Anchor echoes
+  // back, not by this.
+  // Which bank issues the checkout account number. Anchor picks one if unset,
+  // but the student sees this bank's name on the transfer screen, so pinning a
+  // recognisable one (providus, wema) is worth doing.
+  ANCHOR_VA_PROVIDER: z
+    .enum(['wema', 'providus', 'gtb', 'ninepsb', 'corestep', 'column', 'circle', 'anchor'])
+    .optional(),
+  ANCHOR_VA_EXPIRY_SECONDS: z.coerce.number().int().positive().default(1800),
 
   // App
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),

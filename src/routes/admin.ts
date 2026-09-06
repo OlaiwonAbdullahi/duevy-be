@@ -732,11 +732,11 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
     return;
   }
 
-  // Refunding a platform-collected Bachs charge isn't yet supported — nothing
-  // in the Bachs Connect skill covers reversing a checkout session, so this
-  // is stubbed rather than guessed at for real money (see the plan's
-  // decision to stub refunds instead of an unverified endpoint). Process the
-  // reversal manually with the payer for now.
+  // Refunds stay manual for the MVP (PRD §9.4). Anchor makes an automated
+  // refund genuinely buildable — it would be a NIPTransfer from the space's
+  // deposit account back to the payer — but it needs the payer's bank details,
+  // which we never collect, and a balance check so Duevy never fronts the
+  // money. The admin issues it as a manual transfer and records it here.
   fail(res, 501, 'REFUND_NOT_SUPPORTED', 'Refunds are not yet supported — process manually with the payer for now');
 });
 
@@ -1235,6 +1235,6 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.status(200).send(body);
 });
 
-// Bachs is the sole, non-switchable payment provider — the admin gateway-
+// Anchor is the sole, non-switchable payment provider — the admin gateway-
 // switch endpoints that used to live here (GET/PUT /settings/payment-gateway)
 // are gone along with Paystack/Monnify.

@@ -7,8 +7,7 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { getCheckoutSession } from '../lib/bachs';
-import { fulfilByReference } from '../services/payment.service';
+import { pollInflow } from '../services/payment.service';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -130,21 +129,14 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
     return;
   }
 
-  // "I've made payment" tap (§ in-app invoice flow) — actively check with the
-  // gateway instead of just reading our own possibly-stale DB row, so the UI
-  // can reflect success without waiting on the webhook round-trip. The
-  // webhook remains the actual source of truth; fulfilByReference is
-  // idempotent, so this racing with the webhook is safe by construction.
+  // Actively check with Anchor rather than only reading our own possibly-stale
+  // row, so the payer's screen can flip to success without waiting on the
+  // webhook round-trip. The webhook remains the source of truth;
+  // fulfilByReference is idempotent, so racing it is safe by construction.
   if (pending.status === 'pending') {
     try {
-      const live = await getCheckoutSession(reference);
-      if (live?.status === 'PAID') {
-        await fulfilByReference(reference, true);
-        pending = await db.pendingPayment.findUnique({ where: { reference } });
-      } else if (live && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(live.status)) {
-        await fulfilByReference(reference, false);
-        pending = await db.pendingPayment.findUnique({ where: { reference } });
-      }
+      const outcome = await pollInflow(reference);
+      if (outcome !== 'pending') pending = await db.pendingPayment.findUnique({ where: { reference } });
     } catch (err) {
       console.error(`[payments] status check failed for ref=${reference}:`, err);
     }
@@ -153,16 +145,36 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
   const txn = await db.transaction.findUnique({ where: { reference } });
 
-  // Checkout details, snapshotted onto the PendingPayment at creation — lets
-  // a dedicated payment page render the full checkout from just the
-  // reference (e.g. on reload or the callback redirect landing), not only
-  // the session that opened it.
-  const meta = pending?.metadata as { amount?: number; checkoutUrl?: string } | undefined;
+  // The checkout's virtual account, snapshotted onto the PendingPayment when it
+  // was opened — lets the payment page re-render the transfer instructions and
+  // its countdown from the reference alone, on reload or a fresh device.
+  const meta = pending?.metadata as
+    | {
+        amount?: number;
+        virtualAccountNumber?: string;
+        virtualAccountBankName?: string;
+        virtualAccountName?: string;
+        virtualAccountExpiresAt?: string;
+      }
+    | undefined;
+
+  const bankTransfer =
+    status === 'pending' && meta?.virtualAccountNumber
+      ? {
+          accountNumber: meta.virtualAccountNumber,
+          bankName: meta.virtualAccountBankName ?? '',
+          accountName: meta.virtualAccountName ?? '',
+          amountKobo: meta.amount ?? 0,
+          expiresAt: meta.virtualAccountExpiresAt ?? null,
+        }
+      : null;
 
   ok(res, {
     status,
     ...(meta?.amount !== undefined ? { amount: meta.amount } : {}),
-    ...(meta?.checkoutUrl ? { checkoutUrl: meta.checkoutUrl } : {}),
+    // Always present so clients can branch on it; Anchor has no hosted checkout.
+    checkoutUrl: null,
+    bankTransfer,
     ...(txn && status === 'completed' ? { transaction: serializeTransaction(txn) } : {}),
   });
 });

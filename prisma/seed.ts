@@ -157,7 +157,7 @@ async function main() {
       title: dinnerLevy.title,
       detail: space.name,
       amount: -dinnerCharge.totalCharged,
-      method: 'Bachs',
+      method: 'Anchor',
       status: 'completed',
       reference: 'DVY-DEMO-0002',
       spaceId: space.id,
@@ -248,7 +248,7 @@ async function main() {
   console.log(`  password: ${DEMO_PASSWORD}`);
   console.log(`  wallet:   ₦12,000.00`);
   console.log(`  owes:     "Handout Fee" — ₦5,150.00`);
-  console.log(`  history:  "Dinner Levy" already paid via Bachs\n`);
+  console.log(`  history:  "Dinner Levy" already paid via Anchor\n`);
   console.log('Try with Duey:');
   console.log('  "pay my handout fee"');
   console.log('  "what\'s my balance"');

@@ -1,75 +1,79 @@
 import { type Payout } from '@prisma/client';
 import { db } from '../config/db';
+import { env } from '../config/env';
 import {
-  BachsApiError,
-  getConnectedAccountCapabilities,
-  createTransfer,
-  createWithdrawal,
-  getWithdrawal,
-} from '../lib/bachs';
+  AnchorApiError,
+  createBookTransfer,
+  createNipTransfer,
+  getAccountBalance,
+  getTransfer,
+  verifyTransfer,
+  TRANSFER_FAILURE,
+  TRANSFER_SUCCESS,
+} from '../lib/anchor';
 import { notifyMany } from '../lib/notifications';
 
 const STALE_PAYOUT_AFTER_MS = 15 * 60 * 1000;
-// Funds clear 24h after payment, then become eligible for the split-transfer
-// sweep below — same window computeBalances() used to gate "available" on
-// directly; now "available" gates on transferredAt instead (see payouts.ts),
-// so this constant only controls when the sweep fires.
-const CLEARING_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/** Who to notify a withdrawal's outcome to — the requester, falling back to the space's lead rep. */
-async function resolveNotificationEmail(spaceId: string, payout: Payout): Promise<string | null> {
-  if (payout.requestedById) {
-    const user = await db.user.findUnique({ where: { id: payout.requestedById }, select: { email: true } });
-    if (user) return user.email;
-  }
-  const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: { select: { email: true } } } });
-  return lead?.user.email ?? null;
-}
 
 /**
- * Kick off the actual Bachs withdrawal for a freshly-created payout (§10.3).
- * Called AS the connected account (X-Connected-Account-ID) — the withdrawal
- * draws from the department's own Bachs balance, funded by the split
- * transfers below. Capability is re-read live rather than trusting the
- * cached `bachsPayoutsActive` flag, per the skill's non-negotiable: never
- * trust a cached capability for a money-moving call. Best-effort: if the
- * account isn't ready or the call fails, the payout simply stays
+ * Kick off the Anchor NIP transfer for a freshly-created payout.
+ *
+ * The transfer is drawn from the space's OWN deposit account — under Anchor the
+ * collections already landed there, so there is no platform balance in the
+ * middle. `netSentKobo` and the fee columns were computed and stored when the
+ * payout was requested (see computePayoutFees), so what the rep was shown in
+ * the confirmation breakdown is exactly what is sent.
+ *
+ * Best-effort: if the account isn't ready or the call fails, the payout stays
  * `processing` for the reconciliation job to retry.
  */
 export async function initiatePayoutDisbursement(payout: Payout): Promise<void> {
   const space = await db.space.findUnique({
     where: { id: payout.spaceId },
-    select: { bachsAccountId: true, bachsPayoutDestinationId: true },
+    select: { anchorAccountId: true, anchorCounterPartyId: true, payoutsFrozen: true },
   });
-  if (!space?.bachsAccountId || !space.bachsPayoutDestinationId) return;
+  if (!space?.anchorAccountId || !space.anchorCounterPartyId) return;
+  if (space.payoutsFrozen) {
+    console.error(`[payout] withdrawal skipped for ${payout.reference} — space payouts are frozen`);
+    return;
+  }
+  if (payout.netSentKobo <= 0) {
+    await settlePayout(payout.reference, false, 'The amount is too small to cover the withdrawal fees');
+    return;
+  }
 
   try {
-    const capabilities = await getConnectedAccountCapabilities(space.bachsAccountId);
-    if (capabilities.payouts?.status !== 'active') {
-      console.error(`[payout] withdrawal skipped for ${payout.reference} — payouts capability not active`);
+    // Bachs had a per-capability grant we re-read before every disbursement.
+    // Anchor has no equivalent, so the live check is the account's own balance —
+    // the same discipline: never move money on cached state.
+    const balance = await getAccountBalance(space.anchorAccountId);
+    if (balance.availableBalance < payout.amount) {
+      console.error(
+        `[payout] withdrawal deferred for ${payout.reference} — Anchor balance ${balance.availableBalance} < ${payout.amount}`,
+      );
       return;
     }
 
-    const email = await resolveNotificationEmail(payout.spaceId, payout);
-    if (!email) return;
-
-    const result = await createWithdrawal(
-      space.bachsAccountId,
+    const result = await createNipTransfer(
       {
-        amountKobo: payout.amount,
+        accountId: space.anchorAccountId,
+        counterPartyId: space.anchorCounterPartyId,
+        amountKobo: payout.netSentKobo,
         reference: payout.reference,
-        email,
-        payoutDestinationId: space.bachsPayoutDestinationId,
+        reason: `Duevy payout ${payout.reference}`,
       },
-      `WD-${payout.reference}`,
+      `wd-${payout.reference.toLowerCase()}`,
     );
 
-    if (result.status === 'COMPLETED') {
+    await db.payout.update({ where: { id: payout.id }, data: { anchorTransferId: result.id } });
+
+    if (TRANSFER_SUCCESS.has(result.status)) {
       await settlePayout(payout.reference, true);
-    } else if (result.status === 'FAILED' || result.status === 'REJECTED') {
-      await settlePayout(payout.reference, false, 'The payout was rejected by the payment provider');
+    } else if (TRANSFER_FAILURE.has(result.status)) {
+      await settlePayout(payout.reference, false, result.failureReason ?? 'The payout was rejected by the bank');
     }
-    // REQUESTED/PENDING/APPROVED/PROCESSING — leave `processing`; the webhook or reconciliation job resolves it.
+    // PENDING/PROCESSING/etc — leave `processing`; the nip.transfer.* webhook or
+    // the reconciliation job resolves it.
   } catch (err) {
     console.error(`[payout] disbursement init failed for ${payout.reference}:`, err);
   }
@@ -96,6 +100,9 @@ export async function settlePayout(reference: string, success: boolean, failureR
           type: 'payout',
           direction: 'debit',
           amountKobo: u.amount,
+          grossKobo: u.amount,
+          feeKobo: u.duevyFeeKobo + u.anchorFeeKobo + u.stampDutyKobo,
+          netKobo: u.netSentKobo,
           reference: u.reference,
           description: `Payout to ${u.accountMasked}`,
         },
@@ -104,6 +111,14 @@ export async function settlePayout(reference: string, success: boolean, failureR
     return u;
   });
 
+  // Duevy's cut of the withdrawal fee is still sitting in the space's account
+  // (Anchor took only its own NIP fee and the stamp duty), so collect it.
+  if (success && updated.duevyFeeKobo > 0) {
+    await sweepPayoutFee(updated).catch((err) =>
+      console.error(`[payout] fee sweep failed for ${updated.reference}:`, err),
+    );
+  }
+
   const reps = await db.spaceRep.findMany({ where: { spaceId: updated.spaceId }, select: { userId: true } });
   await notifyMany(
     reps.map((r) => r.userId),
@@ -111,7 +126,7 @@ export async function settlePayout(reference: string, success: boolean, failureR
       ? {
           kind: 'payout_completed',
           title: 'Payout completed',
-          detail: `₦${(updated.amount / 100).toLocaleString('en-NG')} was sent to ${updated.accountMasked}.`,
+          detail: `₦${(updated.netSentKobo / 100).toLocaleString('en-NG')} was sent to ${updated.accountMasked}.`,
           href: '/dashboard/payout',
         }
       : {
@@ -124,7 +139,23 @@ export async function settlePayout(reference: string, success: boolean, failureR
   );
 }
 
-/** Poll Bachs for payouts that have sat in `processing` too long (reconciliation job). */
+async function sweepPayoutFee(payout: Payout): Promise<void> {
+  const space = await db.space.findUnique({ where: { id: payout.spaceId }, select: { anchorAccountId: true } });
+  if (!space?.anchorAccountId) return;
+
+  await createBookTransfer(
+    {
+      fromAccountId: space.anchorAccountId,
+      toAccountId: env.ANCHOR_REVENUE_ACCOUNT_ID,
+      amountKobo: payout.duevyFeeKobo,
+      reference: `pfee-${payout.reference.toLowerCase()}`,
+      reason: `Withdrawal fee ${payout.reference}`,
+    },
+    `pfee-${payout.reference.toLowerCase()}`,
+  );
+}
+
+/** Poll Anchor for payouts that have sat in `processing` too long (reconciliation job). */
 export async function reconcileStalePayouts(): Promise<void> {
   const staleThreshold = new Date(Date.now() - STALE_PAYOUT_AFTER_MS);
   const stale = await db.payout.findMany({
@@ -133,14 +164,25 @@ export async function reconcileStalePayouts(): Promise<void> {
   });
 
   for (const payout of stale) {
-    const space = await db.space.findUnique({ where: { id: payout.spaceId }, select: { bachsAccountId: true } });
-    if (!space?.bachsAccountId) continue;
+    // A payout with no transfer id never reached Anchor — retry the disbursement
+    // rather than polling for something that was never created.
+    if (!payout.anchorTransferId) {
+      await initiatePayoutDisbursement(payout).catch((err) =>
+        console.error(`[payout] retry failed for ${payout.reference}:`, err),
+      );
+      continue;
+    }
 
     try {
-      const status = await getWithdrawal(space.bachsAccountId, payout.reference);
+      // verifyTransfer forces Anchor to re-query the provider; getTransfer only
+      // reads its cached view, so it's the fallback.
+      const status =
+        (await verifyTransfer(payout.anchorTransferId)) ?? (await getTransfer(payout.anchorTransferId));
       if (!status) continue;
-      if (status.status === 'COMPLETED') await settlePayout(payout.reference, true);
-      else if (status.status === 'FAILED' || status.status === 'REJECTED') await settlePayout(payout.reference, false);
+      if (TRANSFER_SUCCESS.has(status.status)) await settlePayout(payout.reference, true);
+      else if (TRANSFER_FAILURE.has(status.status)) {
+        await settlePayout(payout.reference, false, status.failureReason);
+      }
     } catch (err) {
       console.error(`[payout] reconciliation failed for ${payout.reference}:`, err);
     }
@@ -148,41 +190,62 @@ export async function reconcileStalePayouts(): Promise<void> {
 }
 
 /**
- * The split — transfers each cleared DuePayment's face amount into its
- * department's Bachs connected-account balance, replacing the old at-charge
- * subaccount split. Fires once the same 24h clearing window today's payout
- * balance used to gate on has passed; on INSUFFICIENT_BALANCE (settlement
- * lag) it's simply left for the next sweep tick.
+ * The service-charge sweep — the inverse of the old Bachs split.
+ *
+ * Under Anchor the payer transfers straight into the space's own deposit
+ * account, so the department's face value is already where it belongs. What has
+ * to move is Duevy's share of the 2%.
+ *
+ * ONLY `duevyFee` IS SWEPT, NOT `processingFee + duevyFee`. Anchor charges its
+ * own collection fee and stamp duty directly against the account as separate
+ * CustomerFee rows, so `processingFee` has already left; sweeping it again
+ * would take Anchor's cut twice out of the rep's money. If Anchor's actual
+ * charge ever diverges from the estimate in computeCharge(), the difference
+ * shows up as account drift for the nightly reconciliation to surface — not as
+ * a shortfall in the rep's withdrawable balance, which is computed from our own
+ * ledger rather than from Anchor.
+ *
+ * Runs per payment with a deterministic idempotency key, the same shape the old
+ * split sweep used; on INSUFFICIENT_BALANCE (settlement lag) it simply waits
+ * for the next tick.
  */
-export async function sweepSettledDuePayments(): Promise<void> {
-  const clearedThreshold = new Date(Date.now() - CLEARING_WINDOW_MS);
+export async function sweepServiceCharges(): Promise<void> {
   const pending = await db.duePayment.findMany({
-    where: { paidAt: { lte: clearedThreshold }, transferredAt: null },
-    include: { due: { include: { space: { select: { bachsAccountId: true } } } } },
+    where: { settledAt: { not: null }, sweptAt: null },
+    include: { due: { include: { space: { select: { anchorAccountId: true } } } } },
     take: 50,
   });
 
   for (const payment of pending) {
-    const accountId = payment.due.space.bachsAccountId;
-    if (!accountId) continue; // department hasn't onboarded yet — leave for the next tick
+    const accountId = payment.due.space.anchorAccountId;
+    if (!accountId) continue; // space isn't provisioned — leave for a later tick
+
+    // A fully discounted charge leaves Duevy nothing to collect; close it out
+    // rather than re-selecting it forever.
+    if (payment.duevyFee <= 0) {
+      await db.duePayment.update({ where: { id: payment.id }, data: { sweptAt: new Date() } });
+      continue;
+    }
 
     try {
-      const transfer = await createTransfer(
+      const key = `swp-${payment.reference.toLowerCase()}`;
+      const transfer = await createBookTransfer(
         {
-          destinationAccountId: accountId,
-          amountKobo: payment.netToSpace,
-          transferGroup: payment.reference,
-          description: `Payment for "${payment.due.title}"`,
+          fromAccountId: accountId,
+          toAccountId: env.ANCHOR_REVENUE_ACCOUNT_ID,
+          amountKobo: payment.duevyFee,
+          reference: key,
+          reason: `Service charge ${payment.reference}`,
         },
-        `SPLIT-${payment.reference}`,
+        key,
       );
       await db.duePayment.update({
         where: { id: payment.id },
-        data: { transferredAt: new Date(), splitTransferId: transfer.id },
+        data: { sweptAt: new Date(), anchorSweepTransferId: transfer.id },
       });
     } catch (err) {
-      if (err instanceof BachsApiError && err.code === 'INSUFFICIENT_BALANCE') continue;
-      console.error(`[payout] split-transfer failed for ${payment.reference}:`, err);
+      if (err instanceof AnchorApiError && err.isInsufficientBalance) continue;
+      console.error(`[payout] service-charge sweep failed for ${payment.reference}:`, err);
     }
   }
 }

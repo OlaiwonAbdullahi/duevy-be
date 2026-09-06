@@ -9,7 +9,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
-import { computeCharge } from '../lib/money';
+import { computeCharge, MAX_DUE_AMOUNT_KOBO } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { notify, notifyMany } from '../lib/notifications';
 
@@ -95,7 +95,9 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
 const createDueSchema = z.object({
   title: z.string().min(3).max(120),
   note: z.string().max(500).optional(),
-  amount: z.number().int().positive(),
+  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO, {
+    message: `a single payment cannot exceed Anchor's ₦${(MAX_DUE_AMOUNT_KOBO / 100).toLocaleString('en-NG')} tier limit once the service charge is added`,
+  }),
   dueDate: dueDateField.refine((s) => {
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
@@ -142,7 +144,9 @@ repDuesRouter.post('/dues', validate(createDueSchema), async (req: Request, res:
 const patchDueSchema = z.object({
   title: z.string().min(3).max(120).optional(),
   note: z.string().max(500).optional(),
-  amount: z.number().int().positive().optional(),
+  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO, {
+    message: `a single payment cannot exceed Anchor's ₦${(MAX_DUE_AMOUNT_KOBO / 100).toLocaleString('en-NG')} tier limit once the service charge is added`,
+  }).optional(),
   dueDate: dueDateField.optional(),
   category: categoryField.optional(),
   allowGuests: z.boolean().optional(),

@@ -1,41 +1,39 @@
 import { Router, type Request, type Response } from 'express';
-import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
-import { ok, fail, errors } from '../lib/response';
-import { db } from '../config/db';
-import { getBanksForAccount } from '../lib/bachs';
-import { ensureConnectedAccount } from '../services/connectAccount.service';
+import { authenticate } from '../middleware/auth';
+import { ok, fail } from '../lib/response';
+import { getBanks, type Bank } from '../lib/anchor';
 
 export const banksRouter = Router();
 banksRouter.use(authenticate);
 
-// ---------------------------------------------------------------------------
-// GET /banks?spaceId=... — Nigerian banks Bachs supports for that space's
-// payout destination (§10.2). Bank lists are scoped per Bachs connected
-// account (unlike Paystack/Monnify's gateway-wide list), so a spaceId is
-// now required — creates the space's connected account on first use if none
-// exists yet (harmless, no financial commitment).
-// ---------------------------------------------------------------------------
-banksRouter.get('/', async (req: Request, res: Response): Promise<void> => {
-  const spaceId = req.query.spaceId as string | undefined;
-  if (!spaceId) {
-    errors.validation(res, [{ field: 'spaceId', issue: 'spaceId query parameter is required' }]);
-    return;
-  }
+// The list changes rarely and every rep setting a payout account fetches it.
+const CACHE_TTL_MS = 60 * 60 * 1000;
+let cache: { banks: Bank[]; at: number } | null = null;
 
-  const userId = (req as AuthenticatedRequest).user.sub as string;
-  const rep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } } });
-  if (!rep) {
-    errors.forbidden(res, 'Only a rep of this space can view its bank list');
+// ---------------------------------------------------------------------------
+// GET /banks — Nigerian banks available as a payout destination (§10.2).
+//
+// Anchor's bank list is organisation-level, so unlike the Bachs version this
+// takes no spaceId and needs no account to exist first. The parameter is still
+// accepted and ignored, so existing clients keep working.
+// ---------------------------------------------------------------------------
+banksRouter.get('/', async (_req: Request, res: Response): Promise<void> => {
+  if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
+    ok(res, cache.banks);
     return;
   }
 
   try {
-    const user = await db.user.findUnique({ where: { id: userId }, select: { email: true } });
-    const accountId = await ensureConnectedAccount(spaceId, user?.email ?? '');
-    const banks = await getBanksForAccount(accountId);
+    const banks = await getBanks();
+    cache = { banks, at: Date.now() };
     ok(res, banks);
   } catch (err) {
     console.error('[banks] failed to fetch bank list:', err);
+    // Serve a stale list rather than blocking a payout setup on a provider blip.
+    if (cache) {
+      ok(res, cache.banks);
+      return;
+    }
     fail(res, 502, 'PROVIDER_ERROR', 'Could not fetch the bank list right now');
   }
 });

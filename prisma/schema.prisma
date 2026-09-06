@@ -268,8 +268,29 @@ model User {
   level                 String?
   notificationPrefs     Json?                // §3.4 — email/push toggles; null = defaults
   referralCode          String?              @unique
+  // Anchor identity. The rep is an Anchor IndividualCustomer; the space's
+  // deposit account is owned by this customer record, so no space can collect
+  // until kycStatus reaches `verified`. Driven by the
+  // customer.identification.* webhooks — the admin override at
+  // PATCH /admin/users/:id/kyc exists for support, but Anchor is the source of
+  // truth. The BVN is submitted to Anchor and NEVER persisted (PRD §8), which
+  // is why a failed check has to be re-entered by the rep rather than retried
+  // from stored data.
+  anchorCustomerId      String?              @unique
   kycStatus             KycStatus            @default(unverified)
   kycDocUrls            String[]             @default([])
+  kycSubmittedAt        DateTime?
+  kycResolvedAt         DateTime?
+  kycRejectionReason    String?
+  kycAttempts           Int                  @default(0)
+  kycRetryLockedUntil   DateTime?            // §9.2 — 24h lock after 3 consecutive failures
+  // Address is required by Anchor at customer creation. Collected once at KYC
+  // submission and kept so the customer can be recreated without re-asking.
+  addressLine1          String?
+  addressLine2          String?
+  city                  String?
+  state                 String?              // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
+  postalCode            String?
   isSuspended           Boolean              @default(false)
   suspendedReason       String?
   isDeactivated         Boolean              @default(false)
@@ -386,17 +407,20 @@ model Space {
   archivedReason String?
   payoutsFrozen  Boolean     @default(false)
   frozenReason   String?
-  // Bachs connected account this department onboards into (see
-  // ensureConnectedAccount() / PUT /payout/account) — null until the space's
-  // first bank-account save creates one. transfersActive/payoutsActive are
-  // driven only by `capability.updated` webhooks, never assumed sticky — a
-  // capability can move back to `restricted`, and every money-moving call
-  // re-checks the live value rather than trusting these cached flags.
-  bachsAccountId            String?  @unique
-  bachsSetupStatus          String?  // incomplete | awaiting_review | complete
-  bachsTransfersActive      Boolean  @default(false)
-  bachsPayoutsActive        Boolean  @default(false)
-  bachsPayoutDestinationId  String?
+  // The space's Anchor deposit account — a SAVINGS account owned by the lead
+  // rep's verified IndividualCustomer. Provisioned from the
+  // customer.identification.approved webhook, never from the client, so a rep
+  // who closes the tab still ends up set up (PRD §6.2). Every checkout's
+  // virtual NUBAN settles here, and payouts are drawn from here.
+  //
+  // anchorAccountNumber/anchorBankName are populated once Anchor assigns the
+  // NUBAN, which happens asynchronously after account creation.
+  anchorAccountId           String?  @unique
+  anchorAccountNumber       String?
+  anchorBankName            String?
+  anchorAccountStatus       String?  // ACTIVE | BLOCKED | CLOSED | DEPRECATED
+  // The rep's payout bank account, registered with Anchor as a CounterParty.
+  anchorCounterPartyId      String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -539,15 +563,25 @@ model DuePayment {
   txnId       String?   @unique
   paidAt      DateTime  @default(now())
   reference   String    @unique
-  amountPaid  Int       // kobo — face value (= due.amount)
-  processingFee Int     // kobo — 1.5% of amountPaid
-  duevyFee    Int       // kobo — 1.5% of amountPaid
-  netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee
-  // Set once the split-transfer sweep has moved netToSpace into the space's
-  // Bachs connected-account balance (see sweepSettledDuePayments()) — the
-  // gate computeBalances() uses for "available to pay out", not just time.
-  transferredAt   DateTime?
-  splitTransferId String?   // tr_... from Bachs
+  amountPaid  Int       // kobo — what the payer was charged (face + 2% service charge)
+  processingFee Int     // kobo — Anchor's expected cut, taken out of the 2%
+  duevyFee    Int       // kobo — Duevy's margin, the rest of the 2%
+  netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee, i.e. the face value
+  // The checkout's single-use virtual NUBAN. Expires after
+  // ANCHOR_VA_EXPIRY_SECONDS and is never reused (PRD §5.2).
+  virtualNubanId          String?
+  virtualAccountNumber    String?
+  virtualAccountExpiresAt DateTime?
+  // payment.received marks the payment successful; payment.settled means the
+  // funds have actually landed in the space's deposit account. `settledAt` is
+  // the gate computeBalances() uses for "available to pay out".
+  settledAt   DateTime?
+  // Set once the 2% service charge has been swept OUT of the space's account
+  // into Duevy's revenue account (see sweepServiceCharges()). Note the
+  // direction: under Anchor the face value is already in the rep's own
+  // account, so what moves is Duevy's cut, not the department's share.
+  sweptAt               DateTime?
+  anchorSweepTransferId String?
 
   user        User        @relation(fields: [userId], references: [id])
   due         Due         @relation(fields: [dueId], references: [id])
@@ -570,7 +604,7 @@ model Transaction {
   title         String
   detail        String?
   amount        Int       // kobo, signed
-  method        String    // "Wallet" | "Bachs"
+  method        String    // "Wallet" (legacy rows) | "Anchor"
   status        TxnStatus @default(pending)
   reference     String    @unique
   spaceId       String?
@@ -594,13 +628,33 @@ model PendingPayment {
   reference String    @unique
   userId    String
   type      String    // "topup" | "due_payment" | "poll_vote"
-  metadata  Json      // stores dueId, pollId etc.
+  metadata  Json      // stores dueId, pollId, the checkout virtual account, etc.
   status    String    @default("pending")
   createdAt DateTime  @default(now())
   expiresAt DateTime
 
   @@index([reference])
   @@map("pending_payments")
+}
+
+// Webhook idempotency (PRD §6.4). Anchor delivers AtLeastOnce, so every event
+// is persisted by its Anchor event id BEFORE it is processed and a repeated id
+// is acknowledged and dropped. Persisting first also makes handlers replayable,
+// which is what stands in for a durable job queue today — see the note in
+// src/routes/webhooks.ts.
+model WebhookEvent {
+  id            String    @id @default(cuid())
+  anchorEventId String    @unique
+  type          String
+  payload       Json
+  status        String    @default("received") // received | processed | failed
+  error         String?
+  receivedAt    DateTime  @default(now())
+  processedAt   DateTime?
+
+  @@index([type, receivedAt])
+  @@index([status])
+  @@map("webhook_events")
 }
 
 // ---------------------------------------------------------------------------
@@ -628,13 +682,24 @@ model Payout {
   id            String       @id @default(cuid())
   spaceId       String
   dueId         String?      // null = space-wide (lead-only); set = due-scoped
-  amount        Int          // kobo
+  amount        Int          // kobo — the GROSS debit against the space's available balance
   reference     String       @unique
   status        PayoutStatus @default(pending_approval)
   accountMasked String       // "GTBank •••• 4021"
   note          String?
   requestedById String?      // who requested it — needed to authorize cancellation
   failureReason String?
+  // PRD §7.3. Every fee comes out of `amount`, so the four below always sum
+  // back to it and the Anchor account reconciles exactly:
+  //   netSent leaves as the NIP transfer;
+  //   anchorFee + stampDuty are deducted by Anchor as CustomerFee rows;
+  //   duevyFee is swept to the revenue account by book transfer.
+  // Shown to the rep as "Duevy fee ₦100" (duevyFee + anchorFee) + stamp duty.
+  duevyFeeKobo    Int        @default(0)
+  anchorFeeKobo   Int        @default(0)
+  stampDutyKobo   Int        @default(0)
+  netSentKobo     Int        @default(0)
+  anchorTransferId String?
   requestedAt   DateTime     @default(now())
   cancelledAt   DateTime?
   settledAt     DateTime?

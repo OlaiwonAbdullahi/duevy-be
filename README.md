@@ -1,6 +1,6 @@
 # Duevy Backend
 
-REST API powering **Duevy** — a dues collection platform for Nigerian university departments/classes. Handles auth, spaces (departments/classes), dues collection, payments (Bachs Connect), payouts to reps, polls, referrals, disputes, notifications, and an AI chat assistant ("Duey").
+REST API powering **Duevy** — a dues collection platform for Nigerian university departments/classes. Handles auth, spaces (departments/classes), dues collection, payments (Anchor), payouts to reps, polls, referrals, disputes, notifications, and an AI chat assistant ("Duey").
 
 ## Tech Stack
 
@@ -9,7 +9,7 @@ REST API powering **Duevy** — a dues collection platform for Nigerian universi
 - **Database**: PostgreSQL via Prisma ORM (designed for Supabase)
 - **Cache/Queue**: Redis (via BullMQ / reconciliation jobs), run through Docker Compose
 - **Auth**: JWT (access + refresh tokens via `jose`), bcrypt password hashing
-- **Payments**: Bachs Connect (bachs.io) — departments are connected accounts, onboarded in-app
+- **Payments**: Anchor (getanchor.co) — each rep is a KYC-verified Anchor customer whose deposit account collects for their space
 - **Email**: Resend
 - **AI Assistant**: pluggable LLM provider — Ollama (local), Gemini, or any OpenAI-compatible hosted endpoint
 - **Validation**: Zod
@@ -21,7 +21,7 @@ REST API powering **Duevy** — a dues collection platform for Nigerian universi
 - Docker (for local Redis) — or a reachable Redis instance
 - A PostgreSQL database (the project is set up for [Supabase](https://supabase.com), but any Postgres works)
 - A [Resend](https://resend.com) API key (required — used for transactional email)
-- A [Bachs](https://bachs.io) account (sandbox keys are fine for local dev)
+- An [Anchor](https://getanchor.co) account (sandbox keys are fine for local dev)
 - (Optional) [Ollama](https://ollama.com) running locally if you want to use the AI assistant with the default `ollama` provider
 
 ## Setup
@@ -49,7 +49,7 @@ Then fill in `.env`. At minimum you need:
 | `DATABASE_URL` / `DIRECT_URL` | Postgres connection strings. `DIRECT_URL` is used for migrations (non-pooled). |
 | `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` | Min 32 chars each. Generate with `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"` |
 | `RESEND_API_KEY` | Required — from [resend.com/api-keys](https://resend.com/api-keys) |
-| `BACHS_SECRET_KEY`, `BACHS_WEBHOOK_SECRET` | Required — from your [Bachs](https://bachs.io) dashboard (sandbox keys for local dev) |
+| `ANCHOR_SECRET_KEY`, `ANCHOR_WEBHOOK_SECRET`, `ANCHOR_REVENUE_ACCOUNT_ID` | Required — from your [Anchor](https://getanchor.co) dashboard (sandbox keys for local dev). The webhook secret is the `token` you register with the webhook and Anchor caps it at 10 characters |
 | `REDIS_URL` | Defaults to `redis://localhost:6379` (matches `docker-compose.yml`) |
 
 Everything else in `.env.example` has a sensible default or is optional (Google Sign-In, encryption key overrides, LLM provider config, etc.) — see the inline comments in `.env.example` for details. Env vars are validated on boot via Zod (`src/config/env.ts`); the server refuses to start if something required is missing or malformed.
@@ -108,7 +108,7 @@ src/
 ├── routes/               # one file per resource (auth, dues, payouts, polls, ...)
 ├── services/             # business logic (auth, payments, payouts, polls, referrals, assistant)
 ├── middleware/            # auth guard, rate limiting, error handling
-├── lib/                   # Bachs client, email, PDF, LLM adapters
+├── lib/                   # Anchor client, email, PDF, LLM adapters
 ├── jobs/                  # background jobs (payment reconciliation)
 └── types/                 # shared TypeScript types
 
@@ -116,7 +116,7 @@ prisma/
 └── schema.prisma          # data model (users, spaces, dues, payments, payouts, polls, ...)
 ```
 
-Key domain concepts: a **Space** is a department/class, and also a Bachs connected account (`bachsAccountId`) once its reps complete onboarding; a **SpaceRep** collects **Dues** from members via **DuePayment**s; payments are collected on Duevy's own Bachs account and reconcile into **Transaction**s; the department's share transfers into its own Bachs balance once a payment clears; reps request **Payout**s, disbursed as a Bachs withdrawal to their **BankAccount**.
+Key domain concepts: a **Space** is a department/class, and owns an Anchor deposit account (`anchorAccountId`) provisioned once its lead rep clears BVN verification; a **SpaceRep** collects **Dues** from members via **DuePayment**s; each checkout opens a single-use Anchor virtual account that settles straight into the space's own deposit account and reconciles into **Transaction**s; Duevy's 2% service charge is then swept out to its revenue account; reps request **Payout**s, disbursed as an Anchor NIP transfer to the **BankAccount** registered as a counterparty.
 
 ## API Documentation
 
@@ -125,6 +125,8 @@ Key domain concepts: a **Space** is a department/class, and also a Bachs connect
 
 ## Notes
 
-- Bachs Connect (bachs.io) is the sole, non-switchable payment provider (`src/lib/bachs.ts`) — see `.claude/skills/bachs-connect/SKILL.md` for the integration reference.
+- Anchor (getanchor.co) is the sole, non-switchable payment provider (`src/lib/anchor.ts`) — see [docs.getanchor.co](https://docs.getanchor.co).
+- **There is no hosted checkout.** `POST /dues/:dueId/pay` returns bank-transfer instructions (`bankTransfer`), not a `checkoutUrl`; the payer transfers to a single-use virtual account and the client polls `GET /payments/:reference/status`. See [`docs/ANCHOR_MIGRATION.md`](docs/ANCHOR_MIGRATION.md).
+- A space cannot collect until its lead rep completes BVN verification (`POST /spaces/:spaceId/payout/kyc`). Anchor's `TIER_2` ceilings apply: ₦50,000 per transfer, ₦300,000 cumulative balance.
 - The AI assistant (`src/services/assistant.service.ts`) is provider-agnostic — switch between `ollama`, `gemini`, and any OpenAI-compatible `hosted` endpoint via `LLM_PROVIDER` with no code changes.
 - Uploaded files (avatars, nominee images) are served statically from `/uploads`.

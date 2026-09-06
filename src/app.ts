@@ -21,8 +21,8 @@ app.use(cors({
   credentials: true,
 }));
 
-// Request parsing. Capture the raw body so the Bachs webhook (§15) can
-// verify its HMAC signature over the exact bytes received.
+// Request parsing. Capture the raw body so the Anchor webhook (§15) can
+// verify its x-anchor-signature HMAC over the exact bytes received.
 app.use(
   express.json({
     limit: '100kb',

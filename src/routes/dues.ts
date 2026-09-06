@@ -7,8 +7,9 @@ import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { computeCharge } from '../lib/money';
+import { KycNotVerifiedError } from '../services/anchorCustomer.service';
 import { renderReceiptPdf } from '../lib/receipt';
-import { initOnlineDuePayment } from '../services/payment.service';
+import { initOnlineDuePayment, TierLimitExceededError } from '../services/payment.service';
 import { type Due, type DuePayment } from '@prisma/client';
 
 export const duesRouter = Router();
@@ -34,7 +35,7 @@ function serializeStudentDue(due: Due, payment: DuePayment | undefined, now: Dat
     title: due.title,
     note: due.note,
     amount: due.amount, // face amount the rep set
-    processingFee: charge.totalFee, // 3% added on top
+    processingFee: charge.totalFee, // the 2% service charge, added on top
     payableAmount: charge.totalCharged, // what the student actually pays
     dueDate: due.dueDate.toISOString().slice(0, 10),
     category: due.category,
@@ -180,8 +181,25 @@ duesRouter.post(
       discount = { id: code.id, amountKobo: code.amountKobo };
     }
 
-    const result = await initOnlineDuePayment(user, due, discount);
-    ok(res, result);
+    try {
+      const result = await initOnlineDuePayment(user, due, discount);
+      ok(res, result);
+    } catch (err) {
+      if (err instanceof TierLimitExceededError) {
+        fail(
+          res,
+          402,
+          'TIER_LIMIT_EXCEEDED',
+          `A single transfer to this space cannot exceed ₦${(err.limitKobo / 100).toLocaleString('en-NG')}`,
+        );
+        return;
+      }
+      if (err instanceof KycNotVerifiedError) {
+        errors.conflict(res, 'SPACE_NOT_VERIFIED', err.message);
+        return;
+      }
+      throw err;
+    }
   },
 );
 

@@ -4,7 +4,7 @@
  * DuePayment/refund-Transaction/completed-Payout rows are the source —
  * their already-recorded fee columns are used as-is rather than recomputed
  * via computeCharge(), since historical fee percentages could in principle
- * have differed from today's PLATFORM_PERCENTAGE_CHARGE.
+ * have differed from today's SERVICE_CHARGE_PERCENT.
  *
  * Idempotent: skips any row that already has a matching LedgerEntry
  * (by reference + type), so it's safe to re-run.
