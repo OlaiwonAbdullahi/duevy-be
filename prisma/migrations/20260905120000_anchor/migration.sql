@@ -123,3 +123,19 @@ CREATE INDEX "webhook_events_status_idx" ON "webhook_events"("status");
 -- ---------------------------------------------------------------------------
 DROP INDEX IF EXISTS "due_payments_reference_key";
 CREATE INDEX "due_payments_reference_idx" ON "due_payments"("reference");
+
+-- ---------------------------------------------------------------------------
+-- KYC tiers (PRD §3.4 / §12 — the deferred tier-upgrade path).
+--
+-- kycTier is the level actually verified; kycPendingTier is the one awaiting a
+-- decision. They differ during an upgrade, so a rep verified at tier_2 who
+-- submits tier_3 keeps collecting while the manual review runs.
+-- ---------------------------------------------------------------------------
+CREATE TYPE "KycTier" AS ENUM ('tier_0', 'tier_2', 'tier_3');
+
+ALTER TABLE "users"
+  ADD COLUMN     "kycTier" "KycTier" NOT NULL DEFAULT 'tier_0',
+  ADD COLUMN     "kycPendingTier" "KycTier";
+
+-- Anyone already verified got there by BVN, which is tier_2.
+UPDATE "users" SET "kycTier" = 'tier_2' WHERE "kycStatus" = 'verified';

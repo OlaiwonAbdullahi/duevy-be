@@ -147,10 +147,23 @@ async function handleEvent(event: AnchorEvent): Promise<void> {
     case 'customer.identification.awaitingDocument':
     case 'customer.identification.reenter_information':
     case 'customer.identification.pending': {
+      // tier_3 is a manual review, so these are its normal resting states and
+      // can persist for days. applyKycPending() deliberately leaves an
+      // already-verified rep alone — an upgrade under review must not stop the
+      // space collecting on the tier it already holds.
       const customerId = relId(event, 'customer');
       if (customerId) await applyKycPending(customerId);
       break;
     }
+
+    // --- tier_3 documents -------------------------------------------------
+    case 'document.approved':
+    case 'document.rejected':
+      // Per-document progress within a tier_3 review. The tier itself only
+      // moves on customer.identification.approved/.rejected, so these are
+      // recorded in webhook_events for support rather than acted on — acting on
+      // one document would promote a rep mid-review.
+      break;
 
     // --- Account provisioning --------------------------------------------
     case 'account.opened':

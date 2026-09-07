@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type RepRole, type PayoutStatus } from '@prisma/client';
+import { type RepRole, type PayoutStatus, type KycTier } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -10,18 +10,26 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccount, createCounterParty, NIGERIAN_STATES, type NigerianState } from '../lib/anchor';
+import {
+  getBanks,
+  verifyAccount,
+  createCounterParty,
+  NIGERIAN_STATES,
+  ANCHOR_ID_TYPES,
+  type NigerianState,
+  type AnchorIdType,
+} from '../lib/anchor';
 import {
   generatePayoutReference,
   computePayoutFees,
   MIN_PAYOUT_KOBO,
-  TIER2_BALANCE_CEILING_KOBO,
+  balanceCeilingFor,
 } from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
 import { castPayoutApproval, getApprovalStatus } from '../services/payoutApproval.service';
 import { initiatePayoutDisbursement } from '../services/payout.service';
-import { submitRepKyc, getSpaceKycState } from '../services/anchorCustomer.service';
+import { submitRepKyc, submitKycUpgrade, getSpaceKycState } from '../services/anchorCustomer.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
@@ -105,21 +113,37 @@ async function computeBalances(sid: string, dueId?: string) {
  * a 300-student space collecting ₦5,000 each blows through long before it
  * finishes. Reps are nudged to withdraw at 70% and hard-warned at 90% (PRD §3.4).
  */
-function ceilingStatus(availableKobo: number) {
-  const usedPct = Math.round((availableKobo / TIER2_BALANCE_CEILING_KOBO) * 100);
+function ceilingStatus(availableKobo: number, tier: KycTier) {
+  const ceilingKobo = balanceCeilingFor(tier);
+  // tier_3 is unlimited, so there is nothing to warn about. Report it as
+  // uncapped rather than falling back to the tier_2 number.
+  if (ceilingKobo === null) {
+    return { ceilingKobo: null, ceilingUsedPct: null, ceilingLevel: 'uncapped' as const };
+  }
+  const usedPct = Math.round((availableKobo / ceilingKobo) * 100);
   return {
-    ceilingKobo: TIER2_BALANCE_CEILING_KOBO,
+    ceilingKobo,
     ceilingUsedPct: usedPct,
     ceilingLevel: usedPct >= 90 ? ('critical' as const) : usedPct >= 70 ? ('warn' as const) : ('ok' as const),
   };
+}
+
+/** The verified tier of the rep whose customer record owns the space's account. */
+async function leadKycTier(sid: string): Promise<KycTier> {
+  const lead = await db.spaceRep.findFirst({
+    where: { spaceId: sid, role: 'lead' },
+    select: { user: { select: { kycTier: true } } },
+  });
+  return lead?.user.kycTier ?? 'tier_0';
 }
 
 // ---------------------------------------------------------------------------
 // GET /payout/summary (§10.1)
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
-  const balances = await computeBalances(spaceId(req));
-  ok(res, { ...balances, ...ceilingStatus(balances.available), minPayout: MIN_PAYOUT_KOBO });
+  const sid = spaceId(req);
+  const [balances, tier] = await Promise.all([computeBalances(sid), leadKycTier(sid)]);
+  ok(res, { ...balances, ...ceilingStatus(balances.available, tier), kycTier: tier, minPayout: MIN_PAYOUT_KOBO });
 });
 
 // ---------------------------------------------------------------------------
@@ -397,6 +421,47 @@ payoutsRouter.post(
 
 // Verification + provisioning state for the dashboard banner. Replaces
 // GET /payout/onboarding-status.
+// ---------------------------------------------------------------------------
+// POST /payout/kyc/upgrade — raise a verified rep from tier_2 to tier_3
+// (PRD §3.4 / §12). The trigger is reps repeatedly hitting the balance ceiling.
+//
+// Manual review at Anchor, so it resolves in days rather than seconds. The rep
+// keeps collecting on tier_2 throughout, and a rejection changes nothing.
+// ---------------------------------------------------------------------------
+const kycUpgradeSchema = z.object({
+  idType: z.enum(ANCHOR_ID_TYPES as unknown as [AnchorIdType, ...AnchorIdType[]]),
+  idNumber: z.string().min(4).max(32),
+  // Passports and licences expire; a NIN slip does not, so this stays optional.
+  expiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD').optional(),
+});
+
+payoutsRouter.post(
+  '/payout/kyc/upgrade',
+  requireSpaceRep(true),
+  validate(kycUpgradeSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const outcome = await submitKycUpgrade(uid(req), req.body as z.infer<typeof kycUpgradeSchema>);
+    if (!outcome.ok) {
+      if (outcome.code === 'NOT_VERIFIED') {
+        errors.conflict(res, 'NOT_VERIFIED', 'Complete BVN verification before upgrading');
+        return;
+      }
+      if (outcome.code === 'ALREADY_AT_TIER') {
+        errors.conflict(res, 'ALREADY_AT_TIER', 'This account is already at the highest tier');
+        return;
+      }
+      if (outcome.code === 'UPGRADE_PENDING') {
+        errors.conflict(res, 'UPGRADE_PENDING', 'An upgrade is already under review');
+        return;
+      }
+      fail(res, 502, 'PROVIDER_ERROR', outcome.message);
+      return;
+    }
+    // 202: accepted for manual review, not decided.
+    ok(res, { status: 'under_review', tier: 'tier_3' }, 202);
+  },
+);
+
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
   ok(res, await getSpaceKycState(spaceId(req)));
 });

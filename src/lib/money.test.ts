@@ -4,6 +4,8 @@ import {
   computePayoutFees,
   MIN_PAYOUT_KOBO,
   STAMP_DUTY_KOBO,
+  TIER2_BALANCE_CEILING_KOBO,
+  balanceCeilingFor,
 } from './money';
 
 const NAIRA = 100;
@@ -152,5 +154,25 @@ describe('computePayoutFees', () => {
     // Guarded at the route by MIN_PAYOUT_KOBO, but the arithmetic must still be
     // honest rather than clamping to a positive transfer.
     expect(computePayoutFees(5_000).netSentKobo).toBeLessThanOrEqual(0);
+  });
+});
+
+describe('balanceCeilingFor', () => {
+  it('caps tier_2 at ₦300,000', () => {
+    expect(balanceCeilingFor('tier_2')).toBe(TIER2_BALANCE_CEILING_KOBO);
+    expect(balanceCeilingFor('tier_2')).toBe(30_000_000);
+  });
+
+  // tier_3 is unlimited — the reason the upgrade exists. Returning null forces
+  // callers to hide the warning; reusing the tier_2 number would cap a rep who
+  // has just paid ₦200 specifically to stop being capped.
+  it('returns null for tier_3, which is unlimited', () => {
+    expect(balanceCeilingFor('tier_3')).toBeNull();
+  });
+
+  it('falls back to the tier_2 figure for an unverified rep', () => {
+    // tier_0 cannot hold a balance at all — no account exists — so this is only
+    // ever a display default, never an enforced limit.
+    expect(balanceCeilingFor('tier_0')).toBe(TIER2_BALANCE_CEILING_KOBO);
   });
 });

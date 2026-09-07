@@ -46,6 +46,42 @@ Rejection paths: `customer.identification.rejected` sets `kycStatus: rejected`
 with a reason; `.error` is transient and retried; `.manualReview`,
 `.awaitingDocument`, `.reenter_information` and `.pending` all hold at `pending`.
 
+### 1b. Raising the tier
+
+| # | Trigger | Anchor call | Duevy code |
+|:--:|---|---|---|
+| 1 | `POST /v1/spaces/:id/payout/kyc/upgrade` | same endpoint, `level: TIER_3` | `submitKycUpgrade()` |
+| 2 | webhook `customer.identification.approved` | — | promotes `kycTier` to `tier_3` |
+
+Anchor accepts exactly two submittable levels. `TIER_2` is BVN + date of birth
++ gender — automatic, ₦50, resolves in seconds. `TIER_3` is a government ID
+(`DRIVERS_LICENSE`, `VOTERS_CARD`, `PASSPORT`, `NATIONAL_ID`, `NIN_SLIP`) — ₦200,
+and a **manual review** that can take days. This is PRD §12's deferred
+tier-upgrade path; its trigger is reps repeatedly hitting the balance ceiling.
+
+**An upgrade is strictly additive, and the code enforces that in three places:**
+
+- `kycTier` (verified) and `kycPendingTier` (under review) are separate columns,
+  so a rep at `tier_2` keeps collecting while `tier_3` is reviewed.
+- `applyKycPending()` leaves an already-verified rep alone — otherwise a
+  `.manualReview` event would stop their space collecting for days.
+- A rejected **upgrade** clears `kycPendingTier` only. It never un-verifies a
+  working account.
+
+`document.approved` / `.rejected` report per-document progress inside a review.
+They are recorded but not acted on: the tier moves only on
+`customer.identification.approved`, and acting on one document would promote a
+rep mid-review.
+
+> **`tier_3` IS UNLIMITED.** No balance ceiling at all — which is the entire
+> reason to offer the upgrade, and the answer to the ₦300,000 problem in PRD
+> §3.4. A space that outgrows `tier_2` pays ₦200 once and stops having a
+> ceiling.
+>
+> `balanceCeilingFor()` returns `null` for it and the payout summary reports
+> `ceilingLevel: "uncapped"`. Never substitute the `tier_2` figure: that would
+> cap a rep who has just paid specifically to stop being capped.
+
 ---
 
 ## 2. Setting the payout destination
@@ -202,6 +238,7 @@ processing; a repeated id is acknowledged and dropped. The handler always return
 | Group | Events |
 |---|---|
 | KYC | `customer.identification.` — `approved`, `rejected`, `error`, `manualReview`, `awaitingDocument`, `reenter_information`, `pending` |
+| tier_3 documents | `document.approved`, `document.rejected` — recorded, not acted on |
 | Provisioning | `account.opened`, `accountNumber.created` |
 | Collection | **`payin.received`** — fulfils and settles in one step |
 | Direct inflows | `nip.inbound.received`, `nip.inbound.completed` — logged, not checkouts |

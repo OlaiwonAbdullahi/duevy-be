@@ -1,3 +1,4 @@
+import { type KycTier } from '@prisma/client';
 import { db } from '../config/db';
 import {
   AnchorApiError,
@@ -6,6 +7,8 @@ import {
   getAccount,
   getCustomer,
   submitTier2Verification,
+  submitTier3Verification,
+  type AnchorIdType,
   type AnchorAddress,
   type Gender,
   type NigerianState,
@@ -145,6 +148,7 @@ export async function submitRepKyc(userId: string, input: KycSubmission): Promis
       where: { id: userId },
       data: {
         kycStatus: 'pending',
+        kycPendingTier: 'tier_2',
         kycSubmittedAt: new Date(),
         kycRejectionReason: null,
         kycAttempts: { increment: 1 },
@@ -155,6 +159,56 @@ export async function submitRepKyc(userId: string, input: KycSubmission): Promis
   } catch (err) {
     if (err instanceof AnchorApiError) {
       console.error(`[kyc] submission failed for user ${userId}:`, err.message);
+      return { ok: false, code: 'PROVIDER_ERROR', message: err.detail ?? err.message };
+    }
+    throw err;
+  }
+}
+
+export type KycUpgradeOutcome =
+  | { ok: true }
+  | { ok: false; code: 'NOT_VERIFIED' }
+  | { ok: false; code: 'ALREADY_AT_TIER' }
+  | { ok: false; code: 'UPGRADE_PENDING' }
+  | { ok: false; code: 'PROVIDER_ERROR'; message: string };
+
+/**
+ * Raise a verified rep from tier_2 to tier_3 (PRD §3.4 / §12 — the deferred
+ * tier-upgrade path, whose trigger is reps repeatedly hitting the balance
+ * ceiling).
+ *
+ * Unlike the initial check this is a MANUAL review at Anchor, so it can sit
+ * unresolved for days. Everything here is therefore additive: the rep keeps
+ * collecting on tier_2 throughout, and only `kycPendingTier` moves. A rejection
+ * clears that and leaves the account exactly as it was.
+ *
+ * The document number is sent to Anchor and never persisted, for the same
+ * reason the BVN is not (PRD §8).
+ */
+export async function submitKycUpgrade(
+  userId: string,
+  input: { idType: AnchorIdType; idNumber: string; expiryDate?: string },
+): Promise<KycUpgradeOutcome> {
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) throw new Error('user not found');
+
+  // An upgrade builds on an existing verified customer; there is nothing to
+  // raise otherwise, and the rep should complete tier_2 first.
+  if (user.kycStatus !== 'verified' || !user.anchorCustomerId) return { ok: false, code: 'NOT_VERIFIED' };
+  if (user.kycTier === 'tier_3') return { ok: false, code: 'ALREADY_AT_TIER' };
+  if (user.kycPendingTier === 'tier_3') return { ok: false, code: 'UPGRADE_PENDING' };
+
+  try {
+    await submitTier3Verification(user.anchorCustomerId, input);
+    await db.user.update({
+      where: { id: userId },
+      // kycStatus deliberately untouched — see the note above.
+      data: { kycPendingTier: 'tier_3', kycSubmittedAt: new Date(), kycRejectionReason: null },
+    });
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof AnchorApiError) {
+      console.error(`[kyc] upgrade failed for user ${userId}:`, err.message);
       return { ok: false, code: 'PROVIDER_ERROR', message: err.detail ?? err.message };
     }
     throw err;
@@ -173,18 +227,37 @@ async function userByCustomerId(customerId: string) {
 
 export async function applyKycApproved(customerId: string): Promise<void> {
   const user = await userByCustomerId(customerId);
-  if (!user || user.kycStatus === 'verified') return;
+  if (!user) return;
+
+  // An approval promotes the rep to whatever tier was awaiting a decision. An
+  // already-verified rep is NOT an early return here: that is exactly the
+  // tier_2 → tier_3 upgrade case, and skipping it would leave them capped.
+  const promotedTo = user.kycPendingTier ?? (user.kycStatus === 'verified' ? user.kycTier : 'tier_2');
+  const wasUpgrade = user.kycStatus === 'verified';
+  if (wasUpgrade && promotedTo === user.kycTier) return; // nothing changed
 
   await db.user.update({
     where: { id: user.id },
     data: {
       kycStatus: 'verified',
+      kycTier: promotedTo,
+      kycPendingTier: null,
       kycResolvedAt: new Date(),
       kycRejectionReason: null,
       kycAttempts: 0,
       kycRetryLockedUntil: null,
     },
   });
+
+  if (wasUpgrade) {
+    await notifyMany([user.id], {
+      kind: 'system',
+      title: 'Verification upgraded',
+      detail: 'Your account limits have been raised.',
+      href: '/dashboard/payout',
+    });
+    return; // the space is already provisioned; nothing else to do
+  }
 
   // Provision every space this rep leads. Driven from here rather than the
   // client so a rep who closed the tab still ends up set up (PRD §6.2).
@@ -207,6 +280,23 @@ export async function applyKycRejected(customerId: string, reason?: string): Pro
   const user = await userByCustomerId(customerId);
   if (!user) return;
 
+  // A failed UPGRADE must not revoke a working account: the rep stays verified
+  // at the tier they already hold, and only the pending upgrade is cleared.
+  if (user.kycStatus === 'verified' && user.kycPendingTier && user.kycPendingTier !== user.kycTier) {
+    await db.user.update({
+      where: { id: user.id },
+      data: { kycPendingTier: null, kycRejectionReason: reason ?? 'The document could not be verified.' },
+    });
+    await notifyMany([user.id], {
+      kind: 'system',
+      tone: 'amber',
+      title: 'Upgrade declined',
+      detail: 'Your existing verification is unaffected. You can try again with a different document.',
+      href: '/dashboard/payout',
+    });
+    return;
+  }
+
   const attempts = user.kycAttempts;
   const locked = attempts >= MAX_KYC_ATTEMPTS;
 
@@ -214,6 +304,7 @@ export async function applyKycRejected(customerId: string, reason?: string): Pro
     where: { id: user.id },
     data: {
       kycStatus: 'rejected',
+      kycPendingTier: null,
       kycResolvedAt: new Date(),
       // BVN name/phone mismatch is the dominant rejection cause, and Anchor's
       // own comment is rarely specific enough to act on (PRD §9.2).
@@ -239,6 +330,9 @@ export async function applyKycRejected(customerId: string, reason?: string): Pro
 
 export async function applyKycPending(customerId: string): Promise<void> {
   const user = await userByCustomerId(customerId);
+  // A verified rep mid-upgrade stays verified — tier_3 is a manual review and
+  // can sit at .manualReview / .awaitingDocument for days. Flipping them to
+  // `pending` would stop their space collecting for the duration.
   if (!user || user.kycStatus === 'verified') return;
   await db.user.update({ where: { id: user.id }, data: { kycStatus: 'pending' } });
 }
@@ -361,6 +455,11 @@ export async function applyAccountOpened(accountId: string): Promise<void> {
 
 export interface KycState {
   kycStatus: string;
+  /** The tier actually verified, and the one under review (null when none is). */
+  kycTier: KycTier;
+  pendingTier: KycTier | null;
+  /** True once tier_3 is available to submit — i.e. verified and not already there. */
+  canUpgrade: boolean;
   rejectionReason: string | null;
   retryLockedUntil: string | null;
   submittedAt: string | null;
@@ -380,15 +479,27 @@ export async function getSpaceKycState(spaceId: string): Promise<KycState> {
       where: { spaceId, role: 'lead' },
       include: {
         user: {
-          select: { kycStatus: true, kycRejectionReason: true, kycRetryLockedUntil: true, kycSubmittedAt: true },
+          select: {
+            kycStatus: true,
+            kycTier: true,
+            kycPendingTier: true,
+            kycRejectionReason: true,
+            kycRetryLockedUntil: true,
+            kycSubmittedAt: true,
+          },
         },
       },
     }),
   ]);
 
   const kycStatus = lead?.user.kycStatus ?? 'unverified';
+  const kycTier = lead?.user.kycTier ?? 'tier_0';
+  const pendingTier = lead?.user.kycPendingTier ?? null;
   return {
     kycStatus,
+    kycTier,
+    pendingTier,
+    canUpgrade: kycStatus === 'verified' && kycTier !== 'tier_3' && pendingTier === null,
     rejectionReason: lead?.user.kycRejectionReason ?? null,
     retryLockedUntil: lead?.user.kycRetryLockedUntil?.toISOString() ?? null,
     submittedAt: lead?.user.kycSubmittedAt?.toISOString() ?? null,

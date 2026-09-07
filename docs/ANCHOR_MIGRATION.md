@@ -188,6 +188,55 @@ Failure handling worth building for:
   `429 KYC_RETRY_LOCKED`, with `retryLockedUntil` in the status response.
 - **The BVN is never stored.** A retry means the rep re-enters it.
 
+## 4b. Raising the KYC tier — new
+
+`POST /v1/spaces/{spaceId}/payout/kyc/upgrade` (lead rep only) → `202`
+
+```json
+{ "idType": "NATIONAL_ID", "idNumber": "12345678901", "expiryDate": "2030-06-25" }
+```
+
+`idType` is one of `DRIVERS_LICENSE`, `VOTERS_CARD`, `PASSPORT`, `NATIONAL_ID`,
+`NIN_SLIP`. `expiryDate` is optional — a NIN slip does not expire.
+
+This raises a verified rep from `tier_2` (BVN, automatic, capped at ₦300,000) to
+**`tier_3`, which is unlimited**. Unlike the initial check it is a **manual
+review at Anchor and can take days**, so build for a long wait, not a spinner.
+
+Removing the ceiling is the entire value proposition — a space collecting from
+300 students at ₦5,000 hits ₦300,000 around student 60, so this is what lets a
+large cohort collect without the rep withdrawing every day.
+
+**The rep keeps collecting throughout.** A pending upgrade never suspends the
+account, and a rejected upgrade leaves the existing verification untouched —
+only the pending tier clears.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `NOT_VERIFIED` | 409 | Finish BVN verification first. |
+| `ALREADY_AT_TIER` | 409 | Already `tier_3`. |
+| `UPGRADE_PENDING` | 409 | One is already under review. |
+
+`GET /v1/spaces/{spaceId}/payout/kyc-status` gains three fields:
+
+```json
+{ "kycTier": "tier_2", "pendingTier": "tier_3", "canUpgrade": false }
+```
+
+`canUpgrade` is the single flag to gate the "Raise my limit" affordance on.
+
+`GET /v1/spaces/{spaceId}/payout/summary` gains `kycTier`, and its ceiling
+fields become tier-dependent:
+
+```json
+{ "kycTier": "tier_3", "ceilingKobo": null, "ceilingUsedPct": null, "ceilingLevel": "uncapped" }
+```
+
+**`ceilingLevel` can now be `uncapped`, and `ceilingKobo` can be `null`.**
+`tier_3` is unlimited — there is genuinely no ceiling — so the UI must **hide**
+the meter in that case, not render `null` as zero. "No limit" is the reward the
+rep paid ₦200 for; showing them an empty progress bar reads as a bug.
+
 ## 5. Bank list — simplified
 
 `GET /v1/banks` no longer requires `spaceId` (Anchor's list is
