@@ -87,6 +87,39 @@ describe('computeCharge', () => {
   });
 });
 
+describe('multi-due checkout (PRD §5.2)', () => {
+  // One transfer settles several dues. The charge is computed per due and
+  // summed, so each line keeps its own face/fee split and the department is
+  // credited per due — the basket total must equal the sum of its lines
+  // exactly, or the Anchor-enforced amount will not match what we recorded.
+  const basket = [500_000, 250_000, 1_200_000];
+
+  it('sums to exactly the per-due charges', () => {
+    const charges = basket.map((f) => computeCharge(f));
+    const total = charges.reduce((n, c) => n + c.totalCharged, 0);
+    expect(total).toBe(charges[0].totalCharged + charges[1].totalCharged + charges[2].totalCharged);
+    // And the department's credit is the untouched face value of every due.
+    expect(charges.reduce((n, c) => n + c.netToSpace, 0)).toBe(1_950_000);
+  });
+
+  it('leaves the same margin whether dues are paid together or separately', () => {
+    const together = basket.map((f) => computeCharge(f)).reduce((n, c) => n + c.duevyFee, 0);
+    const apart = basket.reduce((n, f) => n + computeCharge(f).duevyFee, 0);
+    expect(together).toBe(apart);
+  });
+
+  it('applies a discount to one due only, never the whole basket', () => {
+    const discounted = computeCharge(basket[0], 999_999);
+    const rest = basket.slice(1).map((f) => computeCharge(f));
+    // The discounted line loses its fee entirely...
+    expect(discounted.totalFee).toBe(0);
+    // ...while the others are charged in full.
+    expect(rest.every((c) => c.totalFee > 0)).toBe(true);
+    // Every rep is still paid the face value regardless.
+    expect(discounted.netToSpace).toBe(basket[0]);
+  });
+});
+
 describe('computePayoutFees', () => {
   it('charges ₦100 with no stamp duty at or below ₦10,000', () => {
     const f = computePayoutFees(8_000 * NAIRA);

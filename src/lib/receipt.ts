@@ -12,6 +12,12 @@ interface ReceiptData {
   netToSpace: number;
   paidAt: Date;
   method: string;
+  /**
+   * Every due this payment settled. One checkout can cover several (PRD §5.2),
+   * and §5.3 requires the receipt to itemise them. A single-due payment passes
+   * one line, or none — the summary above is then enough on its own.
+   */
+  lines?: { title: string; amountKobo: number }[];
 }
 
 /**
@@ -59,8 +65,19 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
     row('Paid by', d.payerName);
     row('Date', d.paidAt.toISOString());
     row('Method', d.method);
+
+    // Itemise only when the payment actually covered more than one due —
+    // repeating a single line above the identical summary reads as a bug.
+    if (d.lines && d.lines.length > 1) {
+      doc.moveDown(0.4);
+      doc.fontSize(10).fillColor(muted).text('Dues settled');
+      doc.moveDown(0.4);
+      for (const line of d.lines) row(line.title, formatNaira(line.amountKobo));
+      doc.moveDown(0.2);
+    }
+
     row('Due amount', formatNaira(d.netToSpace));
-    row('Processing fee (3%)', formatNaira(d.processingFee + d.duevyFee));
+    row('Service charge', formatNaira(d.processingFee + d.duevyFee));
     row('Total paid', formatNaira(d.amountPaid));
 
     doc.moveDown(1);
@@ -68,7 +85,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
       .fontSize(9)
       .fillColor(muted)
       .text(
-        `Processing fee breakdown: processing ${formatNaira(d.processingFee)} · Duevy ${formatNaira(d.duevyFee)}. ` +
+        `Service charge breakdown: processing ${formatNaira(d.processingFee)} · Duevy ${formatNaira(d.duevyFee)}. ` +
           `The department receives the full ${formatNaira(d.netToSpace)}.`,
       );
 

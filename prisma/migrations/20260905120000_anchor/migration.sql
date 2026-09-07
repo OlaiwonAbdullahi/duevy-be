@@ -114,3 +114,12 @@ CREATE TABLE "webhook_events" (
 CREATE UNIQUE INDEX "webhook_events_anchorEventId_key" ON "webhook_events"("anchorEventId");
 CREATE INDEX "webhook_events_type_receivedAt_idx" ON "webhook_events"("type", "receivedAt");
 CREATE INDEX "webhook_events_status_idx" ON "webhook_events"("status");
+
+-- ---------------------------------------------------------------------------
+-- Multi-due checkout (PRD §5.2) — one transfer settles several dues, so the
+-- reference identifies the CHECKOUT rather than a single payment and is shared
+-- by every line it creates. Uniqueness stays on (userId, dueId): a due is still
+-- paid exactly once per student.
+-- ---------------------------------------------------------------------------
+DROP INDEX IF EXISTS "due_payments_reference_key";
+CREATE INDEX "due_payments_reference_idx" ON "due_payments"("reference");

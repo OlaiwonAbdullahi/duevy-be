@@ -430,7 +430,7 @@ PostgreSQL. Multi-school-ready columns stay in the schema even though only LAUTE
 | `space_members` | space_id, student_user_id, joined_at, removed_at |
 | `dues` | id, space_id, title, type, amount_kobo, description, deadline, is_mandatory, status (`draft` / `open` / `closed`), created_at |
 | `payments` | id, reference, space_id, student_user_id, subtotal_kobo, service_charge_kobo, total_kobo, status (`pending` / `successful` / `failed` / `expired`), virtual_account_number, virtual_account_expires_at, anchor_payment_id, paid_at |
-| `payment_lines` | payment_id, due_id, amount_kobo — the many-dues-one-payment join |
+| ~~`payment_lines`~~ | **Not built as a separate table.** The many-dues-one-payment join is carried by `due_payments.reference`: one checkout writes one row per due, all sharing the reference, with uniqueness still on (user, due). This keeps the per-due roster, ledger and remittance queries working unchanged. |
 | `payouts` | id, space_id, amount_kobo, duevy_fee_kobo, anchor_fee_kobo, stamp_duty_kobo, net_sent_kobo, destination_bank, destination_account, status, anchor_transfer_id, requested_at, resolved_at |
 | `webhook_events` | anchor_event_id (unique), type, payload, received_at, processed_at, status — the idempotency table |
 | `audit_log` | actor_user_id, action, target_type, target_id, metadata, created_at |

@@ -562,8 +562,11 @@ model DuePayment {
   dueId       String
   txnId       String?   @unique
   paidAt      DateTime  @default(now())
-  reference   String    @unique
-  amountPaid  Int       // kobo — what the payer was charged (face + 2% service charge)
+  // NOT unique: one checkout can settle several dues at once (PRD §5.2), and
+  // every DuePayment it creates shares the checkout's reference. Uniqueness is
+  // carried by @@unique([userId, dueId]) below — a due is paid once per user.
+  reference   String
+  amountPaid  Int       // kobo — this line's share of the charge (face + its 2%)
   processingFee Int     // kobo — Anchor's expected cut, taken out of the 2%
   duevyFee    Int       // kobo — Duevy's margin, the rest of the 2%
   netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee, i.e. the face value
@@ -593,6 +596,7 @@ model DuePayment {
 
   @@unique([userId, dueId])
   @@index([dueId])
+  @@index([reference])
   @@map("due_payments")
 }
 
