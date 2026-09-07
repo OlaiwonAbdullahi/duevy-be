@@ -1,8 +1,8 @@
 import { type Due, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { env } from '../config/env';
-import { computeCharge, generateReference, TIER2_SINGLE_DEPOSIT_LIMIT_KOBO } from '../lib/money';
-import { createVirtualNuban, listAccountTransactions } from '../lib/anchor';
+import { computeCharge, generateReference } from '../lib/money';
+import { createPayWithTransfer, getPayWithTransfer } from '../lib/anchor';
 import { requireCollectableAccount } from './anchorCustomer.service';
 import { notifyMany } from '../lib/notifications';
 import { sendDuePaymentReceiptEmail } from '../lib/email';
@@ -26,27 +26,22 @@ export async function uniqueReference(): Promise<string> {
   return `DVY-${Date.now()}`;
 }
 
-/** A single payment would breach Anchor's TIER_2 per-deposit ceiling (PRD §3.4). */
-export class TierLimitExceededError extends Error {
-  limitKobo = TIER2_SINGLE_DEPOSIT_LIMIT_KOBO;
-  constructor(public attemptedKobo: number) {
-    super('This payment exceeds the maximum single transfer allowed on this account');
-    this.name = 'TierLimitExceededError';
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Online — bank transfer to a single-use virtual account.
+// Online — bank transfer to a single-use Pay With Transfer account.
 //
 // Anchor is a BaaS, not a gateway: there is no hosted checkout page. Each
-// checkout gets its own dynamic virtual NUBAN, fixed to this payment's
-// reference and expiring after ANCHOR_VA_EXPIRY_SECONDS, settling into the
-// space's own deposit account. The payer transfers from any bank app and the
-// screen polls; nothing is ever marked paid by the client (PRD §5.2).
+// checkout gets its own dynamic account, fixed to this exact amount and
+// expiring after ANCHOR_VA_EXPIRY_SECONDS. The payer transfers from any bank
+// app and the screen polls; nothing is ever marked paid by the client (§5.2).
 //
-// Because the space's account receives the full charge, the money does NOT need
-// moving to the department afterwards — what moves is Duevy's 2%, swept out by
-// sweepServiceCharges(). That is the reverse of the old Bachs split.
+// The money lands in DUEVY'S settlement account, not the department's — Anchor
+// confirmed sub-accounts are internal-only and Pay With Transfer takes no
+// settlement destination. The department's share is book-transferred on
+// afterwards by remitToSpaces(), which is why `settledAt` (collected) and
+// `remittedAt` (actually the rep's) are two different columns.
+//
+// Anchor enforces the amount, so the under/overpayment handling the virtual
+// NUBAN flow needed is gone: an inflow is always exactly what we invoiced.
 // ---------------------------------------------------------------------------
 
 export interface BankTransferInstructions {
@@ -70,35 +65,39 @@ export interface RedeemedDiscount {
   amountKobo: number;
 }
 
-interface CheckoutAccount extends BankTransferInstructions {
-  virtualNubanId: string;
+interface OpenedCheckout extends BankTransferInstructions {
+  payWithTransferId: string;
 }
 
-/** Creates the checkout's virtual account against the space's deposit account. */
+/**
+ * Opens the checkout account. `requireCollectableAccount` is still called even
+ * though the money no longer lands in the rep's account: an unverified space has
+ * nowhere to remit to, so it must not be able to take payments either.
+ */
 async function openCheckoutAccount(
   spaceId: string,
   reference: string,
   amountKobo: number,
+  email: string,
   metadata: Record<string, string>,
-): Promise<CheckoutAccount> {
-  if (amountKobo > TIER2_SINGLE_DEPOSIT_LIMIT_KOBO) throw new TierLimitExceededError(amountKobo);
+): Promise<OpenedCheckout> {
+  await requireCollectableAccount(spaceId);
 
-  const { accountId, customerId } = await requireCollectableAccount(spaceId);
-  const nuban = await createVirtualNuban({
-    settlementAccountId: accountId,
-    customerId,
+  const checkout = await createPayWithTransfer({
     reference,
+    email,
+    amountKobo,
     expirySeconds: env.ANCHOR_VA_EXPIRY_SECONDS,
     metadata,
   });
 
   return {
-    virtualNubanId: nuban.id,
-    accountNumber: nuban.accountNumber,
-    bankName: nuban.bankName,
-    accountName: nuban.accountName,
-    amountKobo,
-    expiresAt: nuban.expiresAt.toISOString(),
+    payWithTransferId: checkout.id,
+    accountNumber: checkout.accountNumber,
+    bankName: checkout.bankName,
+    accountName: checkout.accountName,
+    amountKobo: checkout.amountKobo,
+    expiresAt: checkout.expiresAt.toISOString(),
   };
 }
 
@@ -108,9 +107,6 @@ export async function initOnlineDuePayment(
   discount?: RedeemedDiscount,
 ): Promise<InvoiceResult> {
   const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
-  if (charge.totalCharged > TIER2_SINGLE_DEPOSIT_LIMIT_KOBO) {
-    throw new TierLimitExceededError(charge.totalCharged);
-  }
   const reference = await uniqueReference();
 
   await db.$transaction(async (tx) => {
@@ -150,7 +146,7 @@ export async function initOnlineDuePayment(
     });
   });
 
-  const account = await openCheckoutAccount(due.spaceId, reference, charge.totalCharged, {
+  const account = await openCheckoutAccount(due.spaceId, reference, charge.totalCharged, user.email, {
     dueId: due.id,
     userId: user.id,
   });
@@ -165,11 +161,11 @@ export async function initOnlineDuePayment(
         amount: charge.totalCharged,
         discountCodeId: discount?.id ?? null,
         discountAmountKobo: discount?.amountKobo ?? 0,
-        virtualNubanId: account.virtualNubanId,
-        virtualAccountNumber: account.accountNumber,
-        virtualAccountBankName: account.bankName,
-        virtualAccountName: account.accountName,
-        virtualAccountExpiresAt: account.expiresAt,
+        payWithTransferId: account.payWithTransferId,
+        checkoutAccountNumber: account.accountNumber,
+        checkoutBankName: account.bankName,
+        checkoutAccountName: account.accountName,
+        checkoutExpiresAt: account.expiresAt,
       },
     },
   });
@@ -199,7 +195,6 @@ export async function initOnlinePollVote(
   selections: VoteSelection[],
   totalCharged: number,
 ): Promise<InvoiceResult> {
-  if (totalCharged > TIER2_SINGLE_DEPOSIT_LIMIT_KOBO) throw new TierLimitExceededError(totalCharged);
   const reference = await uniqueReference();
 
   await db.$transaction(async (tx) => {
@@ -227,7 +222,7 @@ export async function initOnlinePollVote(
     });
   });
 
-  const account = await openCheckoutAccount(poll.spaceId, reference, totalCharged, {
+  const account = await openCheckoutAccount(poll.spaceId, reference, totalCharged, user.email, {
     pollId: poll.id,
     userId: user.id,
   });
@@ -240,11 +235,11 @@ export async function initOnlinePollVote(
         amountPerVote: poll.amountPerVote,
         selections,
         amount: totalCharged,
-        virtualNubanId: account.virtualNubanId,
-        virtualAccountNumber: account.accountNumber,
-        virtualAccountBankName: account.bankName,
-        virtualAccountName: account.accountName,
-        virtualAccountExpiresAt: account.expiresAt,
+        payWithTransferId: account.payWithTransferId,
+        checkoutAccountNumber: account.accountNumber,
+        checkoutBankName: account.bankName,
+        checkoutAccountName: account.accountName,
+        checkoutExpiresAt: account.expiresAt,
       },
     },
   });
@@ -272,10 +267,13 @@ export type FulfilOutcome = 'fulfilled' | 'already' | 'failed' | 'unknown' | 'un
 
 export interface FulfilOptions {
   /**
-   * What Anchor actually credited, when known. A virtual NUBAN carries no
-   * amount, so it cannot enforce what the payer sends — the check has to happen
-   * here (PRD §9.1). Omit when the caller has no figure (a status poll), in
-   * which case the recorded total is trusted.
+   * What Anchor actually credited, when known.
+   *
+   * SHOULD NEVER DISAGREE WITH THE INVOICED TOTAL. Pay With Transfer fixes the
+   * amount, so a mismatch means Anchor's own guarantee failed rather than that
+   * a payer mistyped. The handling below is kept as a cheap assertion — if it
+   * ever fires, treat it as a provider bug and escalate, not as routine
+   * reconciliation (PRD §9.1). Omit when the caller has no figure.
    */
   creditedKobo?: number;
 }
@@ -312,9 +310,9 @@ export async function fulfilByReference(
     dueId?: string;
     discountCodeId?: string | null;
     discountAmountKobo?: number;
-    virtualNubanId?: string;
-    virtualAccountNumber?: string;
-    virtualAccountExpiresAt?: string;
+    payWithTransferId?: string;
+    checkoutAccountNumber?: string;
+    checkoutExpiresAt?: string;
     underpaidFlaggedAt?: string;
   } & Record<string, unknown>;
 
@@ -378,10 +376,10 @@ export async function fulfilByReference(
             processingFee: charge.processingFee,
             duevyFee: charge.duevyFee,
             netToSpace: charge.netToSpace,
-            virtualNubanId: meta.virtualNubanId ?? null,
-            virtualAccountNumber: meta.virtualAccountNumber ?? null,
-            virtualAccountExpiresAt: meta.virtualAccountExpiresAt
-              ? new Date(meta.virtualAccountExpiresAt)
+            payWithTransferId: meta.payWithTransferId ?? null,
+            checkoutAccountNumber: meta.checkoutAccountNumber ?? null,
+            checkoutExpiresAt: meta.checkoutExpiresAt
+              ? new Date(meta.checkoutExpiresAt)
               : null,
           },
         });
@@ -448,10 +446,9 @@ export async function fulfilByReference(
 }
 
 /**
- * payment.settled — the inflow has cleared from the virtual account into the
- * space's deposit account, so the money is genuinely spendable. This is what
- * computeBalances() gates `available` on; payment.received only proves the
- * payer sent it.
+ * payin.received tells us the money reached DUEVY'S settlement account. That is
+ * "collected", not "the rep's" — remitToSpaces() still has to book-transfer it
+ * on. computeBalances() therefore gates `available` on remittedAt, not on this.
  */
 export async function markPaymentSettled(reference: string): Promise<void> {
   await db.duePayment.updateMany({
@@ -460,31 +457,16 @@ export async function markPaymentSettled(reference: string): Promise<void> {
   });
 }
 
-/** Which Anchor account a checkout was settling into, from its pending metadata. */
-export async function settlementAccountFor(metadata: unknown): Promise<string | null> {
-  const meta = (metadata ?? {}) as { dueId?: string; pollId?: string };
-
-  if (meta.dueId) {
-    const due = await db.due.findUnique({
-      where: { id: meta.dueId },
-      select: { space: { select: { anchorAccountId: true } } },
-    });
-    return due?.space.anchorAccountId ?? null;
-  }
-  if (meta.pollId) {
-    const poll = await db.poll.findUnique({
-      where: { id: meta.pollId },
-      select: { space: { select: { anchorAccountId: true } } },
-    });
-    return poll?.space.anchorAccountId ?? null;
-  }
-  return null;
+/** The Pay With Transfer id a checkout was opened against, from its metadata. */
+export function checkoutIdFor(metadata: unknown): string | null {
+  const meta = (metadata ?? {}) as { payWithTransferId?: string };
+  return meta.payWithTransferId ?? null;
 }
 
 /**
  * Active check for one pending payment, behind the payer's "I've made payment"
- * tap. Anchor has no checkout session to query, so the check is whether a
- * credit carrying our reference has landed in the settlement account.
+ * tap. Anchor has no checkout session to query, but a Pay With Transfer carries
+ * a `payIn` relationship once it has been funded — that is the signal.
  *
  * The webhook remains the source of truth; fulfilByReference is idempotent, so
  * this racing with it is safe by construction.
@@ -493,16 +475,16 @@ export async function pollInflow(reference: string): Promise<FulfilOutcome | 'pe
   const pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending || pending.status !== 'pending') return 'already';
 
-  const accountId = await settlementAccountFor(pending.metadata);
-  if (!accountId) return 'pending';
+  const checkoutId = checkoutIdFor(pending.metadata);
+  if (!checkoutId) return 'pending';
 
-  const transactions = await listAccountTransactions(accountId, { limit: 100 });
-  const credit = transactions.find((t) => t.direction === 'CREDIT' && t.reference === reference);
-  if (credit) return fulfilByReference(reference, true, { creditedKobo: credit.amountKobo });
+  const checkout = await getPayWithTransfer(checkoutId);
+  // Anchor fixes the amount, so a funded checkout is exactly what we invoiced —
+  // there is no credited amount to reconcile against.
+  if (checkout?.funded) return fulfilByReference(reference, true);
 
-  // Nothing arrived and the account is closed — this checkout is over. The row
-  // is only marked failed here, never paid, so an expired-then-paid transfer
-  // still gets picked up by reconciliation as an unmatched inflow.
+  // Nothing arrived and the window has closed. Only ever marked failed here,
+  // never paid — Anchor enforces the expiry, so a late transfer cannot land.
   if (pending.expiresAt <= new Date()) return fulfilByReference(reference, false);
   return 'pending';
 }

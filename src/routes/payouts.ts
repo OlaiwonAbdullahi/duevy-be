@@ -69,10 +69,13 @@ async function uniquePayoutReference(): Promise<string> {
  *  lifetime  = total ever completed
  * Pass `dueId` to scope every figure to a single due's own payments/payouts.
  *
- * Deliberately computed from our own ledger, never from the Anchor balance: the
- * space's real account briefly holds Duevy's 2% as well, until
- * sweepServiceCharges() collects it, so the raw balance overstates what the rep
- * may withdraw.
+ * Deliberately computed from our own ledger, never from the Anchor balance.
+ *
+ * `available` gates on remittedAt, NOT settledAt. A payment is "settled" once it
+ * reaches Duevy's collection account, which is not the same as reaching the
+ * department — remitToSpaces() still has to book-transfer it on. Gating on
+ * settledAt would let a rep request a withdrawal against money that is not yet
+ * in their account.
  */
 async function computeBalances(sid: string, dueId?: string) {
   const paymentWhere = dueId ? { due: { spaceId: sid }, dueId } : { due: { spaceId: sid } };
@@ -83,15 +86,15 @@ async function computeBalances(sid: string, dueId?: string) {
     ? { spaceId: sid, dueId, status: 'completed' as const }
     : { spaceId: sid, status: 'completed' as const };
 
-  const [settled, pending, reserved, lifetime] = await Promise.all([
-    db.duePayment.aggregate({ where: { ...paymentWhere, settledAt: { not: null } }, _sum: { netToSpace: true } }),
-    db.duePayment.aggregate({ where: { ...paymentWhere, settledAt: null }, _sum: { netToSpace: true } }),
+  const [remitted, pending, reserved, lifetime] = await Promise.all([
+    db.duePayment.aggregate({ where: { ...paymentWhere, remittedAt: { not: null } }, _sum: { netToSpace: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, remittedAt: null }, _sum: { netToSpace: true } }),
     db.payout.aggregate({ where: payoutWhere, _sum: { amount: true } }),
     db.payout.aggregate({ where: lifetimeWhere, _sum: { amount: true } }),
   ]);
-  const settledNet = settled._sum.netToSpace ?? 0;
+  const remittedNet = remitted._sum.netToSpace ?? 0;
   return {
-    available: Math.max(0, settledNet - (reserved._sum.amount ?? 0)),
+    available: Math.max(0, remittedNet - (reserved._sum.amount ?? 0)),
     pending: pending._sum.netToSpace ?? 0,
     lifetime: lifetime._sum.amount ?? 0,
   };

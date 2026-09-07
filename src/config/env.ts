@@ -32,18 +32,21 @@ const envSchema = z.object({
   // the token it will accept at 10 characters, so a longer secret can never be
   // registered with them and would fail every signature check.
   ANCHOR_WEBHOOK_SECRET: z.string().min(1).max(10),
-  // Duevy Labs' own Anchor deposit account — where the 2% service charge is
-  // swept to (see sweepServiceCharges() in payout.service.ts).
-  ANCHOR_REVENUE_ACCOUNT_ID: z.string(),
-  // How long a checkout's virtual account stays open. PRD §5.2 puts this at 30
-  // minutes; the countdown the payer sees is driven by the value Anchor echoes
-  // back, not by this.
+  // Duevy Labs' own Anchor deposit account. Two roles, deliberately one
+  // account: every student payment settles here first (Pay With Transfer has no
+  // settlement destination — see anchor.ts), and it is the source of the book
+  // transfers that remit each department's share on. Duevy's margin is simply
+  // whatever stays behind, so there is no separate revenue account to sweep to.
+  ANCHOR_SETTLEMENT_ACCOUNT_ID: z.string(),
   // Which bank issues the checkout account number. Anchor picks one if unset,
   // but the student sees this bank's name on the transfer screen, so pinning a
   // recognisable one (providus, wema) is worth doing.
   ANCHOR_VA_PROVIDER: z
     .enum(['wema', 'providus', 'gtb', 'ninepsb', 'corestep', 'column', 'circle', 'anchor'])
     .optional(),
+  // How long a checkout stays open, in seconds (PRD §5.2 — 30 minutes). Unlike
+  // the virtual-NUBAN flow this is load-bearing: Pay With Transfer takes it as
+  // `expiryTime` and enforces it, so a late transfer genuinely cannot land.
   ANCHOR_VA_EXPIRY_SECONDS: z.coerce.number().int().positive().default(1800),
 
   // App

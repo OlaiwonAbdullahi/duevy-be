@@ -567,21 +567,24 @@ model DuePayment {
   processingFee Int     // kobo — Anchor's expected cut, taken out of the 2%
   duevyFee    Int       // kobo — Duevy's margin, the rest of the 2%
   netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee, i.e. the face value
-  // The checkout's single-use virtual NUBAN. Expires after
-  // ANCHOR_VA_EXPIRY_SECONDS and is never reused (PRD §5.2).
-  virtualNubanId          String?
-  virtualAccountNumber    String?
-  virtualAccountExpiresAt DateTime?
-  // payment.received marks the payment successful; payment.settled means the
-  // funds have actually landed in the space's deposit account. `settledAt` is
-  // the gate computeBalances() uses for "available to pay out".
+  // The checkout's single-use Pay With Transfer account. Anchor fixes the
+  // amount and enforces the expiry, so an inflow here is always exactly
+  // `amountPaid` and never arrives late (PRD §5.2).
+  payWithTransferId     String?
+  checkoutAccountNumber String?
+  checkoutExpiresAt     DateTime?
+  // payin.received — the money is in DUEVY'S settlement account, not the
+  // department's. Collected, but not yet the rep's.
   settledAt   DateTime?
-  // Set once the 2% service charge has been swept OUT of the space's account
-  // into Duevy's revenue account (see sweepServiceCharges()). Note the
-  // direction: under Anchor the face value is already in the rep's own
-  // account, so what moves is Duevy's cut, not the department's share.
-  sweptAt               DateTime?
-  anchorSweepTransferId String?
+  // Set once netToSpace has been book-transferred ON to the space's own deposit
+  // account (see remitToSpaces()). This — not settledAt — is what
+  // computeBalances() gates "available to pay out" on, because until it is set
+  // the money is still sitting with Duevy.
+  //
+  // remitTransferId is provider-neutral on purpose: rows predating Anchor hold
+  // Bachs transfer ids and keep them, as the only audit trail for those moves.
+  remittedAt      DateTime?
+  remitTransferId String?
 
   user        User        @relation(fields: [userId], references: [id])
   due         Due         @relation(fields: [dueId], references: [id])

@@ -4,8 +4,15 @@ import { env } from '../config/env';
 /**
  * Anchor (getanchor.co) API client — the sole payment processor, replacing
  * Bachs Connect. Anchor is a BaaS rather than a gateway: there is no hosted
- * checkout, and every object (customer, deposit account, virtual NUBAN,
- * counterparty, transfer) is addressed explicitly through a JSON:API envelope.
+ * checkout, and every object (customer, deposit account, counterparty,
+ * transfer) is addressed explicitly through a JSON:API envelope.
+ *
+ * TWO PRODUCT SURFACES, ONE KEY. Everything under /api/v1 is the BaaS product
+ * and works in sandbox. The collection endpoints under /pay/* are the Payments
+ * product: same x-anchor-key, but gated on a payment program and available in
+ * PRODUCTION ONLY, with their own webhook registration and their own event
+ * (payin.received, which is absent from the BaaS event enum). Nothing under
+ * /pay/* can be exercised before Duevy Labs' KYB clears.
  *
  * Non-negotiables this module encodes, all verified against Anchor's OpenAPI
  * spec and docs.getanchor.co:
@@ -78,6 +85,20 @@ interface AnchorEnvelope<D> {
   data: D;
   included?: AnchorResource[];
   meta?: Record<string, unknown>;
+}
+
+/**
+ * Read `relationships.<name>.data.id` off a resource. Relationships are typed as
+ * unknown because their shape varies per endpoint, so every read goes through
+ * this rather than a cast at the callsite.
+ */
+export function relationshipId(resource: AnchorResource<unknown>, name: string): string | null {
+  const rel = resource.relationships?.[name];
+  if (!rel || typeof rel !== 'object') return null;
+  const data = (rel as { data?: unknown }).data;
+  if (!data || typeof data !== 'object') return null;
+  const id = (data as { id?: unknown }).id;
+  return typeof id === 'string' ? id : null;
 }
 
 async function anchorFetch<D>(path: string, opts: AnchorRequestOpts = {}): Promise<AnchorEnvelope<D>> {
@@ -303,70 +324,66 @@ export async function getAccountBalance(accountId: string): Promise<AccountBalan
 }
 
 // ---------------------------------------------------------------------------
-// Virtual NUBANs — one dynamic, expiring account per checkout, settling into
-// the space's deposit account.
+// Pay With Transfer — one dynamic account per checkout. PRODUCTION ONLY (see
+// the module header): /pay/* is the Payments product, gated on a payment
+// program, and unreachable in sandbox.
 //
-// NOTE THE VERSION: this is the only /api/v2 endpoint we call. It is documented
-// at docs.getanchor.co/reference/create-a-virtual-nuban but absent from the
-// published OpenAPI document, which is stale — do not "fix" the path to v1 on
-// the strength of the spec.
+// Anchor confirmed this, not virtual NUBANs, is the supported collection path:
+// funds settle into DUEVY'S OWN account, and a free book transfer moves each
+// payment on to the rep afterwards (see remitToSpaces()). Sub-accounts are
+// internal-use only and cannot be a settlement destination — the request has no
+// `relationships` block at all, so there is nothing to route.
 //
-// Two request-shape traps, both of which the OpenAPI schema would mislead you on:
-//  - `customer` is REQUIRED alongside `settlementAccount`. It is the account
-//    holder (the rep), not the payer, and it is what the response's accountName
-//    is derived from — so the student sees the rep's verified name.
-//  - `expiryDate` is NOT a request attribute. Anchor decides the account's
-//    lifetime; we cannot ask for 30 minutes. Our own countdown is therefore a
-//    Duevy-side construct (PendingPayment.expiresAt) and a late transfer can
-//    still land — handled as an unmatched inflow per PRD §9.1.
+// Two properties the whole design leans on, both absent from virtual NUBANs:
+//  - `amount` is REQUIRED and enforced. The payer cannot send the wrong figure,
+//    so under/overpayment reconciliation does not exist.
+//  - `expiryTime` (seconds) is a real request field. The countdown is Anchor's,
+//    not cosmetic, so a late transfer cannot land.
 //
-// A virtual NUBAN carries no `amount`, so it does NOT enforce what the payer
-// sends. Matching is by account; under/overpayment is reconciled by
-// fulfilByReference() against our own recorded total (PRD §9.1).
+// `customer.fullName` is deliberately omitted: Anchor then falls back to the
+// merchant name, so the payer sees "DUEVY" rather than the rep's BVN name.
 // ---------------------------------------------------------------------------
 
-export interface VirtualNubanAttributes {
+interface PayWithTransferAttributes {
+  reference: string;
   accountNumber: string;
-  accountName: string;
-  currency: 'NGN' | 'USD';
-  status: 'ACTIVE' | 'BLOCKED' | 'CLOSED' | 'DEPRECATED';
-  reference?: string;
-  permanent: boolean;
-  expiryDate?: string;
-  bank?: { id: string; name: string; nipCode?: string };
+  accountName?: string;
+  amount: number;
+  status: string;
   createdAt: string;
+  bank?: { name?: string };
+  expiry?: { expiryDate?: string; duration?: number };
 }
 
-export interface VirtualNuban {
+export interface CheckoutAccount {
   id: string;
   accountNumber: string;
   accountName: string;
   bankName: string;
+  amountKobo: number;
   expiresAt: Date;
 }
 
-export async function createVirtualNuban(input: {
-  settlementAccountId: string;
-  customerId: string;
+export async function createPayWithTransfer(input: {
   reference: string;
-  /** Only a UI/PendingPayment countdown — Anchor sets the real lifetime. */
+  email: string;
+  amountKobo: number;
   expirySeconds: number;
   metadata?: Record<string, string>;
-}): Promise<VirtualNuban> {
-  const fallbackExpiry = new Date(Date.now() + input.expirySeconds * 1000);
-  const { data } = await anchorFetch<AnchorResource<VirtualNubanAttributes>>('/api/v2/virtual-nubans', {
+}): Promise<CheckoutAccount> {
+  const { data } = await anchorFetch<AnchorResource<PayWithTransferAttributes>>('/pay/pay-with-transfer', {
+    idempotencyKey: `pwt-${input.reference.toLowerCase()}`,
     body: {
       data: {
-        type: 'VirtualNuban',
+        type: 'PayWithTransfer',
         attributes: {
-          permanent: false, // dynamic — expires, rather than a reserved account
           reference: toAnchorRef(input.reference),
+          amount: input.amountKobo,
+          expiryTime: input.expirySeconds,
+          // No fullName — see the header note; this is what makes it say "DUEVY".
+          customer: { email: input.email },
           ...(env.ANCHOR_VA_PROVIDER ? { provider: env.ANCHOR_VA_PROVIDER } : {}),
           ...(input.metadata ? { metadata: input.metadata } : {}),
-        },
-        relationships: {
-          customer: { data: { id: input.customerId, type: 'IndividualCustomerNG' } },
-          settlementAccount: { data: { id: input.settlementAccountId, type: 'DepositAccount' } },
         },
       },
     },
@@ -375,29 +392,54 @@ export async function createVirtualNuban(input: {
   return {
     id: data.id,
     accountNumber: data.attributes.accountNumber,
-    accountName: data.attributes.accountName,
+    accountName: data.attributes.accountName ?? 'Duevy',
     bankName: data.attributes.bank?.name ?? 'Anchor',
-    // Anchor's own expiry wins when it sends one; ours is only a fallback.
-    expiresAt: data.attributes.expiryDate ? new Date(data.attributes.expiryDate) : fallbackExpiry,
+    amountKobo: data.attributes.amount,
+    expiresAt: data.attributes.expiry?.expiryDate
+      ? new Date(data.attributes.expiry.expiryDate)
+      : new Date(Date.now() + input.expirySeconds * 1000),
   };
 }
 
 /**
- * Best-effort close of an expired or abandoned checkout account. Never throws.
- *
- * UNVERIFIED, AND CURRENTLY UNCALLED. Creation is documented at /api/v2, but no
- * close/deactivate endpoint appears in the docs or the OpenAPI document, so both
- * the verb and the version below are guesses. Wiring this up matters more than
- * it looks: because Anchor — not us — sets the account's lifetime, an abandoned
- * checkout stays open after our 30-minute countdown lapses, and a late transfer
- * lands as an unmatched inflow (PRD §9.1). Confirm the real endpoint with Anchor
- * before calling this.
+ * Read a checkout back. Once funded, the response carries a `payIn` in its
+ * relationships — which is how the reconciliation job spots a payment whose
+ * payin.received webhook never arrived.
  */
-export async function closeVirtualNuban(virtualNubanId: string): Promise<void> {
+export async function getPayWithTransfer(
+  payWithTransferId: string,
+): Promise<{ status: string; reference: string; funded: boolean } | null> {
   try {
-    await anchorFetch(`/api/v2/virtual-nubans/${encodeURIComponent(virtualNubanId)}`, { method: 'DELETE' });
+    const { data } = await anchorFetch<AnchorResource<PayWithTransferAttributes>>(
+      `/pay/pay-with-transfer/${encodeURIComponent(payWithTransferId)}`,
+    );
+    return {
+      status: data.attributes.status,
+      reference: fromAnchorRef(data.attributes.reference),
+      funded: relationshipId(data, 'payIn') !== null,
+    };
   } catch (err) {
-    console.error(`[anchor] closing virtual nuban ${virtualNubanId} failed:`, err);
+    if (err instanceof AnchorApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+/** Resolve a PayIn id (all `payin.received` carries) to our own reference. */
+export async function getPayIn(
+  payInId: string,
+): Promise<{ reference: string; amountKobo: number; status: string } | null> {
+  try {
+    const { data } = await anchorFetch<
+      AnchorResource<{ reference: string; amount: number; status: string }>
+    >(`/pay/payin/${encodeURIComponent(payInId)}`);
+    return {
+      reference: fromAnchorRef(data.attributes.reference),
+      amountKobo: data.attributes.amount,
+      status: data.attributes.status,
+    };
+  } catch (err) {
+    if (err instanceof AnchorApiError && err.status === 404) return null;
+    throw err;
   }
 }
 
@@ -466,7 +508,7 @@ export async function createCounterParty(input: {
 
 // ---------------------------------------------------------------------------
 // Transfers — NIP out to a counterparty (payouts), Book between our own
-// accounts (the service-charge sweep).
+// accounts (remitting each department its share).
 // ---------------------------------------------------------------------------
 
 export type TransferStatus =
@@ -536,7 +578,7 @@ export async function createNipTransfer(
   return toTransferResult(data);
 }
 
-/** Internal move between two accounts we control — the service-charge sweep. */
+/** Internal move between two accounts we control — free, and how remittances are made. */
 export async function createBookTransfer(
   input: { fromAccountId: string; toAccountId: string; amountKobo: number; reference: string; reason: string },
   idempotencyKey: string,

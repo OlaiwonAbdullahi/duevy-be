@@ -17,7 +17,7 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { uniqueReference, initOnlinePollVote, TierLimitExceededError } from '../services/payment.service';
+import { uniqueReference, initOnlinePollVote } from '../services/payment.service';
 import { KycNotVerifiedError } from '../services/anchorCustomer.service';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
 
@@ -516,15 +516,6 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
     const result = await initOnlinePollVote(user, poll, selections, totalCharged);
     ok(res, result);
   } catch (err) {
-    if (err instanceof TierLimitExceededError) {
-      fail(
-        res,
-        402,
-        'TIER_LIMIT_EXCEEDED',
-        `A single transfer cannot exceed ₦${(err.limitKobo / 100).toLocaleString('en-NG')}`,
-      );
-      return;
-    }
     if (err instanceof KycNotVerifiedError) {
       errors.conflict(res, 'SPACE_NOT_VERIFIED', err.message);
       return;

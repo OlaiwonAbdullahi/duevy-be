@@ -3,11 +3,12 @@
 The payment rail moved from Bachs Connect to **Anchor** (getanchor.co). Anchor is
 a BaaS, not a payment gateway, and two consequences reach the API surface:
 
-1. **There is no hosted checkout page.** The payer transfers to a virtual bank
-   account we open per checkout. `checkoutUrl` is gone.
-2. **A space cannot collect until its lead rep passes BVN verification.** The
-   space's collecting account is a deposit account owned by that rep's Anchor
-   customer record.
+1. **There is no hosted checkout page.** The payer transfers to a single-use
+   bank account we open per checkout. `checkoutUrl` is gone.
+2. **A space cannot collect until its lead rep passes BVN verification.** Money
+   settles into Duevy's account and is book-transferred on to a deposit account
+   owned by that rep's Anchor customer record — so without verification there is
+   nowhere for it to land.
 
 Everything else — auth, the response envelope, idempotency keys, pagination,
 error codes — is unchanged.
@@ -34,7 +35,7 @@ error codes — is unchanged.
     "bankTransfer": {
       "accountNumber": "0095000015",
       "bankName": "Providus Bank",
-      "accountName": "OLUWASEUN ADEBAYO TEMITOPE",
+      "accountName": "DUEVY",
       "amountKobo": 510000,
       "expiresAt": "2026-09-05T11:13:01.878Z"
     }
@@ -46,30 +47,28 @@ The old redirect flow no longer works. The pay screen must instead show the
 account number (tap-to-copy), bank, account name, the exact amount, and a
 countdown to `expiresAt`, then poll `GET /v1/payments/{reference}/status`.
 
-> **`accountName` IS NOT OURS TO SET, AND IT IS PROBABLY THE REP'S LEGAL NAME**
+> **THE ACCOUNT NAME IS DUEVY'S, AND THE AMOUNT IS ENFORCED**
 >
-> Anchor treats `accountName` as response-only on every account endpoint —
-> `POST /api/v1/accounts`, `PATCH /api/v1/accounts/{id}` and the `VirtualNuban`
-> schema all derive it from the verified holder rather than from anything we
-> send. (The one request field named `accountName`, on `POST /counterparties`,
-> is overwritten by Anchor when `verifyName: true`.)
+> The checkout is a Pay With Transfer account. `customer.fullName` is omitted
+> deliberately, so Anchor falls back to the merchant name and the payer sees
+> **"DUEVY"** — not the rep's BVN name, which is what the earlier virtual-NUBAN
+> design would have exposed.
 >
-> Because the checkout account settles into the rep's own deposit account, the
-> student most likely sees the rep's **full legal name as registered on their
-> BVN** — not "Duevy". Render it prominently and tell the payer whose name to
-> expect, or the transfer looks like it is going to a stranger. Confirm the
-> exact value in sandbox; it may differ from this example.
+> Anchor also holds the payer to the exact `amount`, so a wrong figure cannot be
+> sent and there is no underpayment state for the UI to handle. Confirm the
+> rendered name in production; `/pay/*` is not reachable in sandbox.
 
 Rules the UI has to respect:
 
-- **The amount shown is exact.** It is the due plus the 2% service charge.
-  Anything else breaks reconciliation.
+- **The amount shown is exact.** It is the due plus the 2% service charge, and
+  Anchor enforces it — a payer cannot send anything else.
 - **One account per checkout attempt** — not per student and not per due. A
   student who lets the countdown expire and retries gets a *new* number. Never
   cache an account number against a student or a due; key it on `reference` and
   re-read it from the status endpoint.
-- **The account is single-use and expires** (30 minutes by default). Expired
-  accounts are never reused — the student starts a new checkout.
+- **The account is single-use and expires** (30 minutes by default), enforced by
+  Anchor rather than by us. A transfer after the countdown cannot land, so the
+  timer hitting zero is final; the student starts a new checkout.
 - **Nothing is marked paid on the client.** There is no "I have paid" button
   that completes a payment; the poll reads our record, which only the Anchor
   webhook writes.
@@ -78,8 +77,10 @@ New failure modes on this endpoint:
 
 | Code | Status | Meaning |
 |---|---|---|
-| `SPACE_NOT_VERIFIED` | 409 | The rep hasn't finished verification, so the space has no account yet. |
-| `TIER_LIMIT_EXCEEDED` | 402 | The total would breach Anchor's ₦50,000 per-transfer ceiling. |
+| `SPACE_NOT_VERIFIED` | 409 | The rep hasn't finished verification, so there is nowhere to remit the money to. |
+
+There is **no per-transfer ceiling** on a checkout: payments settle into Duevy's
+own account, which Anchor confirmed is unlimited. A due can be any amount.
 
 ## 2. Polling status — additive
 
@@ -198,8 +199,12 @@ charge, not ours. `netSentKobo` is what lands in the rep's bank.
 ```
 
 `ceilingLevel` is `ok` / `warn` (≥70%) / `critical` (≥90%). At `warn`, nudge:
-"Withdraw now — your space is close to its limit." A space that hits the
-₦300,000 ceiling cannot receive more until the rep withdraws.
+"Withdraw now — your space is close to its limit."
+
+This ceiling applies to the **rep's own TIER_2 deposit account**, which holds
+remitted funds — not to collection, which is unlimited. Whether an inbound book
+transfer actually counts against it is unconfirmed with Anchor, so treat the
+warning as advisory until that is settled.
 
 New failure modes: `422 BELOW_MIN_PAYOUT` (minimum ₦1,000, or an amount too
 small to cover the fees).

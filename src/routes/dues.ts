@@ -9,7 +9,7 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { computeCharge } from '../lib/money';
 import { KycNotVerifiedError } from '../services/anchorCustomer.service';
 import { renderReceiptPdf } from '../lib/receipt';
-import { initOnlineDuePayment, TierLimitExceededError } from '../services/payment.service';
+import { initOnlineDuePayment } from '../services/payment.service';
 import { type Due, type DuePayment } from '@prisma/client';
 
 export const duesRouter = Router();
@@ -185,15 +185,6 @@ duesRouter.post(
       const result = await initOnlineDuePayment(user, due, discount);
       ok(res, result);
     } catch (err) {
-      if (err instanceof TierLimitExceededError) {
-        fail(
-          res,
-          402,
-          'TIER_LIMIT_EXCEEDED',
-          `A single transfer to this space cannot exceed ₦${(err.limitKobo / 100).toLocaleString('en-NG')}`,
-        );
-        return;
-      }
       if (err instanceof KycNotVerifiedError) {
         errors.conflict(res, 'SPACE_NOT_VERIFIED', err.message);
         return;

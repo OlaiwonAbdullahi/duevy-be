@@ -151,21 +151,21 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const meta = pending?.metadata as
     | {
         amount?: number;
-        virtualAccountNumber?: string;
-        virtualAccountBankName?: string;
-        virtualAccountName?: string;
-        virtualAccountExpiresAt?: string;
+        checkoutAccountNumber?: string;
+        checkoutBankName?: string;
+        checkoutAccountName?: string;
+        checkoutExpiresAt?: string;
       }
     | undefined;
 
   const bankTransfer =
-    status === 'pending' && meta?.virtualAccountNumber
+    status === 'pending' && meta?.checkoutAccountNumber
       ? {
-          accountNumber: meta.virtualAccountNumber,
-          bankName: meta.virtualAccountBankName ?? '',
-          accountName: meta.virtualAccountName ?? '',
+          accountNumber: meta.checkoutAccountNumber,
+          bankName: meta.checkoutBankName ?? '',
+          accountName: meta.checkoutAccountName ?? '',
           amountKobo: meta.amount ?? 0,
-          expiresAt: meta.virtualAccountExpiresAt ?? null,
+          expiresAt: meta.checkoutExpiresAt ?? null,
         }
       : null;
 

@@ -146,7 +146,7 @@ async function sweepPayoutFee(payout: Payout): Promise<void> {
   await createBookTransfer(
     {
       fromAccountId: space.anchorAccountId,
-      toAccountId: env.ANCHOR_REVENUE_ACCOUNT_ID,
+      toAccountId: env.ANCHOR_SETTLEMENT_ACCOUNT_ID,
       amountKobo: payout.duevyFeeKobo,
       reference: `pfee-${payout.reference.toLowerCase()}`,
       reason: `Withdrawal fee ${payout.reference}`,
@@ -190,28 +190,27 @@ export async function reconcileStalePayouts(): Promise<void> {
 }
 
 /**
- * The service-charge sweep — the inverse of the old Bachs split.
+ * Remittance — moves each collected payment ON to the department.
  *
- * Under Anchor the payer transfers straight into the space's own deposit
- * account, so the department's face value is already where it belongs. What has
- * to move is Duevy's share of the 2%.
+ * Anchor confirmed the supported shape: Pay With Transfer settles into DUEVY'S
+ * settlement account (sub-accounts are internal-only and cannot be a settlement
+ * destination), so the department's share has to be book-transferred out
+ * afterwards. Book transfers are internal and free, so this costs nothing per
+ * payment.
  *
- * ONLY `duevyFee` IS SWEPT, NOT `processingFee + duevyFee`. Anchor charges its
- * own collection fee and stamp duty directly against the account as separate
- * CustomerFee rows, so `processingFee` has already left; sweeping it again
- * would take Anchor's cut twice out of the rep's money. If Anchor's actual
- * charge ever diverges from the estimate in computeCharge(), the difference
- * shows up as account drift for the nightly reconciliation to surface — not as
- * a shortfall in the rep's withdrawable balance, which is computed from our own
- * ledger rather than from Anchor.
+ * ONLY `netToSpace` MOVES — the face value of the due. Duevy's margin simply
+ * stays behind in the settlement account, which is why there is no second
+ * sweep and no way to take Anchor's cut twice. Anchor charges its own
+ * collection fee against the settlement account as a CustomerFee row, so it is
+ * Duevy that absorbs it, and the rep receives the full face amount: "your
+ * ₦5,000 due stays ₦5,000" (PRD §7.1).
  *
- * Runs per payment with a deterministic idempotency key, the same shape the old
- * split sweep used; on INSUFFICIENT_BALANCE (settlement lag) it simply waits
- * for the next tick.
+ * Runs per payment with a deterministic idempotency key; on
+ * INSUFFICIENT_BALANCE (settlement lag) it simply waits for the next tick.
  */
-export async function sweepServiceCharges(): Promise<void> {
+export async function remitToSpaces(): Promise<void> {
   const pending = await db.duePayment.findMany({
-    where: { settledAt: { not: null }, sweptAt: null },
+    where: { settledAt: { not: null }, remittedAt: null },
     include: { due: { include: { space: { select: { anchorAccountId: true } } } } },
     take: 50,
   });
@@ -220,32 +219,32 @@ export async function sweepServiceCharges(): Promise<void> {
     const accountId = payment.due.space.anchorAccountId;
     if (!accountId) continue; // space isn't provisioned — leave for a later tick
 
-    // A fully discounted charge leaves Duevy nothing to collect; close it out
+    // Nothing to move (a fully discounted or zero-value due); close it out
     // rather than re-selecting it forever.
-    if (payment.duevyFee <= 0) {
-      await db.duePayment.update({ where: { id: payment.id }, data: { sweptAt: new Date() } });
+    if (payment.netToSpace <= 0) {
+      await db.duePayment.update({ where: { id: payment.id }, data: { remittedAt: new Date() } });
       continue;
     }
 
     try {
-      const key = `swp-${payment.reference.toLowerCase()}`;
+      const key = `rmt-${payment.reference.toLowerCase()}`;
       const transfer = await createBookTransfer(
         {
-          fromAccountId: accountId,
-          toAccountId: env.ANCHOR_REVENUE_ACCOUNT_ID,
-          amountKobo: payment.duevyFee,
+          fromAccountId: env.ANCHOR_SETTLEMENT_ACCOUNT_ID,
+          toAccountId: accountId,
+          amountKobo: payment.netToSpace,
           reference: key,
-          reason: `Service charge ${payment.reference}`,
+          reason: `Dues remittance ${payment.reference}`,
         },
         key,
       );
       await db.duePayment.update({
         where: { id: payment.id },
-        data: { sweptAt: new Date(), anchorSweepTransferId: transfer.id },
+        data: { remittedAt: new Date(), remitTransferId: transfer.id },
       });
     } catch (err) {
       if (err instanceof AnchorApiError && err.isInsufficientBalance) continue;
-      console.error(`[payout] service-charge sweep failed for ${payment.reference}:`, err);
+      console.error(`[payout] remittance failed for ${payment.reference}:`, err);
     }
   }
 }

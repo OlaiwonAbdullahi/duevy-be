@@ -13,7 +13,7 @@ const defaults: Record<string, string> = {
   ANCHOR_SECRET_KEY: 'test-anchor-key',
   ANCHOR_BASE_URL: 'https://api.sandbox.getanchor.co',
   ANCHOR_WEBHOOK_SECRET: 'whsec12345',
-  ANCHOR_REVENUE_ACCOUNT_ID: '012345678901234-anc_acc',
+  ANCHOR_SETTLEMENT_ACCOUNT_ID: '012345678901234-anc_acc',
 };
 
 for (const [key, value] of Object.entries(defaults)) {

@@ -2,10 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   computeCharge,
   computePayoutFees,
-  MAX_DUE_AMOUNT_KOBO,
   MIN_PAYOUT_KOBO,
   STAMP_DUTY_KOBO,
-  TIER2_SINGLE_DEPOSIT_LIMIT_KOBO,
 } from './money';
 
 const NAIRA = 100;
@@ -67,14 +65,25 @@ describe('computeCharge', () => {
     expect(full.totalFee).toBe(0);
   });
 
-  it('keeps the largest allowed due under the TIER_2 single-deposit ceiling', () => {
-    expect(computeCharge(MAX_DUE_AMOUNT_KOBO).totalCharged).toBeLessThanOrEqual(
-      TIER2_SINGLE_DEPOSIT_LIMIT_KOBO,
-    );
-    // And that the cap is tight — one naira more would breach it.
-    expect(computeCharge(MAX_DUE_AMOUNT_KOBO + NAIRA).totalCharged).toBeGreaterThan(
-      TIER2_SINGLE_DEPOSIT_LIMIT_KOBO,
-    );
+  // Under Pay With Transfer the whole charge lands in Duevy's settlement
+  // account and only `netToSpace` is remitted on to the rep. Duevy's margin is
+  // therefore exactly what stays behind — and it must never include
+  // `processingFee`, which is Anchor's own cut and is charged separately
+  // against the settlement account.
+  it('leaves exactly duevyFee behind when netToSpace is remitted', () => {
+    for (const face of [200_000, 500_000, 2_000_000, 5_000_000, 20_000_000]) {
+      const c = computeCharge(face);
+      expect(c.totalCharged - c.netToSpace).toBe(c.totalFee);
+      expect(c.totalFee - c.processingFee).toBe(c.duevyFee);
+      // The rep receives the face value untouched, whatever the ticket size.
+      expect(c.netToSpace).toBe(face);
+    }
+  });
+
+  it('has no single-deposit cap — the settlement account is unlimited', () => {
+    const huge = computeCharge(100_000_000); // ₦1,000,000, well past any TIER_2 limit
+    expect(huge.netToSpace).toBe(100_000_000);
+    expect(huge.totalCharged).toBe(102_000_000);
   });
 });
 

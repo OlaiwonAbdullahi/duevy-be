@@ -52,29 +52,30 @@ UPDATE "spaces"
 CREATE UNIQUE INDEX "spaces_anchorAccountId_key" ON "spaces"("anchorAccountId");
 
 -- ---------------------------------------------------------------------------
--- due_payments — the sweep inverts direction, so these columns change meaning
+-- due_payments — renamed for clarity, but the SEMANTIC IS UNCHANGED from the
+-- Bachs era: money is collected centrally, then moved out to the department.
+-- Under Anchor that second leg is a free book transfer from Duevy's settlement
+-- account, so historical `transferredAt` rows carry over as-is.
 -- ---------------------------------------------------------------------------
-ALTER TABLE "due_payments" RENAME COLUMN "transferredAt" TO "sweptAt";
-ALTER TABLE "due_payments" RENAME COLUMN "splitTransferId" TO "anchorSweepTransferId";
+ALTER TABLE "due_payments" RENAME COLUMN "transferredAt" TO "remittedAt";
+ALTER TABLE "due_payments" RENAME COLUMN "splitTransferId" TO "remitTransferId";
 
 ALTER TABLE "due_payments"
-  ADD COLUMN     "virtualNubanId" TEXT,
-  ADD COLUMN     "virtualAccountNumber" TEXT,
-  ADD COLUMN     "virtualAccountExpiresAt" TIMESTAMP(3),
+  ADD COLUMN     "payWithTransferId" TEXT,
+  ADD COLUMN     "checkoutAccountNumber" TEXT,
+  ADD COLUMN     "checkoutExpiresAt" TIMESTAMP(3),
   ADD COLUMN     "settledAt" TIMESTAMP(3);
 
--- Historical payments were already transferred to the department under the old
--- model, so their funds are settled by definition. Without this they would drop
--- out of computeBalances()'s `available` (which now gates on settledAt) and a
--- rep's withdrawable balance would silently reset to zero.
-UPDATE "due_payments" SET "settledAt" = "paidAt" WHERE "sweptAt" IS NOT NULL;
+-- `settledAt` means "the provider confirmed the inflow into Duevy's collection
+-- account". Anything already remitted to a department under the old model was,
+-- by definition, collected first — so backfill it, or these rows would look
+-- unsettled and a rep's withdrawable balance would silently reset to zero.
+UPDATE "due_payments" SET "settledAt" = "paidAt" WHERE "remittedAt" IS NOT NULL;
 
--- The old sweep moved the department's share INTO its account; the new one
--- moves Duevy's 2% OUT. Those are different operations, so historical rows are
--- reset to un-swept — but only the transfer id, not sweptAt: re-sweeping a
--- payment collected under the old fee model would take a cut that was never
--- charged. Leaving sweptAt set marks them as "nothing further to move".
-UPDATE "due_payments" SET "anchorSweepTransferId" = NULL;
+-- `remitTransferId` deliberately keeps its historical Bachs ids rather than
+-- being nulled: the transfer genuinely happened and is the only audit trail for
+-- it. The column is provider-neutral for exactly this reason — do not rename it
+-- to anchor*.
 
 -- ---------------------------------------------------------------------------
 -- payouts — PRD §7.3 fee breakdown

@@ -158,7 +158,14 @@ Verification is asynchronous. The rep submits, sees a "Verifying…" state, and 
 | `customer.identification.rejected` | Rep status → `kyc_failed`. Banner turns amber with the rejection reason and a "Fix and retry" action. Rep can resubmit; each attempt is a fresh Anchor call and a fresh ₦50. |
 | `customer.identification.error` | Transient. Retry with backoff (3 attempts, 1/5/30 minutes). Rep sees "Still verifying" and is not asked to do anything. |
 
-> ⚠️ **TIER 1 LIMITS — THIS CONSTRAINS THE PRODUCT, NOT JUST COMPLIANCE**
+> ⚠️ **SUPERSEDED IN PART — SEE OPEN QUESTION 3**
+>
+> Collection is no longer bounded by these limits: students pay into Duevy's
+> settlement account, which Anchor confirmed is unlimited, so **Consequence 1
+> below is void** and a due may be any amount. What may still bind is the
+> balance the rep's own account can hold, which is unconfirmed.
+>
+> ⚠️ **TIER 2 LIMITS — THIS CONSTRAINS THE PRODUCT, NOT JUST COMPLIANCE**
 >
 > TIER_2: maximum single deposit ₦50,000; maximum cumulative balance ₦300,000.
 >
@@ -269,9 +276,9 @@ Anchor is the only money rail in the MVP. Everything below maps to Anchor's docu
 | Rep | Individual Customer (created at approval, before KYC) |
 | Rep KYC | Individual verification, level `TIER_2` (BVN + DOB + gender) |
 | Space account | Deposit account (savings), owned by the rep's customer record |
-| Checkout | Virtual NUBAN (dynamic, single-use, amount-fixed) attached to the space's deposit account |
+| Checkout | Pay With Transfer account (dynamic, single-use, amount-fixed, expiring) settling into **Duevy's** settlement account |
 | Withdrawal | NIP transfer out to the rep's saved counterparty bank account |
-| Duevy revenue | Service charge swept to the Duevy revenue account |
+| Duevy revenue | Whatever stays in the settlement account after `netToSpace` is remitted — no sweep |
 
 ### 6.2 Provisioning sequence
 
@@ -285,19 +292,22 @@ Anchor is the only money rail in the MVP. Everything below maps to Anchor's docu
 
 ### 6.3 Collections
 
-- One virtual account per checkout attempt, fixed to the exact total, expiring in 30 minutes.
-- Anchor charges **0.5% capped at ₦500** on inflow through a virtual NUBAN.
+- One Pay With Transfer account per checkout attempt (`POST /pay/pay-with-transfer`), fixed to the exact total and expiring in 30 minutes. **Anchor enforces both**, so a wrong amount cannot be sent and a late transfer cannot land.
+- Funds settle into **Duevy's settlement account**, not the space's. `remitToSpaces()` then book-transfers `netToSpace` on to the rep — free, and the reason the rep receives the face value untouched.
+- Anchor charges **0.5% capped at ₦500** on inflow, against the settlement account, so Duevy absorbs it.
 - CBN stamp duty of ₦50 applies to transfers above ₦10,000 — it applies on both inflow and payout and is the single biggest threat to the margin (see §7).
-- The inflow webhook is the single source of truth for a successful payment.
+- The `payin.received` webhook is the single source of truth for a successful payment.
+- **`/pay/*` is production-only**, gated on a payment program, so none of this can be exercised in sandbox before KYB.
 
 ### 6.4 Webhooks
 
 Duevy subscribes to, at minimum:
 
 - `customer.identification.approved` / `.rejected` / `.error`
-- Deposit account created
-- Virtual account inflow / payment received
-- Transfer successful / failed / reversed
+- `account.opened` / `accountNumber.created`
+- `payin.received` — **registered separately**; it belongs to the Payments product, not the BaaS event enum
+- `nip.transfer.successful` / `.failed` / `.reversed`
+- `book.transfer.successful` / `.failed` — remittance outcomes
 
 **Handler rules — non-negotiable**
 
@@ -512,10 +522,10 @@ These need an answer from Anchor or a decision from you before M2 starts.
 | # | Question |
 |:--:|---|
 | 1 | ~~**Tier naming mismatch**~~ — **ANSWERED.** The API's `level` enum accepts only `TIER_2` and `TIER_3`, and the fee types are `KYC_TIER_2` / `KYC_TIER_3`. The BVN level is `TIER_2`, so the pricing sheet's "Individual KYC Tier 2 — ₦50" is the right line and the ₦50 assumption in §7.2 holds. See §3.4. |
-| 2 | ~~**Account ownership**~~ — **DECIDED: per-rep deposit account.** The space's account belongs to the rep's verified customer record; Duevy never holds student funds. The rejected alternative (Anchor sub-accounts under a Duevy FBO deposit account, each with its own virtual NUBAN) is a real and supported option if the TIER_2 ceilings prove unworkable in the pilot — that route sidesteps them entirely, at the cost of making Duevy the fund holder. |
-| 3 | Is the ₦300,000 TIER_2 cumulative balance a hard block on inflow, or a soft limit? If inflows are refused at the ceiling, the withdrawal nudge in §3.4 must become a hard stop with a queued-payment message. |
-| 4 | ~~**Dynamic virtual accounts**~~ — **ANSWERED: they exist and are documented.** `POST /api/v2/virtual-nubans` (note: **v2** — the endpoint is absent from Anchor's published OpenAPI document, which is stale). `permanent: false` gives a dynamic, expiring account; `settlementAccount` may be a `DepositAccount`, `SubAccount` or `ElectronicAccount`; `provider` selects the issuing bank (wema / providus / gtb / ninepsb / …). **Two constraints the design has to absorb:** (a) `customer` is a required relationship and drives the `accountName`, so the payer sees the rep's verified name, not a Duevy brand; (b) `expiryDate` is **not** a request attribute — Anchor sets the lifetime, so the 30-minute countdown in §5.2 is a Duevy-side construct only and a late transfer can still land, handled as an unmatched inflow per §9.1. A virtual NUBAN still has no `amount` field, so under/overpayment is reconciled in `fulfilByReference()`. |
-| 5 | ~~**Service-charge settlement**~~ — **ANSWERED: the full amount lands and is swept.** Anchor has no split-on-inflow, so the whole charge credits the space's account and Duevy's margin is moved out by book transfer (`sweepServiceCharges()`). The space balance therefore does briefly overstate what the rep may withdraw, which is exactly why `computeBalances()` is derived from our own ledger and never from the Anchor balance. Book transfers are internal and not priced on the rate card. |
+| 2 | ~~**Account ownership**~~ — **ANSWERED BY ANCHOR: neither original option.** Sub-accounts are **internal-use only** and cannot hold customer funds, so the FBO + sub-ledger model is off the table. The supported shape is: students pay into **Duevy's own settlement account** via Pay With Transfer, and each department's share is then moved on by a **free book transfer** to a deposit account owned by the rep's verified customer record. Duevy therefore holds student funds transiently, between `payin.received` and remittance — which makes SCUML (question 6) materially more likely, not less. |
+| 3 | ~~**Balance ceiling**~~ — **PARTLY ANSWERED.** Anchor confirmed **Duevy's settlement account has no limit**, so the ₦50,000 single-deposit cap no longer constrains checkout and a due may be any amount (§3.4's Consequence 1 is void). What remains unconfirmed is whether the rep's own TIER_2 deposit account still enforces the ₦300,000 cumulative ceiling against **inbound book transfers**. The withdrawal nudge stays in place as advisory until Anchor answers. |
+| 4 | ~~**Dynamic virtual accounts**~~ — **ANSWERED: `POST /pay/pay-with-transfer`.** Fixed `amount` (so under/overpayment is impossible), real `expiryTime` in seconds (so the 30-minute countdown is enforced by Anchor, not cosmetic), single-use, and `customer.fullName` omitted means the payer sees **"DUEVY"** rather than the rep's BVN name. The cost: `/pay/*` is the Payments product, gated on a payment program and **production-only**, so the entire collection path is untestable until KYB clears. The earlier `POST /api/v2/virtual-nubans` route is documented and real but settles to the rep's account, which Anchor does not support for collections. |
+| 5 | ~~**Service-charge settlement**~~ — **ANSWERED, AND SIMPLER THAN EITHER OPTION.** The full amount lands in Duevy's settlement account and only `netToSpace` is book-transferred out, so Duevy's margin is simply what stays behind — there is no sweep, and no way to take Anchor's cut twice. Anchor's 0.5% collection fee is charged against the settlement account, so Duevy absorbs it and the rep receives the full face value. Book transfers are internal and free. |
 | 6 | **SCUML registration** — flagged as applicable given third-party fund handling. Confirm whether Anchor requires it before production approval for Duevy Labs Ltd. |
 | 7 | ~~**Stamp duty on payouts**~~ — **DECIDED: passed through.** The rep is charged ₦100 (₦50 Anchor NIP + ₦50 Duevy) plus ₦50 stamp duty above ₦10,000, shown as a separate statutory line. Anchor deducts the duty itself as a `STAMP_DUTY` fee row, so Duevy does not add it to the transfer — it is taken out of the rep's gross request so the account reconciles exactly. Still worth confirming the duty is charged to the customer account rather than the organisation's. |
 | 8 | ~~**Inflow fee**~~ — **ANSWERED: charged separately, not netted off.** Anchor books its fees as distinct `CustomerFee` rows against the account (`PAYMENT_COLLECTION`, `STAMP_DUTY`, `TRANSFER_FEE`, `VAT`, `COT`), so the credit equals what the student sent. No top-up from revenue is needed. The consequence for the sweep: only Duevy's own margin is moved out, never `processingFee`, or Anchor's cut would be taken twice. |

@@ -38,7 +38,7 @@ export function formatNaira(kobo: number): string {
  */
 export const SERVICE_CHARGE_PERCENT = 2;
 
-/** Anchor's inflow pricing on a virtual NUBAN: 0.5%, capped at ₦500. */
+/** Anchor's inflow pricing on a collection: 0.5%, capped at ₦500. */
 const ANCHOR_COLLECTION_RATE = 0.005;
 const ANCHOR_COLLECTION_CAP_KOBO = 50_000; // ₦500
 
@@ -54,21 +54,16 @@ export const DUEVY_PAYOUT_FEE_KOBO = 5_000; // ₦50
 export const MIN_PAYOUT_KOBO = 100_000; // ₦1,000
 
 /**
- * Anchor TIER_2 (BVN) ceilings. These constrain the product, not just
- * compliance: a single due cannot exceed the deposit limit, and a space's
- * balance has to be withdrawn before it reaches the ceiling (PRD §3.4).
+ * Anchor TIER_2 (BVN) balance ceiling for a rep's own deposit account.
+ *
+ * The matching SINGLE-DEPOSIT limit is deliberately absent: students now pay
+ * into Duevy's settlement account, which Anchor confirmed has no limit, so a
+ * due of any size can be collected. What still lands in the rep's TIER_2
+ * account is the remittance, and whether an inbound book transfer counts
+ * against this ceiling is UNCONFIRMED — the warning in payouts.ts stays until
+ * Anchor answers.
  */
-export const TIER2_SINGLE_DEPOSIT_LIMIT_KOBO = 5_000_000; // ₦50,000
 export const TIER2_BALANCE_CEILING_KOBO = 30_000_000; // ₦300,000
-
-/**
- * The largest face amount a due may carry. The payer transfers face + the
- * service charge, and that total is what has to fit under the single-deposit
- * ceiling — so the cap on the face sits just under ₦50,000, not at it.
- */
-export const MAX_DUE_AMOUNT_KOBO = Math.floor(
-  TIER2_SINGLE_DEPOSIT_LIMIT_KOBO / (1 + SERVICE_CHARGE_PERCENT / 100),
-);
 
 export function stampDutyFor(amountKobo: number): number {
   return amountKobo > STAMP_DUTY_THRESHOLD_KOBO ? STAMP_DUTY_KOBO : 0;

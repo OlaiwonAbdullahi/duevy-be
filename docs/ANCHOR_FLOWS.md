@@ -11,7 +11,11 @@ Every Anchor call Duevy makes, grouped by the flow it belongs to. Derived from
   lowercased by `toAnchorRef()` on the way out and restored by `fromAnchorRef()`
   on the way back.
 
-One endpoint is on **v2**: virtual NUBAN creation. Everything else is v1.
+**Two product surfaces, one key.** `/api/v1/*` is the BaaS product and works in
+sandbox. `/pay/*` is the Payments product — same `x-anchor-key`, but gated on a
+payment program and **production only**, with its own webhook registration and
+its own event (`payin.received`). Collections live there, so none of flow 3 can
+be exercised before Duevy Labs' KYB clears.
 
 ---
 
@@ -65,49 +69,56 @@ starts a 24-hour cooldown.
 
 | # | Trigger | Anchor call | Duevy code |
 |:--:|---|---|---|
-| 1 | `POST /v1/dues/:dueId/pay` | `POST /api/v2/virtual-nubans` | `createVirtualNuban()` |
+| 1 | `POST /v1/dues/:dueId/pay` | `POST /pay/pay-with-transfer` | `createPayWithTransfer()` |
 | 2 | Student transfers from their bank app | — | — |
-| 3 | webhook `payment.received` / `nip.inbound.received` | — | `fulfilByReference()` |
-| 4 | webhook `payment.settled` / `nip.inbound.completed` | — | `markPaymentSettled()` |
+| 3 | webhook `payin.received` | `GET /pay/payin/{id}` to recover our reference | `fulfilByReference()` + `markPaymentSettled()` |
 
 Service: `src/services/payment.service.ts`.
 
-The request needs **both** a `customer` and a `settlementAccount` relationship.
-`permanent: false` makes the account dynamic. `provider`
-(`ANCHOR_VA_PROVIDER`) picks the issuing bank the student sees.
+**The money lands in Duevy's settlement account, not the department's.** Anchor
+confirmed sub-accounts are internal-use only, and the Pay With Transfer request
+has no `relationships` block at all — there is no settlement destination to
+name. Flow 4 moves each payment on.
 
-Three things this flow cannot do, all of which the code compensates for:
+`customer.fullName` is deliberately omitted so Anchor falls back to the merchant
+name: the payer sees **"DUEVY"**, not the rep's BVN name.
 
-- **No hosted checkout.** The response is an account number, not a URL. The pay
-  screen renders tap-to-copy transfer details instead of redirecting.
-- **No fixed amount.** A virtual NUBAN has no `amount` field, so the student can
-  send the wrong figure. `fulfilByReference()` reconciles what arrived against
-  our own recorded total (PRD §9.1).
-- **No settable expiry.** `expiryDate` is response-only — Anchor owns the
-  account's lifetime. Our 30-minute countdown is `PendingPayment.expiresAt` plus
-  a UI timer, nothing more, so a late transfer can still land and is handled as
-  an unmatched inflow.
+What this flow gives us that a virtual NUBAN could not:
 
-Step 3 credits the space and moves the money into `pending`; step 4 is what makes
-it withdrawable.
+- **The amount is enforced.** `amount` is required and Anchor holds the payer to
+  it, so under/overpayment cannot occur. The check in `fulfilByReference()`
+  survives only as an assertion — if it fires, Anchor's guarantee broke.
+- **The expiry is real.** `expiryTime` is a request field in seconds, so the
+  30-minute countdown is Anchor's, not cosmetic, and a late transfer cannot land.
+
+Still true: there is no hosted checkout. The response is an account number, and
+the pay screen renders tap-to-copy transfer details.
+
+`payin.received` carries only `relationships.payIn.data.id`, so the handler
+fetches the PayIn to recover our reference before fulfilling.
 
 ---
 
-## 4. Service-charge sweep
+## 4. Remittance to the department
 
-Runs on the reconciliation tick, once a payment has settled.
+Runs on the reconciliation tick, once a payment is settled.
 
 | Anchor call | Duevy code |
 |---|---|
 | `POST /api/v1/transfers` with `type: BookTransfer` | `createBookTransfer()` |
 
-`sweepServiceCharges()` in `src/services/payout.service.ts`, moving money from
-the space's deposit account to `ANCHOR_REVENUE_ACCOUNT_ID`.
+`remitToSpaces()` in `src/services/payout.service.ts`, moving money from
+`ANCHOR_SETTLEMENT_ACCOUNT_ID` to the space's own deposit account. Book
+transfers are internal and free, so this costs nothing per payment.
 
-**It sweeps `duevyFee` only, never `processingFee`.** Anchor books its own
-collection fee against the account as a separate `CustomerFee` row, so sweeping
-the full service charge would take Anchor's cut a second time out of the rep's
-money. Confirmation arrives as `book.transfer.successful` / `.failed`.
+**Only `netToSpace` moves** — the face value of the due. Duevy's margin simply
+stays behind in the settlement account, which is why there is no second sweep
+and no way to take Anchor's cut twice. Anchor charges its 0.5% collection fee
+against the settlement account, so Duevy absorbs it and the rep receives the
+full face amount: *your ₦5,000 due stays ₦5,000* (PRD §7.1).
+
+`remittedAt` — not `settledAt` — is what makes money withdrawable. Confirmation
+arrives as `book.transfer.successful` / `.failed`.
 
 ---
 
@@ -139,15 +150,16 @@ Transfers stuck in flight are polled with
 
 | Anchor call | Duevy code |
 |---|---|
-| `GET /api/v1/transactions?accountId=…` | `listAccountTransactions()` |
+| `GET /pay/pay-with-transfer/{id}` | `getPayWithTransfer()` |
 
 `src/jobs/reconciliation.ts`, every 5 minutes. Anchor has no checkout session to
-poll, so a payment whose webhook never arrived is found by scanning the
-settlement account's own transaction history for a credit carrying our reference.
-One listing per account, not per payment. Stale after 15 minutes, abandoned after
+poll, but a Pay With Transfer gains a `payIn` relationship once funded — so
+reading the checkout back says whether the money arrived and only the
+notification was lost. One call per stale payment; each checkout is its own
+object, so there is nothing to batch. Stale after 15 minutes, abandoned after
 48 hours.
 
-The same tick also runs the service-charge sweep and re-checks stuck payouts.
+The same tick runs the remittance and re-checks stuck payouts.
 
 ---
 
@@ -159,6 +171,10 @@ Registered with `POST /api/v1/webhooks`. **The token Anchor accepts is capped at
 10 characters**, so `ANCHOR_WEBHOOK_SECRET` has to be short — a longer value can
 never be registered and would fail every check.
 
+⚠ `payin.received` is **not** in the BaaS event enum. It belongs to the Payments
+product and needs its own registration; whether it can be pointed at this same
+endpoint and secret is unconfirmed.
+
 Signature verification uses `x-anchor-signature`, computed as
 `base64(hex(HMAC_SHA1(rawBody, token)))` — hex first, *then* base64. A plain
 base64-of-digest implementation fails, and there is a test asserting exactly
@@ -168,15 +184,14 @@ Every event is written to `webhook_events` keyed on Anchor's event id before
 processing; a repeated id is acknowledged and dropped. The handler always returns
 200 — reconciliation is the backstop.
 
-Eighteen events are handled:
-
 | Group | Events |
 |---|---|
 | KYC | `customer.identification.` — `approved`, `rejected`, `error`, `manualReview`, `awaitingDocument`, `reenter_information`, `pending` |
 | Provisioning | `account.opened`, `accountNumber.created` |
-| Collection | `payment.received`, `payment.settled`, `nip.inbound.received`, `nip.inbound.completed` |
+| Collection | **`payin.received`** — fulfils and settles in one step |
+| Direct inflows | `nip.inbound.received`, `nip.inbound.completed` — logged, not checkouts |
 | Payout | `nip.transfer.successful`, `.failed`, `.reversed` |
-| Sweep | `book.transfer.successful`, `.failed` |
+| Remittance | `book.transfer.successful`, `.failed` |
 
 ---
 
@@ -190,8 +205,9 @@ Eighteen events are handled:
 | POST | `/api/v1/accounts` | `createDepositAccount` | 1 |
 | GET | `/api/v1/accounts/{id}` | `getAccount` | 1, 5 |
 | GET | `/api/v1/accounts/balance/{id}` | `getAccountBalance` | 5 |
-| **POST** | **`/api/v2/virtual-nubans`** | `createVirtualNuban` | 3 |
-| DELETE | `/api/v2/virtual-nubans/{id}` ⚠ | `closeVirtualNuban` | — |
+| **POST** | **`/pay/pay-with-transfer`** | `createPayWithTransfer` | 3 |
+| GET | `/pay/pay-with-transfer/{id}` | `getPayWithTransfer` | 6 |
+| GET | `/pay/payin/{id}` | `getPayIn` | 3 |
 | GET | `/api/v1/banks` | `getBanks` | 2 |
 | GET | `/api/v1/payments/verify-account/{bankCode}/{accountNumber}` | `verifyAccount` | 2 |
 | POST | `/api/v1/counterparties` | `createCounterParty` | 2 |
@@ -199,9 +215,10 @@ Eighteen events are handled:
 | POST | `/api/v1/transfers` — `BookTransfer` | `createBookTransfer` | 4 |
 | GET | `/api/v1/transfers/{id}` | `getTransfer` | 5 |
 | GET | `/api/v1/transfers/verify/{id}` | `verifyTransfer` | 5 |
-| GET | `/api/v1/transactions` | `listAccountTransactions` | 6 |
+| GET | `/api/v1/transactions` | `listAccountTransactions` | — |
 
-⚠ **Unverified and currently uncalled.** No close/deactivate endpoint appears in
+The three `/pay/*` rows are production-only. Everything else works in sandbox,
+so flows 1, 2 and 5 can be verified before KYB; flows 3, 4 and 6 cannot.
 Anchor's docs or OpenAPI document, so both the verb and the version are inferred.
 It matters because Anchor owns the account lifetime — an abandoned checkout stays
 open past our countdown. Confirm the real endpoint with Anchor before wiring it up.

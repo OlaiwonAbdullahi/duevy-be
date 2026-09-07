@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from 'express';
-import { verifyWebhookSignature, fromAnchorRef } from '../lib/anchor';
+import { verifyWebhookSignature, fromAnchorRef, getPayIn } from '../lib/anchor';
 import { fulfilByReference, markPaymentSettled } from '../services/payment.service';
 import { settlePayout } from '../services/payout.service';
 import {
@@ -79,9 +79,12 @@ function attrNumber(event: AnchorEvent, ...names: string[]): number | undefined 
 }
 
 /**
- * Our own payment reference for an inflow event. Anchor should echo the
- * `reference` we set on the virtual NUBAN, but the virtual account id is a
- * reliable second route because we stored it on the pending payment.
+ * Our own payment reference for an inflow event.
+ *
+ * Three routes, in decreasing order of directness: the echoed `reference`; the
+ * PayIn, which `payin.received` carries and which must be fetched because the
+ * event itself holds only an id; and finally the checkout id, which works
+ * because we stored it on the pending payment when the checkout was opened.
  */
 async function resolvePaymentReference(event: AnchorEvent): Promise<string | undefined> {
   const echoed = attrString(event, 'reference', 'paymentReference', 'narration');
@@ -90,10 +93,19 @@ async function resolvePaymentReference(event: AnchorEvent): Promise<string | und
     if (await db.pendingPayment.findUnique({ where: { reference: normalised } })) return normalised;
   }
 
-  const nubanId = relId(event, 'virtualNuban', 'virtualNuban', 'account', 'reservedAccount');
-  if (!nubanId) return undefined;
+  // payin.received carries only a payIn id, so the reference has to be fetched.
+  const payInId = relId(event, 'payIn');
+  if (payInId) {
+    const payIn = await getPayIn(payInId);
+    if (payIn && (await db.pendingPayment.findUnique({ where: { reference: payIn.reference } }))) {
+      return payIn.reference;
+    }
+  }
+
+  const checkoutId = relId(event, 'payWithTransfer', 'virtualNuban', 'account', 'reservedAccount');
+  if (!checkoutId) return undefined;
   const pending = await db.pendingPayment.findFirst({
-    where: { metadata: { path: ['virtualNubanId'], equals: nubanId } },
+    where: { metadata: { path: ['payWithTransferId'], equals: checkoutId } },
     select: { reference: true },
   });
   return pending?.reference;
@@ -149,26 +161,28 @@ async function handleEvent(event: AnchorEvent): Promise<void> {
     }
 
     // --- Collections ------------------------------------------------------
-    case 'payment.received':
-    case 'nip.inbound.received': {
-      // The single source of truth for a successful payment. A virtual NUBAN
-      // cannot enforce the amount, so the credited figure is passed through for
-      // the under/overpayment check.
+    //
+    // payin.received belongs to the Payments product, not the BaaS event enum,
+    // so it arrives from a SEPARATE webhook registration (see anchor.ts).
+    case 'payin.received': {
+      // The single source of truth for a successful payment. The money is in
+      // Duevy's settlement account at this point, not the department's, so both
+      // marks are applied: fulfilled AND settled. remitToSpaces() moves it on.
       const reference = await resolvePaymentReference(event);
       if (reference) {
+        // Anchor fixes the amount, so the credited figure should always equal
+        // what we invoiced; it is passed through purely as an assertion.
         const creditedKobo = attrNumber(event, 'amount', 'creditAmount');
         await fulfilByReference(reference, true, creditedKobo !== undefined ? { creditedKobo } : {});
+        await markPaymentSettled(reference);
       }
       break;
     }
-    case 'payment.settled':
-    case 'nip.inbound.completed': {
-      // Funds have cleared from the virtual account into the space's deposit
-      // account — this, not payment.received, is what makes them withdrawable.
-      const reference = await resolvePaymentReference(event);
-      if (reference) await markPaymentSettled(reference);
+    case 'nip.inbound.received':
+    case 'nip.inbound.completed':
+      // A direct transfer into a deposit account — not a checkout. Logged for
+      // visibility; remittances are matched by book.transfer.* below.
       break;
-    }
 
     // --- Payouts ----------------------------------------------------------
     case 'nip.transfer.successful': {
@@ -191,12 +205,12 @@ async function handleEvent(event: AnchorEvent): Promise<void> {
       break;
     }
 
-    // --- Service-charge sweep --------------------------------------------
+    // --- Remittance to departments ---------------------------------------
     case 'book.transfer.successful':
     case 'book.transfer.failed':
-      // The sweep records its own outcome synchronously and retries on the next
-      // reconciliation tick, so there is nothing to do here beyond the log
-      // below. Subscribed so a failure is visible in webhook_events.
+      // remitToSpaces() records its own outcome synchronously and retries on
+      // the next reconciliation tick, so there is nothing to do here beyond the
+      // log below. Subscribed so a failure is visible in webhook_events.
       break;
 
     default:
