@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type RepRole, type PayoutStatus } from '@prisma/client';
+import { type RepRole, type PayoutStatus, type KycTier } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -10,21 +10,38 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBankAccount } from '../lib/serializers';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { getBanks, verifyAccountName, createSubaccount, updateSubaccount, getActiveGatewayName } from '../lib/paymentGateway';
-import { generatePayoutReference, PLATFORM_PERCENTAGE_CHARGE } from '../lib/money';
+import {
+  getBanks,
+  verifyAccount,
+  createCounterParty,
+  NIGERIAN_STATES,
+  ANCHOR_ID_TYPES,
+  type NigerianState,
+  type AnchorIdType,
+} from '../lib/anchor';
+import {
+  generatePayoutReference,
+  computePayoutFees,
+  MIN_PAYOUT_KOBO,
+  balanceCeilingFor,
+} from '../lib/money';
 import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
 import { castPayoutApproval, getApprovalStatus } from '../services/payoutApproval.service';
+import { initiatePayoutDisbursement } from '../services/payout.service';
+import { submitRepKyc, submitKycUpgrade, getSpaceKycState } from '../services/anchorCustomer.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
 payoutsRouter.use(requireSpaceRep());
 
-const CLEARING_WINDOW_MS = 24 * 60 * 60 * 1000; // funds clear 24h after payment
 const ACCOUNT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h hold after an account change
 // A payout awaiting votes already reserves its funds, same as one that's
 // processing/completed — otherwise a second concurrent request could see
 // the same money as still "available" while the first is mid-approval.
+// `pending_approval` no longer occurs going forward (quorum bypassed for
+// MVP — see POST /payout/request below) but is kept here so any lingering
+// historical row still reserves correctly.
 const RESERVED_STATUSES: PayoutStatus[] = ['pending_approval', 'processing', 'completed'];
 
 function uid(req: Request): string {
@@ -51,14 +68,24 @@ async function uniquePayoutReference(): Promise<string> {
 }
 
 /**
- * Payout balances, all net of the 3% charge (fees are taken at collection).
- *  available = cleared collections − (reserved payouts)
- *  pending   = collections still inside the clearing window
+ * Payout balances, all net of the 2% service charge (fees are taken at
+ * collection).
+ *  available = settled collections (Anchor has confirmed the inflow cleared
+ *              into the space's deposit account — the payment.settled webhook)
+ *              − reserved payouts
+ *  pending   = collections received but not yet settled
  *  lifetime  = total ever completed
  * Pass `dueId` to scope every figure to a single due's own payments/payouts.
+ *
+ * Deliberately computed from our own ledger, never from the Anchor balance.
+ *
+ * `available` gates on remittedAt, NOT settledAt. A payment is "settled" once it
+ * reaches Duevy's collection account, which is not the same as reaching the
+ * department — remitToSpaces() still has to book-transfer it on. Gating on
+ * settledAt would let a rep request a withdrawal against money that is not yet
+ * in their account.
  */
 async function computeBalances(sid: string, dueId?: string) {
-  const clearedThreshold = new Date(Date.now() - CLEARING_WINDOW_MS);
   const paymentWhere = dueId ? { due: { spaceId: sid }, dueId } : { due: { spaceId: sid } };
   const payoutWhere = dueId
     ? { spaceId: sid, dueId, status: { in: RESERVED_STATUSES } }
@@ -67,25 +94,56 @@ async function computeBalances(sid: string, dueId?: string) {
     ? { spaceId: sid, dueId, status: 'completed' as const }
     : { spaceId: sid, status: 'completed' as const };
 
-  const [cleared, pending, reserved, lifetime] = await Promise.all([
-    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { lte: clearedThreshold } }, _sum: { netToSpace: true } }),
-    db.duePayment.aggregate({ where: { ...paymentWhere, paidAt: { gt: clearedThreshold } }, _sum: { netToSpace: true } }),
+  const [remitted, pending, reserved, lifetime] = await Promise.all([
+    db.duePayment.aggregate({ where: { ...paymentWhere, remittedAt: { not: null } }, _sum: { netToSpace: true } }),
+    db.duePayment.aggregate({ where: { ...paymentWhere, remittedAt: null }, _sum: { netToSpace: true } }),
     db.payout.aggregate({ where: payoutWhere, _sum: { amount: true } }),
     db.payout.aggregate({ where: lifetimeWhere, _sum: { amount: true } }),
   ]);
-  const clearedNet = cleared._sum.netToSpace ?? 0;
+  const remittedNet = remitted._sum.netToSpace ?? 0;
   return {
-    available: Math.max(0, clearedNet - (reserved._sum.amount ?? 0)),
+    available: Math.max(0, remittedNet - (reserved._sum.amount ?? 0)),
     pending: pending._sum.netToSpace ?? 0,
     lifetime: lifetime._sum.amount ?? 0,
   };
+}
+
+/**
+ * Anchor's TIER_2 customers are capped at a ₦300,000 cumulative balance, which
+ * a 300-student space collecting ₦5,000 each blows through long before it
+ * finishes. Reps are nudged to withdraw at 70% and hard-warned at 90% (PRD §3.4).
+ */
+function ceilingStatus(availableKobo: number, tier: KycTier) {
+  const ceilingKobo = balanceCeilingFor(tier);
+  // tier_3 is unlimited, so there is nothing to warn about. Report it as
+  // uncapped rather than falling back to the tier_2 number.
+  if (ceilingKobo === null) {
+    return { ceilingKobo: null, ceilingUsedPct: null, ceilingLevel: 'uncapped' as const };
+  }
+  const usedPct = Math.round((availableKobo / ceilingKobo) * 100);
+  return {
+    ceilingKobo,
+    ceilingUsedPct: usedPct,
+    ceilingLevel: usedPct >= 90 ? ('critical' as const) : usedPct >= 70 ? ('warn' as const) : ('ok' as const),
+  };
+}
+
+/** The verified tier of the rep whose customer record owns the space's account. */
+async function leadKycTier(sid: string): Promise<KycTier> {
+  const lead = await db.spaceRep.findFirst({
+    where: { spaceId: sid, role: 'lead' },
+    select: { user: { select: { kycTier: true } } },
+  });
+  return lead?.user.kycTier ?? 'tier_0';
 }
 
 // ---------------------------------------------------------------------------
 // GET /payout/summary (§10.1)
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
-  ok(res, await computeBalances(spaceId(req)));
+  const sid = spaceId(req);
+  const [balances, tier] = await Promise.all([computeBalances(sid), leadKycTier(sid)]);
+  ok(res, { ...balances, ...ceilingStatus(balances.available, tier), kycTier: tier, minPayout: MIN_PAYOUT_KOBO });
 });
 
 // ---------------------------------------------------------------------------
@@ -115,14 +173,14 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
   const [totals, dueCount, byDueRaw] = await Promise.all([
     db.duePayment.aggregate({
       where: { due: { spaceId: sid }, ...paymentWhere },
-      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
       _count: { _all: true },
     }),
     db.due.count({ where: { spaceId: sid, payments: { some: paymentWhere } } }),
     db.duePayment.groupBy({
       by: ['dueId'],
       where: { due: { spaceId: sid }, ...paymentWhere },
-      _sum: { amountPaid: true, monnifyFee: true, duevyFee: true, netToSpace: true },
+      _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
       _count: { _all: true },
       orderBy: { _sum: { netToSpace: 'desc' } },
       skip,
@@ -142,7 +200,7 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
     category: dueById.get(d.dueId)?.category ?? null,
     paidCount: d._count._all,
     collected: d._sum.amountPaid ?? 0,
-    fees: (d._sum.monnifyFee ?? 0) + (d._sum.duevyFee ?? 0),
+    fees: (d._sum.processingFee ?? 0) + (d._sum.duevyFee ?? 0),
     net: d._sum.netToSpace ?? 0,
   }));
 
@@ -151,7 +209,7 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
     {
       totals: {
         collected: totals._sum.amountPaid ?? 0,
-        fees: (totals._sum.monnifyFee ?? 0) + (totals._sum.duevyFee ?? 0),
+        fees: (totals._sum.processingFee ?? 0) + (totals._sum.duevyFee ?? 0),
         net: totals._sum.netToSpace ?? 0,
         paidCount: totals._count._all,
       },
@@ -175,8 +233,10 @@ payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promis
 });
 
 // ---------------------------------------------------------------------------
-// Shared bank + account-name resolution (§10.2) — name-enquiry is authoritative
-// and mandatory; the account name is always server-resolved, never client-supplied.
+// Shared bank + account-name resolution (§10.2). Unlike Bachs, Anchor's bank
+// list and name enquiry are organisation-level rather than scoped to a
+// connected account. Name enquiry stays authoritative and mandatory — the
+// account name is always server-resolved, never client-supplied.
 // ---------------------------------------------------------------------------
 const accountLookupSchema = z.object({
   bankCode: z.string().min(3),
@@ -185,12 +245,12 @@ const accountLookupSchema = z.object({
 
 type ResolvedAccount = { bankName: string; accountName: string } | { error: 'UNKNOWN_BANK' | 'UNVERIFIABLE' };
 
-async function resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount> {
+async function resolveBankDetails(bankCode: string, accountNumber: string): Promise<ResolvedAccount> {
   const banks = await getBanks();
   const bankName = banks.find((b) => b.code === bankCode)?.name;
   if (!bankName) return { error: 'UNKNOWN_BANK' };
 
-  const accountName = await verifyAccountName(accountNumber, bankCode);
+  const accountName = await verifyAccount(bankCode, accountNumber);
   if (!accountName) return { error: 'UNVERIFIABLE' };
 
   return { bankName, accountName };
@@ -211,12 +271,11 @@ function failResolution(res: Response, resolved: { error: 'UNKNOWN_BANK' | 'UNVE
 payoutsRouter.post('/payout/account/lookup', validate(accountLookupSchema), async (req: Request, res: Response): Promise<void> => {
   const { bankCode, accountNumber } = req.body as z.infer<typeof accountLookupSchema>;
 
-  const resolved = await resolveAccount(bankCode, accountNumber);
+  const resolved = await resolveBankDetails(bankCode, accountNumber);
   if ('error' in resolved) {
     failResolution(res, resolved);
     return;
   }
-
   ok(res, { bankCode, bankName: resolved.bankName, accountNumber, accountName: resolved.accountName });
 });
 
@@ -229,14 +288,15 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const sid = spaceId(req);
   const { bankCode, accountNumber } = req.body as z.infer<typeof putAccountSchema>;
 
-  const resolved = await resolveAccount(bankCode, accountNumber);
+  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, anchorCounterPartyId: true } });
+
+  const resolved = await resolveBankDetails(bankCode, accountNumber);
   if ('error' in resolved) {
     failResolution(res, resolved);
     return;
   }
   const { bankName, accountName: finalName } = resolved;
 
-  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true, paystackSubaccountCode: true, subaccountGateway: true } });
   const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
   const changed =
     !!existing && (decrypt(existing.accountNumber) !== accountNumber || existing.bankCode !== bankCode);
@@ -244,50 +304,25 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
   const masked = maskAccountNumber(accountNumber);
   const cooldownUntil = changed ? new Date(Date.now() + ACCOUNT_COOLDOWN_MS) : existing?.cooldownUntil ?? null;
 
-  // Resolved fresh via the active gateway's own bank list above, so it's
-  // current as of right now — tag it so resolveActiveBankCode() can skip
-  // re-resolving until the active gateway actually changes again.
-  const bankCodeGateway = await getActiveGatewayName();
-
-  // Create or update this space's subaccount for the *currently active*
-  // gateway, as one step with saving the bank account — a rep shouldn't have
-  // to complete two separate "where my money goes" flows. Subaccount codes
-  // are gateway-specific (a Paystack ACCT_... code means nothing to Monnify),
-  // so a stored code only counts as reusable if it belongs to this gateway —
-  // see resolveActiveSubaccountCode() for the read-side of this same rule.
-  let subaccountCode = space?.subaccountGateway === bankCodeGateway ? space.paystackSubaccountCode : null;
-  let subaccountGateway = space?.subaccountGateway ?? null;
-  try {
-    if (!subaccountCode) {
-      const created = await createSubaccount({
-        businessName: space?.name ?? finalName,
-        bankCode,
-        accountNumber,
-        percentageCharge: PLATFORM_PERCENTAGE_CHARGE,
-      });
-      subaccountCode = created.subaccountCode;
-      subaccountGateway = bankCodeGateway;
-    } else if (changed) {
-      await updateSubaccount(subaccountCode, { bankCode, accountNumber });
+  // Anchor counterparties are immutable, so a changed bank detail registers a
+  // fresh one rather than mutating the old. `verifyName: true` makes Anchor
+  // re-resolve the name at the recipient bank, so the name we store is the
+  // bank's, not ours. Best-effort: a failure here shouldn't block saving the
+  // bank account itself; leave whatever counterparty id was previously stored.
+  let counterPartyId = space?.anchorCounterPartyId ?? null;
+  if (!counterPartyId || changed) {
+    try {
+      const counterParty = await createCounterParty({ bankCode, accountNumber, accountName: finalName });
+      counterPartyId = counterParty.id;
+    } catch (err) {
+      console.error(`[payouts] counterparty create failed for space ${sid}:`, err);
     }
-  } catch (err) {
-    // Best-effort: a gateway that isn't set up for subaccounts yet (e.g.
-    // Monnify's sub-account API requires activation from Monnify support
-    // before it can be used at all) shouldn't block saving the bank account
-    // itself — payments simply fall back to routing through Duevy's main
-    // account until a subaccount exists for this gateway. Leave whatever was
-    // previously stored untouched rather than clobbering it with null, so a
-    // working code from a *different* gateway survives a failed attempt here.
-    console.error(`[payouts] subaccount create/update failed for space ${sid}:`, err);
-    subaccountCode = space?.paystackSubaccountCode ?? null;
-    subaccountGateway = space?.subaccountGateway ?? null;
   }
 
   const account = await db.bankAccount.upsert({
     where: { spaceId: sid },
     update: {
       bankCode,
-      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,
@@ -297,7 +332,6 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     create: {
       spaceId: sid,
       bankCode,
-      bankCodeGateway,
       bankName,
       accountNumber: encrypt(accountNumber),
       accountNumberMasked: masked,
@@ -305,7 +339,7 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
     },
   });
 
-  await db.space.update({ where: { id: sid }, data: { paystackSubaccountCode: subaccountCode, subaccountGateway } });
+  await db.space.update({ where: { id: sid }, data: { anchorCounterPartyId: counterPartyId } });
 
   // Security notice to all reps when an existing account is changed.
   if (changed) {
@@ -334,11 +368,154 @@ payoutsRouter.put('/payout/account', validate(putAccountSchema), async (req: Req
 });
 
 // ---------------------------------------------------------------------------
-// POST /payout/request (§10.3) — Idempotency-Key required
+// Rep identity verification (PRD §3.4). Anchor needs only BVN + date of birth
+// + gender, resolved asynchronously by webhook — none of Bachs's
+// requirements-checklist, document-upload or NIN machinery survives.
+//
+// A space cannot receive a naira until its lead rep reaches `verified`, so this
+// is the gate in front of the whole money path.
+// ---------------------------------------------------------------------------
+
+const kycSchema = z.object({
+  bvn: z.string().regex(/^\d{11}$/, 'must be an 11-digit BVN'),
+  dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD'),
+  gender: z.enum(['Male', 'Female', 'Others']),
+  phone: z.string().min(10).max(15),
+  address: z.object({
+    addressLine1: z.string().min(3).max(120),
+    addressLine2: z.string().max(120).optional(),
+    city: z.string().min(2).max(60),
+    state: z.enum(NIGERIAN_STATES as unknown as [NigerianState, ...NigerianState[]]),
+    postalCode: z.string().max(10).optional(),
+  }),
+});
+
+payoutsRouter.post(
+  '/payout/kyc',
+  requireSpaceRep(true), // the deposit account is owned by the lead rep's customer record
+  validate(kycSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const input = req.body as z.infer<typeof kycSchema>;
+
+    const outcome = await submitRepKyc(uid(req), input);
+    if (!outcome.ok) {
+      if (outcome.code === 'ALREADY_VERIFIED') {
+        errors.conflict(res, 'ALREADY_VERIFIED', 'This account is already verified');
+        return;
+      }
+      if (outcome.code === 'RETRY_LOCKED') {
+        fail(res, 429, 'KYC_RETRY_LOCKED', 'Too many failed attempts. Try again in 24 hours.', [
+          { field: 'bvn', issue: `locked until ${outcome.retryAfter.toISOString()}` },
+        ]);
+        return;
+      }
+      fail(res, 502, 'PROVIDER_ERROR', outcome.message);
+      return;
+    }
+
+    // Deliberately returns the pending state rather than a result: verification
+    // is asynchronous and only the webhook can approve it.
+    ok(res, await getSpaceKycState(spaceId(req)), 202);
+  },
+);
+
+// Verification + provisioning state for the dashboard banner. Replaces
+// GET /payout/onboarding-status.
+// ---------------------------------------------------------------------------
+// POST /payout/kyc/upgrade — raise a verified rep from tier_2 to tier_3
+// (PRD §3.4 / §12). The trigger is reps repeatedly hitting the balance ceiling.
+//
+// Manual review at Anchor, so it resolves in days rather than seconds. The rep
+// keeps collecting on tier_2 throughout, and a rejection changes nothing.
+// ---------------------------------------------------------------------------
+const kycUpgradeSchema = z.object({
+  idType: z.enum(ANCHOR_ID_TYPES as unknown as [AnchorIdType, ...AnchorIdType[]]),
+  idNumber: z.string().min(4).max(32),
+  // Passports and licences expire; a NIN slip does not, so this stays optional.
+  expiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD').optional(),
+});
+
+payoutsRouter.post(
+  '/payout/kyc/upgrade',
+  requireSpaceRep(true),
+  validate(kycUpgradeSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const outcome = await submitKycUpgrade(uid(req), req.body as z.infer<typeof kycUpgradeSchema>);
+    if (!outcome.ok) {
+      if (outcome.code === 'NOT_VERIFIED') {
+        errors.conflict(res, 'NOT_VERIFIED', 'Complete BVN verification before upgrading');
+        return;
+      }
+      if (outcome.code === 'ALREADY_AT_TIER') {
+        errors.conflict(res, 'ALREADY_AT_TIER', 'This account is already at the highest tier');
+        return;
+      }
+      if (outcome.code === 'UPGRADE_PENDING') {
+        errors.conflict(res, 'UPGRADE_PENDING', 'An upgrade is already under review');
+        return;
+      }
+      fail(res, 502, 'PROVIDER_ERROR', outcome.message);
+      return;
+    }
+    // 202: accepted for manual review, not decided.
+    ok(res, { status: 'under_review', tier: 'tier_3' }, 202);
+  },
+);
+
+payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
+  ok(res, await getSpaceKycState(spaceId(req)));
+});
+
+// ---------------------------------------------------------------------------
+// POST /payout/request (§10.3) — Idempotency-Key required. Quorum bypassed
+// for MVP (see plan) — disburses immediately rather than waiting on
+// castPayoutApproval(); re-enabling quorum later is routing this back
+// through that function instead of calling initiatePayoutDisbursement()
+// directly.
 // ---------------------------------------------------------------------------
 const requestSchema = z.object({
   amount: z.number().int().positive(),
   note: z.string().max(300).optional(),
+});
+
+/**
+ * Shared guards for both payout endpoints. `amount` is the GROSS debit against
+ * the available balance — the Duevy fee, Anchor's NIP fee and any stamp duty
+ * all come out of it, so `netSentKobo` is what actually lands in the rep's
+ * bank (PRD §7.3).
+ */
+function guardPayoutAmount(res: Response, amountKobo: number): boolean {
+  if (amountKobo < MIN_PAYOUT_KOBO) {
+    fail(res, 422, 'BELOW_MIN_PAYOUT', `The minimum withdrawal is ₦${(MIN_PAYOUT_KOBO / 100).toLocaleString('en-NG')}`);
+    return false;
+  }
+  if (computePayoutFees(amountKobo).netSentKobo <= 0) {
+    fail(res, 422, 'BELOW_MIN_PAYOUT', 'This amount does not cover the withdrawal fees');
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// GET /payout/quote?amount= — the fee breakdown the rep must see before
+// confirming (PRD §7.3). Pure arithmetic, no provider call.
+// ---------------------------------------------------------------------------
+payoutsRouter.get('/payout/quote', async (req: Request, res: Response): Promise<void> => {
+  const amount = Number(req.query.amount);
+  if (!Number.isInteger(amount) || amount <= 0) {
+    errors.validation(res, [{ field: 'amount', issue: 'must be a positive integer in kobo' }]);
+    return;
+  }
+  const fees = computePayoutFees(amount);
+  ok(res, {
+    amount,
+    // The rep-facing "₦100 flat" of PRD §7.1 is Duevy's margin plus the NIP fee.
+    duevyFeeKobo: fees.duevyFeeKobo + fees.anchorFeeKobo,
+    stampDutyKobo: fees.stampDutyKobo,
+    netSentKobo: fees.netSentKobo,
+    belowMinimum: amount < MIN_PAYOUT_KOBO,
+    minPayout: MIN_PAYOUT_KOBO,
+  });
 });
 
 payoutsRouter.post(
@@ -367,6 +544,8 @@ payoutsRouter.post(
       return;
     }
 
+    if (!guardPayoutAmount(res, amount)) return;
+
     const { available } = await computeBalances(sid);
     if (amount > available) {
       fail(res, 402, 'INSUFFICIENT_PAYOUT_BALANCE', 'Requested amount exceeds the available balance');
@@ -376,18 +555,18 @@ payoutsRouter.post(
     const reference = await uniquePayoutReference();
     const accountMasked = `${account.bankName} ${account.accountNumberMasked}`;
     const actorInfo = await actor(req);
+    const fees = computePayoutFees(amount);
 
     const payout = await db.$transaction(async (tx) => {
       const created = await tx.payout.create({
-        data: { spaceId: sid, amount, reference, status: 'pending_approval', accountMasked, note, requestedById: uid(req) },
+        data: { spaceId: sid, amount, reference, status: 'processing', accountMasked, note, requestedById: uid(req), ...fees },
       });
       await writeAudit(sid, actorInfo, 'payout_requested', `Requested a ₦${(amount / 100).toLocaleString('en-NG')} payout`, tx);
       return created;
     });
 
-    // The requester's own request counts as an implicit "yes" vote — a
-    // solo-rep space (no co-reps) reaches 70% immediately, same as before.
-    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
+    const final = (await db.payout.findUnique({ where: { id: payout.id } }))!;
     ok(res, serializePayout(final), 201);
   },
 );
@@ -407,7 +586,8 @@ payoutsRouter.get('/dues/:dueId/payout/summary', async (req: Request, res: Respo
 
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/payout/request — the lead, or the due's assigned co-rep,
-// can request a payout scoped to just that due's collected funds.
+// can request a payout scoped to just that due's collected funds. Quorum
+// bypassed for MVP, same as the space-wide request above.
 // ---------------------------------------------------------------------------
 payoutsRouter.post(
   '/dues/:dueId/payout/request',
@@ -446,6 +626,8 @@ payoutsRouter.post(
       return;
     }
 
+    if (!guardPayoutAmount(res, amount)) return;
+
     // A due-scoped balance only sees that due's own payments/payouts — clamp
     // against the space-wide available too, so two dues can't collectively
     // overcommit the space's one real bank balance.
@@ -459,6 +641,7 @@ payoutsRouter.post(
     const reference = await uniquePayoutReference();
     const accountMasked = `${account.bankName} ${account.accountNumberMasked}`;
     const actorInfo = await actor(req);
+    const fees = computePayoutFees(amount);
 
     const payout = await db.$transaction(async (tx) => {
       const created = await tx.payout.create({
@@ -467,10 +650,11 @@ payoutsRouter.post(
           dueId: due.id,
           amount,
           reference,
-          status: 'pending_approval',
+          status: 'processing',
           accountMasked,
           note,
           requestedById: uid(req),
+          ...fees,
         },
       });
       await writeAudit(
@@ -483,13 +667,16 @@ payoutsRouter.post(
       return created;
     });
 
-    const { payout: final } = await castPayoutApproval(payout.id, actorInfo, 'approved');
+    await initiatePayoutDisbursement(payout).catch((err) => console.error('[payout] init failed:', err));
+    const final = (await db.payout.findUnique({ where: { id: payout.id } }))!;
     ok(res, serializePayout(final), 201);
   },
 );
 
 // ---------------------------------------------------------------------------
-// POST /payout/{payoutId}/approve — any rep casts/changes their vote
+// POST /payout/{payoutId}/approve — dormant for MVP (payouts no longer land
+// in `pending_approval`, see POST /payout/request above), kept in place so
+// re-enabling quorum later is a small flip rather than a rebuild.
 // ---------------------------------------------------------------------------
 const approveSchema = z.object({ decision: z.enum(['approved', 'rejected']) });
 

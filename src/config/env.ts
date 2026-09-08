@@ -25,26 +25,29 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Which processor actually moves money — see src/lib/paymentGateway.ts.
-  // Both providers' code is fully implemented; this just picks which one is
-  // live. Switching back to 'monnify' needs no code changes, only env vars.
-  PAYMENT_GATEWAY: z.enum(['monnify', 'paystack']).default('paystack'),
-
-  // Monnify — kept fully working, just not the active gateway by default.
-  // Optional now (rather than required) so a Paystack-only deploy doesn't
-  // need dummy Monnify credentials just to pass env validation.
-  MONNIFY_API_KEY: z.string().optional(),
-  MONNIFY_SECRET_KEY: z.string().optional(),
-  MONNIFY_BASE_URL: z.string().url().default('https://sandbox.monnify.com'),
-  MONNIFY_CONTRACT_CODE: z.string().optional(),
-  MONNIFY_WEBHOOK_SECRET: z.string().optional(),
-  // Wallet account payouts are disbursed from. Optional: while unset, payout
-  // requests are recorded but no transfer is initiated (§10.3 stays manual).
-  MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT: z.string().optional(),
-
-  // Paystack
-  PAYSTACK_SECRET_KEY: z.string().optional(),
-  PAYSTACK_BASE_URL: z.string().url().default('https://api.paystack.co'),
+  // Anchor (getanchor.co) — the sole payment processor. See src/lib/anchor.ts.
+  ANCHOR_SECRET_KEY: z.string(),
+  ANCHOR_BASE_URL: z.string().url().default('https://api.sandbox.getanchor.co'),
+  // Webhook token for verifying POST /webhooks/anchor signatures. Anchor caps
+  // the token it will accept at 10 characters, so a longer secret can never be
+  // registered with them and would fail every signature check.
+  ANCHOR_WEBHOOK_SECRET: z.string().min(1).max(10),
+  // Duevy Labs' own Anchor deposit account. Two roles, deliberately one
+  // account: every student payment settles here first (Pay With Transfer has no
+  // settlement destination — see anchor.ts), and it is the source of the book
+  // transfers that remit each department's share on. Duevy's margin is simply
+  // whatever stays behind, so there is no separate revenue account to sweep to.
+  ANCHOR_SETTLEMENT_ACCOUNT_ID: z.string(),
+  // Which bank issues the checkout account number. Anchor picks one if unset,
+  // but the student sees this bank's name on the transfer screen, so pinning a
+  // recognisable one (providus, wema) is worth doing.
+  ANCHOR_VA_PROVIDER: z
+    .enum(['wema', 'providus', 'gtb', 'ninepsb', 'corestep', 'column', 'circle', 'anchor'])
+    .optional(),
+  // How long a checkout stays open, in seconds (PRD §5.2 — 30 minutes). Unlike
+  // the virtual-NUBAN flow this is load-bearing: Pay With Transfer takes it as
+  // `expiryTime` and enforces it, so a late transfer genuinely cannot land.
+  ANCHOR_VA_EXPIRY_SECONDS: z.coerce.number().int().positive().default(1800),
 
   // App
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
@@ -62,6 +65,13 @@ const envSchema = z.object({
     .default('false'),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).default('lax'),
 
+  // Pilot feature gates — these ship fully built but are cut from the MVP
+  // pilot scope. Off by default; flip to 'true' (no code change) to re-enable
+  // for Phase 2. See src/middleware/requireFeature.ts.
+  FEATURE_POLLS: z.string().transform((v) => v === 'true').default('false'),
+  FEATURE_ASSISTANT: z.string().transform((v) => v === 'true').default('false'),
+  FEATURE_REFERRALS: z.string().transform((v) => v === 'true').default('false'),
+
   // Duey (AI assistant) classification backend — 'ollama' talks to a local/dev
   // Ollama instance; 'gemini' talks to Google's Gemini API natively (no
   // OpenAI-compat shim); 'hosted' talks to any other OpenAI-chat-completions
@@ -78,12 +88,6 @@ const envSchema = z.object({
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
-  if (val.PAYMENT_GATEWAY === 'paystack' && !val.PAYSTACK_SECRET_KEY) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYSTACK_SECRET_KEY'], message: 'required when PAYMENT_GATEWAY=paystack' });
-  }
-  if (val.PAYMENT_GATEWAY === 'monnify' && (!val.MONNIFY_API_KEY || !val.MONNIFY_SECRET_KEY || !val.MONNIFY_CONTRACT_CODE || !val.MONNIFY_WEBHOOK_SECRET)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MONNIFY_API_KEY'], message: 'MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE and MONNIFY_WEBHOOK_SECRET are all required when PAYMENT_GATEWAY=monnify' });
-  }
   if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });
   }

@@ -88,11 +88,6 @@ enum PayMethod {
   online
 }
 
-enum PaymentGatewayName {
-  paystack
-  monnify
-}
-
 enum TxnType {
   due
   topup
@@ -120,6 +115,18 @@ enum PayoutStatus {
 enum PayoutApprovalDecision {
   approved
   rejected
+}
+
+enum LedgerEntryType {
+  due_payment
+  refund
+  payout
+  manual_credit
+}
+
+enum LedgerDirection {
+  credit
+  debit
 }
 
 enum PollStatus {
@@ -155,6 +162,20 @@ enum KycStatus {
   pending
   verified
   rejected
+}
+
+// Anchor's verification levels, named as the API names them — NOT as the prose
+// docs do. The `level` enum accepts only TIER_2 and TIER_3; there is no TIER_1
+// to submit. See the callout in src/lib/anchor.ts before renaming anything.
+//
+//   tier_0  the customer exists (name, address, email, phone) but is unverified.
+//   tier_2  BVN + date of birth + gender. Automatic, ₦50, capped at ₦300,000.
+//   tier_3  a government ID document. Manual review, ₦200, and UNLIMITED —
+//           which is the whole reason to offer the upgrade.
+enum KycTier {
+  tier_0
+  tier_2
+  tier_3
 }
 
 enum DisputeStatus {
@@ -261,8 +282,35 @@ model User {
   level                 String?
   notificationPrefs     Json?                // §3.4 — email/push toggles; null = defaults
   referralCode          String?              @unique
+  // Anchor identity. The rep is an Anchor IndividualCustomer; the space's
+  // deposit account is owned by this customer record, so no space can collect
+  // until kycStatus reaches `verified`. Driven by the
+  // customer.identification.* webhooks — the admin override at
+  // PATCH /admin/users/:id/kyc exists for support, but Anchor is the source of
+  // truth. The BVN is submitted to Anchor and NEVER persisted (PRD §8), which
+  // is why a failed check has to be re-entered by the rep rather than retried
+  // from stored data.
+  anchorCustomerId      String?              @unique
   kycStatus             KycStatus            @default(unverified)
+  // The tier actually VERIFIED, and the one awaiting a decision. They differ
+  // during an upgrade: a rep verified at tier_2 who submits tier_3 keeps
+  // collecting on tier_2 limits until the review lands, so a pending upgrade
+  // must never revoke a working account.
+  kycTier               KycTier              @default(tier_0)
+  kycPendingTier        KycTier?
   kycDocUrls            String[]             @default([])
+  kycSubmittedAt        DateTime?
+  kycResolvedAt         DateTime?
+  kycRejectionReason    String?
+  kycAttempts           Int                  @default(0)
+  kycRetryLockedUntil   DateTime?            // §9.2 — 24h lock after 3 consecutive failures
+  // Address is required by Anchor at customer creation. Collected once at KYC
+  // submission and kept so the customer can be recreated without re-asking.
+  addressLine1          String?
+  addressLine2          String?
+  city                  String?
+  state                 String?              // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
+  postalCode            String?
   isSuspended           Boolean              @default(false)
   suspendedReason       String?
   isDeactivated         Boolean              @default(false)
@@ -281,7 +329,6 @@ model User {
   spaceJoinRequests     SpaceJoinRequest[]
   duePayments           DuePayment[]
   transactions          Transaction[]
-  cards                 Card[]
   notifications         Notification[]
   pollVotes             PollVote[]
   referralsMade         Referral[]           @relation("referrer")
@@ -380,18 +427,20 @@ model Space {
   archivedReason String?
   payoutsFrozen  Boolean     @default(false)
   frozenReason   String?
-  // Subaccount reps settle into directly at charge time (payment architecture
-  // migration — see PUT /payout/account, which creates/updates this alongside
-  // the BankAccount it's derived from). Null until a bank account has been
-  // resolved and the subaccount created. Subaccount codes are gateway-specific
-  // (a Paystack ACCT_... code means nothing to Monnify and vice versa) —
-  // subaccountGateway records which gateway this code belongs to, mirroring
-  // BankAccount.bankCodeGateway. If it doesn't match the currently active
-  // gateway, treat as if no subaccount exists (safe fallback: the payment
-  // routes to Duevy's main account instead of erroring) rather than sending a
-  // stale code to a provider that's never heard of it.
-  paystackSubaccountCode String? @unique
-  subaccountGateway      PaymentGatewayName?
+  // The space's Anchor deposit account — a SAVINGS account owned by the lead
+  // rep's verified IndividualCustomer. Provisioned from the
+  // customer.identification.approved webhook, never from the client, so a rep
+  // who closes the tab still ends up set up (PRD §6.2). Every checkout's
+  // virtual NUBAN settles here, and payouts are drawn from here.
+  //
+  // anchorAccountNumber/anchorBankName are populated once Anchor assigns the
+  // NUBAN, which happens asynchronously after account creation.
+  anchorAccountId           String?  @unique
+  anchorAccountNumber       String?
+  anchorBankName            String?
+  anchorAccountStatus       String?  // ACTIVE | BLOCKED | CLOSED | DEPRECATED
+  // The rep's payout bank account, registered with Anchor as a CounterParty.
+  anchorCounterPartyId      String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -405,6 +454,7 @@ model Space {
   polls          Poll[]
   auditLogs      SpaceAuditLog[]
   repApplication RepApplication?
+  ledgerEntries  LedgerEntry[]
 
   @@map("spaces")
 }
@@ -519,6 +569,7 @@ model Due {
   payments    DuePayment[]
   payouts     Payout[]
   assignedRep User?        @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
+  ledgerEntries LedgerEntry[]
 
   @@index([spaceId])
   @@index([assignedRepId])
@@ -531,40 +582,47 @@ model DuePayment {
   dueId       String
   txnId       String?   @unique
   paidAt      DateTime  @default(now())
-  reference   String    @unique
-  amountPaid  Int       // kobo — face value (= due.amount)
-  monnifyFee  Int       // kobo — 1.5% of amountPaid
-  duevyFee    Int       // kobo — 1.5% of amountPaid
-  netToSpace  Int       // kobo — amountPaid - monnifyFee - duevyFee
+  // NOT unique: one checkout can settle several dues at once (PRD §5.2), and
+  // every DuePayment it creates shares the checkout's reference. Uniqueness is
+  // carried by @@unique([userId, dueId]) below — a due is paid once per user.
+  reference   String
+  amountPaid  Int       // kobo — this line's share of the charge (face + its 2%)
+  processingFee Int     // kobo — Anchor's expected cut, taken out of the 2%
+  duevyFee    Int       // kobo — Duevy's margin, the rest of the 2%
+  netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee, i.e. the face value
+  // The checkout's single-use Pay With Transfer account. Anchor fixes the
+  // amount and enforces the expiry, so an inflow here is always exactly
+  // `amountPaid` and never arrives late (PRD §5.2).
+  payWithTransferId     String?
+  checkoutAccountNumber String?
+  checkoutExpiresAt     DateTime?
+  // payin.received — the money is in DUEVY'S settlement account, not the
+  // department's. Collected, but not yet the rep's.
+  settledAt   DateTime?
+  // Set once netToSpace has been book-transferred ON to the space's own deposit
+  // account (see remitToSpaces()). This — not settledAt — is what
+  // computeBalances() gates "available to pay out" on, because until it is set
+  // the money is still sitting with Duevy.
+  //
+  // remitTransferId is provider-neutral on purpose: rows predating Anchor hold
+  // Bachs transfer ids and keep them, as the only audit trail for those moves.
+  remittedAt      DateTime?
+  remitTransferId String?
 
   user        User        @relation(fields: [userId], references: [id])
   due         Due         @relation(fields: [dueId], references: [id])
   transaction Transaction? @relation(fields: [txnId], references: [id])
+  ledgerEntries LedgerEntry[]
 
   @@unique([userId, dueId])
   @@index([dueId])
+  @@index([reference])
   @@map("due_payments")
 }
 
 // ---------------------------------------------------------------------------
-// Wallet, Cards & Transactions
+// Wallet & Transactions
 // ---------------------------------------------------------------------------
-
-model Card {
-  id            String  @id @default(cuid())
-  userId        String
-  providerToken String  @unique
-  brand         String  // Visa | Mastercard | Verve
-  last4         String
-  expiry        String  // MM/YY
-  isDefault     Boolean @default(false)
-  createdAt     DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@map("cards")
-}
 
 model Transaction {
   id            String    @id @default(cuid())
@@ -573,7 +631,7 @@ model Transaction {
   title         String
   detail        String?
   amount        Int       // kobo, signed
-  method        String    // "Wallet" | "Visa •••• 4242" | "Monnify"
+  method        String    // "Wallet" (legacy rows) | "Anchor"
   status        TxnStatus @default(pending)
   reference     String    @unique
   spaceId       String?
@@ -585,6 +643,7 @@ model Transaction {
   duePayment DuePayment?
   refundOf   Transaction?  @relation("TransactionRefunds", fields: [refundOfTxnId], references: [id])
   refunds    Transaction[] @relation("TransactionRefunds")
+  ledgerEntries LedgerEntry[]
 
   @@index([userId, createdAt])
   @@index([refundOfTxnId])
@@ -596,13 +655,33 @@ model PendingPayment {
   reference String    @unique
   userId    String
   type      String    // "topup" | "due_payment" | "poll_vote"
-  metadata  Json      // stores dueId, pollId etc.
+  metadata  Json      // stores dueId, pollId, the checkout virtual account, etc.
   status    String    @default("pending")
   createdAt DateTime  @default(now())
   expiresAt DateTime
 
   @@index([reference])
   @@map("pending_payments")
+}
+
+// Webhook idempotency (PRD §6.4). Anchor delivers AtLeastOnce, so every event
+// is persisted by its Anchor event id BEFORE it is processed and a repeated id
+// is acknowledged and dropped. Persisting first also makes handlers replayable,
+// which is what stands in for a durable job queue today — see the note in
+// src/routes/webhooks.ts.
+model WebhookEvent {
+  id            String    @id @default(cuid())
+  anchorEventId String    @unique
+  type          String
+  payload       Json
+  status        String    @default("received") // received | processed | failed
+  error         String?
+  receivedAt    DateTime  @default(now())
+  processedAt   DateTime?
+
+  @@index([type, receivedAt])
+  @@index([status])
+  @@map("webhook_events")
 }
 
 // ---------------------------------------------------------------------------
@@ -613,11 +692,6 @@ model BankAccount {
   id              String   @id @default(cuid())
   spaceId         String   @unique
   bankCode        String
-  // Bank codes are gateway-specific (Monnify and Paystack number the same
-  // bank differently) — this records which gateway's scheme `bankCode`
-  // currently matches, so a gateway switch can be detected and the code
-  // re-resolved on demand rather than silently misrouting a disbursement.
-  bankCodeGateway PaymentGatewayName?
   bankName        String
   accountNumber   String   // stored encrypted
   accountNumberMasked String // "•••• 4021"
@@ -635,13 +709,24 @@ model Payout {
   id            String       @id @default(cuid())
   spaceId       String
   dueId         String?      // null = space-wide (lead-only); set = due-scoped
-  amount        Int          // kobo
+  amount        Int          // kobo — the GROSS debit against the space's available balance
   reference     String       @unique
   status        PayoutStatus @default(pending_approval)
   accountMasked String       // "GTBank •••• 4021"
   note          String?
   requestedById String?      // who requested it — needed to authorize cancellation
   failureReason String?
+  // PRD §7.3. Every fee comes out of `amount`, so the four below always sum
+  // back to it and the Anchor account reconciles exactly:
+  //   netSent leaves as the NIP transfer;
+  //   anchorFee + stampDuty are deducted by Anchor as CustomerFee rows;
+  //   duevyFee is swept to the revenue account by book transfer.
+  // Shown to the rep as "Duevy fee ₦100" (duevyFee + anchorFee) + stamp duty.
+  duevyFeeKobo    Int        @default(0)
+  anchorFeeKobo   Int        @default(0)
+  stampDutyKobo   Int        @default(0)
+  netSentKobo     Int        @default(0)
+  anchorTransferId String?
   requestedAt   DateTime     @default(now())
   cancelledAt   DateTime?
   settledAt     DateTime?
@@ -650,6 +735,7 @@ model Payout {
   due         Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
   requestedBy User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
   approvals   PayoutApproval[]
+  ledgerEntries LedgerEntry[]
 
   @@index([spaceId])
   @@index([dueId])
@@ -669,6 +755,42 @@ model PayoutApproval {
   @@unique([payoutId, repUserId])
   @@index([payoutId])
   @@map("payout_approvals")
+}
+
+// Append-only double-entry ledger — the audit-grade source of truth for every
+// kobo that moves. Additive to DuePayment's fee columns (kept as the
+// fast-read summary), written alongside the existing Transaction/DuePayment
+// writes at each money-movement site. No .update()/.delete() call on this
+// model exists anywhere in application code — same discipline already relied
+// on for SpaceAuditLog/AdminAuditLog.
+model LedgerEntry {
+  id           String          @id @default(cuid())
+  spaceId      String
+  dueId        String?
+  txnId        String?
+  duePaymentId String?
+  payoutId     String?
+  type         LedgerEntryType
+  direction    LedgerDirection
+  amountKobo   Int             // always positive; direction gives the sign
+  grossKobo    Int?
+  feeKobo      Int?
+  netKobo      Int?
+  reference    String          // Transaction.reference / Payout.reference — traceability
+  description  String
+  actorId      String?         // set for refund / manual_credit (the admin who acted)
+  createdAt    DateTime        @default(now())
+
+  space      Space       @relation(fields: [spaceId], references: [id])
+  due        Due?        @relation(fields: [dueId], references: [id])
+  txn        Transaction? @relation(fields: [txnId], references: [id])
+  duePayment DuePayment? @relation(fields: [duePaymentId], references: [id])
+  payout     Payout?     @relation(fields: [payoutId], references: [id])
+
+  @@index([spaceId, createdAt])
+  @@index([dueId])
+  @@index([reference])
+  @@map("ledger_entries")
 }
 
 // ---------------------------------------------------------------------------
@@ -874,19 +996,6 @@ model AdminAuditLog {
   @@index([actorId])
   @@index([createdAt])
   @@map("admin_audit_logs")
-}
-
-// Single settings row, runtime-editable by a super_admin (§ admin payment
-// gateway switch) so moving between Paystack/Monnify never needs a redeploy.
-// PAYMENT_GATEWAY in env is only the fallback used to seed this row and for
-// when it doesn't exist yet — see src/lib/paymentGateway.ts.
-model AppSettings {
-  id                   String             @id @default("singleton")
-  activePaymentGateway PaymentGatewayName @default(paystack)
-  updatedAt            DateTime           @updatedAt
-  updatedBy            String?
-
-  @@map("app_settings")
 }
 
 model ReferralFlag {

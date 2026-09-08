@@ -379,7 +379,7 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   const { memberCount, payments, students } = await buildRoster(sid, due.id, statusFilter, q);
 
   const collected = payments.reduce((s, p) => s + p.amountPaid, 0);
-  const fees = payments.reduce((s, p) => s + p.monnifyFee + p.duevyFee, 0);
+  const fees = payments.reduce((s, p) => s + p.processingFee + p.duevyFee, 0);
   const net = payments.reduce((s, p) => s + p.netToSpace, 0);
   // Expected is the gross the space would collect if every member paid.
   const expected = computeCharge(due.amount).totalCharged * memberCount;

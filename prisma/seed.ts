@@ -146,7 +146,7 @@ async function main() {
   const handoutFee = await upsertDue('Handout Fee', 500_000, new Date('2026-08-15')); // ₦5,000 face → ₦5,150 payable
   const dinnerLevy = await upsertDue('Dinner Levy', 1_000_000, new Date('2026-09-01')); // ₦10,000 face → ₦10,300 payable
 
-  // Dinner Levy already settled (via card) — sets up realistic history for view_history.
+  // Dinner Levy already settled — sets up realistic history for view_history.
   const dinnerCharge = computeCharge(dinnerLevy.amount);
   const dinnerTxn = await db.transaction.upsert({
     where: { reference: 'DVY-DEMO-0002' },
@@ -157,7 +157,7 @@ async function main() {
       title: dinnerLevy.title,
       detail: space.name,
       amount: -dinnerCharge.totalCharged,
-      method: 'Monnify',
+      method: 'Anchor',
       status: 'completed',
       reference: 'DVY-DEMO-0002',
       spaceId: space.id,
@@ -172,7 +172,7 @@ async function main() {
       txnId: dinnerTxn.id,
       reference: 'DVY-DEMO-0002',
       amountPaid: dinnerCharge.totalCharged,
-      monnifyFee: dinnerCharge.monnifyFee,
+      processingFee: dinnerCharge.processingFee,
       duevyFee: dinnerCharge.duevyFee,
       netToSpace: dinnerCharge.netToSpace,
     },
@@ -248,7 +248,7 @@ async function main() {
   console.log(`  password: ${DEMO_PASSWORD}`);
   console.log(`  wallet:   ₦12,000.00`);
   console.log(`  owes:     "Handout Fee" — ₦5,150.00`);
-  console.log(`  history:  "Dinner Levy" already paid via Monnify\n`);
+  console.log(`  history:  "Dinner Levy" already paid via Anchor\n`);
   console.log('Try with Duey:');
   console.log('  "pay my handout fee"');
   console.log('  "what\'s my balance"');

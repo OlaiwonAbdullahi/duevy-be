@@ -1,23 +1,13 @@
-import { type Due, type Transaction, type User } from '@prisma/client';
+import { type Due, type User } from '@prisma/client';
 import { db } from '../config/db';
-import { computeCharge, computeSubaccountSplit, generateReference } from '../lib/money';
-import { initTransaction, createInvoice, chargeCardToken, getCardDetails, getGatewayLabel } from '../lib/paymentGateway';
-import { notify, notifyMany } from '../lib/notifications';
+import { env } from '../config/env';
+import { computeCharge, generateReference } from '../lib/money';
+import { createPayWithTransfer, getPayWithTransfer } from '../lib/anchor';
+import { requireCollectableAccount } from './anchorCustomer.service';
+import { notifyMany } from '../lib/notifications';
 import { sendDuePaymentReceiptEmail } from '../lib/email';
 import { applyPollVotes, type VoteSelection } from './poll.service';
 import { maybeAwardReferral } from './referral.service';
-import { resolveActiveSubaccountCode } from './payout.service';
-
-// ₦50 verification charge used to tokenize a card during the redirect add-card flow (§8.4).
-const CARD_VERIFICATION_AMOUNT = 5000; // kobo
-
-function normalizeCardBrand(monnifyCardType: string): string {
-  const upper = monnifyCardType.toUpperCase();
-  if (upper.includes('VISA')) return 'Visa';
-  if (upper.includes('MASTERCARD')) return 'Mastercard';
-  if (upper.includes('VERVE')) return 'Verve';
-  return monnifyCardType;
-}
 
 /** After a space records a payment, pay any pending referral bounty for its lead rep. */
 async function triggerReferralReward(spaceId: string): Promise<void> {
@@ -36,40 +26,20 @@ export async function uniqueReference(): Promise<string> {
   return `DVY-${Date.now()}`;
 }
 
-// ---------------------------------------------------------------------------
-// Card — synchronous charge of a saved, tokenized card (§6.3/§8.2/§11.6, method=card)
-// ---------------------------------------------------------------------------
-export interface CardChargeResult {
-  reference: string;
-  methodLabel: string;
+export interface BankTransferInstructions {
+  accountNumber: string;
+  bankName: string;
+  accountName: string;
+  amountKobo: number;
+  expiresAt: string;
 }
 
-/** Charge a saved card for `amount` kobo. Looks up the card, hits Monnify, and
- * returns a reference the caller can use to write its own ledger rows. */
-export async function chargeSavedCard(
-  userId: string,
-  cardId: string,
-  amount: number,
-  description: string,
-): Promise<CardChargeResult> {
-  const [card, user] = await Promise.all([
-    db.card.findFirst({ where: { id: cardId, userId } }),
-    db.user.findUnique({ where: { id: userId } }),
-  ]);
-  if (!card || !user) throw new CardNotFoundError();
-
-  const reference = await uniqueReference();
-  const result = await chargeCardToken({
-    amount,
-    reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description,
-    cardToken: card.providerToken,
-  });
-  if (!result.paid) throw new CardChargeFailedError();
-
-  return { reference, methodLabel: `${card.brand} •••• ${card.last4}` };
+export interface InvoiceResult {
+  reference: string;
+  amount: number; // kobo, totalCharged
+  /** Always null — Anchor has no hosted checkout. Kept so the response shape stays stable. */
+  checkoutUrl: null;
+  bankTransfer: BankTransferInstructions;
 }
 
 export interface RedeemedDiscount {
@@ -77,110 +47,80 @@ export interface RedeemedDiscount {
   amountKobo: number;
 }
 
-export async function settleDueFromCard(
-  user: User,
-  due: Due & { space: { name: string } },
-  cardId: string,
-  discount?: RedeemedDiscount,
-): Promise<Transaction> {
-  const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
-  const { reference, methodLabel } = await chargeSavedCard(user.id, cardId, charge.totalCharged, due.title);
+interface OpenedCheckout extends BankTransferInstructions {
+  payWithTransferId: string;
+}
 
-  const txn = await db.$transaction(async (tx) => {
-    const transaction = await tx.transaction.create({
-      data: {
-        userId: user.id,
-        type: 'due',
-        title: due.title,
-        detail: due.space.name,
-        amount: -charge.totalCharged,
-        method: methodLabel,
-        status: 'completed',
-        reference,
-        spaceId: due.spaceId,
-      },
-    });
+async function openCheckoutAccount(
+  spaceId: string,
+  reference: string,
+  amountKobo: number,
+  email: string,
+  metadata: Record<string, string>,
+): Promise<OpenedCheckout> {
+  await requireCollectableAccount(spaceId);
 
-    await tx.duePayment.create({
-      data: {
-        userId: user.id,
-        dueId: due.id,
-        txnId: transaction.id,
-        reference,
-        amountPaid: charge.totalCharged,
-        monnifyFee: charge.monnifyFee,
-        duevyFee: charge.duevyFee,
-        netToSpace: charge.netToSpace,
-      },
-    });
-
-    if (discount) {
-      await tx.discountCode.update({ where: { id: discount.id }, data: { redeemedAt: new Date(), dueId: due.id } });
-    }
-
-    return transaction;
+  const checkout = await createPayWithTransfer({
+    reference,
+    email,
+    amountKobo,
+    expirySeconds: env.ANCHOR_VA_EXPIRY_SECONDS,
+    metadata,
   });
 
-  await notifyRepsOfPayment(due.spaceId, user.name, due.title, due.amount).catch(() => {});
-  await sendDuePaymentReceiptEmail(user.email, user.name, {
-    dueTitle: due.title,
-    spaceName: due.space.name,
-    amountPaidKobo: charge.totalCharged,
-    reference,
-    dueId: due.id,
-  }).catch(() => {});
-  await triggerReferralReward(due.spaceId);
-  return txn;
+  return {
+    payWithTransferId: checkout.id,
+    accountNumber: checkout.accountNumber,
+    bankName: checkout.bankName,
+    accountName: checkout.accountName,
+    amountKobo: checkout.amountKobo,
+    expiresAt: checkout.expiresAt.toISOString(),
+  };
 }
-
-// ---------------------------------------------------------------------------
-// Online — in-app invoice (§6.3 method=online) / hosted checkout (card-save only)
-// ---------------------------------------------------------------------------
-export interface CheckoutResult {
-  checkoutUrl: string;
-  reference: string;
-}
-
-export interface InvoiceResult {
-  reference: string;
-  amount: number; // kobo, totalCharged
-  checkoutUrl: string;
-  /** Only Monnify's Create Invoice returns this directly; null on Paystack (transfer lives on the hosted checkout page instead). */
-  bankTransfer: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null } | null;
-}
-
-const INVOICE_EXPIRY_MS = 60 * 60 * 1000; // 1h
 
 /**
- * "Invoice" flow (payment architecture migration) — Monnify's Create Invoice
- * returns a transfer account *and* a checkoutUrl in one response; Paystack's
- * equivalent is Initialize Transaction with a subaccount attached (transfer
- * lives on that hosted page, not as a separate field — see createInvoice()
- * in paystack.ts). Either way the payer lands on callbackPath after paying,
- * but the charge.success webhook (routed through fulfilByReference below)
- * remains the actual source of truth, not the redirect itself.
+ * Open one checkout covering one or more dues (PRD §5.2 — "one transfer covers
+ * many dues; the student never pays four times for four dues").
+ *
+ * The charge is computed per due and summed, so each line keeps its own
+ * face/fee split and the department is credited per due. A referral discount
+ * applies to a single due, not the basket.
  */
 export async function initOnlineDuePayment(
   user: User,
-  due: Due & { space: { name: string; paystackSubaccountCode: string | null; subaccountGateway: string | null } },
-  discount?: RedeemedDiscount,
+  dues: (Due & { space: { name: string } })[],
+  discount?: RedeemedDiscount & { dueId: string },
 ): Promise<InvoiceResult> {
-  const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
+  if (!dues.length) throw new Error('initOnlineDuePayment: no dues supplied');
+
+  const charges = dues.map((d) =>
+    computeCharge(d.amount, discount && discount.dueId === d.id ? discount.amountKobo : 0),
+  );
+  const totalCharged = charges.reduce((sum, c) => sum + c.totalCharged, 0);
   const reference = await uniqueReference();
-  const gatewayLabel = await getGatewayLabel();
+  const space = dues[0].space;
+  const title = dues.length === 1 ? dues[0].title : `${dues.length} dues`;
+
+  const baseMetadata = {
+    dueIds: dues.map((d) => d.id),
+    amount: totalCharged,
+    discountCodeId: discount?.id ?? null,
+    discountDueId: discount?.dueId ?? null,
+    discountAmountKobo: discount?.amountKobo ?? 0,
+  };
 
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
       data: {
         userId: user.id,
         type: 'due',
-        title: due.title,
-        detail: due.space.name,
-        amount: -charge.totalCharged,
-        method: gatewayLabel,
+        title,
+        detail: space.name,
+        amount: -totalCharged,
+        method: 'Anchor',
         status: 'pending',
         reference,
-        spaceId: due.spaceId,
+        spaceId: dues[0].spaceId,
       },
     });
     await tx.pendingPayment.create({
@@ -188,69 +128,68 @@ export async function initOnlineDuePayment(
         reference,
         userId: user.id,
         type: 'due_payment',
-        // discountCodeId is only redeemed once this actually completes (fulfilByReference)
-        // — a failed/expired/abandoned charge leaves the code untouched for reuse.
-        // discountAmountKobo is snapshotted here (not re-looked-up) so fulfilment
-        // recomputes the exact same totalCharged that was actually invoiced.
-        metadata: {
-          dueId: due.id,
-          amount: charge.totalCharged,
-          discountCodeId: discount?.id ?? null,
-          discountAmountKobo: discount?.amountKobo ?? 0,
-        },
-        expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
+        // discountCodeId is only redeemed once this actually completes
+        // (fulfilByReference) — a failed/expired/abandoned charge leaves the
+        // code untouched for reuse. discountAmountKobo is snapshotted here (not
+        // re-looked-up) so fulfilment recomputes the exact same totalCharged
+        // that was actually invoiced.
+        metadata: baseMetadata,
+        // The pending row outlives the checkout account so an expired attempt
+      
+        // The pending row outlives the virtual account so an expired checkout
+        // still resolves to a clear "expired" rather than a 404.
+        expiresAt: new Date(Date.now() + env.ANCHOR_VA_EXPIRY_SECONDS * 1000),
       },
     });
   });
 
-  const split = computeSubaccountSplit(due.amount);
-  const subaccountCode = await resolveActiveSubaccountCode(due.space);
-  // The payer is charged the full amount (face + fee) at checkout.
-  const charged = await createInvoice({
-    amount: charge.totalCharged,
-    reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description: due.title,
-    callbackPath: `/dashboard/pay/${reference}?dueId=${due.id}`,
-    expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
-    ...(subaccountCode ? { subaccountCode, subaccountShareKobo: split.subaccountShareKobo } : {}),
+  const account = await openCheckoutAccount(dues[0].spaceId, reference, totalCharged, user.email, {
+    userId: user.id,
+    dueCount: String(dues.length),
   });
 
   // Persist so GET /payments/:reference/status (and a reload of the dedicated
-  // payment page) can render the same invoice without needing this closure —
-  // notably bankTransfer, which only Monnify's Create Invoice returns.
+  // payment page) can re-render the same account without needing this closure.
   await db.pendingPayment.update({
     where: { reference },
     data: {
       metadata: {
-        dueId: due.id,
-        amount: charge.totalCharged,
-        discountCodeId: discount?.id ?? null,
-        discountAmountKobo: discount?.amountKobo ?? 0,
-        checkoutUrl: charged.checkoutUrl,
-        bankTransfer: charged.bankTransfer,
+        ...baseMetadata,
+        payWithTransferId: account.payWithTransferId,
+        checkoutAccountNumber: account.accountNumber,
+        checkoutBankName: account.bankName,
+        checkoutAccountName: account.accountName,
+        checkoutExpiresAt: account.expiresAt,
       },
     },
   });
 
-  return { reference, amount: charge.totalCharged, checkoutUrl: charged.checkoutUrl, bankTransfer: charged.bankTransfer };
+  return {
+    reference,
+    amount: totalCharged,
+    checkoutUrl: null,
+    bankTransfer: {
+      accountNumber: account.accountNumber,
+      bankName: account.bankName,
+      accountName: account.accountName,
+      amountKobo: account.amountKobo,
+      expiresAt: account.expiresAt,
+    },
+  };
 }
 
 /**
- * Same in-app invoice flow as `initOnlineDuePayment`, for a paid poll vote.
- * Extracted out of routes/polls.ts (which used to duplicate this pending/init
- * logic inline against the old hosted-checkout call) so both payment surfaces
- * share one invoice + subaccount-split implementation.
+ * Same virtual-account checkout as `initOnlineDuePayment`, for a paid poll vote.
+ * Extracted out of routes/polls.ts so both payment surfaces share one
+ * implementation.
  */
 export async function initOnlinePollVote(
   user: User,
-  poll: { id: string; title: string; spaceId: string; amountPerVote: number; space: { paystackSubaccountCode: string | null; subaccountGateway: string | null } },
+  poll: { id: string; title: string; spaceId: string; amountPerVote: number },
   selections: VoteSelection[],
   totalCharged: number,
 ): Promise<InvoiceResult> {
   const reference = await uniqueReference();
-  const gatewayLabel = await getGatewayLabel();
 
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
@@ -260,7 +199,7 @@ export async function initOnlinePollVote(
         title: `Votes: ${poll.title}`,
         detail: 'Poll',
         amount: -totalCharged,
-        method: gatewayLabel,
+        method: 'Anchor',
         status: 'pending',
         reference,
         spaceId: poll.spaceId,
@@ -272,29 +211,16 @@ export async function initOnlinePollVote(
         userId: user.id,
         type: 'poll_vote',
         metadata: { pollId: poll.id, amountPerVote: poll.amountPerVote, selections },
-        expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
+        expiresAt: new Date(Date.now() + env.ANCHOR_VA_EXPIRY_SECONDS * 1000),
       },
     });
   });
 
-  // Gross face value (before the payer's 3% charge) drives the subaccount split, same as a due.
-  const grossFace = poll.amountPerVote * selections.reduce((s, sel) => s + sel.quantity, 0);
-  const split = computeSubaccountSplit(grossFace);
-  const subaccountCode = await resolveActiveSubaccountCode(poll.space);
-  const charged = await createInvoice({
-    amount: totalCharged,
-    reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description: `Votes: ${poll.title}`,
-    callbackPath: `/dashboard/pay/${reference}`,
-    expiresAt: new Date(Date.now() + INVOICE_EXPIRY_MS),
-    ...(subaccountCode
-      ? { subaccountCode, subaccountShareKobo: split.subaccountShareKobo }
-      : {}),
+  const account = await openCheckoutAccount(poll.spaceId, reference, totalCharged, user.email, {
+    pollId: poll.id,
+    userId: user.id,
   });
 
-  // See initOnlineDuePayment's identical follow-up update for why this exists.
   await db.pendingPayment.update({
     where: { reference },
     data: {
@@ -303,66 +229,55 @@ export async function initOnlinePollVote(
         amountPerVote: poll.amountPerVote,
         selections,
         amount: totalCharged,
-        checkoutUrl: charged.checkoutUrl,
-        bankTransfer: charged.bankTransfer,
+        payWithTransferId: account.payWithTransferId,
+        checkoutAccountNumber: account.accountNumber,
+        checkoutBankName: account.bankName,
+        checkoutAccountName: account.accountName,
+        checkoutExpiresAt: account.expiresAt,
       },
     },
   });
 
-  return { reference, amount: totalCharged, checkoutUrl: charged.checkoutUrl, bankTransfer: charged.bankTransfer };
-}
-
-// ---------------------------------------------------------------------------
-// Card save — redirect flow (§8.4). The payer completes a small verification
-// charge on the active gateway's hosted checkout; the webhook/reconciliation
-// fulfilment path below exchanges the completed transaction for a reusable card token.
-// ---------------------------------------------------------------------------
-export async function initCardSave(user: User, isDefault: boolean): Promise<CheckoutResult> {
-  const reference = await uniqueReference();
-  const gatewayLabel = await getGatewayLabel();
-
-  const init = await initTransaction({
-    amount: CARD_VERIFICATION_AMOUNT,
+  return {
     reference,
-    customerName: user.name,
-    customerEmail: user.email,
-    description: 'Card verification',
-    callbackPath: '/dashboard/wallet/callback',
-  });
-
-  await db.$transaction(async (tx) => {
-    await tx.transaction.create({
-      data: {
-        userId: user.id,
-        type: 'card_verification',
-        title: 'Card verification',
-        detail: gatewayLabel,
-        amount: -CARD_VERIFICATION_AMOUNT,
-        method: gatewayLabel,
-        status: 'pending',
-        reference,
-      },
-    });
-    await tx.pendingPayment.create({
-      data: {
-        reference,
-        userId: user.id,
-        type: 'card_save',
-        metadata: { isDefault, transactionReference: init.transactionReference },
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-      },
-    });
-  });
-
-  return { checkoutUrl: init.checkoutUrl, reference };
+    amount: totalCharged,
+    checkoutUrl: null,
+    bankTransfer: {
+      accountNumber: account.accountNumber,
+      bankName: account.bankName,
+      accountName: account.accountName,
+      amountKobo: account.amountKobo,
+      expiresAt: account.expiresAt,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Fulfilment — invoked by the webhook (§15) and the status poller (§6.4)
+// Fulfilment — invoked by the payment.received webhook, the status poller, and
+// the reconciliation job. The one idempotent entry point all three share.
 // ---------------------------------------------------------------------------
-export type FulfilOutcome = 'fulfilled' | 'already' | 'failed' | 'unknown';
 
-export async function fulfilByReference(reference: string, success: boolean): Promise<FulfilOutcome> {
+export type FulfilOutcome = 'fulfilled' | 'already' | 'failed' | 'unknown' | 'underpaid';
+
+export interface FulfilOptions {
+
+  creditedKobo?: number;
+}
+
+/** Raises an unmatched/mismatched payment to the platform admins for manual resolution. */
+async function flagToAdmins(title: string, detail: string): Promise<void> {
+  const admins = await db.user.findMany({ where: { role: 'admin' }, select: { id: true } });
+  await notifyMany(
+    admins.map((a) => a.id),
+    { kind: 'system', tone: 'rose', title, detail, href: '/admin/transactions' },
+  ).catch(() => {});
+}
+
+export async function fulfilByReference(
+  reference: string,
+  success: boolean,
+  opts: FulfilOptions = {},
+): Promise<FulfilOutcome> {
   const pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending) return 'unknown';
   if (pending.status === 'completed') return 'already';
@@ -378,57 +293,132 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
 
   const meta = (pending.metadata ?? {}) as {
     amount?: number;
-    dueId?: string;
+    /** Every due this one checkout settles (PRD §5.2). */
+    dueIds?: string[];
     discountCodeId?: string | null;
+    /** A referral discount is redeemed against ONE due, not the whole basket. */
+    discountDueId?: string | null;
     discountAmountKobo?: number;
-  };
+    payWithTransferId?: string;
+    checkoutAccountNumber?: string;
+    checkoutExpiresAt?: string;
+    underpaidFlaggedAt?: string;
+  } & Record<string, unknown>;
 
-  if (pending.type === 'due_payment' && meta.dueId) {
-    const due = await db.due.findUnique({ where: { id: meta.dueId }, include: { space: { select: { name: true } } } });
-    if (!due) return 'unknown';
+  const expected = meta.amount ?? 0;
+  if (opts.creditedKobo !== undefined && expected > 0 && opts.creditedKobo < expected) {
+    if (!meta.underpaidFlaggedAt) {
+      await db.pendingPayment.update({
+        where: { reference },
+        data: {
+          metadata: {
+            ...meta,
+            underpaidFlaggedAt: new Date().toISOString(),
+            underpaidCreditedKobo: opts.creditedKobo,
+          },
+        },
+      });
+      await flagToAdmins(
+        'Underpaid transfer',
+        `${reference}: received ₦${(opts.creditedKobo / 100).toLocaleString('en-NG')} of ₦${(expected / 100).toLocaleString('en-NG')}.`,
+      );
+    }
+    return 'underpaid';
+  }
+  // Overpayment is honoured, and the excess is flagged for a manual refund.
+  if (opts.creditedKobo !== undefined && expected > 0 && opts.creditedKobo > expected) {
+    await flagToAdmins(
+      'Overpaid transfer',
+      `${reference}: received ₦${(opts.creditedKobo / 100).toLocaleString('en-NG')} against ₦${(expected / 100).toLocaleString('en-NG')} — ₦${((opts.creditedKobo - expected) / 100).toLocaleString('en-NG')} to refund.`,
+    );
+  }
 
-    // Guard against a duplicate DuePayment (webhook + reconciliation racing).
-    const existing = await db.duePayment.findUnique({
-      where: { userId_dueId: { userId: pending.userId, dueId: due.id } },
+  if (pending.type === 'due_payment' && meta.dueIds?.length) {
+    // One checkout can settle several dues (PRD §5.2). Every line shares this
+    // checkout's reference; uniqueness is per (user, due), so a line already
+    // present is skipped rather than duplicated — which is also what makes the
+    // webhook and the reconciliation poll safe to race.
+    const dues = await db.due.findMany({
+      where: { id: { in: meta.dueIds } },
+      include: { space: { select: { name: true } } },
     });
+    if (!dues.length) return 'unknown';
 
-    const charge = computeCharge(due.amount, meta.discountAmountKobo ?? 0);
+    const discountByDue = meta.discountDueId ?? null;
     const txn = await db.transaction.findUnique({ where: { reference } });
+    const existing = await db.duePayment.findMany({
+      where: { userId: pending.userId, dueId: { in: dues.map((d) => d.id) } },
+      select: { dueId: true },
+    });
+    const alreadyPaid = new Set(existing.map((e) => e.dueId));
 
     await db.$transaction(async (tx) => {
       await tx.pendingPayment.update({ where: { reference }, data: { status: 'completed' } });
       await tx.transaction.updateMany({ where: { reference }, data: { status: 'completed' } });
-      if (!existing) {
-        await tx.duePayment.create({
+
+      for (const due of dues) {
+        if (alreadyPaid.has(due.id)) continue;
+        // The discount applies to one due only — the one it was redeemed
+        // against — so the other lines are charged in full.
+        const charge = computeCharge(due.amount, discountByDue === due.id ? meta.discountAmountKobo ?? 0 : 0);
+
+        const duePayment = await tx.duePayment.create({
           data: {
             userId: pending.userId,
             dueId: due.id,
             txnId: txn?.id,
             reference,
             amountPaid: charge.totalCharged,
-            monnifyFee: charge.monnifyFee,
+            processingFee: charge.processingFee,
             duevyFee: charge.duevyFee,
             netToSpace: charge.netToSpace,
+            payWithTransferId: meta.payWithTransferId ?? null,
+            checkoutAccountNumber: meta.checkoutAccountNumber ?? null,
+            checkoutExpiresAt: meta.checkoutExpiresAt ? new Date(meta.checkoutExpiresAt) : null,
           },
         });
-        if (meta.discountCodeId) {
-          await tx.discountCode.update({ where: { id: meta.discountCodeId }, data: { redeemedAt: new Date(), dueId: due.id } });
-        }
+        await tx.ledgerEntry.create({
+          data: {
+            spaceId: due.spaceId,
+            dueId: due.id,
+            txnId: txn?.id,
+            duePaymentId: duePayment.id,
+            type: 'due_payment',
+            direction: 'credit',
+            amountKobo: charge.netToSpace,
+            grossKobo: charge.totalCharged,
+            feeKobo: charge.totalFee,
+            netKobo: charge.netToSpace,
+            reference,
+            description: `Payment for "${due.title}"`,
+          },
+        });
+      }
+
+      if (meta.discountCodeId && discountByDue) {
+        await tx.discountCode.update({
+          where: { id: meta.discountCodeId },
+          data: { redeemedAt: new Date(), dueId: discountByDue },
+        });
       }
     });
 
     const payer = await db.user.findUnique({ where: { id: pending.userId }, select: { name: true, email: true } });
-    await notifyRepsOfPayment(due.spaceId, payer?.name ?? 'A member', due.title, due.amount).catch(() => {});
+    const spaceId = dues[0].spaceId;
+    const totalKobo = dues.reduce((sum, d) => sum + d.amount, 0);
+    const title = dues.length === 1 ? dues[0].title : `${dues.length} dues`;
+
+    await notifyRepsOfPayment(spaceId, payer?.name ?? 'A member', title, totalKobo).catch(() => {});
     if (payer) {
       await sendDuePaymentReceiptEmail(payer.email, payer.name, {
-        dueTitle: due.title,
-        spaceName: due.space.name,
-        amountPaidKobo: charge.totalCharged,
+        dueTitle: title,
+        spaceName: dues[0].space.name,
+        amountPaidKobo: meta.amount ?? 0,
         reference,
-        dueId: due.id,
+        dueId: dues[0].id,
       }).catch(() => {});
     }
-    await triggerReferralReward(due.spaceId);
+    await triggerReferralReward(spaceId);
     return 'fulfilled';
   }
 
@@ -454,60 +444,38 @@ export async function fulfilByReference(reference: string, success: boolean): Pr
     return 'fulfilled';
   }
 
-  if (pending.type === 'card_save') {
-    const cardMeta = (pending.metadata ?? {}) as { isDefault?: boolean; transactionReference?: string };
-    const details = await getCardDetails(cardMeta.transactionReference ?? reference);
-
-    if (!details) {
-      // Verification charge succeeded but we couldn't retrieve a reusable token —
-      // leave the pending row unresolved so reconciliation retries rather than
-      // silently losing the ₦50 charge with no card to show for it.
-      console.error(`[card-save] no card details returned for ref=${reference}; will retry`);
-      return 'unknown';
-    }
-
-    const existing = await db.card.findUnique({ where: { providerToken: details.cardToken } });
-    if (existing) {
-      await db.$transaction([
-        db.pendingPayment.update({ where: { reference }, data: { status: 'completed' } }),
-        db.transaction.updateMany({ where: { reference }, data: { status: 'completed' } }),
-      ]);
-      return 'fulfilled';
-    }
-
-    const count = await db.card.count({ where: { userId: pending.userId } });
-    const makeDefault = !!cardMeta.isDefault || count === 0;
-
-    await db.$transaction(async (tx) => {
-      await tx.pendingPayment.update({ where: { reference }, data: { status: 'completed' } });
-      await tx.transaction.updateMany({ where: { reference }, data: { status: 'completed' } });
-      if (makeDefault) {
-        await tx.card.updateMany({ where: { userId: pending.userId, isDefault: true }, data: { isDefault: false } });
-      }
-      await tx.card.create({
-        data: {
-          userId: pending.userId,
-          providerToken: details.cardToken,
-          brand: normalizeCardBrand(details.cardType),
-          last4: details.last4,
-          expiry: `${details.expMonth.padStart(2, '0')}/${details.expYear.slice(-2)}`,
-          isDefault: makeDefault,
-        },
-      });
-    });
-
-    await notify({
-      userId: pending.userId,
-      kind: 'payment_received',
-      title: 'Card added',
-      detail: `Your ${normalizeCardBrand(details.cardType)} card ending in ${details.last4} was saved.`,
-      href: '/dashboard/wallet',
-    }).catch(() => {});
-
-    return 'fulfilled';
-  }
-
   return 'unknown';
+}
+
+export async function markPaymentSettled(reference: string): Promise<void> {
+  await db.duePayment.updateMany({
+    where: { reference, settledAt: null },
+    data: { settledAt: new Date() },
+  });
+}
+
+/** The Pay With Transfer id a checkout was opened against, from its metadata. */
+export function checkoutIdFor(metadata: unknown): string | null {
+  const meta = (metadata ?? {}) as { payWithTransferId?: string };
+  return meta.payWithTransferId ?? null;
+}
+
+export async function pollInflow(reference: string): Promise<FulfilOutcome | 'pending'> {
+  const pending = await db.pendingPayment.findUnique({ where: { reference } });
+  if (!pending || pending.status !== 'pending') return 'already';
+
+  const checkoutId = checkoutIdFor(pending.metadata);
+  if (!checkoutId) return 'pending';
+
+  const checkout = await getPayWithTransfer(checkoutId);
+  // Anchor fixes the amount, so a funded checkout is exactly what we invoiced —
+  // there is no credited amount to reconcile against.
+  if (checkout?.funded) return fulfilByReference(reference, true);
+
+  // Nothing arrived and the window has closed. Only ever marked failed here,
+  // never paid — Anchor enforces the expiry, so a late transfer cannot land.
+  if (pending.expiresAt <= new Date()) return fulfilByReference(reference, false);
+  return 'pending';
 }
 
 // ---------------------------------------------------------------------------
@@ -522,18 +490,4 @@ async function notifyRepsOfPayment(spaceId: string, payerName: string, dueTitle:
       href: '/dashboard/collections',
     },
   );
-}
-
-export class CardNotFoundError extends Error {
-  constructor() {
-    super('Card not found');
-    this.name = 'CardNotFoundError';
-  }
-}
-
-export class CardChargeFailedError extends Error {
-  constructor() {
-    super('Card charge was declined');
-    this.name = 'CardChargeFailedError';
-  }
 }

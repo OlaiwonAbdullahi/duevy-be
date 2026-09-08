@@ -7,8 +7,7 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
-import { fulfilByReference } from '../services/payment.service';
+import { pollInflow } from '../services/payment.service';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -101,7 +100,7 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
     spaceName: dp?.due.space.name ?? txn.detail ?? '',
     payerName: txn.user.name,
     amountPaid: dp?.amountPaid ?? Math.abs(txn.amount),
-    monnifyFee: dp?.monnifyFee ?? 0,
+    processingFee: dp?.processingFee ?? 0,
     duevyFee: dp?.duevyFee ?? 0,
     netToSpace: dp?.netToSpace ?? Math.abs(txn.amount),
     paidAt: txn.createdAt,
@@ -130,25 +129,14 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
     return;
   }
 
-  // "I've made payment" tap (§ in-app invoice flow) — actively check with the
-  // gateway instead of just reading our own possibly-stale DB row, so the UI
-  // can reflect success without waiting on the webhook round-trip. The
-  // webhook remains the actual source of truth; fulfilByReference is
-  // idempotent, so this racing with the webhook is safe by construction.
+  // Actively check with Anchor rather than only reading our own possibly-stale
+  // row, so the payer's screen can flip to success without waiting on the
+  // webhook round-trip. The webhook remains the source of truth;
+  // fulfilByReference is idempotent, so racing it is safe by construction.
   if (pending.status === 'pending') {
     try {
-      // due_payment/poll_vote always go through createInvoice() now — Monnify
-      // needs its dedicated invoice-status endpoint for those (an
-      // invoiceReference isn't a transactionReference); card_save is still a
-      // plain init-transaction, so it keeps using getTransactionStatus.
-      const live = pending.type === 'card_save' ? await getTransactionStatus(reference) : await getInvoiceStatus(reference);
-      if (live?.paymentStatus === 'PAID') {
-        await fulfilByReference(reference, true);
-        pending = await db.pendingPayment.findUnique({ where: { reference } });
-      } else if (live && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(live.paymentStatus)) {
-        await fulfilByReference(reference, false);
-        pending = await db.pendingPayment.findUnique({ where: { reference } });
-      }
+      const outcome = await pollInflow(reference);
+      if (outcome !== 'pending') pending = await db.pendingPayment.findUnique({ where: { reference } });
     } catch (err) {
       console.error(`[payments] status check failed for ref=${reference}:`, err);
     }
@@ -157,19 +145,36 @@ paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Pr
   const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
   const txn = await db.transaction.findUnique({ where: { reference } });
 
-  // Invoice details, snapshotted onto the PendingPayment at creation — lets a
-  // dedicated payment page render the full invoice from just the reference
-  // (e.g. on reload or the callback redirect landing), not only the session
-  // that opened it. bankTransfer is only ever present for Monnify.
+  // The checkout's virtual account, snapshotted onto the PendingPayment when it
+  // was opened — lets the payment page re-render the transfer instructions and
+  // its countdown from the reference alone, on reload or a fresh device.
   const meta = pending?.metadata as
-    | { amount?: number; checkoutUrl?: string; bankTransfer?: { accountNumber: string; bankName: string; accountName: string; expiresAt: string | null } | null }
+    | {
+        amount?: number;
+        checkoutAccountNumber?: string;
+        checkoutBankName?: string;
+        checkoutAccountName?: string;
+        checkoutExpiresAt?: string;
+      }
     | undefined;
+
+  const bankTransfer =
+    status === 'pending' && meta?.checkoutAccountNumber
+      ? {
+          accountNumber: meta.checkoutAccountNumber,
+          bankName: meta.checkoutBankName ?? '',
+          accountName: meta.checkoutAccountName ?? '',
+          amountKobo: meta.amount ?? 0,
+          expiresAt: meta.checkoutExpiresAt ?? null,
+        }
+      : null;
 
   ok(res, {
     status,
     ...(meta?.amount !== undefined ? { amount: meta.amount } : {}),
-    ...(meta?.checkoutUrl ? { checkoutUrl: meta.checkoutUrl } : {}),
-    ...(meta?.bankTransfer ? { bankTransfer: meta.bankTransfer } : {}),
+    // Always present so clients can branch on it; Anchor has no hosted checkout.
+    checkoutUrl: null,
+    bankTransfer,
     ...(txn && status === 'completed' ? { transaction: serializeTransaction(txn) } : {}),
   });
 });

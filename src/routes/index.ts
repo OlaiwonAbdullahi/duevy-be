@@ -13,6 +13,7 @@ import { referralsRouter } from './referrals';
 import { disputesRouter } from './disputes';
 import { banksRouter } from './banks';
 import { assistantRouter } from './assistant';
+import { requireFeature } from '../middleware/requireFeature';
 
 export const apiRouter = Router();
 
@@ -27,7 +28,7 @@ apiRouter.use('/webhooks', webhooksRouter);
 apiRouter.use('/notifications', notificationsRouter);
 apiRouter.use('/polls', pollsPublicRouter);
 apiRouter.use('/admin', adminRouter);
-apiRouter.use('/referrals', referralsRouter);
+apiRouter.use('/referrals', requireFeature('referrals'), referralsRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
-apiRouter.use('/assistant', assistantRouter);
+apiRouter.use('/assistant', requireFeature('assistant'), assistantRouter);

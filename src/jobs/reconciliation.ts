@@ -1,15 +1,21 @@
 import { db } from '../config/db';
-import { getTransactionStatus, getInvoiceStatus } from '../lib/paymentGateway';
-import { fulfilByReference } from '../services/payment.service';
-import { reconcileStalePayouts } from '../services/payout.service';
+import { getPayWithTransfer } from '../lib/anchor';
+import { checkoutIdFor, fulfilByReference } from '../services/payment.service';
+import { reconcileStalePayouts, remitToSpaces } from '../services/payout.service';
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // §15.1 — check with the provider after 15 minutes
-const GIVE_UP_AFTER_MS = 48 * 60 * 60 * 1000; // stop polling an unresolvable reference after 48h
+const GIVE_UP_AFTER_MS = 48 * 60 * 60 * 1000; // stop chasing an unresolvable reference after 48h
 
 /**
- * Resolve hosted-checkout payments (top-ups, due payments, paid votes) whose
- * webhook never arrived. Runs alongside the webhook, not instead of it — the
- * webhook is the fast path, this is the self-healing fallback (§15.1, §6.4).
+ * Resolve payments whose payin.received webhook never arrived. Runs alongside
+ * the webhook, not instead of it — the webhook is the fast path, this is the
+ * self-healing fallback (§15.1, §6.4).
+ *
+ * Anchor has no checkout session to poll, but a Pay With Transfer gains a
+ * `payIn` relationship once it has been funded, so reading the checkout back
+ * tells us whether the money arrived and only the notification was lost. That
+ * is one call per stale payment; unlike the old account-scan there is nothing
+ * to batch, because each checkout is its own object.
  */
 export async function reconcilePendingPayments(): Promise<void> {
   const staleThreshold = new Date(Date.now() - STALE_AFTER_MS);
@@ -21,31 +27,33 @@ export async function reconcilePendingPayments(): Promise<void> {
   });
 
   for (const p of pending) {
+    const checkoutId = checkoutIdFor(p.metadata);
+    if (!checkoutId) {
+      // The checkout was never opened against Anchor — nothing can resolve it.
+      if (p.createdAt <= giveUpThreshold) await fulfilByReference(p.reference, false);
+      continue;
+    }
+
     try {
-      // See transactions.ts's identical dispatch for why: due_payment/poll_vote
-      // always go through createInvoice(), which needs Monnify's dedicated
-      // invoice-status endpoint rather than the plain transaction one.
-      const status = p.type === 'card_save' ? await getTransactionStatus(p.reference) : await getInvoiceStatus(p.reference);
-      if (!status) {
-        if (p.createdAt <= giveUpThreshold) {
-          await fulfilByReference(p.reference, false);
-        }
+      const checkout = await getPayWithTransfer(checkoutId);
+      if (checkout?.funded) {
+        await fulfilByReference(p.reference, true);
         continue;
       }
-      if (status.paymentStatus === 'PAID') {
-        await fulfilByReference(p.reference, true);
-      } else if (['FAILED', 'CANCELLED', 'EXPIRED'].includes(status.paymentStatus)) {
+      // Anchor enforces the expiry, so once the window has closed and nothing
+      // arrived, no late transfer can change that.
+      if (p.expiresAt <= new Date() && p.createdAt <= giveUpThreshold) {
         await fulfilByReference(p.reference, false);
       }
-      // Still pending upstream — leave it for the next tick.
     } catch (err) {
-      console.error(`[reconciliation] failed to check payment ${p.reference}:`, err);
+      console.error(`[reconciliation] failed to check checkout ${checkoutId}:`, err);
     }
   }
 }
 
 async function runOnce(): Promise<void> {
   await reconcilePendingPayments().catch((err) => console.error('[reconciliation] pending payments run failed:', err));
+  await remitToSpaces().catch((err) => console.error('[reconciliation] remittance run failed:', err));
   await reconcileStalePayouts().catch((err) => console.error('[reconciliation] payouts run failed:', err));
 }
 
