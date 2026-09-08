@@ -1,38 +1,7 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { env } from '../config/env';
+import CircuitBreaker from 'opossum';
 
-/**
- * Anchor (getanchor.co) API client — the sole payment processor, replacing
- * Bachs Connect. Anchor is a BaaS rather than a gateway: there is no hosted
- * checkout, and every object (customer, deposit account, counterparty,
- * transfer) is addressed explicitly through a JSON:API envelope.
- *
- * TWO PRODUCT SURFACES, ONE KEY. Everything under /api/v1 is the BaaS product
- * and works in sandbox. The collection endpoints under /pay/* are the Payments
- * product: same x-anchor-key, but gated on a payment program and available in
- * PRODUCTION ONLY, with their own webhook registration and their own event
- * (payin.received, which is absent from the BaaS event enum). Nothing under
- * /pay/* can be exercised before Duevy Labs' KYB clears.
- *
- * Non-negotiables this module encodes, all verified against Anchor's OpenAPI
- * spec and docs.getanchor.co:
- *
- *  - Auth is the `x-anchor-key` header, never a Bearer token.
- *  - Amounts are integer minor units (kobo). Unlike Bachs, Anchor never takes a
- *    decimal string — koboToDecimalString/decimalStringToKobo are gone.
- *  - `reference` must match ^[a-z\d\-_\s]+$ — LOWERCASE ONLY. Our own refs look
- *    like "DVY-4821-7735", so everything crossing this boundary goes through
- *    toAnchorRef()/fromAnchorRef().
- *  - Money-moving calls carry x-anchor-idempotent-key derived from our own
- *    reference, the same discipline the Bachs client used.
- *  - Anchor deducts its own fees (TRANSFER_FEE, STAMP_DUTY, PAYMENT_COLLECTION)
- *    as separate CustomerFee rows against the account — they are NOT netted off
- *    a credited amount, so our recorded gross always matches what was sent.
- */
-
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
 
 interface AnchorErrorEntry {
   title?: string;
@@ -101,7 +70,7 @@ export function relationshipId(resource: AnchorResource<unknown>, name: string):
   return typeof id === 'string' ? id : null;
 }
 
-async function anchorFetch<D>(path: string, opts: AnchorRequestOpts = {}): Promise<AnchorEnvelope<D>> {
+async function anchorFetchRaw<D>(path: string, opts: AnchorRequestOpts = {}): Promise<AnchorEnvelope<D>> {
   const headers: Record<string, string> = {
     'x-anchor-key': env.ANCHOR_SECRET_KEY,
     'Content-Type': 'application/json',
@@ -125,6 +94,34 @@ async function anchorFetch<D>(path: string, opts: AnchorRequestOpts = {}): Promi
   }
   return json as AnchorEnvelope<D>;
 }
+
+
+// ---------------------------------------------------------------------------
+// Global Circuit Breaker for Anchor API Gateways
+// ---------------------------------------------------------------------------
+const anchorBreaker = new CircuitBreaker(anchorFetchRaw, {
+  name: 'anchor',
+  timeout: 10_000,
+  errorThresholdPercentage: 50,
+  volumeThreshold: 5,
+  resetTimeout: 30_000,
+  rollingCountTimeout: 10_000,
+  rollingCountBuckets: 10,
+  // 4xx errors are valid business rejections, not systemic infrastructure failures.
+  errorFilter: (err) => err instanceof AnchorApiError && err.status >= 400 && err.status < 500,
+});
+
+anchorBreaker.on('open',     () => console.error('[anchor] circuit OPEN — shedding load for 30s'));
+anchorBreaker.on('halfOpen', () => console.warn ('[anchor] circuit HALF-OPEN — probing gateway with trial call'));
+anchorBreaker.on('close',    () => console.log  ('[anchor] circuit CLOSED — calls flowing normally'));
+anchorBreaker.on('reject',   () => console.error('[anchor] circuit is open — call fast-failed locally'));
+anchorBreaker.on('timeout',  () => console.error('[anchor] call exceeded 10s timeout threshold'));
+
+/** Public gateway transport proxy preserving TypeScript generic shape */
+function anchorFetch<D>(path: string, opts: AnchorRequestOpts = {}): Promise<AnchorEnvelope<D>> {
+  return anchorBreaker.fire(path, opts) as Promise<AnchorEnvelope<D>>;
+}
+
 
 // ---------------------------------------------------------------------------
 // References — Anchor's `reference` pattern is ^[a-z\d\-_\s]+$, so our

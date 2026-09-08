@@ -26,24 +26,6 @@ export async function uniqueReference(): Promise<string> {
   return `DVY-${Date.now()}`;
 }
 
-// ---------------------------------------------------------------------------
-// Online — bank transfer to a single-use Pay With Transfer account.
-//
-// Anchor is a BaaS, not a gateway: there is no hosted checkout page. Each
-// checkout gets its own dynamic account, fixed to this exact amount and
-// expiring after ANCHOR_VA_EXPIRY_SECONDS. The payer transfers from any bank
-// app and the screen polls; nothing is ever marked paid by the client (§5.2).
-//
-// The money lands in DUEVY'S settlement account, not the department's — Anchor
-// confirmed sub-accounts are internal-only and Pay With Transfer takes no
-// settlement destination. The department's share is book-transferred on
-// afterwards by remitToSpaces(), which is why `settledAt` (collected) and
-// `remittedAt` (actually the rep's) are two different columns.
-//
-// Anchor enforces the amount, so the under/overpayment handling the virtual
-// NUBAN flow needed is gone: an inflow is always exactly what we invoiced.
-// ---------------------------------------------------------------------------
-
 export interface BankTransferInstructions {
   accountNumber: string;
   bankName: string;
@@ -69,11 +51,6 @@ interface OpenedCheckout extends BankTransferInstructions {
   payWithTransferId: string;
 }
 
-/**
- * Opens the checkout account. `requireCollectableAccount` is still called even
- * though the money no longer lands in the rep's account: an unverified space has
- * nowhere to remit to, so it must not be able to take payments either.
- */
 async function openCheckoutAccount(
   spaceId: string,
   reference: string,
@@ -128,11 +105,6 @@ export async function initOnlineDuePayment(
         reference,
         userId: user.id,
         type: 'due_payment',
-        // discountCodeId is only redeemed once this actually completes
-        // (fulfilByReference) — a failed/expired/abandoned charge leaves the
-        // code untouched for reuse. discountAmountKobo is snapshotted here (not
-        // re-looked-up) so fulfilment recomputes the exact same totalCharged
-        // that was actually invoiced.
         metadata: {
           dueId: due.id,
           amount: charge.totalCharged,
@@ -266,15 +238,7 @@ export async function initOnlinePollVote(
 export type FulfilOutcome = 'fulfilled' | 'already' | 'failed' | 'unknown' | 'underpaid';
 
 export interface FulfilOptions {
-  /**
-   * What Anchor actually credited, when known.
-   *
-   * SHOULD NEVER DISAGREE WITH THE INVOICED TOTAL. Pay With Transfer fixes the
-   * amount, so a mismatch means Anchor's own guarantee failed rather than that
-   * a payer mistyped. The handling below is kept as a cheap assertion — if it
-   * ever fires, treat it as a provider bug and escalate, not as routine
-   * reconciliation (PRD §9.1). Omit when the caller has no figure.
-   */
+
   creditedKobo?: number;
 }
 
@@ -316,12 +280,6 @@ export async function fulfilByReference(
     underpaidFlaggedAt?: string;
   } & Record<string, unknown>;
 
-  // Underpayment leaves everything pending and goes to a human: no due is
-  // marked paid on a short transfer, and the payer sees "we received ₦X of ₦Y".
-  //
-  // The row stays `pending`, so reconciliation re-checks it every tick — the
-  // flag is therefore recorded on the payment and raised to admins exactly
-  // once, rather than notifying them every five minutes until someone acts.
   const expected = meta.amount ?? 0;
   if (opts.creditedKobo !== undefined && expected > 0 && opts.creditedKobo < expected) {
     if (!meta.underpaidFlaggedAt) {
@@ -445,11 +403,6 @@ export async function fulfilByReference(
   return 'unknown';
 }
 
-/**
- * payin.received tells us the money reached DUEVY'S settlement account. That is
- * "collected", not "the rep's" — remitToSpaces() still has to book-transfer it
- * on. computeBalances() therefore gates `available` on remittedAt, not on this.
- */
 export async function markPaymentSettled(reference: string): Promise<void> {
   await db.duePayment.updateMany({
     where: { reference, settledAt: null },
@@ -463,14 +416,6 @@ export function checkoutIdFor(metadata: unknown): string | null {
   return meta.payWithTransferId ?? null;
 }
 
-/**
- * Active check for one pending payment, behind the payer's "I've made payment"
- * tap. Anchor has no checkout session to query, but a Pay With Transfer carries
- * a `payIn` relationship once it has been funded — that is the signal.
- *
- * The webhook remains the source of truth; fulfilByReference is idempotent, so
- * this racing with it is safe by construction.
- */
 export async function pollInflow(reference: string): Promise<FulfilOutcome | 'pending'> {
   const pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending || pending.status !== 'pending') return 'already';
