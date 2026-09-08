@@ -164,6 +164,20 @@ enum KycStatus {
   rejected
 }
 
+// Anchor's verification levels, named as the API names them — NOT as the prose
+// docs do. The `level` enum accepts only TIER_2 and TIER_3; there is no TIER_1
+// to submit. See the callout in src/lib/anchor.ts before renaming anything.
+//
+//   tier_0  the customer exists (name, address, email, phone) but is unverified.
+//   tier_2  BVN + date of birth + gender. Automatic, ₦50, capped at ₦300,000.
+//   tier_3  a government ID document. Manual review, ₦200, and UNLIMITED —
+//           which is the whole reason to offer the upgrade.
+enum KycTier {
+  tier_0
+  tier_2
+  tier_3
+}
+
 enum DisputeStatus {
   open
   under_review
@@ -278,6 +292,12 @@ model User {
   // from stored data.
   anchorCustomerId      String?              @unique
   kycStatus             KycStatus            @default(unverified)
+  // The tier actually VERIFIED, and the one awaiting a decision. They differ
+  // during an upgrade: a rep verified at tier_2 who submits tier_3 keeps
+  // collecting on tier_2 limits until the review lands, so a pending upgrade
+  // must never revoke a working account.
+  kycTier               KycTier              @default(tier_0)
+  kycPendingTier        KycTier?
   kycDocUrls            String[]             @default([])
   kycSubmittedAt        DateTime?
   kycResolvedAt         DateTime?
@@ -562,8 +582,11 @@ model DuePayment {
   dueId       String
   txnId       String?   @unique
   paidAt      DateTime  @default(now())
-  reference   String    @unique
-  amountPaid  Int       // kobo — what the payer was charged (face + 2% service charge)
+  // NOT unique: one checkout can settle several dues at once (PRD §5.2), and
+  // every DuePayment it creates shares the checkout's reference. Uniqueness is
+  // carried by @@unique([userId, dueId]) below — a due is paid once per user.
+  reference   String
+  amountPaid  Int       // kobo — this line's share of the charge (face + its 2%)
   processingFee Int     // kobo — Anchor's expected cut, taken out of the 2%
   duevyFee    Int       // kobo — Duevy's margin, the rest of the 2%
   netToSpace  Int       // kobo — amountPaid - processingFee - duevyFee, i.e. the face value
@@ -593,6 +616,7 @@ model DuePayment {
 
   @@unique([userId, dueId])
   @@index([dueId])
+  @@index([reference])
   @@map("due_payments")
 }
 

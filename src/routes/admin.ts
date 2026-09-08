@@ -96,6 +96,49 @@ async function countLowCollectionSpaces(spaceIds: string[]): Promise<number> {
 // ===========================================================================
 // §14.1 Overview
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// GET /admin/health — the money-plumbing view (PRD §10 Observability)
+//
+// Four things that mean money is stuck somewhere, each one actionable:
+// failed webhooks, payments collected but not remitted, payouts stuck in
+// flight, and checkouts that never resolved. Deliberately cheap — counts plus a
+// small sample — so it can back a dashboard that polls.
+// ---------------------------------------------------------------------------
+adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req: Request, res: Response): Promise<void> => {
+  const now = Date.now();
+  const remitStale = new Date(now - 30 * 60 * 1000); // a remittance should clear within a tick or two
+  const payoutStale = new Date(now - 60 * 60 * 1000);
+
+  const [failedWebhooks, unremitted, stuckPayouts, unresolvedCheckouts, samples] = await Promise.all([
+    db.webhookEvent.count({ where: { status: 'failed' } }),
+    db.duePayment.count({ where: { settledAt: { not: null }, remittedAt: null, paidAt: { lte: remitStale } } }),
+    db.payout.count({ where: { status: 'processing', requestedAt: { lte: payoutStale } } }),
+    // Anchor enforces the amount and the expiry, so a checkout that is still
+    // pending well past its window is a lost webhook, not a mispaid transfer.
+    db.pendingPayment.count({ where: { status: 'pending', expiresAt: { lte: remitStale } } }),
+    db.webhookEvent.findMany({
+      where: { status: 'failed' },
+      orderBy: { receivedAt: 'desc' },
+      take: 10,
+      select: { anchorEventId: true, type: true, error: true, receivedAt: true },
+    }),
+  ]);
+
+  ok(res, {
+    failedWebhooks,
+    unremittedPayments: unremitted,
+    stuckPayouts,
+    unresolvedCheckouts,
+    healthy: failedWebhooks === 0 && unremitted === 0 && stuckPayouts === 0 && unresolvedCheckouts === 0,
+    recentWebhookFailures: samples.map((e) => ({
+      eventId: e.anchorEventId,
+      type: e.type,
+      error: e.error,
+      receivedAt: e.receivedAt.toISOString(),
+    })),
+  });
+});
+
 adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void> => {
   const [totalUsers, activeReps, pendingReps] = await Promise.all([
     db.user.count(),

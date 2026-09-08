@@ -229,21 +229,35 @@ export async function getCustomer(customerId: string): Promise<AnchorResource<Cu
 }
 
 /**
- * BVN-tier identity verification.
+ * Identity verification. Anchor exposes exactly two submittable levels.
  *
- * TIER NAMING — READ BEFORE CHANGING. Anchor's prose docs call this "Tier 1",
- * but the API's `level` enum accepts only TIER_2 and TIER_3, and the BVN
- * payload goes in a `level2` object. The fee-type enum (KYC_TIER_2 /
- * KYC_TIER_3) confirms this is the tier the pricing sheet lists at ₦50. Do not
- * "correct" this to TIER_1 — the request is rejected.
+ * TIER NAMING — READ BEFORE CHANGING. Anchor's prose docs call the BVN level
+ * "Tier 1", but the API's `level` enum accepts only TIER_2 and TIER_3, and the
+ * BVN payload goes in a `level2` object. The fee-type enum (KYC_TIER_2 /
+ * KYC_TIER_3) confirms these are the tiers the pricing sheet lists at ₦50 and
+ * ₦200. Do not "correct" either to TIER_1 — the request is rejected.
  *
- * Asynchronous: a 200 means only that the check was accepted. The outcome
- * arrives as customer.identification.approved / .rejected / .error. The BVN is
- * never persisted on our side (PRD §8).
+ * Both are asynchronous: a 200 means only that the check was accepted. The
+ * outcome arrives as customer.identification.approved / .rejected / .error /
+ * .manualReview / .awaitingDocument. Neither the BVN nor the document number is
+ * persisted on our side (PRD §8).
+ */
+
+/** Government ID types Anchor accepts for TIER_3. */
+export type AnchorIdType = 'DRIVERS_LICENSE' | 'VOTERS_CARD' | 'PASSPORT' | 'NATIONAL_ID' | 'NIN_SLIP';
+
+export const ANCHOR_ID_TYPES = [
+  'DRIVERS_LICENSE', 'VOTERS_CARD', 'PASSPORT', 'NATIONAL_ID', 'NIN_SLIP',
+] as const satisfies readonly AnchorIdType[];
+
+/**
+ * TIER_2 — BVN + date of birth + gender. Automatic, ₦50, resolves in seconds.
+ * `selfie` is optional (base64) and only worth sending where Anchor has asked
+ * for it; a BVN name/phone mismatch is the dominant rejection either way.
  */
 export async function submitTier2Verification(
   customerId: string,
-  input: { bvn: string; dateOfBirth: string; gender: Gender },
+  input: { bvn: string; dateOfBirth: string; gender: Gender; selfie?: string },
 ): Promise<void> {
   await anchorFetch(`/api/v1/customers/${encodeURIComponent(customerId)}/verification/individual`, {
     body: {
@@ -251,7 +265,41 @@ export async function submitTier2Verification(
         type: 'Verification',
         attributes: {
           level: 'TIER_2',
-          level2: { bvn: input.bvn, dateOfBirth: input.dateOfBirth, gender: input.gender },
+          level2: {
+            bvn: input.bvn,
+            dateOfBirth: input.dateOfBirth,
+            gender: input.gender,
+            ...(input.selfie ? { selfie: input.selfie } : {}),
+          },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * TIER_3 — a government ID document. ₦200, and MANUAL REVIEW rather than
+ * automatic, so it can sit at `.manualReview` or `.awaitingDocument` for a
+ * while and must never block an account already working at TIER_2.
+ *
+ * TIER_3 is UNLIMITED — no balance ceiling at all, which is the entire reason to
+ * offer it. See balanceCeilingFor() in money.ts, which returns null for it.
+ */
+export async function submitTier3Verification(
+  customerId: string,
+  input: { idType: AnchorIdType; idNumber: string; expiryDate?: string },
+): Promise<void> {
+  await anchorFetch(`/api/v1/customers/${encodeURIComponent(customerId)}/verification/individual`, {
+    body: {
+      data: {
+        type: 'Verification',
+        attributes: {
+          level: 'TIER_3',
+          level3: {
+            idType: input.idType,
+            idNumber: input.idNumber,
+            ...(input.expiryDate ? { expiryDate: input.expiryDate } : {}),
+          },
         },
       },
     },

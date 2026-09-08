@@ -65,6 +65,23 @@ export const MIN_PAYOUT_KOBO = 100_000; // ₦1,000
  */
 export const TIER2_BALANCE_CEILING_KOBO = 30_000_000; // ₦300,000
 
+/**
+ * The balance ceiling that applies to a rep at a given verified tier.
+ *
+ * `null` means there is no ceiling. **tier_3 is unlimited** — that is the whole
+ * point of the upgrade, and the answer to the ₦300,000 problem in PRD §3.4: a
+ * space that outgrows tier_2 pays ₦200 once and stops having a ceiling at all.
+ * Callers must handle null by hiding the warning entirely, never by falling
+ * back to the tier_2 number.
+ *
+ * tier_0 shares the tier_2 ceiling because an unverified rep cannot hold a
+ * balance at all — the account does not exist until KYC passes — so the value
+ * is only ever a display default.
+ */
+export function balanceCeilingFor(tier: 'tier_0' | 'tier_2' | 'tier_3'): number | null {
+  return tier === 'tier_3' ? null : TIER2_BALANCE_CEILING_KOBO;
+}
+
 export function stampDutyFor(amountKobo: number): number {
   return amountKobo > STAMP_DUTY_THRESHOLD_KOBO ? STAMP_DUTY_KOBO : 0;
 }

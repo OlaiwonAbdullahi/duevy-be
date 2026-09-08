@@ -82,13 +82,46 @@ New failure modes on this endpoint:
 There is **no per-transfer ceiling** on a checkout: payments settle into Duevy's
 own account, which Anchor confirmed is unlimited. A due can be any amount.
 
-## 2. Polling status — additive
+## 2. Multi-due checkout — new
+
+`POST /v1/dues/pay` — **requires `Idempotency-Key`.** One transfer settles
+several dues (PRD §5.2), which is the point of the product: *the student never
+pays four times for four dues.*
+
+```json
+{ "method": "online", "dueIds": ["due_1a2b", "due_3c4d", "due_5e6f"] }
+```
+
+The response is identical to the single-due form — one `reference`, one
+`bankTransfer`, one amount covering the whole basket.
+
+`POST /v1/dues/{dueId}/pay` still works and is now just a basket of one, so
+existing clients need no change.
+
+Rejections, all before any account is opened:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `DUE_NOT_PAYABLE` | 409 | One of the dues is not open. The message names it. |
+| `DUE_ALREADY_PAID` | 409 | One is already settled. The message names it. |
+| `MIXED_SPACES` | 422 | The basket spans two spaces; one transfer credits one space. |
+| `NOT_A_MEMBER` | 403 | Not a member, and at least one due disallows guests. |
+
+Up to 20 dues per checkout. A referral discount applies to **one** due — the
+first in the basket — not spread across it, so the per-due amounts stay
+reconcilable.
+
+The receipt at `GET /v1/dues/{dueId}/receipt` now covers the whole payment and
+itemises every due it settled, so any due in the basket returns the same
+receipt.
+
+## 3. Polling status — additive
 
 `GET /v1/payments/{reference}/status` now also returns `checkoutUrl: null` and,
 while still `pending`, the same `bankTransfer` object — so a reload or a
 different device can re-render the transfer screen from the reference alone.
 
-## 3. Rep verification — replaces the onboarding endpoints
+## 4. Rep verification — replaces the onboarding endpoints
 
 **Removed** (all six Bachs onboarding proxies):
 
@@ -155,13 +188,62 @@ Failure handling worth building for:
   `429 KYC_RETRY_LOCKED`, with `retryLockedUntil` in the status response.
 - **The BVN is never stored.** A retry means the rep re-enters it.
 
-## 4. Bank list — simplified
+## 4b. Raising the KYC tier — new
+
+`POST /v1/spaces/{spaceId}/payout/kyc/upgrade` (lead rep only) → `202`
+
+```json
+{ "idType": "NATIONAL_ID", "idNumber": "12345678901", "expiryDate": "2030-06-25" }
+```
+
+`idType` is one of `DRIVERS_LICENSE`, `VOTERS_CARD`, `PASSPORT`, `NATIONAL_ID`,
+`NIN_SLIP`. `expiryDate` is optional — a NIN slip does not expire.
+
+This raises a verified rep from `tier_2` (BVN, automatic, capped at ₦300,000) to
+**`tier_3`, which is unlimited**. Unlike the initial check it is a **manual
+review at Anchor and can take days**, so build for a long wait, not a spinner.
+
+Removing the ceiling is the entire value proposition — a space collecting from
+300 students at ₦5,000 hits ₦300,000 around student 60, so this is what lets a
+large cohort collect without the rep withdrawing every day.
+
+**The rep keeps collecting throughout.** A pending upgrade never suspends the
+account, and a rejected upgrade leaves the existing verification untouched —
+only the pending tier clears.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `NOT_VERIFIED` | 409 | Finish BVN verification first. |
+| `ALREADY_AT_TIER` | 409 | Already `tier_3`. |
+| `UPGRADE_PENDING` | 409 | One is already under review. |
+
+`GET /v1/spaces/{spaceId}/payout/kyc-status` gains three fields:
+
+```json
+{ "kycTier": "tier_2", "pendingTier": "tier_3", "canUpgrade": false }
+```
+
+`canUpgrade` is the single flag to gate the "Raise my limit" affordance on.
+
+`GET /v1/spaces/{spaceId}/payout/summary` gains `kycTier`, and its ceiling
+fields become tier-dependent:
+
+```json
+{ "kycTier": "tier_3", "ceilingKobo": null, "ceilingUsedPct": null, "ceilingLevel": "uncapped" }
+```
+
+**`ceilingLevel` can now be `uncapped`, and `ceilingKobo` can be `null`.**
+`tier_3` is unlimited — there is genuinely no ceiling — so the UI must **hide**
+the meter in that case, not render `null` as zero. "No limit" is the reward the
+rep paid ₦200 for; showing them an empty progress bar reads as a bug.
+
+## 5. Bank list — simplified
 
 `GET /v1/banks` no longer requires `spaceId` (Anchor's list is
 organisation-wide). The parameter is still accepted and ignored, so existing
 callers keep working.
 
-## 5. Payouts — new fee breakdown
+## 6. Payouts — new fee breakdown
 
 Withdrawals now carry explicit fees (PRD §7.3). The requested `amount` is the
 **gross** debit against the available balance; the fees come out of it.
@@ -212,7 +294,7 @@ small to cover the fees).
 Payout objects now include `duevyFeeKobo`, `anchorFeeKobo`, `stampDutyKobo` and
 `netSentKobo`. Show `netSentKobo` as "amount received", not `amount`.
 
-## 6. Fee model — the numbers changed
+## 7. Fee model — the numbers changed
 
 | | Before | Now |
 |---|---|---|
@@ -222,8 +304,28 @@ Payout objects now include `duevyFeeKobo`, `anchorFeeKobo`, `stampDutyKobo` and
 The face amount still reaches the space untouched — "your ₦5,000 due stays
 ₦5,000" holds. A ₦5,000 due now costs the student ₦5,100 rather than ₦5,150.
 
-## 7. Webhook endpoint
+## 8. Webhook endpoint
 
 `POST /v1/webhooks/bachs` → `POST /v1/webhooks/anchor`. Register it in the
 Anchor dashboard with `deliveryMode: AtLeastOnce`. Not a client-facing change,
 but the old path is gone.
+
+## 9. Admin health view — new
+
+`GET /v1/admin/health` (needs `userManagement`) — PRD §10's money-plumbing view.
+
+```json
+{
+  "failedWebhooks": 0,
+  "unremittedPayments": 0,
+  "stuckPayouts": 0,
+  "unresolvedCheckouts": 0,
+  "healthy": true,
+  "recentWebhookFailures": []
+}
+```
+
+Each count is money stuck somewhere: webhooks that threw, payments collected but
+not yet book-transferred to their department, payouts in flight over an hour, and
+checkouts still pending well past expiry (which now means a lost webhook, since
+Anchor enforces the expiry). `healthy` is all four at zero.

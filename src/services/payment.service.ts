@@ -78,26 +78,49 @@ async function openCheckoutAccount(
   };
 }
 
+/**
+ * Open one checkout covering one or more dues (PRD §5.2 — "one transfer covers
+ * many dues; the student never pays four times for four dues").
+ *
+ * The charge is computed per due and summed, so each line keeps its own
+ * face/fee split and the department is credited per due. A referral discount
+ * applies to a single due, not the basket.
+ */
 export async function initOnlineDuePayment(
   user: User,
-  due: Due & { space: { name: string } },
-  discount?: RedeemedDiscount,
+  dues: (Due & { space: { name: string } })[],
+  discount?: RedeemedDiscount & { dueId: string },
 ): Promise<InvoiceResult> {
-  const charge = computeCharge(due.amount, discount?.amountKobo ?? 0);
+  if (!dues.length) throw new Error('initOnlineDuePayment: no dues supplied');
+
+  const charges = dues.map((d) =>
+    computeCharge(d.amount, discount && discount.dueId === d.id ? discount.amountKobo : 0),
+  );
+  const totalCharged = charges.reduce((sum, c) => sum + c.totalCharged, 0);
   const reference = await uniqueReference();
+  const space = dues[0].space;
+  const title = dues.length === 1 ? dues[0].title : `${dues.length} dues`;
+
+  const baseMetadata = {
+    dueIds: dues.map((d) => d.id),
+    amount: totalCharged,
+    discountCodeId: discount?.id ?? null,
+    discountDueId: discount?.dueId ?? null,
+    discountAmountKobo: discount?.amountKobo ?? 0,
+  };
 
   await db.$transaction(async (tx) => {
     await tx.transaction.create({
       data: {
         userId: user.id,
         type: 'due',
-        title: due.title,
-        detail: due.space.name,
-        amount: -charge.totalCharged,
+        title,
+        detail: space.name,
+        amount: -totalCharged,
         method: 'Anchor',
         status: 'pending',
         reference,
-        spaceId: due.spaceId,
+        spaceId: dues[0].spaceId,
       },
     });
     await tx.pendingPayment.create({
@@ -105,12 +128,14 @@ export async function initOnlineDuePayment(
         reference,
         userId: user.id,
         type: 'due_payment',
-        metadata: {
-          dueId: due.id,
-          amount: charge.totalCharged,
-          discountCodeId: discount?.id ?? null,
-          discountAmountKobo: discount?.amountKobo ?? 0,
-        },
+        // discountCodeId is only redeemed once this actually completes
+        // (fulfilByReference) — a failed/expired/abandoned charge leaves the
+        // code untouched for reuse. discountAmountKobo is snapshotted here (not
+        // re-looked-up) so fulfilment recomputes the exact same totalCharged
+        // that was actually invoiced.
+        metadata: baseMetadata,
+        // The pending row outlives the checkout account so an expired attempt
+      
         // The pending row outlives the virtual account so an expired checkout
         // still resolves to a clear "expired" rather than a 404.
         expiresAt: new Date(Date.now() + env.ANCHOR_VA_EXPIRY_SECONDS * 1000),
@@ -118,9 +143,9 @@ export async function initOnlineDuePayment(
     });
   });
 
-  const account = await openCheckoutAccount(due.spaceId, reference, charge.totalCharged, user.email, {
-    dueId: due.id,
+  const account = await openCheckoutAccount(dues[0].spaceId, reference, totalCharged, user.email, {
     userId: user.id,
+    dueCount: String(dues.length),
   });
 
   // Persist so GET /payments/:reference/status (and a reload of the dedicated
@@ -129,10 +154,7 @@ export async function initOnlineDuePayment(
     where: { reference },
     data: {
       metadata: {
-        dueId: due.id,
-        amount: charge.totalCharged,
-        discountCodeId: discount?.id ?? null,
-        discountAmountKobo: discount?.amountKobo ?? 0,
+        ...baseMetadata,
         payWithTransferId: account.payWithTransferId,
         checkoutAccountNumber: account.accountNumber,
         checkoutBankName: account.bankName,
@@ -144,7 +166,7 @@ export async function initOnlineDuePayment(
 
   return {
     reference,
-    amount: charge.totalCharged,
+    amount: totalCharged,
     checkoutUrl: null,
     bankTransfer: {
       accountNumber: account.accountNumber,
@@ -271,8 +293,11 @@ export async function fulfilByReference(
 
   const meta = (pending.metadata ?? {}) as {
     amount?: number;
-    dueId?: string;
+    /** Every due this one checkout settles (PRD §5.2). */
+    dueIds?: string[];
     discountCodeId?: string | null;
+    /** A referral discount is redeemed against ONE due, not the whole basket. */
+    discountDueId?: string | null;
     discountAmountKobo?: number;
     payWithTransferId?: string;
     checkoutAccountNumber?: string;
@@ -308,22 +333,35 @@ export async function fulfilByReference(
     );
   }
 
-  if (pending.type === 'due_payment' && meta.dueId) {
-    const due = await db.due.findUnique({ where: { id: meta.dueId }, include: { space: { select: { name: true } } } });
-    if (!due) return 'unknown';
-
-    // Guard against a duplicate DuePayment (webhook + reconciliation racing).
-    const existing = await db.duePayment.findUnique({
-      where: { userId_dueId: { userId: pending.userId, dueId: due.id } },
+  if (pending.type === 'due_payment' && meta.dueIds?.length) {
+    // One checkout can settle several dues (PRD §5.2). Every line shares this
+    // checkout's reference; uniqueness is per (user, due), so a line already
+    // present is skipped rather than duplicated — which is also what makes the
+    // webhook and the reconciliation poll safe to race.
+    const dues = await db.due.findMany({
+      where: { id: { in: meta.dueIds } },
+      include: { space: { select: { name: true } } },
     });
+    if (!dues.length) return 'unknown';
 
-    const charge = computeCharge(due.amount, meta.discountAmountKobo ?? 0);
+    const discountByDue = meta.discountDueId ?? null;
     const txn = await db.transaction.findUnique({ where: { reference } });
+    const existing = await db.duePayment.findMany({
+      where: { userId: pending.userId, dueId: { in: dues.map((d) => d.id) } },
+      select: { dueId: true },
+    });
+    const alreadyPaid = new Set(existing.map((e) => e.dueId));
 
     await db.$transaction(async (tx) => {
       await tx.pendingPayment.update({ where: { reference }, data: { status: 'completed' } });
       await tx.transaction.updateMany({ where: { reference }, data: { status: 'completed' } });
-      if (!existing) {
+
+      for (const due of dues) {
+        if (alreadyPaid.has(due.id)) continue;
+        // The discount applies to one due only — the one it was redeemed
+        // against — so the other lines are charged in full.
+        const charge = computeCharge(due.amount, discountByDue === due.id ? meta.discountAmountKobo ?? 0 : 0);
+
         const duePayment = await tx.duePayment.create({
           data: {
             userId: pending.userId,
@@ -336,9 +374,7 @@ export async function fulfilByReference(
             netToSpace: charge.netToSpace,
             payWithTransferId: meta.payWithTransferId ?? null,
             checkoutAccountNumber: meta.checkoutAccountNumber ?? null,
-            checkoutExpiresAt: meta.checkoutExpiresAt
-              ? new Date(meta.checkoutExpiresAt)
-              : null,
+            checkoutExpiresAt: meta.checkoutExpiresAt ? new Date(meta.checkoutExpiresAt) : null,
           },
         });
         await tx.ledgerEntry.create({
@@ -357,24 +393,32 @@ export async function fulfilByReference(
             description: `Payment for "${due.title}"`,
           },
         });
-        if (meta.discountCodeId) {
-          await tx.discountCode.update({ where: { id: meta.discountCodeId }, data: { redeemedAt: new Date(), dueId: due.id } });
-        }
+      }
+
+      if (meta.discountCodeId && discountByDue) {
+        await tx.discountCode.update({
+          where: { id: meta.discountCodeId },
+          data: { redeemedAt: new Date(), dueId: discountByDue },
+        });
       }
     });
 
     const payer = await db.user.findUnique({ where: { id: pending.userId }, select: { name: true, email: true } });
-    await notifyRepsOfPayment(due.spaceId, payer?.name ?? 'A member', due.title, due.amount).catch(() => {});
+    const spaceId = dues[0].spaceId;
+    const totalKobo = dues.reduce((sum, d) => sum + d.amount, 0);
+    const title = dues.length === 1 ? dues[0].title : `${dues.length} dues`;
+
+    await notifyRepsOfPayment(spaceId, payer?.name ?? 'A member', title, totalKobo).catch(() => {});
     if (payer) {
       await sendDuePaymentReceiptEmail(payer.email, payer.name, {
-        dueTitle: due.title,
-        spaceName: due.space.name,
-        amountPaidKobo: charge.totalCharged,
+        dueTitle: title,
+        spaceName: dues[0].space.name,
+        amountPaidKobo: meta.amount ?? 0,
         reference,
-        dueId: due.id,
+        dueId: dues[0].id,
       }).catch(() => {});
     }
-    await triggerReferralReward(due.spaceId);
+    await triggerReferralReward(spaceId);
     return 'fulfilled';
   }
 

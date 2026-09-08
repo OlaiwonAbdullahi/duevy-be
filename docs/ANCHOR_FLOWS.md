@@ -46,6 +46,42 @@ Rejection paths: `customer.identification.rejected` sets `kycStatus: rejected`
 with a reason; `.error` is transient and retried; `.manualReview`,
 `.awaitingDocument`, `.reenter_information` and `.pending` all hold at `pending`.
 
+### 1b. Raising the tier
+
+| # | Trigger | Anchor call | Duevy code |
+|:--:|---|---|---|
+| 1 | `POST /v1/spaces/:id/payout/kyc/upgrade` | same endpoint, `level: TIER_3` | `submitKycUpgrade()` |
+| 2 | webhook `customer.identification.approved` | — | promotes `kycTier` to `tier_3` |
+
+Anchor accepts exactly two submittable levels. `TIER_2` is BVN + date of birth
++ gender — automatic, ₦50, resolves in seconds. `TIER_3` is a government ID
+(`DRIVERS_LICENSE`, `VOTERS_CARD`, `PASSPORT`, `NATIONAL_ID`, `NIN_SLIP`) — ₦200,
+and a **manual review** that can take days. This is PRD §12's deferred
+tier-upgrade path; its trigger is reps repeatedly hitting the balance ceiling.
+
+**An upgrade is strictly additive, and the code enforces that in three places:**
+
+- `kycTier` (verified) and `kycPendingTier` (under review) are separate columns,
+  so a rep at `tier_2` keeps collecting while `tier_3` is reviewed.
+- `applyKycPending()` leaves an already-verified rep alone — otherwise a
+  `.manualReview` event would stop their space collecting for days.
+- A rejected **upgrade** clears `kycPendingTier` only. It never un-verifies a
+  working account.
+
+`document.approved` / `.rejected` report per-document progress inside a review.
+They are recorded but not acted on: the tier moves only on
+`customer.identification.approved`, and acting on one document would promote a
+rep mid-review.
+
+> **`tier_3` IS UNLIMITED.** No balance ceiling at all — which is the entire
+> reason to offer the upgrade, and the answer to the ₦300,000 problem in PRD
+> §3.4. A space that outgrows `tier_2` pays ₦200 once and stops having a
+> ceiling.
+>
+> `balanceCeilingFor()` returns `null` for it and the payout summary reports
+> `ceilingLevel: "uncapped"`. Never substitute the `tier_2` figure: that would
+> cap a rep who has just paid specifically to stop being capped.
+
 ---
 
 ## 2. Setting the payout destination
@@ -65,15 +101,24 @@ starts a 24-hour cooldown.
 
 ---
 
-## 3. Student pays a due
+## 3. Student pays their dues
 
 | # | Trigger | Anchor call | Duevy code |
 |:--:|---|---|---|
-| 1 | `POST /v1/dues/:dueId/pay` | `POST /pay/pay-with-transfer` | `createPayWithTransfer()` |
+| 1 | `POST /v1/dues/pay` with `dueIds[]` | `POST /pay/pay-with-transfer` | `createPayWithTransfer()` |
 | 2 | Student transfers from their bank app | — | — |
 | 3 | webhook `payin.received` | `GET /pay/payin/{id}` to recover our reference | `fulfilByReference()` + `markPaymentSettled()` |
 
 Service: `src/services/payment.service.ts`.
+
+**One transfer settles several dues** (PRD §5.2). The basket is charged per due
+and summed, so **one** Anchor account is opened for the total, and fulfilment
+writes **one `DuePayment` row per due**, all sharing the checkout's reference.
+`POST /v1/dues/:dueId/pay` still works as a basket of one.
+
+That is the whole of the many-dues-one-payment join — there is no separate
+`payment_lines` table, because the per-due rows already carry it and every
+downstream query (roster, ledger, remittance) keeps working unchanged.
 
 **The money lands in Duevy's settlement account, not the department's.** Anchor
 confirmed sub-accounts are internal-use only, and the Pay With Transfer request
@@ -110,6 +155,12 @@ Runs on the reconciliation tick, once a payment is settled.
 `remitToSpaces()` in `src/services/payout.service.ts`, moving money from
 `ANCHOR_SETTLEMENT_ACCOUNT_ID` to the space's own deposit account. Book
 transfers are internal and free, so this costs nothing per payment.
+
+**One book transfer per due, not per checkout.** A basket of four dues collects
+in a single transfer and remits as four, each keyed on its own `DuePayment` row.
+That is deliberate: the department's balance, the ledger and the collections
+roster are all per due, so remitting per due keeps them reconcilable without a
+splitting step. Free transfers are what make it affordable.
 
 **Only `netToSpace` moves** — the face value of the due. Duevy's margin simply
 stays behind in the settlement account, which is why there is no second sweep
@@ -187,11 +238,28 @@ processing; a repeated id is acknowledged and dropped. The handler always return
 | Group | Events |
 |---|---|
 | KYC | `customer.identification.` — `approved`, `rejected`, `error`, `manualReview`, `awaitingDocument`, `reenter_information`, `pending` |
+| tier_3 documents | `document.approved`, `document.rejected` — recorded, not acted on |
 | Provisioning | `account.opened`, `accountNumber.created` |
 | Collection | **`payin.received`** — fulfils and settles in one step |
 | Direct inflows | `nip.inbound.received`, `nip.inbound.completed` — logged, not checkouts |
 | Payout | `nip.transfer.successful`, `.failed`, `.reversed` |
 | Remittance | `book.transfer.successful`, `.failed` |
+
+---
+
+## 8. Watching it work
+
+`GET /v1/admin/health` (PRD §10) counts the four states that mean money is stuck:
+
+| Field | Means |
+|---|---|
+| `failedWebhooks` | A handler threw; the event is in `webhook_events` with its error. |
+| `unremittedPayments` | Collected but still in Duevy's account 30+ minutes on — flow 4 is failing. |
+| `stuckPayouts` | `processing` for over an hour — flow 5 never resolved. |
+| `unresolvedCheckouts` | Pending past expiry. Anchor enforces the expiry, so this is a **lost webhook**, not a mispaid transfer. |
+
+`healthy` is all four at zero. The last of these is the one worth watching after
+go-live: it is the only signal that `payin.received` deliveries are being missed.
 
 ---
 
