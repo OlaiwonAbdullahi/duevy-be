@@ -1,8 +1,13 @@
+import { randomInt } from 'crypto';
+
 /**
- * Money helpers — all amounts are stored and transmitted as kobo (₦1 = 100 kobo).
+ * Money helpers. Every amount in this codebase is an integer number of kobo
+ * (₦1 = 100 kobo). No floats are ever used for arithmetic; the only place a
+ * decimal appears is at the provider boundary, where Bachs takes and returns
+ * decimal strings ("7000.00") — see koboToDecimal / decimalToKobo.
  */
 
-/** Convert kobo to naira (for display / email templates). */
+/** Convert kobo to naira (display / email templates only — never for arithmetic). */
 export function koboToNaira(kobo: number): number {
   return kobo / 100;
 }
@@ -21,161 +26,163 @@ export function formatNaira(kobo: number): string {
   }).format(koboToNaira(kobo));
 }
 
-/**
- * The service charge, added ON TOP of the face amount (PRD §7.1).
- *
- * The rep sets the face amount and receives it in full; the payer covers the
- * charge. e.g. face ₦5,000 → payer is charged ₦5,100, space nets ₦5,000.
- * "Your ₦5,000 due stays ₦5,000" is the pitch to the rep, and it stays true.
- *
- * The 2% is INCLUSIVE of Anchor's own collection cut — Duevy does not stack
- * Anchor's 0.5% on top of it. That is why the charge splits across
- * DuePayment's two fee columns rather than needing new ones:
- *
- *   processingFee — what Anchor is expected to take (0.5% capped at ₦500,
- *                   plus ₦50 stamp duty above ₦10,000)
- *   duevyFee      — whatever is left of the 2%, i.e. Duevy's actual margin
- */
-export const SERVICE_CHARGE_PERCENT = 2;
-
-/** Anchor's inflow pricing on a collection: 0.5%, capped at ₦500. */
-const ANCHOR_COLLECTION_RATE = 0.005;
-const ANCHOR_COLLECTION_CAP_KOBO = 50_000; // ₦500
-
-/** CBN stamp duty: a flat ₦50 on any transfer above ₦10,000, in or out. */
-export const STAMP_DUTY_KOBO = 5_000; // ₦50
-export const STAMP_DUTY_THRESHOLD_KOBO = 1_000_000; // ₦10,000
-
-/** Anchor's NIP transfer price, which the rep's withdrawal fee covers. */
-export const ANCHOR_NIP_FEE_KOBO = 5_000; // ₦50
-/** Duevy's own margin on a withdrawal. Together with the NIP fee this is the "₦100 flat" of PRD §7.1. */
-export const DUEVY_PAYOUT_FEE_KOBO = 5_000; // ₦50
-/** PRD §6.5 — no withdrawal below ₦1,000. */
-export const MIN_PAYOUT_KOBO = 100_000; // ₦1,000
-
-/**
- * Anchor TIER_2 (BVN) balance ceiling for a rep's own deposit account.
- *
- * The matching SINGLE-DEPOSIT limit is deliberately absent: students now pay
- * into Duevy's settlement account, which Anchor confirmed has no limit, so a
- * due of any size can be collected. What still lands in the rep's TIER_2
- * account is the remittance, and whether an inbound book transfer counts
- * against this ceiling is UNCONFIRMED — the warning in payouts.ts stays until
- * Anchor answers.
- */
-export const TIER2_BALANCE_CEILING_KOBO = 30_000_000; // ₦300,000
-
-/**
- * The balance ceiling that applies to a rep at a given verified tier.
- *
- * `null` means there is no ceiling. **tier_3 is unlimited** — that is the whole
- * point of the upgrade, and the answer to the ₦300,000 problem in PRD §3.4: a
- * space that outgrows tier_2 pays ₦200 once and stops having a ceiling at all.
- * Callers must handle null by hiding the warning entirely, never by falling
- * back to the tier_2 number.
- *
- * tier_0 shares the tier_2 ceiling because an unverified rep cannot hold a
- * balance at all — the account does not exist until KYC passes — so the value
- * is only ever a display default.
- */
-export function balanceCeilingFor(tier: 'tier_0' | 'tier_2' | 'tier_3'): number | null {
-  return tier === 'tier_3' ? null : TIER2_BALANCE_CEILING_KOBO;
+function assertKobo(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative integer number of kobo, got ${value}`);
+  }
 }
 
-export function stampDutyFor(amountKobo: number): number {
-  return amountKobo > STAMP_DUTY_THRESHOLD_KOBO ? STAMP_DUTY_KOBO : 0;
+// ---------------------------------------------------------------------------
+// Provider boundary: kobo <-> decimal strings
+// ---------------------------------------------------------------------------
+
+/** 700000 → "7000.00". Pure integer/string math. */
+export function koboToDecimal(kobo: number): string {
+  assertKobo(kobo, 'amount');
+  const naira = Math.floor(kobo / 100);
+  const rem = kobo % 100;
+  return `${naira}.${rem.toString().padStart(2, '0')}`;
+}
+
+/**
+ * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number (some
+ * Bachs responses render an amount as a bare number of naira). More than two
+ * decimal places is rounded half-up to the kobo, matching how Bachs stores it.
+ */
+export function decimalToKobo(value: string | number): number {
+  const str = typeof value === 'number' ? numberToPlainString(value) : value.trim();
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(str);
+  if (!match) throw new RangeError(`not a non-negative decimal amount: ${JSON.stringify(value)}`);
+  const whole = match[1] as string;
+  const frac = (match[2] ?? '').padEnd(3, '0');
+  let kobo = Number(whole) * 100 + Number(frac.slice(0, 2));
+  if (Number(frac[2]) >= 5) kobo += 1;
+  if (!Number.isSafeInteger(kobo)) throw new RangeError(`amount out of range: ${JSON.stringify(value)}`);
+  return kobo;
+}
+
+function numberToPlainString(n: number): string {
+  if (!Number.isFinite(n) || n < 0) throw new RangeError(`not a non-negative amount: ${n}`);
+  // toFixed(3) keeps a third digit for the half-up rule without exponent notation.
+  return n.toFixed(3);
+}
+
+// ---------------------------------------------------------------------------
+// Fees (server-side only — never accepted from a client)
+// ---------------------------------------------------------------------------
+
+/** Checkout service charge: 2% of the basket, plus a flat ₦20, paid by the student on top. */
+export const CHECKOUT_FEE_PERCENT = 2;
+export const CHECKOUT_FEE_FLAT_KOBO = 2_000; // ₦20
+
+/** Withdrawal fee: ₦100 under ₦50,000, ₦200 at ₦50,000 and above, deducted from the withdrawal. */
+export const WITHDRAWAL_FEE_LOW_KOBO = 10_000; // ₦100
+export const WITHDRAWAL_FEE_HIGH_KOBO = 20_000; // ₦200
+export const WITHDRAWAL_FEE_THRESHOLD_KOBO = 5_000_000; // ₦50,000
+
+/** No withdrawal below ₦1,000. */
+export const MIN_PAYOUT_KOBO = 100_000;
+
+/** round(a × num / den), half-up, in integers. */
+function mulDivRoundHalfUp(a: number, num: number, den: number): number {
+  return Math.floor((a * num * 2 + den) / (den * 2));
+}
+
+/**
+ * The service charge for one checkout covering `faceKobo` worth of dues.
+ * Charged ONCE per checkout: the ₦20 flat does not multiply per due.
+ */
+export function checkoutFee(faceKobo: number): number {
+  assertKobo(faceKobo, 'faceKobo');
+  if (faceKobo === 0) return 0;
+  return mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_PERCENT, 100) + CHECKOUT_FEE_FLAT_KOBO;
 }
 
 export interface Charge {
+  /** What the space receives — the full face amount. */
   face: number;
-  processingFee: number;
-  duevyFee: number;
-  totalFee: number;
-  totalCharged: number;
-  netToSpace: number;
-  discountApplied: number;
+  /** Duevy's service charge, on top. */
+  fee: number;
+  /** What the student transfers. */
+  total: number;
+}
+
+export function computeCharge(faceKobo: number): Charge {
+  const fee = checkoutFee(faceKobo);
+  return { face: faceKobo, fee, total: faceKobo + fee };
 }
 
 /**
- * `discountKobo` (a redeemed referral DiscountCode, see referral.service.ts)
- * reduces what the payer is charged, capped at the service charge — Duevy's own
- * margin absorbs the discount; the rep's `netToSpace` is always the untouched
- * face value regardless of any discount applied.
- *
- * `totalFee` is net of the discount, so the DuePayment invariant
- * `netToSpace === totalCharged − processingFee − duevyFee` holds under a
- * discount too (the pre-Anchor implementation quietly broke it there).
+ * Split `total` across `weights` proportionally, largest-remainder method, so
+ * the parts are integers that sum exactly to `total`. Used to spread one
+ * checkout's fee across the dues it covers for per-due reporting.
  */
-export function computeCharge(faceKobo: number, discountKobo = 0): Charge {
-  const serviceCharge = Math.round(faceKobo * (SERVICE_CHARGE_PERCENT / 100));
-  const discountApplied = Math.max(0, Math.min(discountKobo, serviceCharge));
-  const totalCharged = faceKobo + serviceCharge - discountApplied;
-  const totalFee = serviceCharge - discountApplied;
-
-  // Anchor's cut is levied on what the payer actually sends, not on the face.
-  const anchorCut =
-    Math.min(Math.round(totalCharged * ANCHOR_COLLECTION_RATE), ANCHOR_COLLECTION_CAP_KOBO) +
-    stampDutyFor(totalCharged);
-
-  // A heavily discounted charge can cost Duevy more than it collects; the fee
-  // split never goes negative, so processingFee absorbs whatever is left.
-  const processingFee = Math.min(anchorCut, totalFee);
-
-  return {
-    face: faceKobo,
-    processingFee,
-    duevyFee: totalFee - processingFee,
-    totalFee,
-    totalCharged,
-    netToSpace: faceKobo,
-    discountApplied,
-  };
+export function allocate(total: number, weights: number[]): number[] {
+  assertKobo(total, 'total');
+  if (weights.length === 0) return [];
+  const sum = weights.reduce((a, b) => a + b, 0);
+  if (sum === 0) {
+    const even = weights.map(() => Math.floor(total / weights.length));
+    even[0] = (even[0] as number) + (total - even.reduce((a, b) => a + b, 0));
+    return even;
+  }
+  // BigInt so total × weight can't lose precision on large amounts.
+  const T = BigInt(total);
+  const S = BigInt(sum);
+  const parts = weights.map((w) => (T * BigInt(w)) / S);
+  const rems = weights.map((w, i) => ({ i, rem: (T * BigInt(w)) % S }));
+  let left = T - parts.reduce((a, b) => a + b, 0n);
+  rems.sort((a, b) => (a.rem === b.rem ? a.i - b.i : a.rem > b.rem ? -1 : 1));
+  for (const { i } of rems) {
+    if (left <= 0n) break;
+    parts[i] = (parts[i] as bigint) + 1n;
+    left -= 1n;
+  }
+  return parts.map(Number);
 }
 
-export interface PayoutFees {
-  duevyFeeKobo: number;
-  anchorFeeKobo: number;
-  stampDutyKobo: number;
-  netSentKobo: number;
+export function withdrawalFee(grossKobo: number): number {
+  assertKobo(grossKobo, 'grossKobo');
+  return grossKobo < WITHDRAWAL_FEE_THRESHOLD_KOBO ? WITHDRAWAL_FEE_LOW_KOBO : WITHDRAWAL_FEE_HIGH_KOBO;
 }
 
-/**
- * Splits a withdrawal into what the rep is charged and what actually lands
- * (PRD §7.3). The requested `amountKobo` is the GROSS debit against the space's
- * available balance and everything comes out of it, so the account reconciles
- * exactly: `netSent` leaves as the NIP transfer, Anchor deducts its own
- * TRANSFER_FEE and STAMP_DUTY as separate CustomerFee rows, and Duevy's margin
- * is swept by book transfer.
- *
- * Surface this to the rep as "Duevy fee ₦100 + stamp duty ₦50" — the ₦100 is
- * `duevyFeeKobo + anchorFeeKobo`, which is what §7.1 calls the flat fee.
- */
-export function computePayoutFees(amountKobo: number): PayoutFees {
-  const stampDutyKobo = stampDutyFor(amountKobo);
-  return {
-    duevyFeeKobo: DUEVY_PAYOUT_FEE_KOBO,
-    anchorFeeKobo: ANCHOR_NIP_FEE_KOBO,
-    stampDutyKobo,
-    netSentKobo: amountKobo - DUEVY_PAYOUT_FEE_KOBO - ANCHOR_NIP_FEE_KOBO - stampDutyKobo,
-  };
+export interface WithdrawalBreakdown {
+  /** Debited from the space's ledger. */
+  gross: number;
+  /** Duevy's withdrawal fee, deducted from the gross. */
+  fee: number;
+  /** What lands in the rep's bank account. */
+  net: number;
 }
 
-/** Generate a unique transaction reference in the format DVY-XXXX-XXXX */
+export function computeWithdrawal(grossKobo: number): WithdrawalBreakdown {
+  const fee = withdrawalFee(grossKobo);
+  return { gross: grossKobo, fee, net: grossKobo - fee };
+}
+
+// ---------------------------------------------------------------------------
+// References
+// ---------------------------------------------------------------------------
+
+const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+
+function randomChunk(len: number): string {
+  let out = '';
+  for (let i = 0; i < len; i++) out += REF_ALPHABET[randomInt(REF_ALPHABET.length)];
+  return out;
+}
+
+/** Checkout / transaction reference, e.g. DVY-7KQ2-MN4X. */
 export function generateReference(prefix = 'DVY'): string {
-  const part1 = Math.floor(1000 + Math.random() * 9000);
-  const part2 = Math.floor(1000 + Math.random() * 9000);
-  return `${prefix}-${part1}-${part2}`;
+  return `${prefix}-${randomChunk(4)}-${randomChunk(4)}`;
 }
 
-/** Generate a payout reference e.g. PAY-2026-0642 */
+/** Withdrawal reference, e.g. WD-2026-7KQ2MN. */
 export function generatePayoutReference(): string {
-  const year = new Date().getFullYear();
-  const seq = Math.floor(100 + Math.random() * 9900)
-    .toString()
-    .padStart(4, '0');
-  return `PAY-${year}-${seq}`;
+  return `WD-${new Date().getUTCFullYear()}-${randomChunk(6)}`;
 }
 
-// koboToDecimalString/decimalStringToKobo lived here for Bachs, which took
-// amounts as decimal strings ("7000.00"). Anchor takes integer minor units
-// throughout, so kobo goes over the wire unchanged and the conversion is gone.
+/** Receipt number, e.g. RCT-2026-7KQ2MN4X. */
+export function generateReceiptNumber(): string {
+  return `RCT-${new Date().getUTCFullYear()}-${randomChunk(8)}`;
+}

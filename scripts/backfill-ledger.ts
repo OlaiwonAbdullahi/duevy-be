@@ -1,4 +1,8 @@
 /**
+ * HISTORICAL: written for the pre-ledger -> ledger move. Since the Bachs
+ * cutover the ledger is written by the services themselves (see
+ * src/services/ledger.service.ts); this should not be needed again.
+ *
  * One-time backfill: create LedgerEntry rows for financial activity that
  * predates the ledger (see prisma/schema.prisma LedgerEntry). Historical
  * DuePayment/refund-Transaction/completed-Payout rows are the source —
@@ -125,7 +129,7 @@ async function backfillPayouts() {
 
   for (;;) {
     const batch = await db.payout.findMany({
-      where: { status: 'completed' },
+      where: { status: 'success' },
       take: BATCH_SIZE,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
       orderBy: { id: 'asc' },

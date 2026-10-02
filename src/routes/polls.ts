@@ -15,10 +15,8 @@ import { idempotent } from '../middleware/idempotency';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
-import { computeCharge } from '../lib/money';
 import { writeAudit } from '../lib/audit';
-import { uniqueReference, initOnlinePollVote } from '../services/payment.service';
-import { KycNotVerifiedError } from '../services/anchorCustomer.service';
+import { generateReference } from '../lib/money';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
 
 const pollInclude = { categories: { include: { nominees: true }, orderBy: { createdAt: 'asc' as const } } };
@@ -486,40 +484,13 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
 
   // Free poll — count immediately.
   if (!poll.paid) {
-    const reference = await uniqueReference();
+    const reference = generateReference('VOTE');
     await db.$transaction((tx) => applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: 0, reference }));
     ok(res, { receiptId: reference, totalCharged: 0 }, 201);
     return;
   }
 
-  // Paid poll. The space keeps the full face; the voter pays the 3% charge on
-  // top (1.5% processing + 1.5% Duevy), mirroring dues (§1.5).
-  const totalQuantity = selections.reduce((s, sel) => s + sel.quantity, 0);
-  const gross = totalQuantity * poll.amountPerVote; // space's cut
-  const charge = computeCharge(gross);
-  const totalCharged = charge.totalCharged; // what the voter actually pays
-
-  if (!req.headers['idempotency-key']) {
-    fail(res, 400, 'VALIDATION_ERROR', 'Idempotency-Key header is required for paid votes', [
-      { field: 'Idempotency-Key', issue: 'header is required' },
-    ]);
-    return;
-  }
-
-  // Bank-transfer checkout to a single-use Anchor virtual account, same as a due.
-  const user = await db.user.findUnique({ where: { id: userId } });
-  if (!user) {
-    errors.notFound(res, 'User not found');
-    return;
-  }
-  try {
-    const result = await initOnlinePollVote(user, poll, selections, totalCharged);
-    ok(res, result);
-  } catch (err) {
-    if (err instanceof KycNotVerifiedError) {
-      errors.conflict(res, 'SPACE_NOT_VERIFIED', err.message);
-      return;
-    }
-    throw err;
-  }
+  // Paid voting is out of the MVP scope and has no payment path on the
+  // current rail. Free polls above keep working.
+  fail(res, 501, 'PAID_VOTING_UNAVAILABLE', 'Paid voting is not available yet');
 });

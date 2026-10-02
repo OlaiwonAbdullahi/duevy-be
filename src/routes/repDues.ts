@@ -10,6 +10,8 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
+import { DUE_TYPES } from '../lib/dueTypes';
+import { getSpaceKycState } from '../services/kyc.service';
 import { writeAudit } from '../lib/audit';
 import { notify, notifyMany } from '../lib/notifications';
 
@@ -51,7 +53,28 @@ const dueDateField = z
   .regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD')
   .refine((s) => !Number.isNaN(new Date(`${s}T00:00:00Z`).getTime()), 'invalid date');
 
-const categoryField = z.enum(['levy', 'dinner', 'handout', 'welfare', 'sport']);
+const categoryField = z.enum(DUE_TYPES);
+
+/** `type` is the field name; `category` is accepted as its legacy alias. */
+function typeAlias(req: Request, _res: Response, next: () => void): void {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  if (body.type !== undefined && body.category === undefined) body.category = body.type;
+  delete body.type;
+  req.body = body;
+  next();
+}
+
+/** A space may only open dues for payment once its lead rep has passed KYC. */
+async function assertCanCollect(sid: string, res: Response): Promise<boolean> {
+  const kyc = await getSpaceKycState(sid);
+  if (kyc.canCollect) return true;
+  errors.conflict(
+    res,
+    'KYC_REQUIRED',
+    'Complete identity verification before publishing dues. You can keep them as drafts until then.',
+  );
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // GET /dues — all dues the space has raised (§7.1)
@@ -59,6 +82,7 @@ const categoryField = z.enum(['levy', 'dinner', 'handout', 'welfare', 'sport']);
 const listDuesQuery = z.object({
   status: z.enum(['draft', 'active', 'closed']).optional(),
   category: categoryField.optional(),
+  type: categoryField.optional(),
 });
 
 repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> => {
@@ -68,7 +92,8 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
     errors.validation(res, parsed.error.errors.map((e) => ({ field: e.path.join('.'), issue: e.message })));
     return;
   }
-  const { status, category } = parsed.data;
+  const { status } = parsed.data;
+  const category = parsed.data.type ?? parsed.data.category;
 
   const dues = await db.due.findMany({
     where: { spaceId: sid, ...(status ? { status } : {}), ...(category ? { category } : {}) },
@@ -106,10 +131,11 @@ const createDueSchema = z.object({
   publish: z.boolean().default(false),
 });
 
-repDuesRouter.post('/dues', validate(createDueSchema), async (req: Request, res: Response): Promise<void> => {
+repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const data = req.body as z.infer<typeof createDueSchema>;
   const publishing = data.publish;
+  if (publishing && !(await assertCanCollect(sid, res))) return;
 
   const due = await db.$transaction(async (tx) => {
     const created = await tx.due.create({
@@ -148,7 +174,7 @@ const patchDueSchema = z.object({
   allowGuests: z.boolean().optional(),
 });
 
-repDuesRouter.patch('/dues/:dueId', validate(patchDueSchema), async (req: Request, res: Response): Promise<void> => {
+repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const data = req.body as z.infer<typeof patchDueSchema>;
 
@@ -204,6 +230,7 @@ repDuesRouter.post('/dues/:dueId/publish', async (req: Request, res: Response): 
     errors.conflict(res, 'INVALID_TRANSITION', 'Only a draft due can be published');
     return;
   }
+  if (!(await assertCanCollect(sid, res))) return;
 
   const updated = await db.$transaction(async (tx) => {
     const u = await tx.due.update({ where: { id: due.id }, data: { status: 'active', publishedAt: new Date() } });
@@ -382,7 +409,7 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   const fees = payments.reduce((s, p) => s + p.processingFee + p.duevyFee, 0);
   const net = payments.reduce((s, p) => s + p.netToSpace, 0);
   // Expected is the gross the space would collect if every member paid.
-  const expected = computeCharge(due.amount).totalCharged * memberCount;
+  const expected = computeCharge(due.amount).total * memberCount;
 
   const paged = students.slice(skip, skip + take);
 

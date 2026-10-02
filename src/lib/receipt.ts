@@ -85,8 +85,9 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
       .fontSize(9)
       .fillColor(muted)
       .text(
-        `Service charge breakdown: processing ${formatNaira(d.processingFee)} · Duevy ${formatNaira(d.duevyFee)}. ` +
-          `The department receives the full ${formatNaira(d.netToSpace)}.`,
+        (d.processingFee > 0
+          ? `Service charge breakdown: processing ${formatNaira(d.processingFee)} · Duevy ${formatNaira(d.duevyFee)}. `
+          : 'Service charge: 2% + ₦20 per payment. ') + `The department receives the full ${formatNaira(d.netToSpace)}.`,
       );
 
     doc.moveDown(1.5);

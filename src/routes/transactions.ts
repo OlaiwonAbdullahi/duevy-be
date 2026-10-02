@@ -7,7 +7,8 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { pollInflow } from '../services/payment.service';
+import { getCheckoutForUser } from '../services/checkout.service';
+import { getReceiptByNumber, listReceipts, renderCheckoutReceipt, renderReceiptByNumber } from '../services/receipt.service';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -93,6 +94,21 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
     return;
   }
 
+  // A checkout payment has a proper receipt; render that.
+  const checkout = await db.checkout.findUnique({ where: { reference: txn.reference }, select: { id: true, status: true } });
+  if (checkout) {
+    if (checkout.status !== 'paid') {
+      errors.notFound(res, 'No receipt — this payment has not completed');
+      return;
+    }
+    const { filename, pdf } = await renderCheckoutReceipt(checkout.id, id);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    res.status(200).send(pdf);
+    return;
+  }
+
+  // Legacy (pre-Bachs) transactions.
   const dp = txn.duePayment;
   const pdf = await renderReceiptPdf({
     reference: txn.reference,
@@ -113,68 +129,74 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
 });
 
 // ---------------------------------------------------------------------------
-// GET /payments/{reference}/status — poll a pending online payment (§6.4)
-// Mounted separately at /payments.
+// GET /payments/{reference} · /payments/{reference}/status — a checkout's
+// state, for the "I've paid" screen. Mounted separately at /payments.
+//
+// Reads our own record only. The webhook (and the reconciliation job behind
+// it) is what moves a checkout; a client poll never can.
 // ---------------------------------------------------------------------------
 export const paymentsRouter = Router();
 paymentsRouter.use(authenticate);
 
-paymentsRouter.get('/:reference/status', async (req: Request, res: Response): Promise<void> => {
+async function paymentStatus(req: Request, res: Response): Promise<void> {
   const id = uid(req);
   const reference = req.params.reference as string;
 
-  let pending = await db.pendingPayment.findUnique({ where: { reference } });
+  const checkout = await db.checkout.findUnique({ where: { reference }, select: { userId: true } });
+  if (checkout) {
+    if (checkout.userId !== id) {
+      errors.notFound(res, 'Payment not found');
+      return;
+    }
+    const view = await getCheckoutForUser(reference, id);
+    const txn = await db.transaction.findUnique({ where: { reference } });
+    const receipt = view.status === 'paid' ? await db.receipt.findFirst({ where: { checkout: { reference } }, select: { number: true } }) : null;
+    ok(res, {
+      ...view,
+      receiptNumber: receipt?.number ?? null,
+      ...(txn && view.status === 'paid' ? { transaction: serializeTransaction(txn) } : {}),
+    });
+    return;
+  }
+
+  // Legacy (pre-Bachs) pending payments: report what we recorded.
+  const pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending || pending.userId !== id) {
     errors.notFound(res, 'Payment not found');
     return;
   }
-
-  // Actively check with Anchor rather than only reading our own possibly-stale
-  // row, so the payer's screen can flip to success without waiting on the
-  // webhook round-trip. The webhook remains the source of truth;
-  // fulfilByReference is idempotent, so racing it is safe by construction.
-  if (pending.status === 'pending') {
-    try {
-      const outcome = await pollInflow(reference);
-      if (outcome !== 'pending') pending = await db.pendingPayment.findUnique({ where: { reference } });
-    } catch (err) {
-      console.error(`[payments] status check failed for ref=${reference}:`, err);
-    }
-  }
-
-  const status = pending?.status === 'completed' ? 'completed' : pending?.status === 'failed' ? 'failed' : 'pending';
-  const txn = await db.transaction.findUnique({ where: { reference } });
-
-  // The checkout's virtual account, snapshotted onto the PendingPayment when it
-  // was opened — lets the payment page re-render the transfer instructions and
-  // its countdown from the reference alone, on reload or a fresh device.
-  const meta = pending?.metadata as
-    | {
-        amount?: number;
-        checkoutAccountNumber?: string;
-        checkoutBankName?: string;
-        checkoutAccountName?: string;
-        checkoutExpiresAt?: string;
-      }
-    | undefined;
-
-  const bankTransfer =
-    status === 'pending' && meta?.checkoutAccountNumber
-      ? {
-          accountNumber: meta.checkoutAccountNumber,
-          bankName: meta.checkoutBankName ?? '',
-          accountName: meta.checkoutAccountName ?? '',
-          amountKobo: meta.amount ?? 0,
-          expiresAt: meta.checkoutExpiresAt ?? null,
-        }
-      : null;
-
   ok(res, {
-    status,
-    ...(meta?.amount !== undefined ? { amount: meta.amount } : {}),
-    // Always present so clients can branch on it; Anchor has no hosted checkout.
+    reference,
+    status: pending.status === 'completed' ? 'paid' : pending.status === 'failed' ? 'expired' : pending.status,
     checkoutUrl: null,
-    bankTransfer,
-    ...(txn && status === 'completed' ? { transaction: serializeTransaction(txn) } : {}),
+    bankTransfer: null,
   });
+}
+
+paymentsRouter.get('/:reference', paymentStatus);
+paymentsRouter.get('/:reference/status', paymentStatus);
+
+// ---------------------------------------------------------------------------
+// GET /receipts · /receipts/{number} — the student's receipts. Mounted at /receipts.
+// ?format=pdf on the single receipt returns the PDF.
+// ---------------------------------------------------------------------------
+export const receiptsRouter = Router();
+receiptsRouter.use(authenticate);
+
+receiptsRouter.get('/', async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const { total, rows } = await listReceipts(uid(req), skip, take);
+  ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+receiptsRouter.get('/:number', async (req: Request, res: Response): Promise<void> => {
+  const number = req.params.number as string;
+  if (req.query.format === 'pdf') {
+    const { filename, pdf } = await renderReceiptByNumber(number, uid(req));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    res.status(200).send(pdf);
+    return;
+  }
+  ok(res, await getReceiptByNumber(number, uid(req)));
 });

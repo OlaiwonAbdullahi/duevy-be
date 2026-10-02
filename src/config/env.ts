@@ -25,29 +25,33 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Anchor (getanchor.co) — the sole payment processor. See src/lib/anchor.ts.
-  ANCHOR_SECRET_KEY: z.string(),
-  ANCHOR_BASE_URL: z.string().url().default('https://api.sandbox.getanchor.co'),
-  // Webhook token for verifying POST /webhooks/anchor signatures. Anchor caps
-  // the token it will accept at 10 characters, so a longer secret can never be
-  // registered with them and would fail every signature check.
-  ANCHOR_WEBHOOK_SECRET: z.string().min(1).max(10),
-  // Duevy Labs' own Anchor deposit account. Two roles, deliberately one
-  // account: every student payment settles here first (Pay With Transfer has no
-  // settlement destination — see anchor.ts), and it is the source of the book
-  // transfers that remit each department's share on. Duevy's margin is simply
-  // whatever stays behind, so there is no separate revenue account to sweep to.
-  ANCHOR_SETTLEMENT_ACCOUNT_ID: z.string(),
-  // Which bank issues the checkout account number. Anchor picks one if unset,
-  // but the student sees this bank's name on the transfer screen, so pinning a
-  // recognisable one (providus, wema) is worth doing.
-  ANCHOR_VA_PROVIDER: z
-    .enum(['wema', 'providus', 'gtb', 'ninepsb', 'corestep', 'column', 'circle', 'anchor'])
-    .optional(),
-  // How long a checkout stays open, in seconds (PRD §5.2 — 30 minutes). Unlike
-  // the virtual-NUBAN flow this is load-bearing: Pay With Transfer takes it as
-  // `expiryTime` and enforces it, so a late transfer genuinely cannot land.
-  ANCHOR_VA_EXPIRY_SECONDS: z.coerce.number().int().positive().default(1800),
+  // Payment rail. 'bachs' is the only live provider; 'fake' is an in-memory
+  // stand-in for local development, the seed and the test suite. See
+  // src/providers/payment/.
+  PAYMENT_PROVIDER: z.enum(['bachs', 'fake']).default('bachs'),
+
+  // Bachs (docs.bachs.io) — Connect platform. sk_sandbox_… against the sandbox
+  // URL, sk_live_… against https://api.bachs.io; going live is a key swap.
+  BACHS_BASE_URL: z.string().url().default('https://sandbox-api.bachs.io'),
+  BACHS_SECRET_KEY: z.string().optional(),
+  // The signing secret of the webhook endpoint registered for /v1/webhooks/bachs
+  // (returned once, at endpoint creation). During a rotation Bachs keeps the old
+  // secret valid for 24h, so the outgoing one can be kept here meanwhile.
+  BACHS_WEBHOOK_SECRET: z.string().optional(),
+  BACHS_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  // Reject signed deliveries whose timestamp is further than this from now.
+  WEBHOOK_TOLERANCE_SECONDS: z.coerce.number().int().positive().default(300),
+  // How long a checkout's one-time bank account stays open (Bachs allows 1–1440).
+  CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
+  // Run the webhook/job worker and reconciliation inside the API process.
+  // Turn off when they run as a separate process (npm run worker).
+  RUN_WORKERS: z
+    .string()
+    .transform((v) => v !== 'false')
+    .default('true'),
+
+  // Structured logging (pino)
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 
   // App
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
@@ -88,6 +92,14 @@ const envSchema = z.object({
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
+  if (val.PAYMENT_PROVIDER === 'bachs') {
+    for (const key of ['BACHS_SECRET_KEY', 'BACHS_WEBHOOK_SECRET'] as const) {
+      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=bachs' });
+    }
+  }
+  if (val.NODE_ENV === 'production' && val.PAYMENT_PROVIDER === 'fake') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYMENT_PROVIDER'], message: 'the fake provider cannot run in production' });
+  }
   if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });
   }

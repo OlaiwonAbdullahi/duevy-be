@@ -1,13 +1,15 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import morgan from 'morgan';
+import { randomUUID } from 'crypto';
+import { pinoHttp } from 'pino-http';
 import cookieParser from 'cookie-parser';
 import { env } from './config/env';
 import { apiRouter } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { standardLimiter } from './middleware/rateLimiter';
 import { ok, fail } from './lib/response';
+import { logger } from './lib/logger';
 
 export const app = express();
 
@@ -21,8 +23,8 @@ app.use(cors({
   credentials: true,
 }));
 
-// Request parsing. Capture the raw body so the Anchor webhook (§15) can
-// verify its x-anchor-signature HMAC over the exact bytes received.
+// Request parsing. Capture the raw body so the payment webhook can verify its
+// HMAC signature over the exact bytes received.
 app.use(
   express.json({
     limit: '100kb',
@@ -36,9 +38,24 @@ app.use(cookieParser());
 // Uploaded assets (avatars §3.2, nominee images §11)
 app.use('/uploads', express.static('uploads'));
 
-// Logging
+// Structured request logging. Bodies are never logged; sensitive headers are
+// redacted by the logger (src/lib/logger.ts).
 if (env.NODE_ENV !== 'test') {
-  app.use(morgan(env.NODE_ENV === 'development' ? 'dev' : 'combined'));
+  app.use(
+    pinoHttp({
+      logger,
+      genReqId: (req, res) => {
+        const id = (req.headers['x-request-id'] as string | undefined) ?? randomUUID();
+        res.setHeader('x-request-id', id);
+        return id;
+      },
+      customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
+      serializers: {
+        req: (req: { id: string; method: string; url: string }) => ({ id: req.id, method: req.method, url: req.url }),
+        res: (res: { statusCode: number }) => ({ statusCode: res.statusCode }),
+      },
+    }),
+  );
 }
 
 // Global rate limit

@@ -40,29 +40,34 @@ export function serializeTransaction(t: Transaction) {
   };
 }
 
-/** The `Payout` resource (§10.4). */
+/**
+ * The `Payout` (withdrawal) resource. `amount` is the gross debited from the
+ * space; `fee` is Duevy's withdrawal fee, deducted from it; `net` is what
+ * reaches the rep's bank. Status: pending | processing | success | failed | reversed.
+ */
 export function serializePayout(p: Payout) {
+  const legacy = p.provider === 'anchor';
+  const fee = legacy ? p.duevyFeeKobo + p.anchorFeeKobo + p.stampDutyKobo : p.feeKobo;
+  const net = legacy ? p.netSentKobo : p.netKobo;
   return {
     id: p.id,
-    dueId: p.dueId,
     amount: p.amount,
+    fee,
+    net,
     reference: p.reference,
     status: p.status,
     account: p.accountMasked,
     note: p.note,
     requestedById: p.requestedById,
     requestedAt: p.requestedAt.toISOString(),
-    cancelledAt: p.cancelledAt?.toISOString() ?? null,
+    processingAt: p.processingAt?.toISOString() ?? null,
     settledAt: p.settledAt?.toISOString() ?? null,
+    failedAt: p.failedAt?.toISOString() ?? null,
+    reversedAt: p.reversedAt?.toISOString() ?? null,
     failureReason: p.failureReason,
-    // The fee breakdown (PRD §7.3). `amount` is the gross debit against the
-    // space's balance; `netSent` is what actually reaches the rep's bank, and is
-    // the figure to show as "amount received". The rep-facing "₦100 flat" is
-    // Duevy's margin plus Anchor's NIP fee, so they are surfaced as one line;
-    // stamp duty stays separate because it is a statutory charge, not ours.
-    duevyFee: p.duevyFeeKobo + p.anchorFeeKobo,
-    stampDuty: p.stampDutyKobo,
-    netSent: p.netSentKobo,
+    // Deprecated aliases kept for existing clients.
+    duevyFee: fee,
+    netSent: net,
   };
 }
 
@@ -207,6 +212,7 @@ export function serializeSpace(
     about: space.about,
     faculty: space.faculty,
     school: space.school,
+    institution: space.institution,
     memberCount: opts.memberCount,
     theme: space.theme,
     createdAt: space.createdAt.toISOString(),
@@ -223,9 +229,9 @@ export function serializeRepDue(due: Due, opts: { paidCount: number; memberCount
     note: due.note,
     amount: due.amount,
     dueDate: due.dueDate.toISOString().slice(0, 10),
-    category: due.category,
+    type: due.category,
+    category: due.category, // deprecated alias of `type`
     status: due.status,
-    allowGuests: due.allowGuests,
     assignedRepId: due.assignedRepId,
     paidCount: opts.paidCount,
     memberCount: opts.memberCount,

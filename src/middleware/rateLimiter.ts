@@ -51,3 +51,26 @@ export const assistantLimiter = rateLimit({
     fail(res, 429, "RATE_LIMITED", "Too many messages, please slow down.");
   },
 });
+
+// Checkout: 10/min per user. Each checkout opens a real bank account at the
+// provider, so this also bounds how fast one account can mint them.
+export const checkoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (req: Request) =>
+    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many payment attempts, please slow down.");
+  },
+});
+
+// Money-out and identity endpoints (withdrawals, KYC, name enquiry): 10/min per user.
+export const sensitiveLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (req: Request) =>
+    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many requests, please slow down.");
+  },
+});
