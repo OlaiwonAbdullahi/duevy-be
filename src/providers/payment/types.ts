@@ -20,10 +20,16 @@ export interface IdentityProfile {
   phone?: string | null;
 }
 
+/** A government identifier. Pass-through only: never stored, never logged. */
+export interface IdentityNumber {
+  type: 'nin' | 'bvn';
+  value: string;
+}
+
 export interface VerifyIdentityInput {
   profile: IdentityProfile;
-  /** Pass-through only. Never stored, never logged. */
-  bvn: string;
+  /** At least a NIN. A BVN is added only when the provider asks for one. */
+  idNumbers: IdentityNumber[];
   /** YYYY-MM-DD. Pass-through only. */
   dob: string;
   /** Re-use the rep's existing provider account/person on a retry. */
@@ -40,6 +46,16 @@ export interface IdentityResult {
   /** Whether the account may pay out right now. */
   payoutsActive: boolean;
   failureReason?: string | null;
+  /** What the provider still asks for, as its field keys (e.g. "persons.per_x.bvn"). */
+  requirementsDue: string[];
+}
+
+export interface IdentityDocumentInput {
+  accountId: string;
+  personId: string;
+  buffer: Buffer;
+  fileName: string;
+  mimeType: string;
 }
 
 export interface CreateCollectionInput {
@@ -230,6 +246,8 @@ export interface PaymentProvider {
   // --- supporting reads/writes the core flows depend on ---------------------
   listBanks(): Promise<Bank[]>;
   getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult>;
+  /** Attach a government ID document to the rep's person, when the provider asks for one. */
+  uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }>;
   registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination>;
   getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus>;
   getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult>;

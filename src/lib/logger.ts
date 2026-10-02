@@ -12,6 +12,8 @@ import { env } from '../config/env';
  */
 const REDACT_KEYS = [
   'bvn',
+  'nin',
+  'idNumbers',
   'dob',
   'dateOfBirth',
   'date_of_birth',

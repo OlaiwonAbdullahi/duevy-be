@@ -50,6 +50,17 @@ const envSchema = z.object({
     .transform((v) => v !== 'false')
     .default('true'),
 
+  // Private file storage for KYC documents (the rep's student ID card).
+  // 'imagekit' in every real environment; 'memory' only for tests and local
+  // development without ImageKit keys (refused in production).
+  FILE_STORAGE: z.enum(['imagekit', 'memory']).default('imagekit'),
+  IMAGEKIT_PRIVATE_KEY: z.string().optional(),
+  // e.g. https://ik.imagekit.io/your_imagekit_id
+  IMAGEKIT_URL_ENDPOINT: z.string().url().optional(),
+  // Folder that holds KYC documents. Restrict it in the ImageKit dashboard
+  // (files are uploaded as private, so they are only served via signed URLs).
+  IMAGEKIT_KYC_FOLDER: z.string().default('/duevy/kyc'),
+
   // Structured logging (pino)
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 
@@ -96,6 +107,14 @@ const envSchema = z.object({
     for (const key of ['BACHS_SECRET_KEY', 'BACHS_WEBHOOK_SECRET'] as const) {
       if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=bachs' });
     }
+  }
+  if (val.FILE_STORAGE === 'imagekit') {
+    for (const key of ['IMAGEKIT_PRIVATE_KEY', 'IMAGEKIT_URL_ENDPOINT'] as const) {
+      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when FILE_STORAGE=imagekit' });
+    }
+  }
+  if (val.NODE_ENV === 'production' && val.FILE_STORAGE === 'memory') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['FILE_STORAGE'], message: 'memory storage cannot run in production' });
   }
   if (val.NODE_ENV === 'production' && val.PAYMENT_PROVIDER === 'fake') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYMENT_PROVIDER'], message: 'the fake provider cannot run in production' });

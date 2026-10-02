@@ -73,6 +73,9 @@ async function main() {
             bachsAccountId: 'acct_fake_seed_rep',
             bachsPersonId: 'per_fake_seed_rep',
             bachsPayoutsActive: true,
+            studentIdStatus: 'approved' as const,
+            studentIdUploadedAt: now,
+            studentIdReviewedAt: now,
             kycSubmittedAt: now,
             kycResolvedAt: now,
           }

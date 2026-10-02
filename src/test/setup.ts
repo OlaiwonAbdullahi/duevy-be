@@ -16,6 +16,7 @@ const defaults: Record<string, string> = {
   PAYMENT_PROVIDER: 'fake',
   BACHS_WEBHOOK_SECRET: 'whsec_test_secret',
   RUN_WORKERS: 'false',
+  FILE_STORAGE: 'memory',
 };
 
 for (const [key, value] of Object.entries(defaults)) {

@@ -35,6 +35,7 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       bachsAccountId: verified ? `acct_fake_${u}` : null,
       bachsPersonId: verified ? `per_fake_${u}` : null,
       bachsPayoutsActive: verified,
+      studentIdStatus: verified ? 'approved' : null,
     },
   });
   const space = await db.space.create({
@@ -146,3 +147,19 @@ export async function sendWebhook(event: { id: string; type: string; data: Recor
 }
 
 export const newKey = () => randomUUID();
+
+/** A minimal valid PNG (8-byte signature + padding), for document uploads. */
+export const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
+
+/** multipart/form-data request: string fields plus named files. */
+export async function apiMultipart(
+  path: string,
+  opts: { token: string; fields?: Record<string, string>; files?: Record<string, { bytes: Buffer; name: string; type: string }> },
+) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(opts.fields ?? {})) form.append(k, v);
+  for (const [k, f] of Object.entries(opts.files ?? {})) form.append(k, new Blob([f.bytes], { type: f.type }), f.name);
+  const res = await fetch(`${base}${path}`, { method: 'POST', headers: { Authorization: `Bearer ${opts.token}` }, body: form });
+  const text = await res.text();
+  return { status: res.status, body: text ? JSON.parse(text) : null };
+}

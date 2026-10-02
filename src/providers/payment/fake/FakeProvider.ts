@@ -6,6 +6,7 @@ import {
   type CollectionAccount,
   type CollectionStatus,
   type CreateCollectionInput,
+  type IdentityDocumentInput,
   type IdentityResult,
   type IdentityStatus,
   type InitiatePayoutInput,
@@ -38,6 +39,8 @@ export class FakeProvider implements PaymentProvider {
   identityOutcome: IdentityStatus = 'pending';
   /** What getIdentityStatus reports, per account — set this, then send identity.updated. */
   identityByAccount = new Map<string, { status: IdentityStatus; payoutsActive: boolean }>();
+  /** What getIdentityStatus reports as still outstanding. */
+  requirementsDue: string[] = [];
   /** Account numbers name enquiry cannot resolve. */
   unresolvable = new Set<string>();
   resolvedName = 'ADA OBI';
@@ -61,12 +64,15 @@ export class FakeProvider implements PaymentProvider {
 
   private record(op: string, args: unknown): void {
     // Never retain secrets, even in a test double.
-    const safe = JSON.parse(JSON.stringify(args ?? {}, (k, v) => (k === 'bvn' || k === 'dob' ? '[redacted]' : v)));
+    const safe = JSON.parse(
+      JSON.stringify(args ?? {}, (k, v) => (['bvn', 'dob', 'idNumbers', 'buffer'].includes(k) ? '[redacted]' : v)),
+    );
     this.calls.push({ op, args: safe });
   }
 
   reset(): void {
     this.identityOutcome = 'pending';
+    this.requirementsDue = [];
     this.identityByAccount.clear();
     this.unresolvable.clear();
     this.failNextPayout = null;
@@ -96,12 +102,21 @@ export class FakeProvider implements PaymentProvider {
 
   async verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult> {
     this.record('verifyIdentity', input);
-    if (!/^\d{11}$/.test(input.bvn)) throw new ProviderError('Invalid BVN', 422, 'VALIDATION_ERROR', false);
+    if (!input.idNumbers.some((n) => n.type === 'nin' && /^\d{11}$/.test(n.value))) {
+      throw new ProviderError('A valid NIN is required', 422, 'VALIDATION_ERROR', false);
+    }
     const accountId = input.existingAccountId ?? `acct_fake_${input.profile.userId}`;
     const personId = input.existingPersonId ?? `per_fake_${input.profile.userId}`;
     const verified = this.identityOutcome === 'verified';
     this.identityByAccount.set(accountId, { status: this.identityOutcome, payoutsActive: verified });
-    return { accountId, personId, status: this.identityOutcome, payoutsActive: verified, failureReason: null };
+    return {
+      accountId,
+      personId,
+      status: this.identityOutcome,
+      payoutsActive: verified,
+      failureReason: null,
+      requirementsDue: this.requirementsDue,
+    };
   }
 
   async getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult> {
@@ -112,8 +127,19 @@ export class FakeProvider implements PaymentProvider {
       personId,
       status: s.status,
       payoutsActive: s.payoutsActive,
-      failureReason: s.status === 'rejected' ? 'BVN details did not match' : null,
+      failureReason: s.status === 'rejected' ? 'Identity details did not match' : null,
+      requirementsDue: this.requirementsDue,
     };
+  }
+
+  async uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }> {
+    this.record('uploadIdentityDocument', {
+      accountId: input.accountId,
+      personId: input.personId,
+      mimeType: input.mimeType,
+      bytes: input.buffer.length,
+    });
+    return { documentId: `doc_fake_${++this.seq}` };
   }
 
   async listBanks(): Promise<Bank[]> {

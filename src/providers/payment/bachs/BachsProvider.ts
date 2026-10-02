@@ -8,6 +8,7 @@ import {
   type CollectionAccount,
   type CollectionStatus,
   type CreateCollectionInput,
+  type IdentityDocumentInput,
   type IdentityResult,
   type IdentityStatus,
   type InitiatePayoutInput,
@@ -75,6 +76,7 @@ interface BachsCheckout {
 interface BachsAccount {
   id: string;
   capabilities?: Record<string, { status?: string } | undefined> | null;
+  requirements?: { currently_due?: string[]; past_due?: string[] } | null;
 }
 interface BachsPerson {
   id: string;
@@ -266,8 +268,9 @@ export class BachsProvider implements PaymentProvider {
       email: profile.email,
       ...(profile.phone ? { phone: profile.phone } : {}),
       relationship: { representative: true },
-      // The identity guide's typed form, so the number is read as a BVN.
-      id_numbers: [{ type: 'bvn', value: input.bvn, issuing_country: 'NG' }],
+      // Typed identifiers. A NIN satisfies the id_number requirement on its
+      // own; a BVN, if Bachs later asks, sits beside it in the same list.
+      id_numbers: input.idNumbers.map((n) => ({ type: n.type, value: n.value, issuing_country: 'NG' })),
     };
 
     // Re-use the representative if one exists (a retry, or a create that timed
@@ -327,7 +330,7 @@ export class BachsProvider implements PaymentProvider {
   }
 
   async getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult> {
-    const [person, caps] = await Promise.all([
+    const [person, caps, account] = await Promise.all([
       this.client.request<BachsPerson>({
         method: 'GET',
         path: `/v1/accounts/${encodeURIComponent(accountId)}/persons/${encodeURIComponent(personId)}`,
@@ -338,7 +341,13 @@ export class BachsProvider implements PaymentProvider {
         path: `/v1/accounts/${encodeURIComponent(accountId)}/capabilities`,
         op: 'account.capabilities',
       }),
+      this.client.request<BachsAccount>({
+        method: 'GET',
+        path: `/v1/accounts/${encodeURIComponent(accountId)}`,
+        op: 'account.get',
+      }),
     ]);
+    const due = [...(account.requirements?.past_due ?? []), ...(account.requirements?.currently_due ?? [])];
     const payouts = caps.items?.find((c) => c.name === 'payouts');
     return {
       accountId,
@@ -346,7 +355,32 @@ export class BachsProvider implements PaymentProvider {
       status: mapIdentityStatus(person.verification?.status),
       payoutsActive: payouts?.status === 'active',
       failureReason: person.verification?.failure_reason ?? null,
+      requirementsDue: [...new Set(due)],
     };
+  }
+
+  /**
+   * Bachs takes documents as a file upload first, then a reference to it:
+   * POST /v1/utilities/uploads (scope identity_document), then attach to the
+   * person's primary_verification slot.
+   */
+  async uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }> {
+    const form = new FormData();
+    form.append('scope', 'identity_document');
+    form.append('file', new Blob([input.buffer], { type: input.mimeType }), input.fileName);
+    const upload = await this.client.request<{ upload_id: string }>({
+      method: 'POST',
+      path: '/v1/utilities/uploads',
+      op: 'upload.identity_document',
+      body: form,
+    });
+    const doc = await this.client.request<{ id: string }>({
+      method: 'POST',
+      path: `/v1/accounts/${encodeURIComponent(input.accountId)}/persons/${encodeURIComponent(input.personId)}/documents`,
+      op: 'person.document.attach',
+      body: { file: upload.upload_id, document: 'primary_verification', side: 'front' },
+    });
+    return { documentId: doc.id };
   }
 
   // -------------------------------------------------------------------------

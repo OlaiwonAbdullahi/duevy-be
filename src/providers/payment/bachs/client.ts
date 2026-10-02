@@ -51,7 +51,9 @@ export class BachsClient {
       Authorization: `Bearer ${this.secretKey}`,
       Accept: 'application/json',
     };
-    if (req.body !== undefined) headers['Content-Type'] = 'application/json';
+    const multipart = req.body instanceof FormData;
+    // fetch sets the multipart boundary itself.
+    if (req.body !== undefined && !multipart) headers['Content-Type'] = 'application/json';
     if (req.accountId) headers['X-Account-Id'] = req.accountId;
     if (req.idempotencyKey) headers['Idempotency-Key'] = req.idempotencyKey;
 
@@ -61,7 +63,7 @@ export class BachsClient {
       res = await fetch(url, {
         method: req.method,
         headers,
-        body: req.body === undefined ? undefined : JSON.stringify(req.body),
+        body: req.body === undefined ? undefined : multipart ? (req.body as FormData) : JSON.stringify(req.body),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (err) {

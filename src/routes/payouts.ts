@@ -20,7 +20,16 @@ import {
 import { sendEmail, renderEmail } from '../lib/email';
 import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
-import { getSpaceKycState, submitKyc, getKycState } from '../services/kyc.service';
+import multer from 'multer';
+import { MAX_DOCUMENT_BYTES, sniffDocumentType } from '../lib/storage';
+import {
+  getKycState,
+  getSpaceKycState,
+  resubmitStudentId,
+  submitGovernmentId,
+  submitKyc,
+  type UploadedDocument,
+} from '../services/kyc.service';
 import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { quoteWithdrawal, requestWithdrawal } from '../services/withdrawal.service';
 import { listBanksCached } from './banks';
@@ -275,12 +284,55 @@ payoutsRouter.put(
 );
 
 // ---------------------------------------------------------------------------
-// KYC — BVN + date of birth + gender, verified by the provider and confirmed
-// by webhook. The BVN and DOB are passed through and never stored or logged.
+// KYC — multipart/form-data, submitted together:
+//   fields:  nin, dob (YYYY-MM-DD), gender, bvn? (only if Bachs asks),
+//            firstName?, lastName?, phone?
+//   files:   studentIdCard (required) — reviewed by a Duevy admin
+//            governmentId (optional)  — forwarded to Bachs if it asks for one
+//
+// The NIN, BVN and date of birth go to Bachs and are never stored or logged;
+// validation errors never echo them. Images/PDFs only, 5 MB each, checked by
+// their actual bytes rather than the client's Content-Type.
 // ---------------------------------------------------------------------------
+const kycUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_DOCUMENT_BYTES, files: 2, fields: 10 },
+});
+
+function kycFiles(fields: { name: string; maxCount: number }[]) {
+  const handler = kycUpload.fields(fields);
+  return (req: Request, res: Response, next: (err?: unknown) => void) => {
+    handler(req, res, (err?: unknown) => {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          fail(res, 413, 'FILE_TOO_LARGE', 'Each document must be 5 MB or smaller');
+          return;
+        }
+        errors.validation(res, [{ field: err.field ?? 'file', issue: err.message }]);
+        return;
+      }
+      next(err);
+    });
+  };
+}
+
+/** Take one uploaded file and confirm it really is an image or PDF. */
+function readDocument(req: Request, field: string): UploadedDocument | null | 'invalid' {
+  const files = (req.files ?? {}) as Record<string, Express.Multer.File[] | undefined>;
+  const file = files[field]?.[0];
+  if (!file) return null;
+  const type = sniffDocumentType(file.buffer);
+  if (!type) return 'invalid';
+  return { buffer: file.buffer, mimeType: type.mime, ext: type.ext };
+}
+
 const kycSchema = z
   .object({
-    bvn: z.string().regex(/^\d{11}$/, 'must be an 11-digit BVN'),
+    nin: z.string().regex(/^\d{11}$/, 'must be an 11-digit NIN'),
+    bvn: z
+      .string()
+      .regex(/^\d{11}$/, 'must be an 11-digit BVN')
+      .optional(),
     dob: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD')
@@ -290,8 +342,8 @@ const kycSchema = z
         return !Number.isNaN(d.getTime()) && age >= 15 && age <= 100;
       }, 'must be a real date of birth'),
     gender: z.enum(['male', 'female']),
-    firstName: z.string().min(1).max(60).optional(),
-    lastName: z.string().min(1).max(60).optional(),
+    firstName: z.string().trim().min(1).max(60).optional(),
+    lastName: z.string().trim().min(1).max(60).optional(),
     phone: z
       .string()
       .regex(/^\+234\d{10}$/, 'must be +234 followed by 10 digits')
@@ -299,28 +351,82 @@ const kycSchema = z
   })
   .strict();
 
-// Accepts the field names the previous (Anchor) client sent, too.
+/** Multipart fields arrive as strings; drop empties so optional fields stay optional. */
 function normaliseKycBody(body: Record<string, unknown>): Record<string, unknown> {
-  const out = { ...body };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body ?? {})) {
+    if (typeof v === 'string' && v.trim() === '') continue;
+    out[k] = typeof v === 'string' ? v.trim() : v;
+  }
   if (out.dateOfBirth && !out.dob) out.dob = out.dateOfBirth;
   if (typeof out.gender === 'string') out.gender = out.gender.toLowerCase();
   delete out.dateOfBirth;
-  delete out.address;
   return out;
 }
 
 payoutsRouter.post(
   '/payout/kyc',
   sensitiveLimiter,
+  kycFiles([
+    { name: 'studentIdCard', maxCount: 1 },
+    { name: 'governmentId', maxCount: 1 },
+  ]),
   (req: Request, _res: Response, next) => {
     req.body = normaliseKycBody((req.body ?? {}) as Record<string, unknown>);
     next();
   },
   validate(kycSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const state = await submitKyc(uid(req), req.body as z.infer<typeof kycSchema>);
-    // 202: submitted; the verdict arrives by webhook.
-    ok(res, state, state.kycStatus === 'pending' ? 202 : 200);
+    const studentId = readDocument(req, 'studentIdCard');
+    const governmentId = readDocument(req, 'governmentId');
+    if (!studentId) {
+      errors.validation(res, [{ field: 'studentIdCard', issue: 'a photo or scan of your student ID card is required' }]);
+      return;
+    }
+    if (studentId === 'invalid' || governmentId === 'invalid') {
+      errors.validation(res, [
+        { field: studentId === 'invalid' ? 'studentIdCard' : 'governmentId', issue: 'must be a JPEG, PNG, WebP or PDF file' },
+      ]);
+      return;
+    }
+    const state = await submitKyc(uid(req), {
+      ...(req.body as z.infer<typeof kycSchema>),
+      studentId,
+      governmentId: governmentId ?? undefined,
+    });
+    // 202: submitted; the Bachs verdict arrives by webhook and an admin reviews the student ID.
+    ok(res, state, 202);
+  },
+);
+
+// POST /payout/kyc/student-id — replace a rejected (or missing) student ID card.
+payoutsRouter.post(
+  '/payout/kyc/student-id',
+  sensitiveLimiter,
+  kycFiles([{ name: 'studentIdCard', maxCount: 1 }]),
+  async (req: Request, res: Response): Promise<void> => {
+    const doc = readDocument(req, 'studentIdCard');
+    if (!doc || doc === 'invalid') {
+      errors.validation(res, [{ field: 'studentIdCard', issue: 'a JPEG, PNG, WebP or PDF of your student ID card is required' }]);
+      return;
+    }
+    ok(res, await resubmitStudentId(uid(req), doc), 202);
+  },
+);
+
+// POST /payout/kyc/government-id — send Bachs an ID document when it asks for one
+// (see requirementsDue on GET /payout/kyc-status).
+payoutsRouter.post(
+  '/payout/kyc/government-id',
+  sensitiveLimiter,
+  kycFiles([{ name: 'governmentId', maxCount: 1 }]),
+  async (req: Request, res: Response): Promise<void> => {
+    const doc = readDocument(req, 'governmentId');
+    if (!doc || doc === 'invalid') {
+      errors.validation(res, [{ field: 'governmentId', issue: 'a JPEG, PNG, WebP or PDF of a government ID is required' }]);
+      return;
+    }
+    ok(res, await submitGovernmentId(uid(req), doc), 202);
   },
 );
 

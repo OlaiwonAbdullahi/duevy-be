@@ -184,6 +184,13 @@ enum NotificationTone {
   rose
 }
 
+// Duevy's own review of a document Bachs doesn't check (the rep's student ID).
+enum DocumentReviewStatus {
+  pending
+  approved
+  rejected
+}
+
 enum KycStatus {
   unverified
   pending
@@ -295,64 +302,80 @@ enum AssistantRole {
 // ---------------------------------------------------------------------------
 
 model User {
-  id                   String               @id @default(cuid())
-  name                 String
-  email                String               @unique
-  emailVerified        Boolean              @default(false)
-  passwordHash         String?
-  phone                String?
-  avatarUrl            String?
+  id                      String                @id @default(cuid())
+  name                    String
+  email                   String                @unique
+  emailVerified           Boolean               @default(false)
+  passwordHash            String?
+  phone                   String?
+  avatarUrl               String?
   // `role` is the coarse label carried in the access token (admin vs not).
   // Permissions are ADDITIVE: every user is a student; `isRep` is granted on
   // top once an admin approves their rep application, and is what rep-only
   // actions (creating a space) check. Space-level authority is SpaceRep.
-  role                 Role                 @default(student)
-  isRep                Boolean              @default(false)
-  repApplicationStatus RepApplicationStatus @default(none)
-  adminSubRole         AdminSubRole?
+  role                    Role                  @default(student)
+  isRep                   Boolean               @default(false)
+  repApplicationStatus    RepApplicationStatus  @default(none)
+  adminSubRole            AdminSubRole?
   // Multi-school ready; launch is LAUTECH only.
-  institution          String               @default("LAUTECH")
-  matricNo             String?
-  level                String?
-  notificationPrefs    Json? // §3.4 — email/push toggles; null = defaults
-  referralCode         String?              @unique
+  institution             String                @default("LAUTECH")
+  matricNo                String?
+  level                   String?
+  notificationPrefs       Json? // §3.4 — email/push toggles; null = defaults
+  referralCode            String?               @unique
   // Rep identity on Bachs Connect. Each rep is a recipient Connect account
   // (bachsAccountId) whose representative person (bachsPersonId — the
-  // provider reference for KYC) carries the BVN. Collections settle into this
-  // account as destination charges and withdrawals are paid out of it.
+  // provider reference for KYC) carries the rep's NIN (and a BVN only if Bachs
+  // later asks for one). Collections settle into this account as destination
+  // charges and withdrawals are paid out of it.
   //
-  // THE BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to Bachs
-  // in the KYC request and nowhere else; only the outcome below is stored.
-  bachsAccountId       String?              @unique
-  bachsPersonId        String?
+  // THE NIN, BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to
+  // Bachs in the KYC request and nowhere else; only the outcome is stored.
+  bachsAccountId          String?               @unique
+  bachsPersonId           String?
   // Bachs reports these separately: the person's verification, and whether the
   // account may pay out. A rep can collect only when both are true.
-  kycStatus            KycStatus            @default(unverified)
-  bachsPayoutsActive   Boolean              @default(false)
-  kycSubmittedAt       DateTime?
-  kycResolvedAt        DateTime?
-  kycRejectionReason   String?
-  kycAttempts          Int                  @default(0)
-  kycRetryLockedUntil  DateTime? // §9.2 — 24h lock after 3 consecutive failures
+  kycStatus               KycStatus             @default(unverified)
+  bachsPayoutsActive      Boolean               @default(false)
+  kycSubmittedAt          DateTime?
+  kycResolvedAt           DateTime?
+  kycRejectionReason      String?
+  kycAttempts             Int                   @default(0)
+  kycRetryLockedUntil     DateTime? // §9.2 — 24h lock after 3 consecutive failures
+  // Field keys Bachs still asks for on the rep's account (e.g. a BVN or an ID
+  // document), refreshed on every identity event, so the rep can be told.
+  kycRequirementsDue      String[]              @default([])
+  governmentIdSubmittedAt DateTime? // an ID document forwarded to Bachs on request
+  // The rep's student ID card — Duevy's own check, not Bachs's. Uploaded at
+  // KYC time to private storage (ImageKit) and reviewed by an admin; a space
+  // can only collect once it is approved. Only the storage reference is kept.
+  studentIdFileId         String?
+  studentIdFilePath       String?
+  studentIdMimeType       String?
+  studentIdStatus         DocumentReviewStatus?
+  studentIdUploadedAt     DateTime?
+  studentIdReviewedAt     DateTime?
+  studentIdReviewedById   String?
+  studentIdReviewNote     String?
   // --- Legacy (Anchor era). Read-only; kept so historical rows and any
   // balance still held at Anchor stay traceable. Nothing writes these.
-  anchorCustomerId     String?              @unique
-  kycTier              KycTier              @default(tier_0)
-  kycPendingTier       KycTier?
-  kycDocUrls           String[]             @default([])
-  addressLine1         String?
-  addressLine2         String?
-  city                 String?
-  state                String? // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
-  postalCode           String?
-  isSuspended          Boolean              @default(false)
-  suspendedReason      String?
-  isDeactivated        Boolean              @default(false)
-  deactivatedReason    String?
-  termsAcceptedAt      DateTime?
-  termsVersion         String?
-  createdAt            DateTime             @default(now())
-  updatedAt            DateTime             @updatedAt
+  anchorCustomerId        String?               @unique
+  kycTier                 KycTier               @default(tier_0)
+  kycPendingTier          KycTier?
+  kycDocUrls              String[]              @default([])
+  addressLine1            String?
+  addressLine2            String?
+  city                    String?
+  state                   String? // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
+  postalCode              String?
+  isSuspended             Boolean               @default(false)
+  suspendedReason         String?
+  isDeactivated           Boolean               @default(false)
+  deactivatedReason       String?
+  termsAcceptedAt         DateTime?
+  termsVersion            String?
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
 
   // Relations
   refreshTokens          RefreshToken[]
@@ -380,6 +403,7 @@ model User {
   receipts               Receipt[]
 
   @@index([institution])
+  @@index([studentIdStatus])
   @@map("users")
 }
 

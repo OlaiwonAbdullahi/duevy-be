@@ -38,7 +38,7 @@ Base URL: `/v1`. Request and response bodies are JSON.
 ```json
 { "name": "Aisha Bello", "matricNo": "210805019", "email": "aisha@example.com", "password": "min 8 chars",
   "acceptedTerms": true, "role": "student" | "rep",
-  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…", "theme": "emerald" }  // required when role = rep
+  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" }  // required when role = rep
 }
 ```
 
@@ -65,7 +65,7 @@ Refresh, logout, Google sign-in, email verification and password reset are uncha
 
 ```json
 { "name": "CSC Association", "short": "CSA", "kind": "association", "school": "…", "institution": "LAUTECH",
-  "faculty": "…", "about": "…", "theme": "emerald" }
+  "faculty": "…", "about": "…" }
 ```
 
 - `201`: `Space & { joinCode }`.
@@ -197,15 +197,38 @@ Only the webhook (and the reconciliation job behind it) changes the status. Poll
 
 All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the space.
 
-### `POST /payout/kyc`
+KYC has two parts, and a space collects only when **both** pass:
+
+- **Identity, verified by Bachs:** NIN + date of birth. A BVN is not required; Bachs may ask for one (or an ID document) later, and `requirementsDue` says so.
+- **Student status, verified by a Duevy admin:** the rep's student ID card.
+
+### `POST /payout/kyc` (`multipart/form-data`)
+
+| Part | Required | Notes |
+|---|---|---|
+| `nin` | yes | 11 digits. Sent to Bachs; never stored or logged. |
+| `dob` | yes | `YYYY-MM-DD`. Sent to Bachs; never stored or logged. |
+| `gender` | yes | `male` or `female`. Validated; Bachs has no field for it. |
+| `studentIdCard` | yes | File: JPEG, PNG, WebP or PDF, max 5 MB, checked by its bytes. Stored privately in ImageKit for admin review. |
+| `governmentId` | no | File, same rules. Forwarded to Bachs, only useful when it asks for an ID document. |
+| `bvn` | no | 11 digits. Only if Bachs asks for it. |
+| `firstName`, `lastName`, `phone` | no | `phone` as `+234…`. Names default to the account name. |
+
+`202`:
 
 ```json
-{ "bvn": "22345678901", "dob": "2001-04-12", "gender": "male" | "female", "firstName"?: "…", "lastName"?: "…", "phone"?: "+2348012345678" }
+{ "kycStatus": "pending", "payoutsActive": false, "canCollect": false, "canWithdraw": false, "providerReference": "per_…",
+  "requirementsDue": [], "governmentIdSubmittedAt": null,
+  "studentId": { "status": "pending", "uploadedAt": "…", "reviewedAt": null, "reviewNote": null },
+  "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": null }
 ```
 
-- `202`: `{ kycStatus: "pending", payoutsActive, canCollect, canWithdraw, providerReference, rejectionReason, retryLockedUntil, submittedAt, resolvedAt }`.
-- The verdict arrives by webhook.
-- The BVN and date of birth are passed to Bachs and never stored or logged. Validation errors never echo them back.
+The Bachs verdict arrives by webhook. Validation errors never echo the NIN, BVN or date of birth.
+
+| Error | When |
+|---|---|
+| `400 VALIDATION_ERROR` | Bad field, missing `studentIdCard`, or a file that isn't really a JPEG/PNG/WebP/PDF. |
+| `413 FILE_TOO_LARGE` | A file over 5 MB. |
 
 | Error | When |
 |---|---|
@@ -214,9 +237,17 @@ All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the s
 | `422 KYC_REJECTED` | Bachs refused the details. |
 | `429 KYC_RETRY_LOCKED` | Three failed attempts; retries are locked for 24 hours. |
 
+### `POST /payout/kyc/student-id` (`multipart/form-data`)
+
+Replaces the student ID card after an admin rejected it (or if none was sent). Part: `studentIdCard`. Returns `202` with the KYC state. `409 STUDENT_ID_PENDING` / `STUDENT_ID_APPROVED` if there is nothing to replace.
+
+### `POST /payout/kyc/government-id` (`multipart/form-data`)
+
+Forwards a government ID document to Bachs, for when `requirementsDue` asks for one. Part: `governmentId`. Returns `202`. `409 KYC_NOT_STARTED` before the first submission.
+
 ### `GET /payout/kyc-status`
 
-`200`: the space lead's KYC state (`kycStatus`, `canCollect`, …) plus `mine`, the caller's own state.
+`200`: the space lead's KYC state (shape above) plus `mine`, the caller's own state.
 
 ### `GET /payout/summary` (rep dashboard)
 
@@ -293,12 +324,14 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 | `POST /admin/reps/:repId/verify` | userManagement | Approves the rep: sets `isRep` and creates the space from the application. Body: `{ note? }`. |
 | `POST /admin/reps/:repId/reject` | userManagement | Body: `{ reason }`. |
 | `GET /admin/reps` | userManagement | Reps with their collections. |
+| `GET /admin/kyc/student-ids?status=pending` | userManagement | Student ID cards to review: `[{ userId, name, email, matricNo, institution, kycStatus, studentId: { status, mimeType, uploadedAt, reviewedAt, reviewNote, viewUrl, viewUrlExpiresInSeconds } }]`. `viewUrl` is a signed ImageKit link that expires after 10 minutes. |
+| `POST /admin/users/:userId/student-id/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. The rep is notified. |
 | `GET /admin/spaces?q=&school=&type=` | userManagement | `[{ id, name, short, kind, school, memberCount, duesTarget, collectedAmount, assignedRepIds, isArchived, payoutsFrozen }]` |
 | `GET /admin/transactions?type=&status=&spaceId=&userId=&from=&to=` | userManagement | Every transaction. |
 | `GET /admin/checkouts?status=&needsReview=true&overpaid=true&spaceId=` | userManagement | The review queue: underpaid, overpaid, late and duplicate payments. |
 | `POST /admin/checkouts/:reference/resolve` | overrides | Clears a review flag. Body: `{ note }`. |
 | `GET /admin/payouts?status=&spaceId=` | payouts | Every withdrawal. |
-| `GET /admin/health` | userManagement | `{ deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledWithdrawalFees, healthy, recentWebhookFailures }` |
+| `GET /admin/health` | userManagement | `{ deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledWithdrawalFees, pendingStudentIds, healthy, recentWebhookFailures }` |
 | `POST /admin/reps/:repId/freeze-payouts` · `/unfreeze-payouts` | payouts | Freezes or unfreezes the rep's withdrawals. |
 
 ---
@@ -333,6 +366,7 @@ Anything else is acknowledged and ignored.
 
 - `POST /webhooks/anchor` is gone; use `/webhooks/bachs`.
 - `POST /payout/kyc/upgrade` is removed, along with KYC tiers and the ₦300,000 balance ceiling.
+- `POST /payout/kyc` is now `multipart/form-data` and takes a **NIN** (not a BVN) plus a `studentIdCard` file. A space can only collect once an admin approves the card.
 - `POST /payout/:id/approve`, `POST /payout/:id/cancel`, `GET|POST /dues/:dueId/payout/*` are removed (approval quorum and co-rep payouts are out of scope).
 - `POST /dues/pay` no longer accepts `discountCode` or `method: "card"`. Guest payers are refused.
 - `POST /polls/:slug/votes` on a paid poll returns `501 PAID_VOTING_UNAVAILABLE`. Free polls still work.

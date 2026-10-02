@@ -24,9 +24,10 @@ Payments run on **Bachs Connect** ([docs.bachs.io](https://docs.bachs.io)). Laun
 1. **Rep onboarding.** A rep signs up, their application is `pending`, and an admin approves it, which sets `isRep`.
    - An approved rep can create a space and draft dues straight away.
    - Publishing dues, and so collecting, needs KYC.
-2. **KYC.** The rep submits BVN, date of birth and gender. Duevy creates a Bachs **Connect account** for the rep and adds them as its representative.
-   - Bachs reviews the submission, and the verdict arrives by webhook.
-   - The BVN and date of birth are never stored or logged. Only the status and Bachs's references are kept.
+2. **KYC.** Two checks, both needed before the rep's spaces can collect:
+   - **Identity, by Bachs.** The rep submits their NIN, date of birth and gender. Duevy creates a Bachs **Connect account** for the rep with them as its representative, and the verdict arrives by webhook. A BVN or ID document is sent only if Bachs asks for one; what Bachs still wants is shown to the rep.
+   - **Student status, by Duevy.** In the same submission the rep uploads their student ID card. It is stored privately in ImageKit, and an admin approves or rejects it.
+   - The NIN, BVN and date of birth are never stored or logged. Only the statuses, Bachs's references and the ImageKit file reference are kept.
 3. **Checkout.** A student picks one or more dues from one space. Duevy computes the amounts:
    - face = the sum of the dues
    - fee = 2% of the face + ₦20
@@ -57,7 +58,7 @@ npm run dev               # http://localhost:3000, all routes under /v1
 
 `npm install` runs `postinstall`, which runs the build (`prisma generate` + `tsc`).
 
-**Running locally without Bachs.** Set `PAYMENT_PROVIDER=fake`. The fake provider opens fake bank accounts and resolves names instantly, but webhooks still use the real Bachs signature scheme. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
+**Running locally without Bachs or ImageKit.** Set `PAYMENT_PROVIDER=fake` and `FILE_STORAGE=memory`. The fake provider opens fake bank accounts and resolves names instantly, but webhooks still use the real Bachs signature scheme. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
 
 Seeded logins (password `Demo1234!`):
 
@@ -86,6 +87,9 @@ Every variable is validated at boot in `src/config/env.ts`, and the server refus
 | `RUN_WORKERS` | no (`true`) | Run the webhook worker and reconciliation inside the API. Set `false` and run `npm run worker` separately. |
 | `LOG_LEVEL` | no (`info`) | pino level. |
 | `ENCRYPTION_KEY` | recommended | Encrypts stored bank account numbers. |
+| `FILE_STORAGE` | no (`imagekit`) | `imagekit`, or `memory` for tests and local dev (refused in production). |
+| `IMAGEKIT_PRIVATE_KEY`, `IMAGEKIT_URL_ENDPOINT` | with `imagekit` | Private storage for student ID cards. |
+| `IMAGEKIT_KYC_FOLDER` | no (`/duevy/kyc`) | Folder the KYC documents go in. |
 | `FEATURE_POLLS`, `FEATURE_ASSISTANT`, `FEATURE_REFERRALS` | no (`false`) | Features outside the MVP. Paid voting stays off. |
 
 Google sign-in, CORS, cookies and LLM settings are documented inline in `.env.example`.
@@ -110,7 +114,7 @@ What the integration suite covers:
   - Unknown reference: the event is retried with backoff.
 - **Ledger.** The balance is derived from entries, a reversal restores it, and UPDATE or DELETE is refused by the database.
 - **Withdrawal locking.** With five concurrent requests, exactly one succeeds and the other four get `WITHDRAWAL_IN_PROGRESS`. Also covered: insufficient balance, a provider refusal (balance restored), a timeout (left pending, never assumed failed), payout webhooks, and Idempotency-Key replay and reuse over HTTP.
-- **KYC.** Submit, then a webhook confirms. The test also checks that the BVN and date of birth appear nowhere in the database. Publishing dues is blocked until the rep is verified.
+- **KYC.** NIN plus student ID card in one multipart submission; a Bachs webhook confirms the identity and an admin approves the card, and collection opens only when both are done. Also covered: replacing a rejected card (the old file is deleted), forwarding a government ID when Bachs asks, rejecting files that aren't really images or PDFs, and checking that the NIN and date of birth appear nowhere in the database.
 
 ## Testing webhooks locally
 

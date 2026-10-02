@@ -11,6 +11,7 @@ import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTr
 import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
+import { listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
@@ -111,13 +112,14 @@ adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req
   const payoutStale = new Date(now - 60 * 60 * 1000);
   const checkoutStale = new Date(now - 30 * 60 * 1000);
 
-  const [deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledFees, samples] = await Promise.all([
+  const [deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledFees, pendingStudentIds, samples] = await Promise.all([
     db.webhookEvent.count({ where: { status: 'dead', provider: { not: 'anchor' } } }),
     db.webhookEvent.count({ where: { status: 'failed' } }),
     db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: payoutStale } } }),
     db.checkout.count({ where: { needsReview: true } }),
     db.checkout.count({ where: { status: 'pending', expiresAt: { lte: checkoutStale } } }),
     db.payout.count({ where: { status: 'success', feeSettledAt: null, settledAt: { lte: payoutStale } } }),
+    db.user.count({ where: { studentIdStatus: 'pending' } }),
     db.webhookEvent.findMany({
       where: { status: { in: ['dead', 'failed'] }, provider: { not: 'anchor' } },
       orderBy: { receivedAt: 'desc' },
@@ -133,6 +135,7 @@ adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req
     checkoutsNeedingReview,
     unresolvedCheckouts,
     unsettledWithdrawalFees: unsettledFees,
+    pendingStudentIds,
     healthy: deadWebhooks === 0 && stuckPayouts === 0 && checkoutsNeedingReview === 0 && unresolvedCheckouts === 0,
     recentWebhookFailures: samples.map((e) => ({
       eventId: e.providerEventId,
@@ -424,6 +427,37 @@ adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManage
   await writeAdminAudit(req, 'user.kyc_review', { target: id, metadata: { decision, note: note ?? null } });
   ok(res, { kycStatus: decision });
 });
+
+
+// ---------------------------------------------------------------------------
+// Rep student ID review. Bachs verifies identity (NIN); Duevy verifies the rep
+// is a student. A space can only collect once its lead rep's student ID is
+// approved here. View links are signed and expire after a few minutes.
+// ---------------------------------------------------------------------------
+adminRouter.get('/kyc/student-ids', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const raw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+  const status = (['pending', 'approved', 'rejected'].includes(raw) ? raw : 'pending') as 'pending' | 'approved' | 'rejected';
+  const { total, rows } = await listStudentIdsForReview(status, skip, take);
+  ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+const studentIdReviewSchema = z
+  .object({ decision: z.enum(['approved', 'rejected']), note: z.string().trim().min(1).max(500).optional() })
+  .strict();
+
+adminRouter.post(
+  '/users/:userId/student-id/review',
+  requireAdminPermission('userManagement'),
+  validate(studentIdReviewSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.params.userId as string;
+    const { decision, note } = req.body as z.infer<typeof studentIdReviewSchema>;
+    const state = await reviewStudentId((req as AuthenticatedRequest).user.sub as string, userId, decision, note);
+    await writeAdminAudit(req, 'user.student_id_review', { target: userId, metadata: { decision, note: note ?? null } });
+    ok(res, state);
+  },
+);
 
 // ===========================================================================
 // §14.3 Reps

@@ -6,8 +6,9 @@ This covers how Duevy uses Bachs (docs.bachs.io), why it is built this way, what
 
 | Duevy concept | Bachs concept |
 |---|---|
-| Rep | A **recipient Connect account** (`POST /v1/accounts`, `entity_type: individual`, capabilities `transfers` and `payouts`). Its representative **person** carries the BVN. |
-| Rep KYC | `POST /v1/accounts/{id}/persons` with `id_numbers: [{ type: "bvn" }]` and `dob`. The verdict arrives through `account.updated` / `capability.updated`, then Duevy re-reads the person (`verification.status`) and the `payouts` capability. |
+| Rep | A **recipient Connect account** (`POST /v1/accounts`, `entity_type: individual`, capabilities `transfers` and `payouts`). Its representative **person** carries the NIN. |
+| Rep KYC | `POST /v1/accounts/{id}/persons` with `id_numbers: [{ type: "nin" }]` and `dob`. Bachs: "The `id_number` requirement is satisfied by any non-BVN entry", and `persons.bvn` is `eventually_due` and "do[es] not block getting started". The verdict arrives through `account.updated` / `capability.updated`; Duevy then re-reads the person (`verification.status`), the `payouts` capability and the account's outstanding `requirements` (shown to the rep as `requirementsDue`). If Bachs asks for a BVN, it is added beside the NIN; if it asks for an ID document, the file goes through `POST /v1/utilities/uploads` (scope `identity_document`) and is attached to the person as `primary_verification`. |
+| Student ID card | **Not a Bachs document.** Bachs's ID types are government IDs (`nin`, `passport`, `id_card`, `drivers_license`, `residence_permit`). The card is Duevy's own check that the rep is a student: uploaded at KYC time to private ImageKit storage and approved by an admin. Collection needs Bachs `verified` **and** the card approved. |
 | Checkout | A **destination charge** created by the platform with `ui_mode: "custom"`:<br>• `pricing.amount` = face + fee<br>• `platform_fee` = fee<br>• `transfer_data.destination` = the rep's account<br>• `payment_method_types: ["NGN_BANK_TRANSFER"]`<br>Then `PATCH` sets the payment method and `POST …/confirm` returns `next_step.bank_account`, the one-time account the student pays into. |
 | Space balance | Duevy's own append-only ledger, per space. The rep's Bachs account holds the money for all of their spaces. |
 | Withdrawal | A **payout made as the rep's account** (`X-Account-Id`) to a registered destination (`POST /v1/payouts/destinations`). The payout reference is used as the `Idempotency-Key`. |
@@ -54,14 +55,11 @@ This covers how Duevy uses Bachs (docs.bachs.io), why it is built this way, what
 
 1. **Custom Checkout and destination charges.** Can `ui_mode: "custom"` be combined with `transfer_data` + `platform_fee`? The guides show each separately, and the OpenAPI spec has no `ui_mode` or `/confirm` at all.
    - Fallback if not: charge on the platform with no split, then `POST /v1/transfers` the face amount to the rep's account once it settles. `createCollectionAccount` is the only place that would change.
-2. **Is BVN alone enough for KYC?** In live mode, does a BVN alone take a recipient account's `payouts` capability to `active`?
-   - The create-account example lists `persons.…id_document` as currently due.
-   - The requirements page says "the `id_number` requirement is satisfied by any non-BVN entry", and `persons.bvn` is `eventually_due`.
-   - If an ID document is required, a document-upload step has to be added.
-3. **How is the BVN field sent?** The identity guide uses `id_numbers: [{ type: "bvn", value, issuing_country }]`; the OpenAPI spec has a single untyped `id_number`. Duevy sends `id_numbers`.
+2. **Is a NIN enough for KYC in live mode?** Does NIN + name + a resolvable bank account take a recipient account's `payouts` capability to `active`, or will Bachs also ask for an ID document (the create-account example lists `persons.…id_document` as currently due)? Duevy handles either: what is still due is shown to the rep, who can send a government ID through `POST /payout/kyc/government-id`. When is the `eventually_due` BVN actually requested?
+3. **How is the ID number sent?** The identity guide uses `id_numbers: [{ type, value, issuing_country }]`; the OpenAPI spec has a single untyped `id_number`. Duevy sends `id_numbers`, so the NIN is unambiguous.
    - Verification statuses also differ: `pending | passed | failed` in the guide, `unverified | pending | verified | failed` in the spec. Both are accepted.
 4. **Gender.** Bachs has no gender field. Duevy validates the field (the product requires it) and does not send or store it.
-5. **KYC review turnaround.** How long does the human review take, and is there an SLA?
+5. **KYC review turnaround.** How long does the human review take for a NIN-only person, and is there an SLA?
 6. **Underpaid destination charges.** Does an underpaid charge settle to the rep, get auto-refunded, or wait? Can the student top up the same one-time account? Is there an API to accept a partial payment? Duevy marks the checkout `underpaid`, marks no due paid, and flags it for an admin.
 7. **Overpayment.** Is the excess kept, and on which balance (the platform's or the rep's)? Duevy honours the payment and flags the excess for a manual refund.
 8. **Payment after `expires_at`.** Is a transfer that arrives after expiry auto-refunded, or credited? Duevy honours it if Bachs reports it as succeeded.
@@ -91,6 +89,6 @@ This covers how Duevy uses Bachs (docs.bachs.io), why it is built this way, what
    - It maps old due categories and payout statuses onto the new ones.
    - It tags all existing payouts and webhook events `provider = 'anchor'`.
    - It debits Anchor-era payouts still in flight so they can't be double-counted.
-   - It resets rep KYC to `unverified`. Every rep re-verifies on Bachs once.
+   - It resets rep KYC to `unverified`. Every rep re-verifies once on Bachs (NIN) and uploads their student ID card.
 3. **Resolve by hand** any Anchor payout still `pending`/`processing`, using `GET /admin/payouts?status=processing`.
 4. **Ledger uniqueness.** If creating `ledger_entries_type_duePaymentId_key` or `ledger_entries_type_payoutId_key` fails, the ledger already holds a duplicate from before. Investigate it; don't drop the key.

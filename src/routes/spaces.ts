@@ -89,7 +89,6 @@ const createSpaceSchema = z
       .default('LAUTECH'),
     faculty: z.string().trim().max(120).optional(),
     about: z.string().trim().max(500).optional(),
-    theme: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).default('emerald'),
   })
   .strict();
 
@@ -117,7 +116,6 @@ spacesRouter.post('/', validate(createSpaceSchema), async (req: Request, res: Re
         institution: d.institution,
         faculty: d.faculty,
         about: d.about,
-        theme: d.theme,
         joinCode,
       },
     });
