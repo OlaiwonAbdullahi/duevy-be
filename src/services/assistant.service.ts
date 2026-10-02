@@ -71,7 +71,7 @@ function toDueOption(due: {
     dueId: due.id,
     title: due.title,
     amount: due.amount,
-    payableAmount: charge.totalCharged,
+    payableAmount: charge.total,
     spaceId: due.spaceId,
     spaceName: due.space.name,
     dueDate: due.dueDate.toISOString().slice(0, 10),
@@ -147,7 +147,7 @@ async function handleCheckBalance(userId: string): Promise<CheckBalanceResult> {
       dueId: d.id,
       title: d.title,
       amount: d.amount,
-      payableAmount: charge.totalCharged,
+      payableAmount: charge.total,
       spaceName: d.space.name,
       dueDate: d.dueDate.toISOString().slice(0, 10),
     };
@@ -282,7 +282,7 @@ async function handleRepSummary(userId: string): Promise<RepSummaryResult> {
       const [dueCount, payments, payouts] = await Promise.all([
         db.due.count({ where: { spaceId: sid } }),
         db.duePayment.aggregate({ where: { due: { spaceId: sid } }, _sum: { amountPaid: true, netToSpace: true } }),
-        db.payout.aggregate({ where: { spaceId: sid, status: 'completed' }, _sum: { amount: true } }),
+        db.payout.aggregate({ where: { spaceId: sid, status: 'success' }, _sum: { amount: true } }),
       ]);
       return {
         spaceId: sid,

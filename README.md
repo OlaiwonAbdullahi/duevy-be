@@ -1,132 +1,182 @@
 # Duevy Backend
 
-REST API powering **Duevy** — a dues collection platform for Nigerian university departments/classes. Handles auth, spaces (departments/classes), dues collection, payments (Paystack/Monnify), payouts to reps, polls, referrals, disputes, notifications, and an AI chat assistant ("Duey").
+REST API for **Duevy**, a dues collection platform for Nigerian universities. Students join their department or association with a join code and pay its dues. Reps collect the money and withdraw it.
 
-## Tech Stack
+Payments run on **Bachs Connect** ([docs.bachs.io](https://docs.bachs.io)). Launch is LAUTECH only, but the data model is multi-school.
 
-- **Runtime**: Node.js 20+, TypeScript
-- **Framework**: Express 5
-- **Database**: PostgreSQL via Prisma ORM (designed for Supabase)
-- **Cache/Queue**: Redis (via BullMQ / reconciliation jobs), run through Docker Compose
-- **Auth**: JWT (access + refresh tokens via `jose`), bcrypt password hashing
-- **Payments**: Paystack and Monnify (both fully implemented, toggled via env var)
-- **Email**: Resend
-- **AI Assistant**: pluggable LLM provider — Ollama (local), Gemini, or any OpenAI-compatible hosted endpoint
-- **Validation**: Zod
-- **Testing**: Vitest
+- API reference: [`API.md`](API.md)
+- How the Bachs integration works, and the open questions: [`docs/BACHS.md`](docs/BACHS.md)
 
-## Prerequisites
+## Tech stack
 
-- Node.js **20+** and npm
-- Docker (for local Redis) — or a reachable Redis instance
-- A PostgreSQL database (the project is set up for [Supabase](https://supabase.com), but any Postgres works)
-- A [Resend](https://resend.com) API key (required — used for transactional email)
-- A [Paystack](https://paystack.com) or [Monnify](https://monnify.com) account (test/sandbox keys are fine for local dev)
-- (Optional) [Ollama](https://ollama.com) running locally if you want to use the AI assistant with the default `ollama` provider
+- **Runtime:** Node.js 20+, TypeScript, Express 5
+- **Database:** PostgreSQL (Supabase) through Prisma
+- **Validation:** Zod for request bodies and env vars
+- **Auth:** JWT access tokens plus httpOnly refresh cookies (jose, bcrypt)
+- **Payments:** Bachs Connect, behind a provider interface in `src/providers/payment`
+- **Jobs:** a database-backed queue for webhooks plus a reconciliation sweep. No Redis is required.
+- **Logging:** pino (structured JSON), with sensitive fields redacted
+- **Email:** Resend
+- **Tests:** Vitest. Integration tests run against a throwaway embedded Postgres.
+
+## How money moves
+
+1. **Rep onboarding.** A rep signs up, their application is `pending`, and an admin approves it, which sets `isRep`.
+   - An approved rep can create a space and draft dues straight away.
+   - Publishing dues, and so collecting, needs KYC.
+2. **KYC.** Two checks, both needed before the rep's spaces can collect:
+   - **Identity, by Bachs.** The rep submits their NIN, date of birth and gender. Duevy creates a Bachs **Connect account** for the rep with them as its representative, and the verdict arrives by webhook. A BVN or ID document is sent only if Bachs asks for one; what Bachs still wants is shown to the rep.
+   - **Student status, by Duevy.** In the same submission the rep uploads their student ID card. It is stored privately in ImageKit, and an admin approves or rejects it.
+   - The NIN, BVN and date of birth are never stored or logged. Only the statuses, Bachs's references and the ImageKit file reference are kept.
+3. **Checkout.** A student picks one or more dues from one space. Duevy computes the amounts:
+   - face = the sum of the dues
+   - fee = 2% of the face + ₦20
+   - total = face + fee
+
+   It then opens a Bachs **destination charge** for the total:
+   - `platform_fee` is set to the fee, and the destination is the rep's account.
+   - Bachs returns a one-time bank account, and the student pays everything with **one bank transfer**.
+4. **Webhook.** `collection.succeeded` marks the dues paid, credits the space's ledger with the face amount, and issues a receipt.
+   - Underpaid, overpaid, expired and duplicate events are all handled; see [`docs/BACHS.md`](docs/BACHS.md).
+5. **Ledger.** Each space has an append-only ledger, and the balance is always the sum of its entries. A database trigger rejects any UPDATE or DELETE.
+6. **Withdrawal.** The rep withdraws to their own bank account. The account name must match the rep's name.
+   - Fee: ₦100 under ₦50,000, ₦200 from ₦50,000, deducted from the withdrawal.
+   - Safeguards: the request needs an idempotency key, the space is locked, and only one withdrawal can be in flight.
+   - The amount is debited from the ledger when the withdrawal is created. If it fails or is reversed, the full amount is credited back.
+
+All money is integer kobo. Fees are always computed on the server.
 
 ## Setup
 
-### 1. Clone and install dependencies
-
 ```bash
-git clone <repo-url>
-cd duevy-backend
 npm install
+cp .env.example .env      # then fill it in, see "Environment variables"
+npm run db:deploy         # apply migrations (npm run db:migrate in development)
+npm run db:seed           # super admin, test rep, test student, a space with dues
+npm run dev               # http://localhost:3000, all routes under /v1
 ```
 
-`npm install` runs `postinstall` automatically, which runs `prisma generate` + `tsc` (the build script). This is expected — you don't need to build manually before `npm run dev`.
+`npm install` runs `postinstall`, which runs the build (`prisma generate` + `tsc`).
 
-### 2. Configure environment variables
+**Running locally without Bachs or ImageKit.** Set `PAYMENT_PROVIDER=fake` and `FILE_STORAGE=memory`. The fake provider opens fake bank accounts and resolves names instantly, but webhooks still use the real Bachs signature scheme. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
 
-```bash
-cp .env.example .env
-```
+Seeded logins (password `Demo1234!`):
 
-Then fill in `.env`. At minimum you need:
-
-| Variable | Notes |
+| Who | Email |
 |---|---|
-| `DATABASE_URL` / `DIRECT_URL` | Postgres connection strings. `DIRECT_URL` is used for migrations (non-pooled). |
-| `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` | Min 32 chars each. Generate with `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"` |
-| `RESEND_API_KEY` | Required — from [resend.com/api-keys](https://resend.com/api-keys) |
-| `PAYMENT_GATEWAY` | `paystack` (default) or `monnify` |
-| `PAYSTACK_SECRET_KEY` | Required if `PAYMENT_GATEWAY=paystack` |
-| `MONNIFY_API_KEY`, `MONNIFY_SECRET_KEY`, `MONNIFY_CONTRACT_CODE`, `MONNIFY_WEBHOOK_SECRET` | Required if `PAYMENT_GATEWAY=monnify` |
-| `REDIS_URL` | Defaults to `redis://localhost:6379` (matches `docker-compose.yml`) |
+| Super admin | `admin@duevy.test` |
+| Rep (lead of "Computer Science Department", join code `CSC-LAU1`) | `rep@duevy.test` |
+| Student (member of that space) | `student@duevy.test` |
 
-Everything else in `.env.example` has a sensible default or is optional (Google Sign-In, encryption key overrides, LLM provider config, etc.) — see the inline comments in `.env.example` for details. Env vars are validated on boot via Zod (`src/config/env.ts`); the server refuses to start if something required is missing or malformed.
+## Environment variables
 
-### 3. Start Redis
+Every variable is validated at boot in `src/config/env.ts`, and the server refuses to start if a required one is missing. `.env.example` lists them all with comments.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `DATABASE_URL`, `DIRECT_URL` | yes | Postgres. `DIRECT_URL` is the non-pooled URL used for migrations. |
+| `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | yes | At least 32 characters each. |
+| `RESEND_API_KEY` | yes | Email delivery. |
+| `PAYMENT_PROVIDER` | no (`bachs`) | `bachs` or `fake`. `fake` is refused in production. |
+| `BACHS_BASE_URL` | no | Sandbox `https://sandbox-api.bachs.io`; live `https://api.bachs.io`. |
+| `BACHS_SECRET_KEY` | with `bachs` | `sk_sandbox_…` or `sk_live_…`. |
+| `BACHS_WEBHOOK_SECRET` | with `bachs` | The signing secret of the endpoint registered for `/v1/webhooks/bachs`. |
+| `BACHS_WEBHOOK_SECRET_PREVIOUS` | no | The outgoing secret during a 24h rotation. |
+| `WEBHOOK_TOLERANCE_SECONDS` | no (300) | Maximum age of a signed delivery. |
+| `CHECKOUT_EXPIRY_MINUTES` | no (60) | Lifetime of a checkout's bank account, 1–1440. |
+| `RUN_WORKERS` | no (`true`) | Run the webhook worker and reconciliation inside the API. Set `false` and run `npm run worker` separately. |
+| `LOG_LEVEL` | no (`info`) | pino level. |
+| `ENCRYPTION_KEY` | recommended | Encrypts stored bank account numbers. |
+| `FILE_STORAGE` | no (`imagekit`) | `imagekit`, or `memory` for tests and local dev (refused in production). |
+| `IMAGEKIT_PRIVATE_KEY`, `IMAGEKIT_URL_ENDPOINT` | with `imagekit` | Private storage for student ID cards. |
+| `IMAGEKIT_KYC_FOLDER` | no (`/duevy/kyc`) | Folder the KYC documents go in. |
+| `FEATURE_POLLS`, `FEATURE_ASSISTANT`, `FEATURE_REFERRALS` | no (`false`) | Features outside the MVP. Paid voting stays off. |
+
+Google sign-in, CORS, cookies and LLM settings are documented inline in `.env.example`.
+
+## Testing
 
 ```bash
-docker compose up -d
+npm test            # unit tests: fees, kobo/decimal conversion, signatures, event parsing, state machines
+npm run test:int    # integration tests against a real, throwaway Postgres
+npm run test:all    # both
 ```
 
-This starts Redis on `localhost:6379` with a persisted volume.
+`test:int` downloads and starts an embedded Postgres (`embedded-postgres`) and applies the real migration chain to it. That also proves the migrations apply from a clean baseline. It never touches the `DATABASE_URL` in `.env`. To use an existing **empty** database instead (for example in CI), set `TEST_DATABASE_URL`.
 
-### 4. Set up the database
+What the integration suite covers:
+
+- **Webhook idempotency.** One event delivered 5 times, some of them concurrently, plus the same outcome under a second event id. The result is exactly one paid checkout, one ledger credit per due, and one receipt. A forged signature gets 401.
+- **Payment outcomes.**
+  - Underpaid: nothing is marked paid.
+  - Overpaid: the dues are paid at face value and the excess is flagged.
+  - Expired: the checkout closes, and money that arrives later is still honoured.
+  - Unknown reference: the event is retried with backoff.
+- **Ledger.** The balance is derived from entries, a reversal restores it, and UPDATE or DELETE is refused by the database.
+- **Withdrawal locking.** With five concurrent requests, exactly one succeeds and the other four get `WITHDRAWAL_IN_PROGRESS`. Also covered: insufficient balance, a provider refusal (balance restored), a timeout (left pending, never assumed failed), payout webhooks, and Idempotency-Key replay and reuse over HTTP.
+- **KYC.** NIN plus student ID card in one multipart submission; a Bachs webhook confirms the identity and an admin approves the card, and collection opens only when both are done. Also covered: replacing a rejected card (the old file is deleted), forwarding a government ID when Bachs asks, rejecting files that aren't really images or PDFs, and checking that the NIN and date of birth appear nowhere in the database.
+
+## Testing webhooks locally
+
+`scripts/send-test-webhook.ts` posts a correctly signed Bachs-format event, signed with `BACHS_WEBHOOK_SECRET`, to the running API:
 
 ```bash
-npm run db:migrate   # applies Prisma migrations, generates the client
-npm run db:seed       # optional — seeds initial data
+# Start a checkout as the seeded student, then pay it:
+npm run webhook:test -- paid      DVY-XXXX-XXXX 6650        # amount in naira = the checkout total
+npm run webhook:test -- underpaid DVY-XXXX-XXXX 3000 6650
+npm run webhook:test -- overpaid  DVY-XXXX-XXXX 7000 6650
+npm run webhook:test -- expired   DVY-XXXX-XXXX
+npm run webhook:test -- payout-paid   WD-2026-XXXXXX
+npm run webhook:test -- payout-failed WD-2026-XXXXXX
+npm run webhook:test -- identity  acct_fake_seed_rep        # makes the API re-read KYC state
+EVENT_ID=evt_same npm run webhook:test -- paid DVY-XXXX-XXXX 6650   # repeat to test dedupe
 ```
 
-Use `npm run db:studio` any time to browse the database in Prisma Studio.
+`WEBHOOK_URL` overrides the target (the default is `http://localhost:$PORT/v1/webhooks/bachs`).
 
-### 5. Run the dev server
+**Against the Bachs sandbox:**
 
-```bash
-npm run dev
-```
+1. Expose the API with a tunnel, e.g. `cloudflared tunnel --url http://localhost:3000` or `ngrok http 3000`.
+2. In the Bachs dashboard, register `https://<tunnel>/v1/webhooks/bachs` with **`event_source: all`**. Without it, Connect events such as KYC and capability changes never arrive.
+3. Put the endpoint's signing secret in `BACHS_WEBHOOK_SECRET`.
+4. For sandbox payments, Bachs's custom checkout `confirm` accepts `simulated_outcome` (`success`, `failed` or `underpaid`). `POST /v1/webhooks/replay` re-sends an event.
 
-The API starts at `http://localhost:3000`, with all routes mounted under `/v1` (e.g. `http://localhost:3000/v1/auth/login`). A health check is available at `GET /health`.
+The webhook route only verifies the signature, stores the event (deduplicated by Bachs's event id) and returns 200. Processing happens in `src/jobs/webhookWorker.ts`. Events that keep failing land in `dead` and show on `GET /v1/admin/health`.
 
 ## Scripts
 
 | Command | Description |
 |---|---|
-| `npm run dev` | Start the dev server with hot reload (`tsx watch`) |
-| `npm run build` | Generate Prisma client + compile TypeScript to `dist/` |
-| `npm start` | Run the compiled server (`dist/server.js`) — use in production |
-| `npm run lint` | Lint `src/` with ESLint |
-| `npm run format` | Format `src/` with Prettier |
-| `npm test` | Run the test suite once (Vitest) |
-| `npm run test:watch` | Run tests in watch mode |
-| `npm run db:generate` | Regenerate the Prisma client |
-| `npm run db:migrate` | Run/create Prisma migrations (dev) |
-| `npm run db:push` | Push schema changes without a migration |
-| `npm run db:studio` | Open Prisma Studio |
-| `npm run db:seed` | Run `prisma/seed.ts` |
+| `npm run dev` / `npm run dev:worker` | API / standalone worker, with hot reload |
+| `npm run build` / `npm start` | Compile to `dist/` / run the compiled API |
+| `npm run worker` | Run the compiled worker (webhook queue + reconciliation) |
+| `npm test`, `npm run test:int`, `npm run test:all` | Tests |
+| `npm run db:deploy` | Apply migrations (production) |
+| `npm run db:migrate` | Create and apply migrations (development) |
+| `npm run db:seed` | Seed development data. Refuses to run in production. |
+| `npm run db:studio` | Prisma Studio |
+| `npm run webhook:test -- …` | Send a signed test webhook |
 
-There's also `scripts/create-admin.mjs` for provisioning an admin user, and one-off scripts under `prisma/` (`backfillSubaccounts.ts`, `convertWalletBalances.ts`, `notifyBalanceConversion.ts`) for data migrations — run with `tsx prisma/<script>.ts`.
-
-## Project Structure
+## Project structure
 
 ```
 src/
-├── app.ts              # Express app: middleware, CORS, routing, error handling
-├── server.ts            # Entry point: connects DB, starts server + background jobs
-├── config/              # env validation, db client, assistant system prompt
-├── routes/               # one file per resource (auth, dues, payouts, polls, ...)
-├── services/             # business logic (auth, payments, payouts, polls, referrals, assistant)
-├── middleware/            # auth guard, rate limiting, error handling
-├── lib/                   # gateway clients (Paystack/Monnify), email, PDF, LLM adapters
-├── jobs/                  # background jobs (payment reconciliation)
-└── types/                 # shared TypeScript types
-
+├── app.ts / server.ts / worker.ts   Express app, API entry point, standalone worker entry point
+├── config/                          env validation, Prisma client
+├── providers/payment/               PaymentProvider interface + Bachs and fake implementations
+├── services/                        checkout, ledger, withdrawal, kyc, receipt, webhookProcessor, …
+├── jobs/                            webhookWorker (DB queue), reconciliation (backstop for lost webhooks)
+├── routes/                          one router per resource
+├── middleware/                      auth, idempotency, rate limits, validation, errors
+├── lib/                             money (kobo + fees), state machines, logger, …
+└── test/                            unit test setup, integration fixtures
 prisma/
-└── schema.prisma          # data model (users, spaces, dues, payments, payouts, polls, ...)
+├── schema.prisma
+├── migrations/
+└── seed.ts
 ```
-
-Key domain concepts: a **Space** is a department/class; a **SpaceRep** collects **Dues** from members via **DuePayment**s; payments flow through Paystack or Monnify and reconcile into **Transaction**s; reps request **Payout**s to their **BankAccount**.
-
-## API Documentation
-
-- [`docs/FRONTEND_API_GUIDE.md`](docs/FRONTEND_API_GUIDE.md) — guide for frontend consumers
-- [`docs/ASSISTANT_API_GUIDE.md`](docs/ASSISTANT_API_GUIDE.md) — Duey (AI assistant) integration guide
 
 ## Notes
 
-- Payment gateway is swappable via `PAYMENT_GATEWAY` env var — both Paystack and Monnify implementations are kept fully working (`src/lib/paystack.ts`, `src/lib/monnify.ts`, selected in `src/lib/paymentGateway.ts`).
-- The AI assistant (`src/services/assistant.service.ts`) is provider-agnostic — switch between `ollama`, `gemini`, and any OpenAI-compatible `hosted` endpoint via `LLM_PROVIDER` with no code changes.
-- Uploaded files (avatars, nominee images) are served statically from `/uploads`.
+- **Out of MVP scope:** polls, the assistant, referrals and co-rep features exist behind feature flags, but their payment paths are disabled. This includes paid voting and discount codes at checkout. The payout approval quorum is gone.
+- **Anchor-era columns** (`anchor*`, `kycTier`, the remittance fields) are kept read-only. Payouts and webhook events from before the cutover are tagged `provider = 'anchor'`, and the Bachs reconciliation never touches them. See [`docs/BACHS.md`](docs/BACHS.md) for cutover steps.

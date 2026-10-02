@@ -14,6 +14,8 @@ const prefixes = {
   notification: 'ntf',
   dispute: 'dsp',
   report: 'rpt',
+  checkout: 'chk',
+  ledger: 'led',
 } as const;
 
 type Prefix = keyof typeof prefixes;

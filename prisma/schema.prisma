@@ -68,12 +68,17 @@ enum SpaceTheme {
   tangerine
 }
 
-enum DueCategory {
-  levy
-  dinner
+// The kind of payment item a due is. Stored in the dues.category column.
+enum DueType {
   handout
-  welfare
-  sport
+  departmental_due
+  exam_levy
+  lab_manual
+  association_due
+  departmental_wear
+  trip_fee
+  clearance
+  other
 }
 
 enum RepDueStatus {
@@ -86,11 +91,6 @@ enum PayMethod {
   wallet
   card
   online
-}
-
-enum PaymentGatewayName {
-  paystack
-  monnify
 }
 
 enum TxnType {
@@ -109,17 +109,51 @@ enum TxnStatus {
   failed
 }
 
+// A withdrawal's lifecycle. Legal moves live in src/lib/stateMachine.ts:
+// pending → processing → success | failed | reversed (plus pending → failed).
 enum PayoutStatus {
-  pending_approval
+  pending
   processing
-  completed
+  success
   failed
-  cancelled
+  reversed
+}
+
+// A checkout's lifecycle: pending → paid | expired | underpaid (plus the
+// late-money exceptions documented in src/lib/stateMachine.ts).
+enum CheckoutStatus {
+  pending
+  paid
+  expired
+  underpaid
+}
+
+// The DB-backed job queue's states for an inbound webhook event.
+enum WebhookStatus {
+  received
+  processing
+  processed
+  failed
+  dead
 }
 
 enum PayoutApprovalDecision {
   approved
   rejected
+}
+
+enum LedgerEntryType {
+  due_payment // credit: a student's payment, at face value
+  refund
+  payout // debit: what was sent to the rep's bank
+  payout_fee // debit: the withdrawal fee, deducted from the withdrawal
+  payout_reversal // credit: a failed or reversed withdrawal, restored in full
+  manual_credit
+}
+
+enum LedgerDirection {
+  credit
+  debit
 }
 
 enum PollStatus {
@@ -150,11 +184,32 @@ enum NotificationTone {
   rose
 }
 
+// Duevy's own review of a document Bachs doesn't check (the rep's student ID).
+enum DocumentReviewStatus {
+  pending
+  approved
+  rejected
+}
+
 enum KycStatus {
   unverified
   pending
   verified
   rejected
+}
+
+// Anchor's verification levels, named as the API names them — NOT as the prose
+// docs do. The `level` enum accepts only TIER_2 and TIER_3; there is no TIER_1
+// to submit. See the callout in src/lib/anchor.ts before renaming anything.
+//
+//   tier_0  the customer exists (name, address, email, phone) but is unverified.
+//   tier_2  BVN + date of birth + gender. Automatic, ₦50, capped at ₦300,000.
+//   tier_3  a government ID document. Manual review, ₦200, and UNLIMITED —
+//           which is the whole reason to offer the upgrade.
+enum KycTier {
+  tier_0
+  tier_2
+  tier_3
 }
 
 enum DisputeStatus {
@@ -247,55 +302,108 @@ enum AssistantRole {
 // ---------------------------------------------------------------------------
 
 model User {
-  id                    String               @id @default(cuid())
-  name                  String
-  email                 String               @unique
-  emailVerified         Boolean              @default(false)
-  passwordHash          String?
-  phone                 String?
-  avatarUrl             String?
-  role                  Role                 @default(student)
-  repApplicationStatus  RepApplicationStatus @default(none)
-  adminSubRole          AdminSubRole?
-  matricNo              String?
-  level                 String?
-  notificationPrefs     Json?                // §3.4 — email/push toggles; null = defaults
-  referralCode          String?              @unique
-  kycStatus             KycStatus            @default(unverified)
-  kycDocUrls            String[]             @default([])
-  isSuspended           Boolean              @default(false)
-  suspendedReason       String?
-  isDeactivated         Boolean              @default(false)
-  deactivatedReason     String?
-  termsAcceptedAt       DateTime?
-  termsVersion          String?
-  createdAt             DateTime             @default(now())
-  updatedAt             DateTime             @updatedAt
+  id                      String                @id @default(cuid())
+  name                    String
+  email                   String                @unique
+  emailVerified           Boolean               @default(false)
+  passwordHash            String?
+  phone                   String?
+  avatarUrl               String?
+  // `role` is the coarse label carried in the access token (admin vs not).
+  // Permissions are ADDITIVE: every user is a student; `isRep` is granted on
+  // top once an admin approves their rep application, and is what rep-only
+  // actions (creating a space) check. Space-level authority is SpaceRep.
+  role                    Role                  @default(student)
+  isRep                   Boolean               @default(false)
+  repApplicationStatus    RepApplicationStatus  @default(none)
+  adminSubRole            AdminSubRole?
+  // Multi-school ready; launch is LAUTECH only.
+  institution             String                @default("LAUTECH")
+  matricNo                String?
+  level                   String?
+  notificationPrefs       Json? // §3.4 — email/push toggles; null = defaults
+  referralCode            String?               @unique
+  // Rep identity on Bachs Connect. Each rep is a recipient Connect account
+  // (bachsAccountId) whose representative person (bachsPersonId — the
+  // provider reference for KYC) carries the rep's NIN (and a BVN only if Bachs
+  // later asks for one). Collections settle into this account as destination
+  // charges and withdrawals are paid out of it.
+  //
+  // THE NIN, BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to
+  // Bachs in the KYC request and nowhere else; only the outcome is stored.
+  bachsAccountId          String?               @unique
+  bachsPersonId           String?
+  // Bachs reports these separately: the person's verification, and whether the
+  // account may pay out. A rep can collect only when both are true.
+  kycStatus               KycStatus             @default(unverified)
+  bachsPayoutsActive      Boolean               @default(false)
+  kycSubmittedAt          DateTime?
+  kycResolvedAt           DateTime?
+  kycRejectionReason      String?
+  kycAttempts             Int                   @default(0)
+  kycRetryLockedUntil     DateTime? // §9.2 — 24h lock after 3 consecutive failures
+  // Field keys Bachs still asks for on the rep's account (e.g. a BVN or an ID
+  // document), refreshed on every identity event, so the rep can be told.
+  kycRequirementsDue      String[]              @default([])
+  governmentIdSubmittedAt DateTime? // an ID document forwarded to Bachs on request
+  // The rep's student ID card — Duevy's own check, not Bachs's. Uploaded at
+  // KYC time to private storage (ImageKit) and reviewed by an admin; a space
+  // can only collect once it is approved. Only the storage reference is kept.
+  studentIdFileId         String?
+  studentIdFilePath       String?
+  studentIdMimeType       String?
+  studentIdStatus         DocumentReviewStatus?
+  studentIdUploadedAt     DateTime?
+  studentIdReviewedAt     DateTime?
+  studentIdReviewedById   String?
+  studentIdReviewNote     String?
+  // --- Legacy (Anchor era). Read-only; kept so historical rows and any
+  // balance still held at Anchor stay traceable. Nothing writes these.
+  anchorCustomerId        String?               @unique
+  kycTier                 KycTier               @default(tier_0)
+  kycPendingTier          KycTier?
+  kycDocUrls              String[]              @default([])
+  addressLine1            String?
+  addressLine2            String?
+  city                    String?
+  state                   String? // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
+  postalCode              String?
+  isSuspended             Boolean               @default(false)
+  suspendedReason         String?
+  isDeactivated           Boolean               @default(false)
+  deactivatedReason       String?
+  termsAcceptedAt         DateTime?
+  termsVersion            String?
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
 
   // Relations
-  refreshTokens         RefreshToken[]
-  emailVerifications    EmailVerification[]
-  passwordResets        PasswordReset[]
-  spaceMemberships      SpaceMembership[]
-  spaceReps             SpaceRep[]
-  spaceJoinRequests     SpaceJoinRequest[]
-  duePayments           DuePayment[]
-  transactions          Transaction[]
-  cards                 Card[]
-  notifications         Notification[]
-  pollVotes             PollVote[]
-  referralsMade         Referral[]           @relation("referrer")
-  referralReceived      Referral?            @relation("referred")
-  discountCodes         DiscountCode[]
-  adminPermissions      AdminPermission?
-  disputes              Dispute[]
-  idempotencyKeys       IdempotencyKey[]
-  sessions              Session[]
+  refreshTokens          RefreshToken[]
+  emailVerifications     EmailVerification[]
+  passwordResets         PasswordReset[]
+  spaceMemberships       SpaceMembership[]
+  spaceReps              SpaceRep[]
+  spaceJoinRequests      SpaceJoinRequest[]
+  duePayments            DuePayment[]
+  transactions           Transaction[]
+  notifications          Notification[]
+  pollVotes              PollVote[]
+  referralsMade          Referral[]              @relation("referrer")
+  referralReceived       Referral?               @relation("referred")
+  discountCodes          DiscountCode[]
+  adminPermissions       AdminPermission?
+  disputes               Dispute[]
+  idempotencyKeys        IdempotencyKey[]
+  sessions               Session[]
   assistantConversations AssistantConversation[]
-  assignedDues          Due[]                    @relation("DueAssignedRep")
-  requestedPayouts      Payout[]                 @relation("PayoutRequestedBy")
-  payoutApprovals       PayoutApproval[]
+  assignedDues           Due[]                   @relation("DueAssignedRep")
+  requestedPayouts       Payout[]                @relation("PayoutRequestedBy")
+  payoutApprovals        PayoutApproval[]
+  checkouts              Checkout[]
+  receipts               Receipt[]
 
+  @@index([institution])
+  @@index([studentIdStatus])
   @@map("users")
 }
 
@@ -317,13 +425,13 @@ model RefreshToken {
 }
 
 model Session {
-  id        String    @id @default(cuid())
-  userId    String
-  device    String?
-  ip        String?
-  lastSeenAt DateTime @default(now())
-  revokedAt DateTime?
-  createdAt DateTime  @default(now())
+  id         String    @id @default(cuid())
+  userId     String
+  device     String?
+  ip         String?
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -332,12 +440,12 @@ model Session {
 }
 
 model EmailVerification {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
-  token     String   @unique
+  token     String    @unique
   expiresAt DateTime
   usedAt    DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -364,36 +472,37 @@ model PasswordReset {
 // ---------------------------------------------------------------------------
 
 model Space {
-  id             String      @id @default(cuid())
-  name           String
-  short          String      // 2-6 chars, monogram
-  kind           SpaceKind
-  hue            EmblemHue   @default(emerald)
-  theme          SpaceTheme  @default(emerald)
-  about          String?
-  faculty        String?
-  school         String
-  joinCode       String      @unique
-  requireApproval Boolean    @default(false)
-  isArchived     Boolean     @default(false)
-  archivedAt     DateTime?
-  archivedReason String?
-  payoutsFrozen  Boolean     @default(false)
-  frozenReason   String?
-  // Subaccount reps settle into directly at charge time (payment architecture
-  // migration — see PUT /payout/account, which creates/updates this alongside
-  // the BankAccount it's derived from). Null until a bank account has been
-  // resolved and the subaccount created. Subaccount codes are gateway-specific
-  // (a Paystack ACCT_... code means nothing to Monnify and vice versa) —
-  // subaccountGateway records which gateway this code belongs to, mirroring
-  // BankAccount.bankCodeGateway. If it doesn't match the currently active
-  // gateway, treat as if no subaccount exists (safe fallback: the payment
-  // routes to Duevy's main account instead of erroring) rather than sending a
-  // stale code to a provider that's never heard of it.
-  paystackSubaccountCode String? @unique
-  subaccountGateway      PaymentGatewayName?
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  id                   String     @id @default(cuid())
+  name                 String
+  short                String // 2-6 chars, monogram
+  kind                 SpaceKind
+  hue                  EmblemHue  @default(emerald)
+  theme                SpaceTheme @default(emerald)
+  about                String?
+  faculty              String?
+  school               String // display name of the school
+  // Institution code the space belongs to. Multi-school ready; launch is
+  // LAUTECH only.
+  institution          String     @default("LAUTECH")
+  joinCode             String     @unique
+  requireApproval      Boolean    @default(false)
+  isArchived           Boolean    @default(false)
+  archivedAt           DateTime?
+  archivedReason       String?
+  payoutsFrozen        Boolean    @default(false)
+  frozenReason         String?
+  // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
+  // its own: collections settle into the LEAD REP's Connect account and the
+  // space's share is tracked by its ledger. These stay so any balance still
+  // held in an Anchor deposit account can be traced and paid out by an admin.
+  anchorAccountId      String?    @unique
+  anchorAccountNumber  String?
+  anchorBankName       String?
+  anchorAccountStatus  String? // ACTIVE | BLOCKED | CLOSED | DEPRECATED
+  // The rep's payout bank account, registered with Anchor as a CounterParty.
+  anchorCounterPartyId String?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
 
   // Relations
   memberships    SpaceMembership[]
@@ -405,16 +514,20 @@ model Space {
   polls          Poll[]
   auditLogs      SpaceAuditLog[]
   repApplication RepApplication?
+  ledgerEntries  LedgerEntry[]
+  checkouts      Checkout[]
+  receipts       Receipt[]
 
+  @@index([institution])
   @@map("spaces")
 }
 
 model SpaceMembership {
-  id         String              @id @default(cuid())
-  userId     String
-  spaceId    String
-  kind       SpaceMembershipKind @default(member)
-  joinedAt   DateTime            @default(now())
+  id       String              @id @default(cuid())
+  userId   String
+  spaceId  String
+  kind     SpaceMembershipKind @default(member)
+  joinedAt DateTime            @default(now())
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
@@ -425,10 +538,10 @@ model SpaceMembership {
 }
 
 model SpaceRep {
-  id      String  @id @default(cuid())
+  id      String   @id @default(cuid())
   userId  String
   spaceId String
-  role    RepRole @default(co)
+  role    RepRole  @default(co)
   addedAt DateTime @default(now())
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -440,11 +553,11 @@ model SpaceRep {
 }
 
 model SpaceJoinRequest {
-  id        String                 @id @default(cuid())
-  userId    String
-  spaceId   String
-  status    SpaceJoinRequestStatus @default(pending)
-  createdAt DateTime               @default(now())
+  id         String                 @id @default(cuid())
+  userId     String
+  spaceId    String
+  status     SpaceJoinRequestStatus @default(pending)
+  createdAt  DateTime               @default(now())
   resolvedAt DateTime?
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -457,21 +570,21 @@ model SpaceJoinRequest {
 
 // Holds pending rep application data (submitted at signup, provisioned on admin approve)
 model RepApplication {
-  id              String    @id @default(cuid())
-  userId          String    @unique
-  spaceId         String?   @unique // set once space is provisioned on approval
-  spaceName       String
-  spaceShort      String
-  spaceKind       SpaceKind
-  school          String
-  faculty         String?
-  theme           SpaceTheme
-  coRepInvites    String[]  @default([])
-  referralCode    String?
-  status          RepApplicationStatus @default(pending)
-  reviewNote      String?
-  reviewedAt      DateTime?
-  createdAt       DateTime  @default(now())
+  id           String               @id @default(cuid())
+  userId       String               @unique
+  spaceId      String?              @unique // set once space is provisioned on approval
+  spaceName    String
+  spaceShort   String
+  spaceKind    SpaceKind
+  school       String
+  faculty      String?
+  theme        SpaceTheme
+  coRepInvites String[]             @default([])
+  referralCode String?
+  status       RepApplicationStatus @default(pending)
+  reviewNote   String?
+  reviewedAt   DateTime?
+  createdAt    DateTime             @default(now())
 
   space Space? @relation(fields: [spaceId], references: [id])
 
@@ -483,7 +596,7 @@ model SpaceAuditLog {
   spaceId     String
   actorId     String
   actorName   String
-  actorRole   RepRole?    // the actor's SpaceRep role at write time; null for historical rows
+  actorRole   RepRole? // the actor's SpaceRep role at write time; null for historical rows
   action      AuditAction
   description String
   createdAt   DateTime    @default(now())
@@ -499,26 +612,28 @@ model SpaceAuditLog {
 // ---------------------------------------------------------------------------
 
 model Due {
-  id          String       @id @default(cuid())
-  spaceId     String
-  title       String
-  note        String?
-  amount      Int          // kobo
-  dueDate     DateTime     // YYYY-MM-DD
-  category    DueCategory
-  status      RepDueStatus @default(draft)
-  allowGuests Boolean      @default(false)
-  publishedAt DateTime?
-  closedAt    DateTime?
+  id             String       @id @default(cuid())
+  spaceId        String
+  title          String
+  note           String?
+  amount         Int // kobo
+  dueDate        DateTime // YYYY-MM-DD — the deadline
+  category       DueType // exposed as `type` in the API
+  status         RepDueStatus @default(draft)
+  allowGuests    Boolean      @default(false)
+  publishedAt    DateTime?
+  closedAt       DateTime?
   lastRemindedAt DateTime? // §7.7 reminder cooldown
-  assignedRepId String?    // the rep whose due-scoped payout access this due is scoped to
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  assignedRepId  String? // the rep whose due-scoped payout access this due is scoped to
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
-  space       Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
-  payments    DuePayment[]
-  payouts     Payout[]
-  assignedRep User?        @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
+  space         Space          @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  payments      DuePayment[]
+  payouts       Payout[]
+  assignedRep   User?          @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
+  ledgerEntries LedgerEntry[]
+  checkoutItems CheckoutItem[]
 
   @@index([spaceId])
   @@index([assignedRepId])
@@ -526,45 +641,132 @@ model Due {
 }
 
 model DuePayment {
-  id          String    @id @default(cuid())
-  userId      String
-  dueId       String
-  txnId       String?   @unique
-  paidAt      DateTime  @default(now())
-  reference   String    @unique
-  amountPaid  Int       // kobo — face value (= due.amount)
-  monnifyFee  Int       // kobo — 1.5% of amountPaid
-  duevyFee    Int       // kobo — 1.5% of amountPaid
-  netToSpace  Int       // kobo — amountPaid - monnifyFee - duevyFee
+  id                    String    @id @default(cuid())
+  userId                String
+  dueId                 String
+  txnId                 String?   @unique
+  paidAt                DateTime  @default(now())
+  // NOT unique: one checkout can settle several dues at once (PRD §5.2), and
+  // every DuePayment it creates shares the checkout's reference. Uniqueness is
+  // carried by @@unique([userId, dueId]) below — a due is paid once per user.
+  reference             String
+  checkoutId            String? // the checkout that settled it; null for legacy and manual-credit rows
+  amountPaid            Int // kobo — this line's share of what the student paid (face + its share of the fee)
+  processingFee         Int // kobo — legacy split of the fee; 0 for Bachs-era rows (Duevy absorbs Bachs's fee)
+  duevyFee              Int // kobo — this line's share of the checkout service charge
+  netToSpace            Int // kobo — the face value, credited to the space in full
+  // --- Legacy (Anchor era) checkout/remittance fields. Nothing writes these now.
+  payWithTransferId     String?
+  checkoutAccountNumber String?
+  checkoutExpiresAt     DateTime?
+  settledAt             DateTime?
+  remittedAt            DateTime?
+  remitTransferId       String?
 
-  user        User        @relation(fields: [userId], references: [id])
-  due         Due         @relation(fields: [dueId], references: [id])
-  transaction Transaction? @relation(fields: [txnId], references: [id])
+  user          User          @relation(fields: [userId], references: [id])
+  due           Due           @relation(fields: [dueId], references: [id])
+  transaction   Transaction?  @relation(fields: [txnId], references: [id])
+  checkout      Checkout?     @relation(fields: [checkoutId], references: [id])
+  ledgerEntries LedgerEntry[]
 
   @@unique([userId, dueId])
   @@index([dueId])
+  @@index([reference])
+  @@index([checkoutId])
   @@map("due_payments")
 }
 
 // ---------------------------------------------------------------------------
-// Wallet, Cards & Transactions
+// Checkouts — one bank transfer settling one or more dues
 // ---------------------------------------------------------------------------
 
-model Card {
-  id            String  @id @default(cuid())
-  userId        String
-  providerToken String  @unique
-  brand         String  // Visa | Mastercard | Verve
-  last4         String
-  expiry        String  // MM/YY
-  isDefault     Boolean @default(false)
-  createdAt     DateTime @default(now())
+// A student's basket of dues from one space, paid by ONE transfer into a
+// one-time bank account opened for this checkout. Fees are computed server
+// side when it is created and never change afterwards.
+model Checkout {
+  id                   String         @id @default(cuid())
+  reference            String         @unique // our reference; also the provider's
+  userId               String
+  spaceId              String
+  status               CheckoutStatus @default(pending)
+  faceKobo             Int // sum of the dues' face amounts — what the space receives
+  feeKobo              Int // 2% + ₦20, on top
+  totalKobo            Int // faceKobo + feeKobo — what the student must transfer
+  receivedKobo         Int? // what the provider reported as received
+  overpaidKobo         Int            @default(0)
+  // The sorted due ids, so a repeat request for the same basket returns the
+  // still-open checkout instead of opening a second account.
+  dueSetKey            String
+  provider             String         @default("bachs")
+  providerCheckoutId   String?        @unique
+  providerChargeId     String?
+  // The rep's Connect account the face amount is routed to (destination charge).
+  destinationAccountId String?
+  // The one-time bank account the student transfers into.
+  vaAccountNumber      String?
+  vaBankName           String?
+  vaAccountName        String?
+  expiresAt            DateTime
+  paidAt               DateTime?
+  expiredAt            DateTime?
+  underpaidAt          DateTime?
+  // Set on anything a human has to look at: underpaid, overpaid, late money,
+  // or a paid checkout whose dues had already been settled elsewhere.
+  needsReview          Boolean        @default(false)
+  reviewReason         String?
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user        User           @relation(fields: [userId], references: [id])
+  space       Space          @relation(fields: [spaceId], references: [id])
+  items       CheckoutItem[]
+  duePayments DuePayment[]
+  receipt     Receipt?
 
-  @@index([userId])
-  @@map("cards")
+  @@index([userId, status])
+  @@index([spaceId, status])
+  @@index([status, expiresAt])
+  @@index([needsReview])
+  @@map("checkouts")
 }
+
+model CheckoutItem {
+  id         String @id @default(cuid())
+  checkoutId String
+  dueId      String
+  faceKobo   Int // the due's face amount at the time of checkout
+  feeKobo    Int // this line's share of the checkout fee (sums to Checkout.feeKobo)
+
+  checkout Checkout @relation(fields: [checkoutId], references: [id], onDelete: Cascade)
+  due      Due      @relation(fields: [dueId], references: [id])
+
+  @@unique([checkoutId, dueId])
+  @@index([dueId])
+  @@map("checkout_items")
+}
+
+// Issued once per paid checkout. The PDF is rendered on demand from the
+// checkout's own rows, so the receipt can never disagree with the ledger.
+model Receipt {
+  id         String   @id @default(cuid())
+  number     String   @unique
+  checkoutId String   @unique
+  userId     String
+  spaceId    String
+  totalKobo  Int
+  issuedAt   DateTime @default(now())
+
+  checkout Checkout @relation(fields: [checkoutId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+  space    Space    @relation(fields: [spaceId], references: [id])
+
+  @@index([userId, issuedAt])
+  @@map("receipts")
+}
+
+// ---------------------------------------------------------------------------
+// Wallet & Transactions
+// ---------------------------------------------------------------------------
 
 model Transaction {
   id            String    @id @default(cuid())
@@ -572,19 +774,20 @@ model Transaction {
   type          TxnType
   title         String
   detail        String?
-  amount        Int       // kobo, signed
-  method        String    // "Wallet" | "Visa •••• 4242" | "Monnify"
+  amount        Int // kobo, signed
+  method        String // "Bank transfer" | legacy: "Wallet", "Anchor", "Bachs"
   status        TxnStatus @default(pending)
   reference     String    @unique
   spaceId       String?
-  refundOfTxnId String?   // set on `type: refund` rows — the transaction this refund reverses
+  refundOfTxnId String? // set on `type: refund` rows — the transaction this refund reverses
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  user       User          @relation(fields: [userId], references: [id])
-  duePayment DuePayment?
-  refundOf   Transaction?  @relation("TransactionRefunds", fields: [refundOfTxnId], references: [id])
-  refunds    Transaction[] @relation("TransactionRefunds")
+  user          User          @relation(fields: [userId], references: [id])
+  duePayment    DuePayment?
+  refundOf      Transaction?  @relation("TransactionRefunds", fields: [refundOfTxnId], references: [id])
+  refunds       Transaction[] @relation("TransactionRefunds")
+  ledgerEntries LedgerEntry[]
 
   @@index([userId, createdAt])
   @@index([refundOfTxnId])
@@ -592,17 +795,44 @@ model Transaction {
 }
 
 model PendingPayment {
-  id        String    @id @default(cuid())
-  reference String    @unique
+  id        String   @id @default(cuid())
+  reference String   @unique
   userId    String
-  type      String    // "topup" | "due_payment" | "poll_vote"
-  metadata  Json      // stores dueId, pollId etc.
-  status    String    @default("pending")
-  createdAt DateTime  @default(now())
+  type      String // "topup" | "due_payment" | "poll_vote"
+  metadata  Json // stores dueId, pollId, the checkout virtual account, etc.
+  status    String   @default("pending")
+  createdAt DateTime @default(now())
   expiresAt DateTime
 
   @@index([reference])
   @@map("pending_payments")
+}
+
+// Inbound provider events, and the DB-backed job queue that processes them.
+//
+// Bachs delivers at least once, so the webhook route only verifies the
+// signature and inserts here (deduplicated by the provider's event id), then
+// returns 200. src/jobs/webhookWorker.ts claims rows with
+// FOR UPDATE SKIP LOCKED and retries failures with backoff until `dead`.
+// Handlers are idempotent, so a retry or a duplicate is always safe.
+model WebhookEvent {
+  id              String        @id @default(cuid())
+  provider        String        @default("bachs")
+  providerEventId String
+  type            String
+  payload         Json
+  status          WebhookStatus @default(received)
+  attempts        Int           @default(0)
+  nextAttemptAt   DateTime      @default(now())
+  lockedAt        DateTime?
+  error           String?
+  receivedAt      DateTime      @default(now())
+  processedAt     DateTime?
+
+  @@unique([provider, providerEventId])
+  @@index([status, nextAttemptAt])
+  @@index([type, receivedAt])
+  @@map("webhook_events")
 }
 
 // ---------------------------------------------------------------------------
@@ -610,21 +840,20 @@ model PendingPayment {
 // ---------------------------------------------------------------------------
 
 model BankAccount {
-  id              String   @id @default(cuid())
-  spaceId         String   @unique
-  bankCode        String
-  // Bank codes are gateway-specific (Monnify and Paystack number the same
-  // bank differently) — this records which gateway's scheme `bankCode`
-  // currently matches, so a gateway switch can be detected and the code
-  // re-resolved on demand rather than silently misrouting a disbursement.
-  bankCodeGateway PaymentGatewayName?
-  bankName        String
-  accountNumber   String   // stored encrypted
+  id                  String    @id @default(cuid())
+  spaceId             String    @unique
+  bankCode            String
+  bankName            String
+  accountNumber       String // stored encrypted
   accountNumberMasked String // "•••• 4021"
-  accountName     String
-  cooldownUntil   DateTime? // §10.2 — 24h payout hold after an account change
-  setAt           DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  accountName         String
+  // The payout destination registered on the lead rep's Bachs account, and
+  // which account that was (it changes if the space's lead changes).
+  bachsDestinationId  String?
+  bachsAccountId      String?
+  cooldownUntil       DateTime? // §10.2 — 24h payout hold after an account change
+  setAt               DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 
   space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
 
@@ -632,36 +861,65 @@ model BankAccount {
 }
 
 model Payout {
-  id            String       @id @default(cuid())
-  spaceId       String
-  dueId         String?      // null = space-wide (lead-only); set = due-scoped
-  amount        Int          // kobo
-  reference     String       @unique
-  status        PayoutStatus @default(pending_approval)
-  accountMasked String       // "GTBank •••• 4021"
-  note          String?
-  requestedById String?      // who requested it — needed to authorize cancellation
-  failureReason String?
-  requestedAt   DateTime     @default(now())
-  cancelledAt   DateTime?
-  settledAt     DateTime?
+  id                String       @id @default(cuid())
+  spaceId           String
+  dueId             String? // null = space-wide (lead-only); set = due-scoped
+  amount            Int // kobo — the GROSS debit against the space's ledger balance
+  reference         String       @unique // ours; also the provider reference and idempotency key
+  status            PayoutStatus @default(pending)
+  accountMasked     String // "GTBank •••• 4021"
+  note              String?
+  requestedById     String?
+  failureReason     String?
+  // amount = feeKobo + netKobo. netKobo is sent to the bank; feeKobo is
+  // Duevy's withdrawal fee. Both are debited from the ledger when the
+  // withdrawal is created and credited back in full if it fails.
+  feeKobo           Int          @default(0)
+  netKobo           Int          @default(0)
+  // Set to spaceId while the payout is pending/processing and cleared when it
+  // ends. Unique, so a space can never have two withdrawals in flight — the
+  // database-level backstop behind the advisory lock in withdrawal.service.
+  activeSpaceId     String?      @unique
+  provider          String       @default("bachs")
+  providerPayoutId  String?      @unique
+  providerAccountId String? // the rep's Connect account it was paid out of
+  providerFeeKobo   Int? // what Bachs charged on top, from the payout response
+  // Once the payout succeeds, Duevy's fee (less Bachs's own payout fee) is
+  // moved from the rep's account to the platform. Signed: positive = swept to
+  // the platform, negative = the platform topped the account up.
+  feeSettlementKobo Int?
+  feeSettledAt      DateTime?
+  requestedAt       DateTime     @default(now())
+  processingAt      DateTime?
+  cancelledAt       DateTime?
+  settledAt         DateTime?
+  failedAt          DateTime?
+  reversedAt        DateTime?
+  // --- Legacy (Anchor era) fee split. Nothing writes these now.
+  duevyFeeKobo      Int          @default(0)
+  anchorFeeKobo     Int          @default(0)
+  stampDutyKobo     Int          @default(0)
+  netSentKobo       Int          @default(0)
+  anchorTransferId  String?
 
-  space       Space            @relation(fields: [spaceId], references: [id])
-  due         Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
-  requestedBy User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
-  approvals   PayoutApproval[]
+  space         Space            @relation(fields: [spaceId], references: [id])
+  due           Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
+  requestedBy   User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  approvals     PayoutApproval[]
+  ledgerEntries LedgerEntry[]
 
-  @@index([spaceId])
+  @@index([spaceId, requestedAt])
+  @@index([status, requestedAt])
   @@index([dueId])
   @@map("payouts")
 }
 
 model PayoutApproval {
-  id        String                  @id @default(cuid())
+  id        String                 @id @default(cuid())
   payoutId  String
   repUserId String
   decision  PayoutApprovalDecision
-  decidedAt DateTime                @default(now())
+  decidedAt DateTime               @default(now())
 
   payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
   rep    User   @relation(fields: [repUserId], references: [id], onDelete: Cascade)
@@ -669,6 +927,44 @@ model PayoutApproval {
   @@unique([payoutId, repUserId])
   @@index([payoutId])
   @@map("payout_approvals")
+}
+
+// Append-only ledger per space — the source of truth for a space's balance,
+// which is always derived (SUM(credit) − SUM(debit), see ledger.service.ts)
+// and never stored. A Postgres trigger rejects UPDATE and DELETE on this
+// table, so a correction is always a new compensating entry. The two unique
+// keys make every write idempotent: one collection credit per DuePayment and
+// one entry of each type per withdrawal, however often a webhook is replayed.
+model LedgerEntry {
+  id           String          @id @default(cuid())
+  spaceId      String
+  dueId        String?
+  txnId        String?
+  duePaymentId String?
+  payoutId     String?
+  type         LedgerEntryType
+  direction    LedgerDirection
+  amountKobo   Int // always positive; direction gives the sign
+  grossKobo    Int?
+  feeKobo      Int?
+  netKobo      Int?
+  reference    String // Transaction.reference / Payout.reference — traceability
+  description  String
+  actorId      String? // set for refund / manual_credit (the admin who acted)
+  createdAt    DateTime        @default(now())
+
+  space      Space        @relation(fields: [spaceId], references: [id])
+  due        Due?         @relation(fields: [dueId], references: [id])
+  txn        Transaction? @relation(fields: [txnId], references: [id])
+  duePayment DuePayment?  @relation(fields: [duePaymentId], references: [id])
+  payout     Payout?      @relation(fields: [payoutId], references: [id])
+
+  @@unique([type, duePaymentId])
+  @@unique([type, payoutId])
+  @@index([spaceId, createdAt])
+  @@index([dueId])
+  @@index([reference])
+  @@map("ledger_entries")
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +1021,7 @@ model Nominee {
   code       String?
   votes      Int     @default(0)
 
-  category PollCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  category  PollCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   pollVotes PollVote[]
 
   @@index([categoryId])
@@ -776,13 +1072,13 @@ model Referral {
 // pays out of pocket beyond its own platform cut; the rep's netToSpace is
 // always untouched by a discount.
 model DiscountCode {
-  id          String    @id @default(cuid())
-  code        String    @unique
-  userId      String
-  amountKobo  Int
-  redeemedAt  DateTime?
-  dueId       String? // which due it was redeemed against, once used
-  createdAt   DateTime  @default(now())
+  id         String    @id @default(cuid())
+  code       String    @unique
+  userId     String
+  amountKobo Int
+  redeemedAt DateTime?
+  dueId      String? // which due it was redeemed against, once used
+  createdAt  DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -816,24 +1112,24 @@ model Notification {
 // ---------------------------------------------------------------------------
 
 model Dispute {
-  id               String        @id @default(cuid())
-  type             DisputeType
-  openedById       String
-  openedByName     String
-  openedByEmail    String
-  department       String?
-  status           DisputeStatus @default(open)
-  slaDays          Int           @default(3)
-  txnReference     String?
-  description      String
-  studentEvidence  Json?
-  repEvidence      Json?
-  claimedById      String?
-  resolution       String?
-  refundTxnId      String?
-  resolvedAt       DateTime?
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
+  id              String        @id @default(cuid())
+  type            DisputeType
+  openedById      String
+  openedByName    String
+  openedByEmail   String
+  department      String?
+  status          DisputeStatus @default(open)
+  slaDays         Int           @default(3)
+  txnReference    String?
+  description     String
+  studentEvidence Json?
+  repEvidence     Json?
+  claimedById     String?
+  resolution      String?
+  refundTxnId     String?
+  resolvedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 
   openedBy User @relation(fields: [openedById], references: [id])
 
@@ -876,51 +1172,38 @@ model AdminAuditLog {
   @@map("admin_audit_logs")
 }
 
-// Single settings row, runtime-editable by a super_admin (§ admin payment
-// gateway switch) so moving between Paystack/Monnify never needs a redeploy.
-// PAYMENT_GATEWAY in env is only the fallback used to seed this row and for
-// when it doesn't exist yet — see src/lib/paymentGateway.ts.
-model AppSettings {
-  id                   String             @id @default("singleton")
-  activePaymentGateway PaymentGatewayName @default(paystack)
-  updatedAt            DateTime           @updatedAt
-  updatedBy            String?
-
-  @@map("app_settings")
-}
-
 model ReferralFlag {
-  id          String     @id @default(cuid())
-  referrerId  String
-  referredId  String
+  id           String     @id @default(cuid())
+  referrerId   String
+  referredId   String
   referrerName String
   referredName String
-  label       String     // rule that fired
-  description String
-  amount      Int        // kobo at stake
-  status      FlagStatus @default(pending)
-  note        String?
-  resolvedAt  DateTime?
-  createdAt   DateTime   @default(now())
+  label        String // rule that fired
+  description  String
+  amount       Int // kobo at stake
+  status       FlagStatus @default(pending)
+  note         String?
+  resolvedAt   DateTime?
+  createdAt    DateTime   @default(now())
 
   @@index([status])
   @@map("referral_flags")
 }
 
 model Report {
-  id          String       @id @default(cuid())
+  id            String       @id @default(cuid())
   requestedById String
-  scope       ReportScope
-  format      ReportFormat
-  status      ReportStatus @default(generating)
-  fromDate    DateTime
-  toDate      DateTime
-  spaceId     String?
-  downloadUrl String?
-  fileSize    Int?
-  generatedAt DateTime?
-  expiresAt   DateTime?
-  createdAt   DateTime     @default(now())
+  scope         ReportScope
+  format        ReportFormat
+  status        ReportStatus @default(generating)
+  fromDate      DateTime
+  toDate        DateTime
+  spaceId       String?
+  downloadUrl   String?
+  fileSize      Int?
+  generatedAt   DateTime?
+  expiresAt     DateTime?
+  createdAt     DateTime     @default(now())
 
   @@index([requestedById])
   @@map("reports")
@@ -930,12 +1213,17 @@ model Report {
 // Idempotency
 // ---------------------------------------------------------------------------
 
+// A key is CLAIMED (responseStatus 0) before the handler runs, so a concurrent
+// duplicate gets 409 instead of running the handler twice; the response is
+// stored on completion. requestHash binds the key to the exact request, so a
+// reused key with a different body is rejected rather than replayed.
 model IdempotencyKey {
   id             String   @id @default(cuid())
   key            String   @unique
   userId         String
-  responseStatus Int
-  responseBody   Json
+  requestHash    String?
+  responseStatus Int // 0 = in progress
+  responseBody   Json?
   expiresAt      DateTime
   createdAt      DateTime @default(now())
 
@@ -964,14 +1252,14 @@ model AssistantConversation {
 }
 
 model AssistantMessage {
-  id             String          @id @default(cuid())
+  id             String           @id @default(cuid())
   conversationId String
   role           AssistantRole
   content        String
   intent         AssistantIntent?
   params         Json?
   confidence     Float?
-  createdAt      DateTime        @default(now())
+  createdAt      DateTime         @default(now())
 
   conversation AssistantConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 

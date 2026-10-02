@@ -1,22 +1,23 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepApplication, type PaymentGatewayName } from '@prisma/client';
+import { type Prisma, type RepApplication } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireAdmin, requireSuperAdmin, requireAdminPermission } from '../middleware/requireRole';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTransaction } from '../lib/serializers';
+import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
-import { uniqueReference } from '../services/payment.service';
+import { computeCharge, generateReference } from '../lib/money';
+import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
+import { listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getGatewayLabel, isGatewayConfigured, invalidateGatewayCache, refundTransaction } from '../lib/paymentGateway';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -34,7 +35,7 @@ async function spacesFinancials(spaceIds: string[]) {
 
   const [collectedAgg, paidOutAgg, activeDues, memberGroups] = await Promise.all([
     db.duePayment.aggregate({ where: { due: { spaceId: { in: spaceIds } } }, _sum: { netToSpace: true } }),
-    db.payout.aggregate({ where: { spaceId: { in: spaceIds }, status: 'completed' }, _sum: { amount: true } }),
+    db.ledgerEntry.groupBy({ by: ['direction'], where: { spaceId: { in: spaceIds } }, _sum: { amountKobo: true } }),
     db.due.findMany({ where: { spaceId: { in: spaceIds }, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
     db.spaceMembership.groupBy({ by: ['spaceId'], where: { spaceId: { in: spaceIds } }, _count: { _all: true } }),
   ]);
@@ -55,7 +56,10 @@ async function spacesFinancials(spaceIds: string[]) {
   const collected = collectedAgg._sum.netToSpace ?? 0;
   return {
     collected,
-    held: collected - (paidOutAgg._sum.amount ?? 0),
+    // The ledger is the balance: credits − debits across these spaces.
+    held:
+      (paidOutAgg.find((g) => g.direction === 'credit')?._sum.amountKobo ?? 0) -
+      (paidOutAgg.find((g) => g.direction === 'debit')?._sum.amountKobo ?? 0),
     expected,
     uncollected: Math.max(0, expected - collectedActive),
     collectionRate: expected > 0 ? collectedActive / expected : 0,
@@ -96,10 +100,147 @@ async function countLowCollectionSpaces(spaceIds: string[]): Promise<number> {
 // ===========================================================================
 // §14.1 Overview
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// GET /admin/health — the money-plumbing view.
+//
+// Everything that means money is stuck or needs a human: dead/failing webhook
+// jobs, withdrawals stuck in flight, checkouts flagged for review (underpaid,
+// overpaid, late or duplicate money), and checkouts that never resolved.
+// ---------------------------------------------------------------------------
+adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req: Request, res: Response): Promise<void> => {
+  const now = Date.now();
+  const payoutStale = new Date(now - 60 * 60 * 1000);
+  const checkoutStale = new Date(now - 30 * 60 * 1000);
+
+  const [deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledFees, pendingStudentIds, samples] = await Promise.all([
+    db.webhookEvent.count({ where: { status: 'dead', provider: { not: 'anchor' } } }),
+    db.webhookEvent.count({ where: { status: 'failed' } }),
+    db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: payoutStale } } }),
+    db.checkout.count({ where: { needsReview: true } }),
+    db.checkout.count({ where: { status: 'pending', expiresAt: { lte: checkoutStale } } }),
+    db.payout.count({ where: { status: 'success', feeSettledAt: null, settledAt: { lte: payoutStale } } }),
+    db.user.count({ where: { studentIdStatus: 'pending' } }),
+    db.webhookEvent.findMany({
+      where: { status: { in: ['dead', 'failed'] }, provider: { not: 'anchor' } },
+      orderBy: { receivedAt: 'desc' },
+      take: 10,
+      select: { providerEventId: true, type: true, status: true, attempts: true, error: true, receivedAt: true },
+    }),
+  ]);
+
+  ok(res, {
+    deadWebhooks,
+    retryingWebhooks,
+    stuckPayouts,
+    checkoutsNeedingReview,
+    unresolvedCheckouts,
+    unsettledWithdrawalFees: unsettledFees,
+    pendingStudentIds,
+    healthy: deadWebhooks === 0 && stuckPayouts === 0 && checkoutsNeedingReview === 0 && unresolvedCheckouts === 0,
+    recentWebhookFailures: samples.map((e) => ({
+      eventId: e.providerEventId,
+      type: e.type,
+      status: e.status,
+      attempts: e.attempts,
+      error: e.error,
+      receivedAt: e.receivedAt.toISOString(),
+    })),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /admin/checkouts — every checkout, filterable; ?needsReview=true is the
+// queue of underpaid / overpaid / late / duplicate payments.
+// ---------------------------------------------------------------------------
+adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take, q } = parseListQuery(req);
+  const where: Prisma.CheckoutWhereInput = {};
+  if (typeof req.query.status === 'string' && ['pending', 'paid', 'expired', 'underpaid'].includes(req.query.status)) {
+    where.status = req.query.status as never;
+  }
+  if (req.query.needsReview === 'true') where.needsReview = true;
+  if (req.query.overpaid === 'true') where.overpaidKobo = { gt: 0 };
+  if (typeof req.query.spaceId === 'string') where.spaceId = req.query.spaceId;
+  if (q) where.OR = [{ reference: { contains: q, mode: 'insensitive' } }, { user: { email: { contains: q, mode: 'insensitive' } } }];
+
+  const [total, rows] = await Promise.all([
+    db.checkout.count({ where }),
+    db.checkout.findMany({
+      where,
+      include: { user: { select: { name: true, email: true } }, space: { select: { name: true } }, _count: { select: { items: true } } },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+    }),
+  ]);
+  ok(
+    res,
+    rows.map((c) => ({
+      reference: c.reference,
+      status: c.status,
+      user: { id: c.userId, name: c.user.name, email: c.user.email },
+      space: { id: c.spaceId, name: c.space.name },
+      dueCount: c._count.items,
+      face: c.faceKobo,
+      fee: c.feeKobo,
+      total: c.totalKobo,
+      received: c.receivedKobo,
+      overpaid: c.overpaidKobo,
+      needsReview: c.needsReview,
+      reviewReason: c.reviewReason,
+      expiresAt: c.expiresAt.toISOString(),
+      paidAt: c.paidAt?.toISOString() ?? null,
+      createdAt: c.createdAt.toISOString(),
+    })),
+    200,
+    buildMeta(page, perPage, total),
+  );
+});
+
+// POST /admin/checkouts/:reference/resolve — clear a review flag once handled off-platform.
+const resolveCheckoutSchema = z.object({ note: z.string().min(1).max(500) });
+
+adminRouter.post('/checkouts/:reference/resolve', requireAdminPermission('overrides'), validate(resolveCheckoutSchema), async (req: Request, res: Response): Promise<void> => {
+  const reference = req.params.reference as string;
+  const { note } = req.body as z.infer<typeof resolveCheckoutSchema>;
+  const updated = await db.checkout.updateMany({
+    where: { reference, needsReview: true },
+    data: { needsReview: false, reviewReason: note },
+  });
+  if (updated.count === 0) {
+    errors.notFound(res, 'No checkout awaiting review with that reference');
+    return;
+  }
+  await writeAdminAudit(req, 'checkout.review_resolved', { target: reference, severity: 'warning', metadata: { note } });
+  ok(res, { reference, needsReview: false });
+});
+
+// ---------------------------------------------------------------------------
+// GET /admin/payouts — every withdrawal across spaces
+// ---------------------------------------------------------------------------
+adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const where: Prisma.PayoutWhereInput = {};
+  if (typeof req.query.status === 'string' && ['pending', 'processing', 'success', 'failed', 'reversed'].includes(req.query.status)) {
+    where.status = req.query.status as never;
+  }
+  if (typeof req.query.spaceId === 'string') where.spaceId = req.query.spaceId;
+  const [total, rows] = await Promise.all([
+    db.payout.count({ where }),
+    db.payout.findMany({ where, include: { space: { select: { name: true } } }, orderBy: { requestedAt: 'desc' }, skip, take }),
+  ]);
+  ok(
+    res,
+    rows.map((p) => ({ ...serializePayout(p), spaceId: p.spaceId, spaceName: p.space.name, provider: p.provider })),
+    200,
+    buildMeta(page, perPage, total),
+  );
+});
+
 adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void> => {
   const [totalUsers, activeReps, pendingReps] = await Promise.all([
     db.user.count(),
-    db.user.count({ where: { role: 'rep', isSuspended: false } }),
+    db.user.count({ where: { isRep: true, isSuspended: false } }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
   ]);
 
@@ -287,14 +428,45 @@ adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManage
   ok(res, { kycStatus: decision });
 });
 
+
+// ---------------------------------------------------------------------------
+// Rep student ID review. Bachs verifies identity (NIN); Duevy verifies the rep
+// is a student. A space can only collect once its lead rep's student ID is
+// approved here. View links are signed and expire after a few minutes.
+// ---------------------------------------------------------------------------
+adminRouter.get('/kyc/student-ids', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const raw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+  const status = (['pending', 'approved', 'rejected'].includes(raw) ? raw : 'pending') as 'pending' | 'approved' | 'rejected';
+  const { total, rows } = await listStudentIdsForReview(status, skip, take);
+  ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+const studentIdReviewSchema = z
+  .object({ decision: z.enum(['approved', 'rejected']), note: z.string().trim().min(1).max(500).optional() })
+  .strict();
+
+adminRouter.post(
+  '/users/:userId/student-id/review',
+  requireAdminPermission('userManagement'),
+  validate(studentIdReviewSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.params.userId as string;
+    const { decision, note } = req.body as z.infer<typeof studentIdReviewSchema>;
+    const state = await reviewStudentId((req as AuthenticatedRequest).user.sub as string, userId, decision, note);
+    await writeAdminAudit(req, 'user.student_id_review', { target: userId, metadata: { decision, note: note ?? null } });
+    ok(res, state);
+  },
+);
+
 // ===========================================================================
 // §14.3 Reps
 // ===========================================================================
-async function buildAdminRep(user: { id: string; name: string; isSuspended: boolean; repApplicationStatus: string; role: string }) {
+async function buildAdminRep(user: { id: string; name: string; isSuspended: boolean; repApplicationStatus: string; role: string; isRep: boolean }) {
   const reps = await db.spaceRep.findMany({ where: { userId: user.id }, select: { spaceId: true } });
   const spaceIds = reps.map((r) => r.spaceId);
   const fin = await spacesFinancials(spaceIds);
-  const verification = user.repApplicationStatus === 'approved' || user.role === 'rep' ? 'verified' : user.repApplicationStatus === 'pending' ? 'pending' : 'unverified';
+  const verification = user.repApplicationStatus === 'approved' || user.isRep ? 'verified' : user.repApplicationStatus === 'pending' ? 'pending' : 'unverified';
   const status = user.isSuspended ? 'suspended' : user.repApplicationStatus === 'pending' ? 'pending' : 'active';
   return {
     id: user.id,
@@ -311,7 +483,7 @@ async function buildAdminRep(user: { id: string; name: string; isSuspended: bool
 adminRouter.get('/reps', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
   const where: Prisma.UserWhereInput = {
-    OR: [{ role: 'rep' }, { repApplicationStatus: 'pending' }],
+    OR: [{ isRep: true }, { repApplicationStatus: 'pending' }],
   };
   if (q) where.AND = [{ OR: [{ name: { contains: q, mode: 'insensitive' } }, { email: { contains: q, mode: 'insensitive' } }] }];
 
@@ -428,7 +600,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
       });
       await tx.spaceRep.create({ data: { userId, spaceId: created.id, role: 'lead' } });
       await tx.spaceMembership.create({ data: { userId, spaceId: created.id, kind: 'member' } });
-      await tx.user.update({ where: { id: userId }, data: { role: 'rep', repApplicationStatus: 'approved', referralCode } });
+      await tx.user.update({ where: { id: userId }, data: { role: 'rep', isRep: true, repApplicationStatus: 'approved', referralCode } });
       await tx.repApplication.update({ where: { userId }, data: { status: 'approved', spaceId: created.id, reviewedAt: new Date(), reviewNote: note } });
       return created;
     },
@@ -452,7 +624,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
   await writeAdminAudit(req, 'rep.verify', { target: userId, metadata: { spaceId: space.id } });
   sendRepApprovedEmail(user.email, user.name, space.name).catch(console.error);
 
-  ok(res, await buildAdminRep({ ...user, role: 'rep', repApplicationStatus: 'approved' }));
+  ok(res, await buildAdminRep({ ...user, role: 'rep', isRep: true, repApplicationStatus: 'approved' }));
 });
 
 adminRouter.post('/reps/:repId/reject', requireAdminPermission('userManagement'), validate(reasonSchema), async (req: Request, res: Response): Promise<void> => {
@@ -477,7 +649,7 @@ adminRouter.post('/reps/:repId/reject', requireAdminPermission('userManagement')
 adminRouter.post('/reps/:repId/suspend', requireAdminPermission('userManagement'), validate(reasonSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = req.params.repId as string;
   const { reason } = req.body as z.infer<typeof reasonSchema>;
-  const updated = await db.user.updateMany({ where: { id: userId, role: 'rep' }, data: { isSuspended: true, suspendedReason: reason } });
+  const updated = await db.user.updateMany({ where: { id: userId, isRep: true }, data: { isSuspended: true, suspendedReason: reason } });
   if (updated.count === 0) {
     errors.notFound(res, 'Rep not found');
     return;
@@ -621,7 +793,7 @@ adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userMana
       await tx.spaceRep.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: { role }, create: { userId, spaceId, role } });
       await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, kind: 'member' } });
       // Attaching a rep promotes the account.
-      await tx.user.update({ where: { id: userId }, data: { role: 'rep', referralCode } });
+      await tx.user.update({ where: { id: userId }, data: { role: user.role === 'admin' ? 'admin' : 'rep', isRep: true, repApplicationStatus: 'approved', referralCode } });
     },
     { timeout: 20_000 },
   );
@@ -732,42 +904,124 @@ adminRouter.post('/transactions/:txnId/refund', requireAdminPermission('override
     return;
   }
 
-  // Reverse to the payer's original source (card/bank) via the gateway's real
-  // refund API — there's no wallet to credit anymore (payment architecture
-  // migration). Do this before writing any DB rows: if Paystack rejects the
-  // refund, nothing here should look like it succeeded.
-  try {
-    await refundTransaction({ reference: original.reference, amount: refundAmount });
-  } catch (err) {
-    console.error(`[admin] refund failed for txn=${original.id}:`, err);
-    fail(res, 502, 'REFUND_FAILED', 'The payment provider rejected this refund');
-    return;
-  }
-
-  const reference = await uniqueReference();
-  const refund = await db.$transaction(async (tx) =>
-    tx.transaction.create({
-      data: {
-        userId: original.userId,
-        type: 'refund',
-        title: 'Refund',
-        detail: reason,
-        amount: refundAmount,
-        method: original.method,
-        status: 'completed',
-        reference,
-        spaceId: original.spaceId,
-        refundOfTxnId: original.id,
-      },
-    }),
-  );
-
-  await Promise.all([
-    writeAdminAudit(req, 'transaction.refund', { target: original.id, severity: 'critical', metadata: { refundAmount, reason } }),
-    notify({ userId: original.userId, kind: 'system', tone: 'brand', title: 'Refund issued', detail: `₦${(refundAmount / 100).toLocaleString('en-NG')} was refunded to your original payment method.`, href: '/dashboard/transactions' }).catch(() => {}),
-  ]);
-  ok(res, serializeTransaction(refund), 201);
+  // Refunds are out of the MVP scope: an admin settles them with the payer
+  // off-platform. The validation above stays so the endpoint's contract holds.
+  fail(res, 501, 'REFUND_NOT_SUPPORTED', 'Refunds are not yet supported — process manually with the payer for now');
 });
+
+// ---------------------------------------------------------------------------
+// Manual credit — fixes a payment that genuinely happened (e.g. a webhook
+// that never landed) but never got recorded, so it doesn't show as paid.
+// Unlike refund, this has no prior Transaction to act on: it creates one, plus
+// the DuePayment and LedgerEntry a normal successful payment would have
+// produced, tagged as a manual override for auditability (§ ledger, admin
+// manual-credit tool).
+// ---------------------------------------------------------------------------
+const manualCreditSchema = z.object({
+  userId: z.string().min(1),
+  reference: z.string().min(1).max(60).optional(),
+  reason: z.string().min(1).max(500),
+});
+
+adminRouter.post(
+  '/dues/:dueId/credit',
+  requireAdminPermission('overrides'),
+  validate(manualCreditSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { userId, reference: suppliedReference, reason } = req.body as z.infer<typeof manualCreditSchema>;
+    const due = await db.due.findUnique({
+      where: { id: req.params.dueId as string },
+      include: { space: { select: { id: true, name: true } } },
+    });
+    if (!due) {
+      errors.notFound(res, 'Due not found');
+      return;
+    }
+
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      errors.notFound(res, 'User not found');
+      return;
+    }
+
+    const existing = await db.duePayment.findUnique({
+      where: { userId_dueId: { userId, dueId: due.id } },
+    });
+    if (existing) {
+      errors.conflict(res, 'DUE_ALREADY_PAID', 'This due has already been settled for this user');
+      return;
+    }
+
+    // Credited at face value, the same as a real collection. This puts money
+    // on the space's ledger that the provider may not hold for it, so it is
+    // only for a payment that demonstrably happened (and is audited as critical).
+    const charge = computeCharge(due.amount);
+    const reference = suppliedReference ?? generateReference('MAN');
+    const actorId = (req as AuthenticatedRequest).user.sub as string;
+
+    const transaction = await db.$transaction(async (tx) => {
+      const txn = await tx.transaction.create({
+        data: {
+          userId,
+          type: 'due',
+          title: due.title,
+          detail: due.space.name,
+          amount: -charge.total,
+          method: 'Manual (admin)',
+          status: 'completed',
+          reference,
+          spaceId: due.spaceId,
+        },
+      });
+      const duePayment = await tx.duePayment.create({
+        data: {
+          userId,
+          dueId: due.id,
+          txnId: txn.id,
+          reference,
+          amountPaid: charge.total,
+          processingFee: 0,
+          duevyFee: charge.fee,
+          netToSpace: charge.face,
+        },
+      });
+      await lockSpace(tx, due.spaceId);
+      await appendLedgerEntry(tx, {
+        spaceId: due.spaceId,
+        dueId: due.id,
+        txnId: txn.id,
+        duePaymentId: duePayment.id,
+        type: 'manual_credit',
+        direction: 'credit',
+        amountKobo: charge.face,
+        grossKobo: charge.total,
+        feeKobo: charge.fee,
+        netKobo: charge.face,
+        reference,
+        description: reason,
+        actorId,
+      });
+      return txn;
+    });
+
+    await Promise.all([
+      writeAdminAudit(req, 'due.manual_credit', {
+        target: due.id,
+        severity: 'critical',
+        metadata: { userId, amount: charge.total, reason, reference },
+      }),
+      notify({
+        userId,
+        kind: 'payment_received',
+        title: 'Payment recorded',
+        detail: `${due.title} was marked as paid by an admin.`,
+        href: '/dashboard/dues',
+      }).catch(() => {}),
+    ]);
+
+    ok(res, serializeTransaction(transaction), 201);
+  },
+);
 
 // ===========================================================================
 // §14.6 Disputes
@@ -1104,7 +1358,7 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   } else if (report.scope === 'financial_summary') {
     const [collected, fees, topups, refunds, payouts] = await Promise.all([
       db.duePayment.aggregate({ where: { paidAt: range }, _sum: { netToSpace: true } }),
-      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { monnifyFee: true, duevyFee: true } }),
+      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { processingFee: true, duevyFee: true } }),
       db.transaction.aggregate({ where: { type: 'topup', status: 'completed', createdAt: range }, _sum: { amount: true } }),
       db.transaction.aggregate({ where: { type: 'refund', createdAt: range }, _sum: { amount: true } }),
       db.payout.aggregate({ where: { requestedAt: range }, _sum: { amount: true } }),
@@ -1112,7 +1366,7 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
     rows = [
       ['Metric', 'Amount (kobo)'],
       ['Net collected (to spaces)', collected._sum.netToSpace ?? 0],
-      ['Monnify fees', fees._sum.monnifyFee ?? 0],
+      ['Processing fees', fees._sum.processingFee ?? 0],
       ['Duevy revenue (fees)', fees._sum.duevyFee ?? 0],
       ['Wallet top-ups', topups._sum.amount ?? 0],
       ['Refunds issued', refunds._sum.amount ?? 0],
@@ -1123,8 +1377,8 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
     const spaces = await db.space.findMany({ where, select: { id: true, name: true } });
     rows = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
     for (const s of spaces) {
-      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, monnifyFee: true, duevyFee: true } });
-      rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.monnifyFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
+      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, processingFee: true, duevyFee: true } });
+      rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
     }
   } else {
     // rep_performance
@@ -1152,59 +1406,4 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.status(200).send(body);
 });
 
-// ---------------------------------------------------------------------------
-// GET /admin/settings/payment-gateway — which processor is live, and which
-// gateways currently have their credentials configured (so the dashboard can
-// grey out/warn before an admin switches to one that isn't set up).
-// ---------------------------------------------------------------------------
-adminRouter.get('/settings/payment-gateway', async (_req: Request, res: Response): Promise<void> => {
-  const active = (await getGatewayLabel()).toLowerCase() as PaymentGatewayName;
-  ok(res, {
-    active,
-    gateways: {
-      paystack: { configured: isGatewayConfigured('paystack') },
-      monnify: { configured: isGatewayConfigured('monnify') },
-    },
-  });
-});
-
-// ---------------------------------------------------------------------------
-// PUT /admin/settings/payment-gateway (super_admin only) — switches which
-// processor is live without a redeploy. Refuses to switch to a gateway whose
-// credentials aren't set in env, since that would break payments instantly.
-// ---------------------------------------------------------------------------
-const setGatewaySchema = z.object({ gateway: z.enum(['paystack', 'monnify']) });
-
-adminRouter.put(
-  '/settings/payment-gateway',
-  requireSuperAdmin(),
-  validate(setGatewaySchema),
-  async (req: Request, res: Response): Promise<void> => {
-    const { gateway } = req.body as z.infer<typeof setGatewaySchema>;
-
-    if (!isGatewayConfigured(gateway)) {
-      errors.conflict(
-        res,
-        'GATEWAY_NOT_CONFIGURED',
-        `${gateway} is missing required credentials in env — set them before switching`,
-      );
-      return;
-    }
-
-    const actorId = (req as AuthenticatedRequest).user.sub as string;
-    await db.appSettings.upsert({
-      where: { id: 'singleton' },
-      update: { activePaymentGateway: gateway, updatedBy: actorId },
-      create: { id: 'singleton', activePaymentGateway: gateway, updatedBy: actorId },
-    });
-    invalidateGatewayCache();
-
-    await writeAdminAudit(req, 'payment_gateway_changed', {
-      target: gateway,
-      severity: 'critical',
-      metadata: { gateway },
-    });
-
-    ok(res, { active: gateway });
-  },
-);
+// The payment rail is chosen by configuration (PAYMENT_PROVIDER), not at runtime.

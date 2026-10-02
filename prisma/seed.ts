@@ -1,10 +1,14 @@
 /**
- * Demo data seed — a rep account, a student account, and a full slate of
- * data (dues, a settled payment, a payout, a poll, notifications) so Duey and
- * the rest of the API can be exercised end-to-end without a real signup flow.
+ * Development seed: one super admin, one approved test rep with a LAUTECH
+ * space and dues, one test student who has joined it.
  *
- * Idempotent: safe to re-run. Existing rows are upserted/reused rather than
- * duplicated, keyed on each model's natural unique field where one exists.
+ * With PAYMENT_PROVIDER=fake the rep is also KYC-verified (against fake
+ * provider ids) with a payout account, and the student has one paid checkout,
+ * created through the real checkout service, so the ledger, receipt and rep
+ * dashboard all have data. With PAYMENT_PROVIDER=bachs the rep is left
+ * unverified: KYC must be done for real against the Bachs sandbox.
+ *
+ * Idempotent: safe to re-run. Refuses to run with NODE_ENV=production.
  *
  * Run with: npm run db:seed
  */
@@ -12,35 +16,70 @@ import bcrypt from 'bcryptjs';
 import { db } from '../src/config/db';
 import { env } from '../src/config/env';
 import { encrypt, maskAccountNumber } from '../src/lib/encryption';
-import { computeCharge } from '../src/lib/money';
-import { generateReferralCode } from '../src/lib/referral';
+import { createCheckout, fulfilCheckout, findCheckoutId } from '../src/services/checkout.service';
+import { getSpaceBalance } from '../src/services/ledger.service';
 
-const DEMO_PASSWORD = 'Demo1234!';
-const JOIN_CODE = 'CSSA-7F2K';
+const PASSWORD = 'Demo1234!';
+const JOIN_CODE = 'CSC-LAU1';
 
 async function main() {
-  const passwordHash = await bcrypt.hash(DEMO_PASSWORD, env.BCRYPT_ROUNDS);
+  if (env.NODE_ENV === 'production') throw new Error('Refusing to seed a production database');
+  const fake = env.PAYMENT_PROVIDER === 'fake';
+  const passwordHash = await bcrypt.hash(PASSWORD, env.BCRYPT_ROUNDS);
+  const now = new Date();
 
-  // -------------------------------------------------------------------------
-  // Rep account + their space
-  // -------------------------------------------------------------------------
+  // --- Super admin -----------------------------------------------------------
+  const admin = await db.user.upsert({
+    where: { email: 'admin@duevy.test' },
+    update: {},
+    create: {
+      name: 'Duevy Admin',
+      email: 'admin@duevy.test',
+      emailVerified: true,
+      passwordHash,
+      role: 'admin',
+      adminSubRole: 'super_admin',
+      termsAcceptedAt: now,
+      termsVersion: '1.0.0',
+    },
+  });
+  await db.adminPermission.upsert({
+    where: { userId: admin.id },
+    update: {},
+    create: { userId: admin.id, userManagement: true, payouts: true, disputes: true, overrides: true },
+  });
+
+  // --- Test rep (approved) ---------------------------------------------------
   const rep = await db.user.upsert({
-    where: { email: 'rep@duevy.demo' },
+    where: { email: 'rep@duevy.test' },
     update: {},
     create: {
       name: 'Tunde Okafor',
-      email: 'rep@duevy.demo',
+      email: 'rep@duevy.test',
       emailVerified: true,
       passwordHash,
       phone: '+2348012345678',
       role: 'rep',
+      isRep: true,
       repApplicationStatus: 'approved',
+      institution: 'LAUTECH',
       matricNo: '190802044',
       level: '400',
-      referralCode: await generateReferralCode('Tunde Okafor'),
-      kycStatus: 'verified',
-      termsAcceptedAt: new Date(),
-      termsVersion: '1.0',
+      termsAcceptedAt: now,
+      termsVersion: '1.0.0',
+      ...(fake
+        ? {
+            kycStatus: 'verified' as const,
+            bachsAccountId: 'acct_fake_seed_rep',
+            bachsPersonId: 'per_fake_seed_rep',
+            bachsPayoutsActive: true,
+            studentIdStatus: 'approved' as const,
+            studentIdUploadedAt: now,
+            studentIdReviewedAt: now,
+            kycSubmittedAt: now,
+            kycResolvedAt: now,
+          }
+        : {}),
     },
   });
 
@@ -48,86 +87,50 @@ async function main() {
     where: { joinCode: JOIN_CODE },
     update: {},
     create: {
-      name: 'Computer Science Student Association',
-      short: 'CSSA',
-      kind: 'association',
+      name: 'Computer Science Department',
+      short: 'CSC',
+      kind: 'department',
       hue: 'indigo',
       theme: 'ocean',
-      about: 'The umbrella body for CS undergraduates — dues, events, and department news.',
-      faculty: 'Physical Sciences',
-      school: 'University of Lagos',
+      about: 'Departmental dues, handouts and lab manuals for CSC students.',
+      faculty: 'Engineering and Technology',
+      school: 'Ladoke Akintola University of Technology',
+      institution: 'LAUTECH',
       joinCode: JOIN_CODE,
     },
   });
-
   await db.spaceRep.upsert({
     where: { userId_spaceId: { userId: rep.id, spaceId: space.id } },
     update: {},
     create: { userId: rep.id, spaceId: space.id, role: 'lead' },
   });
-
-  // Bank account on file (so payout requests + BankAccount reads have something to show).
-  const accountNumber = '0123456789';
-  await db.bankAccount.upsert({
-    where: { spaceId: space.id },
-    update: {},
-    create: {
-      spaceId: space.id,
-      bankCode: '058',
-      bankName: 'GTBank',
-      accountNumber: encrypt(accountNumber),
-      accountNumberMasked: maskAccountNumber(accountNumber),
-      accountName: 'CSSA UNILAG',
-    },
-  });
-
-  await db.payout.upsert({
-    where: { reference: 'PAY-2026-0001' },
-    update: {},
-    create: {
-      spaceId: space.id,
-      amount: 500_000, // ₦5,000
-      reference: 'PAY-2026-0001',
-      status: 'completed',
-      accountMasked: 'GTBank •••• 6789',
-      note: 'Weekly payout',
-      settledAt: new Date(),
-    },
-  });
-
-  // -------------------------------------------------------------------------
-  // Student account + membership
-  // -------------------------------------------------------------------------
-  const student = await db.user.upsert({
-    where: { email: 'student@duevy.demo' },
-    update: {},
-    create: {
-      name: 'Aisha Bello',
-      email: 'student@duevy.demo',
-      emailVerified: true,
-      passwordHash,
-      phone: '+2348098765432',
-      role: 'student',
-      matricNo: '210805019',
-      level: '300',
-      referralCode: await generateReferralCode('Aisha Bello'),
-      kycStatus: 'verified',
-      termsAcceptedAt: new Date(),
-      termsVersion: '1.0',
-    },
-  });
-
   await db.spaceMembership.upsert({
-    where: { userId_spaceId: { userId: student.id, spaceId: space.id } },
+    where: { userId_spaceId: { userId: rep.id, spaceId: space.id } },
     update: {},
-    create: { userId: student.id, spaceId: space.id, kind: 'member' },
+    create: { userId: rep.id, spaceId: space.id },
   });
 
-  // -------------------------------------------------------------------------
-  // Dues — one unpaid (for pay_dues / check_balance), one already settled
-  // (for view_history). Amounts match the worked examples in the assistant docs.
-  // -------------------------------------------------------------------------
-  async function upsertDue(title: string, amount: number, dueDate: Date) {
+  if (fake) {
+    const accountNumber = '0123456789';
+    await db.bankAccount.upsert({
+      where: { spaceId: space.id },
+      update: {},
+      create: {
+        spaceId: space.id,
+        bankCode: '058',
+        bankName: 'Guaranty Trust Bank',
+        accountNumber: encrypt(accountNumber),
+        accountNumberMasked: maskAccountNumber(accountNumber),
+        accountName: 'OKAFOR TUNDE',
+        bachsDestinationId: 'pd_fake_seed_rep',
+        bachsAccountId: 'acct_fake_seed_rep',
+      },
+    });
+  }
+
+  // --- Dues --------------------------------------------------------------------
+  const inDays = (d: number) => new Date(Date.now() + d * 864e5);
+  async function upsertDue(title: string, amount: number, category: 'handout' | 'departmental_due' | 'lab_manual' | 'exam_levy', days: number, active: boolean) {
     const existing = await db.due.findFirst({ where: { spaceId: space.id, title } });
     if (existing) return existing;
     return db.due.create({
@@ -135,131 +138,69 @@ async function main() {
         spaceId: space.id,
         title,
         amount,
-        dueDate,
-        category: 'levy',
-        status: 'active',
-        publishedAt: new Date(),
+        category,
+        dueDate: inDays(days),
+        // Publishing needs a verified rep; without one these stay drafts.
+        status: active && fake ? 'active' : 'draft',
+        publishedAt: active && fake ? now : null,
+        assignedRepId: rep.id,
       },
     });
   }
+  const departmental = await upsertDue('2026/2027 Departmental Due', 500_000, 'departmental_due', 30, true); // ₦5,000
+  const handout = await upsertDue('CSC 301 Handout', 150_000, 'handout', 14, true); // ₦1,500
+  await upsertDue('CSC 305 Lab Manual', 250_000, 'lab_manual', 21, true); // ₦2,500
+  await upsertDue('Rain Semester Exam Levy', 300_000, 'exam_levy', 45, false); // draft
 
-  const handoutFee = await upsertDue('Handout Fee', 500_000, new Date('2026-08-15')); // ₦5,000 face → ₦5,150 payable
-  const dinnerLevy = await upsertDue('Dinner Levy', 1_000_000, new Date('2026-09-01')); // ₦10,000 face → ₦10,300 payable
-
-  // Dinner Levy already settled (via card) — sets up realistic history for view_history.
-  const dinnerCharge = computeCharge(dinnerLevy.amount);
-  const dinnerTxn = await db.transaction.upsert({
-    where: { reference: 'DVY-DEMO-0002' },
+  // --- Test student ------------------------------------------------------------
+  const student = await db.user.upsert({
+    where: { email: 'student@duevy.test' },
     update: {},
     create: {
-      userId: student.id,
-      type: 'due',
-      title: dinnerLevy.title,
-      detail: space.name,
-      amount: -dinnerCharge.totalCharged,
-      method: 'Monnify',
-      status: 'completed',
-      reference: 'DVY-DEMO-0002',
-      spaceId: space.id,
+      name: 'Aisha Bello',
+      email: 'student@duevy.test',
+      emailVerified: true,
+      passwordHash,
+      phone: '+2348098765432',
+      institution: 'LAUTECH',
+      matricNo: '210805019',
+      level: '300',
+      termsAcceptedAt: now,
+      termsVersion: '1.0.0',
     },
   });
-  await db.duePayment.upsert({
-    where: { userId_dueId: { userId: student.id, dueId: dinnerLevy.id } },
+  await db.spaceMembership.upsert({
+    where: { userId_spaceId: { userId: student.id, spaceId: space.id } },
     update: {},
-    create: {
-      userId: student.id,
-      dueId: dinnerLevy.id,
-      txnId: dinnerTxn.id,
-      reference: 'DVY-DEMO-0002',
-      amountPaid: dinnerCharge.totalCharged,
-      monnifyFee: dinnerCharge.monnifyFee,
-      duevyFee: dinnerCharge.duevyFee,
-      netToSpace: dinnerCharge.netToSpace,
-    },
+    create: { userId: student.id, spaceId: space.id },
   });
 
-  // Handout Fee is left unpaid on purpose — this is the due Duey's pay_dues
-  // and check_balance examples resolve to.
-  void handoutFee;
-
-  // -------------------------------------------------------------------------
-  // A paid poll — exercises the polls feature end-to-end.
-  // -------------------------------------------------------------------------
-  const poll = await db.poll.upsert({
-    where: { slug: 'best-coder-award-cssa' },
-    update: {},
-    create: {
-      spaceId: space.id,
-      title: 'Best Coder Award',
-      description: "Vote for CSSA's most impressive coder this session.",
-      deadline: new Date('2026-08-30'),
-      status: 'active',
-      membersOnly: true,
-      paid: true,
-      amountPerVote: 5_000, // ₦50/vote
-      slug: 'best-coder-award-cssa',
-      totalVotes: 20,
-      revenue: 100_000,
-      publishedAt: new Date(),
-    },
-  });
-
-  let category = await db.pollCategory.findFirst({ where: { pollId: poll.id, title: 'Overall Winner' } });
-  if (!category) {
-    category = await db.pollCategory.create({ data: { pollId: poll.id, title: 'Overall Winner' } });
+  // --- One paid checkout (fake provider only) ---------------------------------
+  let paidNote = 'skipped (PAYMENT_PROVIDER is not fake)';
+  if (fake) {
+    const alreadyPaid = await db.duePayment.findFirst({ where: { userId: student.id, dueId: { in: [departmental.id, handout.id] } } });
+    if (!alreadyPaid) {
+      const { checkout } = await createCheckout(student.id, [departmental.id, handout.id]);
+      await fulfilCheckout(await findCheckoutId(checkout.reference, null), checkout.amount, 0, 'seed');
+      paidNote = `${checkout.reference} — ₦${(checkout.amount / 100).toLocaleString('en-NG')} for 2 dues`;
+    } else {
+      paidNote = `already present (${alreadyPaid.reference})`;
+    }
   }
 
-  async function upsertNominee(name: string, votes: number) {
-    const existing = await db.nominee.findFirst({ where: { categoryId: category!.id, name } });
-    if (existing) return existing;
-    return db.nominee.create({ data: { categoryId: category!.id, name, votes } });
-  }
-  await upsertNominee('Aisha Bello', 12);
-  await upsertNominee('Tunde Okafor', 8);
-
-  // -------------------------------------------------------------------------
-  // Notifications — one per side, so both dashboards show real activity.
-  // -------------------------------------------------------------------------
-  async function ensureNotification(userId: string, title: string, detail: string, href: string) {
-    const existing = await db.notification.findFirst({ where: { userId, title } });
-    if (existing) return;
-    await db.notification.create({ data: { userId, kind: 'payment_received', tone: 'brand', title, detail, href } });
-  }
-  await ensureNotification(
-    rep.id,
-    'Payment received',
-    `Aisha Bello paid ₦10,300.00 for "Dinner Levy".`,
-    '/dashboard/collections',
-  );
-  await ensureNotification(
-    student.id,
-    'Due reminder',
-    'Your "Handout Fee" (₦5,150.00) is still unpaid.',
-    '/dashboard/dues',
-  );
-
-  console.log('✅ Demo data seeded\n');
-  console.log('Rep login:');
-  console.log(`  email:    ${rep.email}`);
-  console.log(`  password: ${DEMO_PASSWORD}`);
-  console.log(`  space:    ${space.name} (join code: ${space.joinCode})\n`);
-  console.log('Student login:');
-  console.log(`  email:    ${student.email}`);
-  console.log(`  password: ${DEMO_PASSWORD}`);
-  console.log(`  wallet:   ₦12,000.00`);
-  console.log(`  owes:     "Handout Fee" — ₦5,150.00`);
-  console.log(`  history:  "Dinner Levy" already paid via Monnify\n`);
-  console.log('Try with Duey:');
-  console.log('  "pay my handout fee"');
-  console.log('  "what\'s my balance"');
-  console.log('  "show my payment history"');
-  console.log(`  "join ${JOIN_CODE}"`);
-  console.log('  "who is my rep"');
+  const balance = await getSpaceBalance(space.id);
+  console.log('Seeded.\n');
+  console.log(`  super admin  admin@duevy.test / ${PASSWORD}`);
+  console.log(`  rep          rep@duevy.test / ${PASSWORD}   (KYC: ${fake ? 'verified (fake provider)' : 'not verified — run KYC against the Bachs sandbox'})`);
+  console.log(`  student      student@duevy.test / ${PASSWORD}`);
+  console.log(`  space        ${space.name} — join code ${space.joinCode}`);
+  console.log(`  paid example ${paidNote}`);
+  console.log(`  space balance ₦${(balance / 100).toLocaleString('en-NG')}`);
 }
 
 main()
   .catch((err) => {
-    console.error('❌ Seed failed:', err);
+    console.error('Seed failed:', err);
     process.exitCode = 1;
   })
   .finally(async () => {

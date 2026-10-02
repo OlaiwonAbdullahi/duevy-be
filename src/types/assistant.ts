@@ -1,3 +1,4 @@
+import { DUE_TYPES } from '../lib/dueTypes';
 import { z } from 'zod';
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ export const INTENTS = [
 export type Intent = (typeof INTENTS)[number];
 
 // Must stay in sync with Prisma's DueCategory enum and repDues.ts's categoryField.
-export const DUE_CATEGORIES = ['levy', 'dinner', 'handout', 'welfare', 'sport'] as const;
+export const DUE_CATEGORIES = DUE_TYPES;
 export type DueCategory = (typeof DUE_CATEGORIES)[number];
 
 // ---------------------------------------------------------------------------

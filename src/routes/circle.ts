@@ -13,6 +13,7 @@ import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
 import { computeCharge } from '../lib/money';
+import { getSpaceBalance } from '../services/ledger.service';
 import { sendEmail, renderEmail } from '../lib/email';
 
 // Mounted at /spaces/:spaceId — mergeParams exposes spaceId to these handlers.
@@ -275,13 +276,14 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   const activeDuesOut = activeDues.map((d) => {
     const agg = paidByDue.get(d.id) ?? { count: 0, sum: 0 };
     collected += agg.sum;
-    expected += computeCharge(d.amount).totalCharged * memberCount;
+    expected += computeCharge(d.amount).total * memberCount;
     unpaidCount += Math.max(0, memberCount - agg.count);
     return {
       id: d.id,
       title: d.title,
       amount: d.amount,
       dueDate: d.dueDate.toISOString().slice(0, 10),
+      type: d.category,
       category: d.category,
       status: d.status,
       paidCount: agg.count,
@@ -384,18 +386,14 @@ circleRouter.post('/archive', requireSpaceRep(true), validate(archiveSchema), as
     return;
   }
 
-  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: { in: ['pending_approval', 'processing'] } } });
+  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: { in: ['pending', 'processing'] } } });
   if (pendingPayout > 0) {
     errors.conflict(res, 'PENDING_PAYOUT', 'Wait for pending/processing payouts to settle before archiving');
     return;
   }
 
-  // Held balance = net collected − amount already paid out.
-  const [netAgg, paidOutAgg] = await Promise.all([
-    db.duePayment.aggregate({ where: { due: { spaceId: sid } }, _sum: { netToSpace: true } }),
-    db.payout.aggregate({ where: { spaceId: sid, status: 'completed' }, _sum: { amount: true } }),
-  ]);
-  const held = (netAgg._sum.netToSpace ?? 0) - (paidOutAgg._sum.amount ?? 0);
+  // Held balance comes from the space's ledger.
+  const held = await getSpaceBalance(sid);
   if (held > 0) {
     errors.conflict(res, 'HELD_BALANCE', 'Pay out the collected balance before archiving');
     return;

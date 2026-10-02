@@ -5,6 +5,8 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
 import { lookupLimiter } from '../middleware/rateLimiter';
+import { generateJoinCode } from '../lib/joincode';
+import { writeAudit } from '../lib/audit';
 import { ok, fail, errors } from '../lib/response';
 import { serializeSpace, type SpaceMembershipView } from '../lib/serializers';
 import { circleRouter } from './circle';
@@ -33,6 +35,7 @@ function serializeDue(d: {
     title: d.title,
     amount: d.amount,
     dueDate: d.dueDate.toISOString().slice(0, 10),
+    type: d.category,
     category: d.category,
     status: d.status,
   };
@@ -59,6 +62,70 @@ spacesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
         }),
       ),
   );
+});
+
+// ---------------------------------------------------------------------------
+// POST /spaces — an approved rep creates a space (with a unique join code).
+// The rep becomes its lead and first member. Creating a space and drafting
+// dues needs no KYC; publishing dues does (see repDues.ts).
+// ---------------------------------------------------------------------------
+const createSpaceSchema = z
+  .object({
+    name: z.string().trim().min(2).max(120),
+    short: z
+      .string()
+      .trim()
+      .min(2)
+      .max(6)
+      .transform((v) => v.toUpperCase()),
+    kind: z.enum(['department', 'association', 'faculty', 'club']),
+    school: z.string().trim().min(2).max(120).default('Ladoke Akintola University of Technology'),
+    institution: z
+      .string()
+      .trim()
+      .min(2)
+      .max(20)
+      .transform((v) => v.toUpperCase())
+      .default('LAUTECH'),
+    faculty: z.string().trim().max(120).optional(),
+    about: z.string().trim().max(500).optional(),
+  })
+  .strict();
+
+spacesRouter.post('/', validate(createSpaceSchema), async (req: Request, res: Response): Promise<void> => {
+  const userId = auth(req).sub as string;
+  const user = await db.user.findUnique({ where: { id: userId }, select: { name: true, isRep: true, repApplicationStatus: true, isSuspended: true } });
+  if (!user?.isRep || user.repApplicationStatus !== 'approved' || user.isSuspended) {
+    errors.forbidden(res, 'Only an approved rep can create a space');
+    return;
+  }
+  const d = req.body as z.infer<typeof createSpaceSchema>;
+
+  let joinCode = generateJoinCode(d.short);
+  for (let i = 0; i < 8 && (await db.space.findUnique({ where: { joinCode }, select: { id: true } })); i++) {
+    joinCode = generateJoinCode(d.short);
+  }
+
+  const space = await db.$transaction(async (tx) => {
+    const created = await tx.space.create({
+      data: {
+        name: d.name,
+        short: d.short,
+        kind: d.kind,
+        school: d.school,
+        institution: d.institution,
+        faculty: d.faculty,
+        about: d.about,
+        joinCode,
+      },
+    });
+    await tx.spaceRep.create({ data: { userId, spaceId: created.id, role: 'lead' } });
+    await tx.spaceMembership.create({ data: { userId, spaceId: created.id, kind: 'member' } });
+    await writeAudit(created.id, { id: userId, name: user.name, role: 'lead' }, 'profile_updated', 'Created the space', tx);
+    return created;
+  });
+
+  ok(res, { ...serializeSpace(space, { memberCount: 1 }), joinCode: space.joinCode }, 201);
 });
 
 // ---------------------------------------------------------------------------

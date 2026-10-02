@@ -47,9 +47,6 @@ const spaceDraftSchema = z.object({
   kind: z.enum(["department", "association", "faculty", "club"]),
   school: z.string(),
   faculty: z.string().optional(),
-  theme: z
-    .enum(["emerald", "ocean", "royal", "crimson", "tangerine"])
-    .default("emerald"),
   coRepInvites: z.array(z.string().email()).optional(),
 });
 
@@ -120,7 +117,7 @@ authRouter.post(
             spaceKind: data.space.kind,
             school: data.space.school,
             faculty: data.space.faculty,
-            theme: data.space.theme,
+            theme: "emerald", // not chosen at registration; the rep can change it later
             coRepInvites: data.space.coRepInvites || [],
             referralCode: data.referralCode,
           },
@@ -238,7 +235,7 @@ authRouter.post(
               spaceKind: data.space.kind,
               school: data.space.school,
               faculty: data.space.faculty,
-              theme: data.space.theme,
+              theme: "emerald", // not chosen at registration; the rep can change it later
               coRepInvites: data.space.coRepInvites || [],
               referralCode: data.referralCode,
             },
@@ -597,6 +594,10 @@ authRouter.get(
         phone: true,
         avatarUrl: true,
         role: true,
+        isRep: true,
+        adminSubRole: true,
+        institution: true,
+        kycStatus: true,
         repApplicationStatus: true,
         matricNo: true,
         level: true,
