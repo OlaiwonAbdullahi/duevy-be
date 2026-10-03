@@ -12,6 +12,8 @@ import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { ok, fail, errors } from '../lib/response';
 import { hashToken } from '../lib/tokens';
 import { sendVerification } from '../services/auth.service';
+import { getKycState } from '../services/kyc.service';
+import { governmentIdHandlers, resubmitStudentIdHandlers, submitKycHandlers } from './kycHandlers';
 
 export const meRouter = Router();
 
@@ -21,6 +23,17 @@ meRouter.use(authenticate);
 function userId(req: Request): string {
   return (req as AuthenticatedRequest).user.sub as string;
 }
+
+// ---------------------------------------------------------------------------
+// KYC for the caller — rep applicants verify here before their space exists;
+// approved reps can use these or the /spaces/:id/payout/kyc* mounts.
+// ---------------------------------------------------------------------------
+meRouter.get('/kyc-status', async (req: Request, res: Response): Promise<void> => {
+  ok(res, await getKycState(userId(req)));
+});
+meRouter.post('/kyc', ...submitKycHandlers);
+meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
+meRouter.post('/kyc/government-id', ...governmentIdHandlers);
 
 // Default notification preferences (§3.4) applied when the column is null.
 const DEFAULT_NOTIFICATION_PREFS = {

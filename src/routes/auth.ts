@@ -127,6 +127,26 @@ authRouter.post(
       return newUser;
     });
 
+    sendVerification(user.id, user.email, user.name).catch(console.error);
+
+    const { passwordHash: _, ...userSafe } = user;
+
+    if (user.repApplicationStatus === "pending") {
+      // A rep applicant gets no session yet: they verify their email, then sign
+      // in (and do KYC). The user payload rides alongside a 403 so the client
+      // can show the "account created" screen. The standard fail() envelope has
+      // no data slot, so this one response is built inline.
+      res.status(403).json({
+        success: false,
+        error: {
+          code: "REP_APPROVAL_PENDING",
+          message: "Rep application is under review",
+        },
+        data: { user: userSafe, emailVerificationRequired: true },
+      });
+      return;
+    }
+
     const { accessToken, refreshToken } = await createTokens(
       user.id,
       user.role,
@@ -135,24 +155,6 @@ authRouter.post(
       req.ip,
     );
     setRefreshCookie(res, refreshToken);
-    sendVerification(user.id, user.email, user.name).catch(console.error);
-
-    const { passwordHash: _, ...userSafe } = user;
-
-    if (user.repApplicationStatus === "pending") {
-      // Spec returns the user payload alongside a 403 so the client can show a
-      // pending-review screen. The standard fail() envelope has no data slot, so
-      // this one response is built inline.
-      res.status(403).json({
-        success: false,
-        error: {
-          code: "REP_APPROVAL_PENDING",
-          message: "Rep application is under review",
-        },
-        data: { user: userSafe, accessToken },
-      });
-      return;
-    }
 
     ok(res, { user: userSafe, accessToken }, 201);
   },
@@ -336,6 +338,17 @@ authRouter.post(
       return;
     }
 
+    // Rep applicants confirm their email before they can sign in and start KYC.
+    if (user.repApplicationStatus === "pending" && !user.emailVerified) {
+      fail(
+        res,
+        403,
+        "EMAIL_NOT_VERIFIED",
+        "Verify your email address to continue. Check your inbox for the link.",
+      );
+      return;
+    }
+
     const spaceIds = [
       ...user.spaceMemberships.map((m) => m.spaceId),
       ...user.spaceReps.map((r) => r.spaceId),
@@ -499,6 +512,30 @@ authRouter.post(
     ]);
 
     ok(res, { verified: true });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /auth/resend-verification — public; always 200 so it can't be used to
+// probe which emails have accounts.
+// ---------------------------------------------------------------------------
+const resendVerificationSchema = z.object({
+  email: z
+    .string()
+    .email()
+    .transform((e) => e.toLowerCase()),
+});
+authRouter.post(
+  "/resend-verification",
+  authLimiter,
+  validate(resendVerificationSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { email } = req.body as z.infer<typeof resendVerificationSchema>;
+    const user = await db.user.findUnique({ where: { email } });
+    if (user && !user.emailVerified && !user.isDeactivated) {
+      sendVerification(user.id, user.email, user.name).catch(console.error);
+    }
+    ok(res, { sent: true });
   },
 );
 

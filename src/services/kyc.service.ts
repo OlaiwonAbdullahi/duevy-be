@@ -19,7 +19,7 @@ import { getPaymentProvider, ProviderError, type IdentityNumber, type IdentityRe
  * The NIN, BVN and date of birth go straight to Bachs and are NEVER persisted
  * or logged. For the student ID we keep only the storage reference.
  *
- * Students never do KYC.
+ * Students never do KYC; rep applicants do it as part of their application.
  */
 
 /** §9.2 — three failed attempts lock retries for 24 hours. */
@@ -127,6 +127,14 @@ const EMPTY_STATE: KycState = {
   resolvedAt: null,
 };
 
+/**
+ * KYC is part of the rep application: applicants verify before an admin gives
+ * final approval, so a pending application is enough to submit.
+ */
+function isRepOrApplicant(user: Pick<User, 'isRep' | 'repApplicationStatus'>): boolean {
+  return user.isRep || user.repApplicationStatus === 'pending' || user.repApplicationStatus === 'approved';
+}
+
 export async function getKycState(userId: string): Promise<KycState> {
   const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
   return toState(user);
@@ -163,8 +171,8 @@ async function discardFile(fileId: string | null | undefined): Promise<void> {
 export async function submitKyc(userId: string, input: KycSubmission): Promise<KycState> {
   const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
 
-  if (!user.isRep || user.repApplicationStatus !== 'approved') {
-    throw forbidden('Only an approved rep can verify their identity', 'REP_NOT_APPROVED');
+  if (!isRepOrApplicant(user)) {
+    throw forbidden('Only reps and rep applicants can verify their identity', 'REP_NOT_APPROVED');
   }
   if (user.kycStatus === 'verified') throw conflict('ALREADY_VERIFIED', 'Your identity is already verified');
   if (user.kycStatus === 'pending' && user.bachsPersonId) {
@@ -260,8 +268,8 @@ export async function submitKyc(userId: string, input: KycSubmission): Promise<K
 /** Replace the student ID card — when an admin rejected it, or none was ever sent. */
 export async function resubmitStudentId(userId: string, doc: UploadedDocument): Promise<KycState> {
   const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
-  if (!user.isRep || user.repApplicationStatus !== 'approved') {
-    throw forbidden('Only an approved rep can upload a student ID', 'REP_NOT_APPROVED');
+  if (!isRepOrApplicant(user)) {
+    throw forbidden('Only reps and rep applicants can upload a student ID', 'REP_NOT_APPROVED');
   }
   if (user.studentIdStatus === 'approved') throw conflict('STUDENT_ID_APPROVED', 'Your student ID is already approved');
   if (user.studentIdStatus === 'pending') throw conflict('STUDENT_ID_PENDING', 'Your student ID is already awaiting review');
@@ -361,11 +369,13 @@ export async function refreshIdentity(accountId: string): Promise<'updated' | 'u
       title: kycStatus === 'verified' ? 'Identity verified' : 'Identity verification failed',
       detail:
         kycStatus === 'verified'
-          ? user.studentIdStatus === 'approved'
-            ? 'Your spaces can now collect payments.'
-            : 'Your identity is verified. Collection opens once your student ID is approved.'
+          ? !user.isRep
+            ? 'Your identity is verified. An admin will now review your rep application.'
+            : user.studentIdStatus === 'approved'
+              ? 'Your spaces can now collect payments.'
+              : 'Your identity is verified. Collection opens once your student ID is approved.'
           : `We could not verify your identity${result.failureReason ? `: ${result.failureReason}` : ''}. Please try again.`,
-      href: '/dashboard/payout',
+      href: '/dashboard/kyc',
     }).catch(() => {});
   } else if (!sameRequirements && result.requirementsDue.length > 0) {
     await notify({
@@ -374,7 +384,7 @@ export async function refreshIdentity(accountId: string): Promise<'updated' | 'u
       tone: 'amber',
       title: 'More verification details needed',
       detail: 'Our payment partner has asked for more information to finish verifying you.',
-      href: '/dashboard/payout',
+      href: '/dashboard/kyc',
     }).catch(() => {});
   }
   return 'updated';
@@ -383,6 +393,44 @@ export async function refreshIdentity(accountId: string): Promise<'updated' | 'u
 // ---------------------------------------------------------------------------
 // Admin: student ID review
 // ---------------------------------------------------------------------------
+
+type AdminKycFields = Pick<
+  User,
+  | 'kycStatus'
+  | 'kycRejectionReason'
+  | 'kycRequirementsDue'
+  | 'kycSubmittedAt'
+  | 'kycResolvedAt'
+  | 'studentIdStatus'
+  | 'studentIdFilePath'
+  | 'studentIdMimeType'
+  | 'studentIdUploadedAt'
+  | 'studentIdReviewedAt'
+  | 'studentIdReviewNote'
+>;
+
+/** The KYC picture an admin needs next to a rep application: the Bachs NIN verdict and the student ID card. */
+export function adminKycSummary(u: AdminKycFields) {
+  return {
+    identity: {
+      status: u.kycStatus,
+      rejectionReason: u.kycRejectionReason,
+      requirementsDue: u.kycRequirementsDue,
+      submittedAt: u.kycSubmittedAt?.toISOString() ?? null,
+      resolvedAt: u.kycResolvedAt?.toISOString() ?? null,
+    },
+    studentId: {
+      status: u.studentIdStatus,
+      mimeType: u.studentIdMimeType,
+      uploadedAt: u.studentIdUploadedAt?.toISOString() ?? null,
+      reviewedAt: u.studentIdReviewedAt?.toISOString() ?? null,
+      reviewNote: u.studentIdReviewNote,
+      // Short-lived: the document is private and never linked permanently.
+      viewUrl: u.studentIdFilePath ? getFileStore().signedUrl(u.studentIdFilePath, REVIEW_URL_TTL_SECONDS) : null,
+      viewUrlExpiresInSeconds: REVIEW_URL_TTL_SECONDS,
+    },
+  };
+}
 
 export async function listStudentIdsForReview(status: DocumentReviewStatus, skip: number, take: number) {
   const where = { studentIdStatus: status };
@@ -460,11 +508,13 @@ export async function reviewStudentId(
     title: decision === 'approved' ? 'Student ID approved' : 'Student ID not accepted',
     detail:
       decision === 'approved'
-        ? updated.kycStatus === 'verified'
-          ? 'Your spaces can now collect payments.'
-          : 'Collection opens once your identity verification completes.'
+        ? !updated.isRep
+          ? 'Your student ID is approved. An admin will finish reviewing your rep application.'
+          : updated.kycStatus === 'verified'
+            ? 'Your spaces can now collect payments.'
+            : 'Collection opens once your identity verification completes.'
         : `Please upload a clearer, valid student ID card. Reason: ${note}`,
-    href: '/dashboard/payout',
+    href: '/dashboard/kyc',
   }).catch(() => {});
   return toState(updated);
 }
