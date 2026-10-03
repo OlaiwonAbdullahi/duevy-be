@@ -279,6 +279,7 @@ const patchSpaceSchema = z.object({
   name: z.string().min(2).max(120).optional(),
   short: z.string().min(2).max(6).optional(),
   about: z.string().max(500).optional(),
+  faculty: z.string().trim().max(120).nullable().optional(),
   hue: z.enum(['emerald', 'indigo', 'amber', 'rose', 'slate']).optional(),
   theme: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).optional(),
 });

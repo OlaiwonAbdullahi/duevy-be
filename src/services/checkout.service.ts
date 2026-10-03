@@ -488,7 +488,8 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       kind: 'payment_received',
       title: 'Payment received',
       detail: `${payer?.name ?? 'A member'} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for "${title}".`,
-      href: '/dashboard/collections',
+      // One due opens its collections roster; a basket goes to the dues list.
+      href: items.length === 1 ? `/dashboard/create-dues?due=${items[0]!.dueId}` : '/dashboard/create-dues',
     },
   );
   await notifyMany([checkout.userId], {
