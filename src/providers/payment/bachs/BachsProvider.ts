@@ -77,6 +77,8 @@ interface BachsAccount {
   id: string;
   capabilities?: Record<string, { status?: string } | undefined> | null;
   requirements?: { currently_due?: string[]; past_due?: string[] } | null;
+  /** Field-level problems with a `fields` submission (POST /v1/accounts/{id}). */
+  errors?: { field?: string; code?: string; message?: string }[] | null;
 }
 interface BachsPerson {
   id: string;
@@ -424,6 +426,37 @@ export class BachsProvider implements PaymentProvider {
       },
     });
     return { destinationId: d.id, usable: d.is_usable ?? false, accountName: d.account_name ?? null };
+  }
+
+  async submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void> {
+    // docs.bachs.io/connect/requirements#the-payout-destination-shape
+    const account = await this.client.request<BachsAccount>({
+      method: 'POST',
+      path: `/v1/accounts/${encodeURIComponent(input.accountId)}`,
+      op: 'account.payout_destination',
+      idempotencyKey: `acct-dest-${digest(input.accountId, input.bankCode, input.accountNumber)}`,
+      body: {
+        fields: {
+          payout_destination: {
+            type: 'bank_account',
+            currency: 'NGN',
+            account_number: input.accountNumber,
+            account_name: input.accountName,
+            bank_code: input.bankCode,
+          },
+        },
+      },
+    });
+    // A refused field comes back in errors[] on a 200; `required` only means incomplete.
+    const refused = (account.errors ?? []).find((e) => e.field?.startsWith('payout_destination') && e.code !== 'required');
+    if (refused) {
+      throw new ProviderError(
+        refused.message ?? 'The payment provider refused this bank account',
+        422,
+        'PAYOUT_DESTINATION_REJECTED',
+        false,
+      );
+    }
   }
 
   async initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult> {

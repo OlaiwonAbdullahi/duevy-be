@@ -245,6 +245,14 @@ Replaces the student ID card after an admin rejected it (or if none was sent). P
 
 Forwards a government ID document to Bachs, for when `requirementsDue` asks for one. Part: `governmentId`. Returns `202`. `409 KYC_NOT_STARTED` before the first submission.
 
+### `POST /payout/kyc/payout-destination` (also `/me/kyc/payout-destination`)
+
+The rep's own bank account, for when Bachs lists `payout_destination` in `requirementsDue`. Bachs won't finish onboarding (and payouts stay off) until it has one. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. The account is name-checked and the bank's name is sent to Bachs. `200` with the refreshed KYC state. Errors: `409 KYC_NOT_STARTED`, `422 ACCOUNT_UNVERIFIABLE`, `422 PAYOUT_DESTINATION_REJECTED` (Bachs refused it).
+
+`POST /me/kyc/payout-destination/lookup` with the same body runs the name check without sending anything: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
+
+This is separate from beneficiaries: it only tells Bachs where the rep's account would pay out by default. Withdrawals still go to the beneficiary or account chosen each time.
+
 ### `GET /payout/kyc-status`
 
 `200`: the space lead's KYC state (shape above) plus `mine`, the caller's own state.

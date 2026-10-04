@@ -13,7 +13,13 @@ import { ok, fail, errors } from '../lib/response';
 import { hashToken } from '../lib/tokens';
 import { sendVerification } from '../services/auth.service';
 import { getKycState } from '../services/kyc.service';
-import { governmentIdHandlers, resubmitStudentIdHandlers, submitKycHandlers } from './kycHandlers';
+import {
+  governmentIdHandlers,
+  payoutDestinationHandlers,
+  payoutDestinationLookupHandlers,
+  resubmitStudentIdHandlers,
+  submitKycHandlers,
+} from './kycHandlers';
 
 export const meRouter = Router();
 
@@ -34,6 +40,8 @@ meRouter.get('/kyc-status', async (req: Request, res: Response): Promise<void> =
 meRouter.post('/kyc', ...submitKycHandlers);
 meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
 meRouter.post('/kyc/government-id', ...governmentIdHandlers);
+meRouter.post('/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
+meRouter.post('/kyc/payout-destination', ...payoutDestinationHandlers);
 
 // Default notification preferences (§3.4) applied when the column is null.
 const DEFAULT_NOTIFICATION_PREFS = {

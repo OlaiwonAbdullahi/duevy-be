@@ -165,6 +165,11 @@ export class FakeProvider implements PaymentProvider {
     return { destinationId: `pd_fake_${++this.seq}`, usable: true, accountName: input.accountName };
   }
 
+  async submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void> {
+    this.record('submitAccountPayoutDestination', { accountId: input.accountId, bankCode: input.bankCode });
+    this.requirementsDue = this.requirementsDue.filter((r) => r !== 'payout_destination');
+  }
+
   async initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult> {
     this.record('initiatePayout', input);
     if (this.payoutDelayMs) await new Promise((r) => setTimeout(r, this.payoutDelayMs));

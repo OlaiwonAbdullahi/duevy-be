@@ -249,6 +249,12 @@ export interface PaymentProvider {
   /** Attach a government ID document to the rep's person, when the provider asks for one. */
   uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }>;
   registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination>;
+  /**
+   * Put the rep's own bank account on their provider account, satisfying the
+   * `payout_destination` onboarding requirement. Distinct from
+   * registerPayoutDestination, which adds a place a withdrawal can be sent.
+   */
+  submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void>;
   getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus>;
   getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult>;
   /** Move Duevy's withdrawal fee (net of the provider's own payout fee) between the rep's account and the platform. */
