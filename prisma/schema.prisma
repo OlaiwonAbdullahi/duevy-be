@@ -278,6 +278,8 @@ enum AuditAction {
   payout_approval_cast
   payout_disbursement_started
   payout_cancelled
+  beneficiary_added
+  beneficiary_removed
 }
 
 enum AssistantIntent {
@@ -509,7 +511,7 @@ model Space {
   reps           SpaceRep[]
   joinRequests   SpaceJoinRequest[]
   dues           Due[]
-  bankAccount    BankAccount?
+  beneficiaries  PayoutBeneficiary[]
   payouts        Payout[]
   polls          Poll[]
   auditLogs      SpaceAuditLog[]
@@ -839,25 +841,31 @@ model WebhookEvent {
 // Payouts & Bank Accounts
 // ---------------------------------------------------------------------------
 
-model BankAccount {
-  id                  String    @id @default(cuid())
-  spaceId             String    @unique
+// A bank account the space can withdraw to: the rep's own, a lecturer's, a
+// vendor's. Name enquiry runs when it is added, so `accountName` is always the
+// bank's. Registered as a payout destination on the lead rep's Bachs account;
+// if the lead changes, it is re-registered on the new lead's account at the
+// next withdrawal.
+model PayoutBeneficiary {
+  id                  String   @id @default(cuid())
+  spaceId             String
+  label               String? // the rep's own note, e.g. "Dr. Adeyemi (HOD)"
   bankCode            String
   bankName            String
   accountNumber       String // stored encrypted
   accountNumberMasked String // "•••• 4021"
   accountName         String
-  // The payout destination registered on the lead rep's Bachs account, and
-  // which account that was (it changes if the space's lead changes).
   bachsDestinationId  String?
   bachsAccountId      String?
-  cooldownUntil       DateTime? // §10.2 — 24h payout hold after an account change
-  setAt               DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  createdById         String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
-  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  space   Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  payouts Payout[]
 
-  @@map("bank_accounts")
+  @@index([spaceId, createdAt])
+  @@map("payout_beneficiaries")
 }
 
 model Payout {
@@ -868,6 +876,11 @@ model Payout {
   reference         String       @unique // ours; also the provider reference and idempotency key
   status            PayoutStatus @default(pending)
   accountMasked     String // "GTBank •••• 4021"
+  // Who it was sent to, fixed when the withdrawal is requested so a later
+  // edit or removal of the beneficiary can't redirect it.
+  beneficiaryId     String?
+  accountName       String?
+  destinationId     String? // the provider payout destination it is sent to
   note              String?
   requestedById     String?
   failureReason     String?
@@ -902,9 +915,10 @@ model Payout {
   netSentKobo       Int          @default(0)
   anchorTransferId  String?
 
-  space         Space            @relation(fields: [spaceId], references: [id])
-  due           Due?             @relation(fields: [dueId], references: [id], onDelete: SetNull)
-  requestedBy   User?            @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  space         Space              @relation(fields: [spaceId], references: [id])
+  due           Due?               @relation(fields: [dueId], references: [id], onDelete: SetNull)
+  beneficiary   PayoutBeneficiary? @relation(fields: [beneficiaryId], references: [id], onDelete: SetNull)
+  requestedBy   User?              @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
   approvals     PayoutApproval[]
   ledgerEntries LedgerEntry[]
 

@@ -43,8 +43,9 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
   });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
   await db.spaceMembership.create({ data: { userId: rep.id, spaceId: space.id } });
+  let beneficiary = null;
   if (verified) {
-    await db.bankAccount.create({
+    beneficiary = await db.payoutBeneficiary.create({
       data: {
         spaceId: space.id,
         bankCode: '058',
@@ -73,7 +74,7 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       }),
     );
   }
-  return { rep, space, students, dues };
+  return { rep, space, students, dues, beneficiary };
 }
 
 /** Put money on a space's ledger directly (as if collected). */

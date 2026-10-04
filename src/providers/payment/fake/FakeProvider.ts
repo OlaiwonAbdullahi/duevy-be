@@ -75,6 +75,7 @@ export class FakeProvider implements PaymentProvider {
     this.requirementsDue = [];
     this.identityByAccount.clear();
     this.unresolvable.clear();
+    this.resolvedName = 'ADA OBI';
     this.failNextPayout = null;
     this.payoutDelayMs = 0;
     this.collectionStatus.clear();

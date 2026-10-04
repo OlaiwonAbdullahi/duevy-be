@@ -255,7 +255,7 @@ Forwards a government ID document to Bachs, for when `requirementsDue` asks for 
 
 ```json
 { "available": 900000, "balance": 900000, "collected": 900000, "withdrawn": 0, "withdrawalFees": 0, "inFlight": 0,
-  "kyc": { … }, "payoutAccountReady": true, "cooldownUntil": null, "minPayout": 100000,
+  "kyc": { … }, "beneficiaryCount": 1, "minPayout": 100000,
   "fees": { "below": { "thresholdKobo": 5000000, "feeKobo": 10000 }, "atOrAbove": { "thresholdKobo": 5000000, "feeKobo": 20000 } } }
 ```
 
@@ -269,17 +269,20 @@ The balance always comes from the ledger.
 | `GET /payout/breakdown?from=&to=` | Collections per due: `{ totals: { collected, fees, net, paidCount }, byDue: [{ dueId, title, type, paidCount, collected, fees, net }] }` |
 | `GET /overview` | The space dashboard (existing endpoint). |
 
-### Payout account
+### Beneficiaries
+
+A withdrawal goes to a beneficiary: any bank account the space has added, such as the rep's own, a lecturer's or a vendor's. The account holder doesn't have to be the rep, and there is no hold after adding one. The account name always comes from the bank's name enquiry.
 
 | Endpoint | Behaviour |
 |---|---|
-| `POST /payout/account/lookup` | Name enquiry. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. Returns `200` `{ bankCode, bankName, accountNumber (masked), accountName, matchesYourName }`. |
-| `PUT /payout/account` | Lead rep only, same body. Runs name enquiry, checks the name matches the rep, and registers the account with Bachs. Returns `200` `{ bankCode, bankName, accountNumber, accountName, cooldownUntil, ready, usable }`. |
-| `GET /payout/account` | The account on file, masked. |
+| `POST /payout/beneficiaries/lookup` | Name enquiry without saving. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. Returns `200` `{ bankCode, bankName, accountNumber (masked), accountName }`. |
+| `GET /payout/beneficiaries` | Any rep. `[Beneficiary]`, newest first. |
+| `POST /payout/beneficiaries` | Lead rep only. Body: `{ bankCode, accountNumber, label? }` (`label` up to 60 characters, e.g. `"Dr. Adeyemi (HOD)"`). Runs name enquiry and registers the account with Bachs. `201` with the new `Beneficiary`, or `200` with the existing one if that account was already added. Every rep of the space is emailed. |
+| `DELETE /payout/beneficiaries/:beneficiaryId` | Lead rep only. `200` `{ removed: true }`. Withdrawals already made to it are unaffected. |
 
-`PUT /payout/account` errors: `409 KYC_NOT_VERIFIED`, `422 ACCOUNT_UNVERIFIABLE`, `422 ACCOUNT_NAME_MISMATCH` (withdrawals only go to an account in the rep's own name).
+`Beneficiary = { id, label, bankCode, bankName, accountNumber (masked), accountName, createdAt }`
 
-Changing the account starts a 24-hour hold on withdrawals, and every rep of the space is emailed.
+`POST /payout/beneficiaries` errors: `409 KYC_NOT_VERIFIED`, `409 TOO_MANY_BENEFICIARIES` (25 per space), `422 ACCOUNT_UNVERIFIABLE`.
 
 ### `GET /payout/quote?amount=500000`
 
@@ -289,18 +292,17 @@ The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from
 
 ### 🔑 `POST /payout/request` (lead rep only)
 
-- Body: `{ "amount": 500000, "note"?: "…" }`, the gross amount in kobo.
+- Body: `{ "amount": 500000, "beneficiaryId": "…", "note"?: "…" }`. `amount` is the gross in kobo.
 - `201`: `Payout`.
 
-`Payout = { id, amount, fee, net, reference, status, account, note, requestedById, requestedAt, processingAt, settledAt, failedAt, reversedAt, failureReason }`
+`Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, note, requestedById, requestedAt, processingAt, settledAt, failedAt, reversedAt, failureReason }`
 
 Withdrawal status moves `pending → processing → success | failed | reversed`. On `failed` or `reversed`, the full amount goes back to the balance.
 
 | Error | When |
 |---|---|
 | `403 KYC_NOT_VERIFIED` | The rep has not passed KYC. |
-| `409 NO_PAYOUT_ACCOUNT` | No payout account on file. |
-| `409 ACCOUNT_COOLDOWN` | Within 24 hours of a payout-account change. |
+| `404 BENEFICIARY_NOT_FOUND` | No beneficiary with that id in this space. |
 | `409 WITHDRAWAL_IN_PROGRESS` | Another withdrawal for this space is still in flight. |
 | `422 INSUFFICIENT_BALANCE` | The amount is more than the balance. |
 | `422 BELOW_MIN_PAYOUT` | Under the ₦1,000 minimum. |
