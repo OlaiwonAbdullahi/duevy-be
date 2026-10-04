@@ -6,31 +6,25 @@ import { type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
 import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
-import { ok, fail, errors } from '../lib/response';
+import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { serializePayout, serializeBankAccount } from '../lib/serializers';
-import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
-import { namesMatch } from '../lib/nameMatch';
+import { serializePayout, serializeBeneficiary } from '../lib/serializers';
+import { maskAccountNumber } from '../lib/encryption';
 import {
   MIN_PAYOUT_KOBO,
   WITHDRAWAL_FEE_HIGH_KOBO,
   WITHDRAWAL_FEE_LOW_KOBO,
   WITHDRAWAL_FEE_THRESHOLD_KOBO,
 } from '../lib/money';
-import { sendEmail, renderEmail } from '../lib/email';
-import { logger } from '../lib/logger';
-import { getPaymentProvider } from '../providers/payment';
 import { getKycState, getSpaceKycState } from '../services/kyc.service';
 import { governmentIdHandlers, resubmitStudentIdHandlers, submitKycHandlers } from './kycHandlers';
 import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { quoteWithdrawal, requestWithdrawal } from '../services/withdrawal.service';
-import { listBanksCached } from './banks';
+import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
 export const payoutsRouter = Router({ mergeParams: true });
 payoutsRouter.use(requireSpaceRep());
-
-const ACCOUNT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h hold after an account change
 
 function uid(req: Request): string {
   return (req as AuthenticatedRequest).user.sub as string;
@@ -45,10 +39,10 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, account] = await Promise.all([
+  const [ledger, kyc, beneficiaryCount] = await Promise.all([
     getSpaceLedgerSummary(sid),
     getSpaceKycState(sid),
-    db.bankAccount.findUnique({ where: { spaceId: sid }, select: { bachsDestinationId: true, cooldownUntil: true } }),
+    db.payoutBeneficiary.count({ where: { spaceId: sid } }),
   ]);
   ok(res, {
     available: ledger.balance,
@@ -60,8 +54,7 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     // Kept for older clients: lifetime amount withdrawn.
     lifetime: ledger.withdrawn,
     kyc,
-    payoutAccountReady: !!account?.bachsDestinationId,
-    cooldownUntil: account?.cooldownUntil?.toISOString() ?? null,
+    beneficiaryCount,
     minPayout: MIN_PAYOUT_KOBO,
     fees: {
       below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_LOW_KOBO },
@@ -151,127 +144,63 @@ payoutsRouter.get('/payout/breakdown', async (req: Request, res: Response): Prom
 });
 
 // ---------------------------------------------------------------------------
-// Payout bank account. Name enquiry is mandatory and server-side; the account
-// name is always the bank's, never the client's — and it must match the
-// rep's own name, so money only ever leaves to the rep's own account.
+// Beneficiaries — the accounts a withdrawal can go to (the rep's own, a
+// lecturer's, a vendor's). Name enquiry is mandatory and server-side: the
+// account name is always the bank's, never the client's.
 // ---------------------------------------------------------------------------
 const accountSchema = z.object({
   bankCode: z.string().min(3).max(10),
   accountNumber: z.string().regex(/^\d{10}$/, 'must be a 10-digit NUBAN'),
 });
+const beneficiarySchema = accountSchema.extend({ label: z.string().trim().max(60).optional() });
 
-async function resolveBankDetails(bankCode: string, accountNumber: string) {
-  const banks = await listBanksCached();
-  const bankName = banks.find((b) => b.code === bankCode)?.name;
-  if (!bankName) return { error: 'UNKNOWN_BANK' as const };
-  const resolved = await getPaymentProvider().resolveAccount(bankCode, accountNumber);
-  if (!resolved) return { error: 'UNVERIFIABLE' as const };
-  return { bankName, accountName: resolved.accountName };
-}
-
-payoutsRouter.get('/payout/account', async (req: Request, res: Response): Promise<void> => {
-  const account = await db.bankAccount.findUnique({ where: { spaceId: spaceId(req) } });
-  if (!account) {
-    fail(res, 404, 'NO_PAYOUT_ACCOUNT', 'No payout account has been set for this space');
-    return;
-  }
-  ok(res, { ...serializeBankAccount(account), ready: !!account.bachsDestinationId }); // masked
-});
-
-// POST /payout/account/lookup — preview the bank's name for an account before saving it.
+// POST /payout/beneficiaries/lookup — preview the bank's name for an account before adding it.
 payoutsRouter.post(
-  '/payout/account/lookup',
+  '/payout/beneficiaries/lookup',
   sensitiveLimiter,
   validate(accountSchema),
   async (req: Request, res: Response): Promise<void> => {
     const { bankCode, accountNumber } = req.body as z.infer<typeof accountSchema>;
     const resolved = await resolveBankDetails(bankCode, accountNumber);
-    if ('error' in resolved) {
-      if (resolved.error === 'UNKNOWN_BANK') errors.validation(res, [{ field: 'bankCode', issue: 'unknown bank code' }]);
-      else fail(res, 422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
-      return;
-    }
-    const me = await db.user.findUniqueOrThrow({ where: { id: uid(req) }, select: { name: true } });
-    ok(res, {
-      bankCode,
-      bankName: resolved.bankName,
-      accountNumber: maskAccountNumber(accountNumber),
-      accountName: resolved.accountName,
-      matchesYourName: namesMatch(me.name, resolved.accountName),
-    });
+    ok(res, { bankCode, bankName: resolved.bankName, accountNumber: maskAccountNumber(accountNumber), accountName: resolved.accountName });
   },
 );
 
-// PUT /payout/account — lead rep only; registers the account with the provider.
-payoutsRouter.put(
-  '/payout/account',
+payoutsRouter.get('/payout/beneficiaries', async (req: Request, res: Response): Promise<void> => {
+  ok(res, (await listBeneficiaries(spaceId(req))).map(serializeBeneficiary));
+});
+
+// POST /payout/beneficiaries — lead rep only; registers the account with the provider.
+payoutsRouter.post(
+  '/payout/beneficiaries',
   requireSpaceRep(true),
   sensitiveLimiter,
-  validate(accountSchema),
+  validate(beneficiarySchema),
   async (req: Request, res: Response): Promise<void> => {
-    const sid = spaceId(req);
-    const { bankCode, accountNumber } = req.body as z.infer<typeof accountSchema>;
-
+    const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
     const me = await db.user.findUniqueOrThrow({ where: { id: uid(req) } });
     if (!me.bachsAccountId || me.kycStatus !== 'verified') {
-      errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a payout account');
+      errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
     }
-
-    const resolved = await resolveBankDetails(bankCode, accountNumber);
-    if ('error' in resolved) {
-      if (resolved.error === 'UNKNOWN_BANK') errors.validation(res, [{ field: 'bankCode', issue: 'unknown bank code' }]);
-      else fail(res, 422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
-      return;
-    }
-    if (!namesMatch(me.name, resolved.accountName)) {
-      fail(res, 422, 'ACCOUNT_NAME_MISMATCH', 'Withdrawals can only go to a bank account in your own name');
-      return;
-    }
-
-    const destination = await getPaymentProvider().registerPayoutDestination({
-      accountId: me.bachsAccountId,
+    const { beneficiary, created } = await addBeneficiary({
+      spaceId: spaceId(req),
+      actor: { id: me.id, name: me.name, bachsAccountId: me.bachsAccountId },
       bankCode,
       accountNumber,
-      accountName: resolved.accountName,
+      label,
     });
+    ok(res, serializeBeneficiary(beneficiary), created ? 201 : 200);
+  },
+);
 
-    const existing = await db.bankAccount.findUnique({ where: { spaceId: sid } });
-    const changed = !!existing && (decrypt(existing.accountNumber) !== accountNumber || existing.bankCode !== bankCode);
-    const masked = maskAccountNumber(accountNumber);
-    const cooldownUntil = changed ? new Date(Date.now() + ACCOUNT_COOLDOWN_MS) : existing?.cooldownUntil ?? null;
-
-    const data = {
-      bankCode,
-      bankName: resolved.bankName,
-      accountNumber: encrypt(accountNumber),
-      accountNumberMasked: masked,
-      accountName: resolved.accountName,
-      bachsDestinationId: destination.destinationId,
-      bachsAccountId: me.bachsAccountId,
-      cooldownUntil,
-    };
-    const account = await db.bankAccount.upsert({ where: { spaceId: sid }, update: data, create: { spaceId: sid, ...data } });
-    logger.info({ spaceId: sid, bank: bankCode, account: masked, usable: destination.usable }, 'payout account set');
-
-    if (changed) {
-      const reps = await db.spaceRep.findMany({ where: { spaceId: sid }, include: { user: { select: { email: true, name: true } } } });
-      for (const r of reps) {
-        sendEmail({
-          to: r.user.email,
-          subject: 'Duevy payout account changed',
-          html: renderEmail(
-            `<h1>Payout account changed</h1>
-             <p>Hi ${r.user.name}, the payout bank account for your space was changed to <strong>${resolved.bankName} ${masked}</strong>.</p>
-             <div class="callout">Withdrawals are held for 24 hours as a security measure.</div>
-             <p class="muted">If this wasn't you, contact support immediately at support@duevy.app</p>`,
-            '#b01e4e',
-          ),
-        }).catch(() => {});
-      }
-    }
-
-    ok(res, { ...serializeBankAccount(account), ready: true, usable: destination.usable });
+payoutsRouter.delete(
+  '/payout/beneficiaries/:beneficiaryId',
+  requireSpaceRep(true),
+  async (req: Request, res: Response): Promise<void> => {
+    const me = await db.user.findUniqueOrThrow({ where: { id: uid(req) }, select: { id: true, name: true } });
+    await removeBeneficiary(spaceId(req), req.params.beneficiaryId as string, me);
+    ok(res, { removed: true });
   },
 );
 
@@ -303,12 +232,21 @@ payoutsRouter.get('/payout/quote', async (req: Request, res: Response): Promise<
 // ---------------------------------------------------------------------------
 // POST /payout/request — lead rep only. Idempotency-Key required.
 // ---------------------------------------------------------------------------
+// Either a saved beneficiary, or a one-off account (bankCode + accountNumber)
+// that is name-checked but not saved.
 const requestSchema = z
   .object({
     amount: z.number().int().positive(),
+    beneficiaryId: z.string().min(1).optional(),
+    bankCode: accountSchema.shape.bankCode.optional(),
+    accountNumber: accountSchema.shape.accountNumber.optional(),
     note: z.string().max(300).optional(),
   })
-  .strict();
+  .strict()
+  .refine((b) => (b.beneficiaryId ? !b.bankCode && !b.accountNumber : !!b.bankCode && !!b.accountNumber), {
+    message: 'send either beneficiaryId, or bankCode and accountNumber',
+    path: ['beneficiaryId'],
+  });
 
 payoutsRouter.post(
   '/payout/request',
@@ -318,8 +256,15 @@ payoutsRouter.post(
   idempotent,
   validate(requestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { amount, note } = req.body as z.infer<typeof requestSchema>;
-    const payout = await requestWithdrawal({ spaceId: spaceId(req), userId: uid(req), amountKobo: amount, note });
+    const { amount, beneficiaryId, bankCode, accountNumber, note } = req.body as z.infer<typeof requestSchema>;
+    const payout = await requestWithdrawal({
+      spaceId: spaceId(req),
+      userId: uid(req),
+      amountKobo: amount,
+      beneficiaryId,
+      account: bankCode && accountNumber ? { bankCode, accountNumber } : undefined,
+      note,
+    });
     ok(res, serializePayout(payout), 201);
   },
 );

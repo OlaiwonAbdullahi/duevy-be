@@ -112,20 +112,22 @@ async function main() {
 
   if (fake) {
     const accountNumber = '0123456789';
-    await db.bankAccount.upsert({
-      where: { spaceId: space.id },
-      update: {},
-      create: {
-        spaceId: space.id,
-        bankCode: '058',
-        bankName: 'Guaranty Trust Bank',
-        accountNumber: encrypt(accountNumber),
-        accountNumberMasked: maskAccountNumber(accountNumber),
-        accountName: 'OKAFOR TUNDE',
-        bachsDestinationId: 'pd_fake_seed_rep',
-        bachsAccountId: 'acct_fake_seed_rep',
-      },
-    });
+    if (!(await db.payoutBeneficiary.findFirst({ where: { spaceId: space.id } }))) {
+      await db.payoutBeneficiary.create({
+        data: {
+          spaceId: space.id,
+          label: 'My account',
+          bankCode: '058',
+          bankName: 'Guaranty Trust Bank',
+          accountNumber: encrypt(accountNumber),
+          accountNumberMasked: maskAccountNumber(accountNumber),
+          accountName: 'OKAFOR TUNDE',
+          bachsDestinationId: 'pd_fake_seed_rep',
+          bachsAccountId: 'acct_fake_seed_rep',
+          createdById: rep.id,
+        },
+      });
+    }
   }
 
   // --- Dues --------------------------------------------------------------------

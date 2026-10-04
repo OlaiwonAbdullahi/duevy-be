@@ -5,7 +5,7 @@ import {
   type SpaceAuditLog,
   type Transaction,
   type Payout,
-  type BankAccount,
+  type PayoutBeneficiary,
   type Notification,
   type Poll,
   type PollCategory,
@@ -43,7 +43,7 @@ export function serializeTransaction(t: Transaction) {
 /**
  * The `Payout` (withdrawal) resource. `amount` is the gross debited from the
  * space; `fee` is Duevy's withdrawal fee, deducted from it; `net` is what
- * reaches the rep's bank. Status: pending | processing | success | failed | reversed.
+ * reaches the beneficiary's bank. Status: pending | processing | success | failed | reversed.
  */
 export function serializePayout(p: Payout) {
   const legacy = p.provider === 'anchor';
@@ -57,6 +57,8 @@ export function serializePayout(p: Payout) {
     reference: p.reference,
     status: p.status,
     account: p.accountMasked,
+    accountName: p.accountName,
+    beneficiaryId: p.beneficiaryId,
     note: p.note,
     requestedById: p.requestedById,
     requestedAt: p.requestedAt.toISOString(),
@@ -71,17 +73,16 @@ export function serializePayout(p: Payout) {
   };
 }
 
-/**
- * The `BankAccount` resource (§10.2). The account number is masked on reads;
- * pass `revealAccountNumber` (the decrypted value) only on the PUT echo.
- */
-export function serializeBankAccount(a: BankAccount, revealAccountNumber?: string) {
+/** A payout beneficiary. The account number is always masked. */
+export function serializeBeneficiary(b: PayoutBeneficiary) {
   return {
-    bankCode: a.bankCode,
-    bankName: a.bankName,
-    accountNumber: revealAccountNumber ?? a.accountNumberMasked,
-    accountName: a.accountName,
-    cooldownUntil: a.cooldownUntil?.toISOString() ?? null,
+    id: b.id,
+    label: b.label,
+    bankCode: b.bankCode,
+    bankName: b.bankName,
+    accountNumber: b.accountNumberMasked,
+    accountName: b.accountName,
+    createdAt: b.createdAt.toISOString(),
   };
 }
 

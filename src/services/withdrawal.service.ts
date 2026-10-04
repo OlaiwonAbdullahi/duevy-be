@@ -1,6 +1,6 @@
 import { Prisma, type Payout } from '@prisma/client';
 import { db } from '../config/db';
-import { AppError, conflict, forbidden, notFound } from '../lib/errors';
+import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { computeWithdrawal, generatePayoutReference, MIN_PAYOUT_KOBO } from '../lib/money';
 import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine';
@@ -9,10 +9,11 @@ import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getSpaceBalance, lockSpace } from './ledger.service';
 import { canWithdraw } from './kyc.service';
+import { destinationFor, oneOffDestination } from './beneficiary.service';
 
 /**
- * Withdrawals: a space's lead rep moves the space's balance to their own
- * verified bank account.
+ * Withdrawals: a space's lead rep moves the space's balance to one of its
+ * beneficiaries — any bank account the space has added.
  *
  *   gross = what the rep asks for, debited from the space's ledger
  *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross
@@ -43,6 +44,9 @@ export interface WithdrawalRequest {
   spaceId: string;
   userId: string;
   amountKobo: number;
+  /** Where it goes: a saved beneficiary, or a one-off account that isn't saved. */
+  beneficiaryId?: string;
+  account?: { bankCode: string; accountNumber: string };
   note?: string;
 }
 
@@ -66,22 +70,18 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   }
   const breakdown = computeWithdrawal(amountKobo);
 
-  const [space, user, account] = await Promise.all([
+  const [space, user] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
     db.user.findUnique({ where: { id: userId } }),
-    db.bankAccount.findUnique({ where: { spaceId } }),
   ]);
   if (!space || !user) throw notFound('Space not found');
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
   if (!canWithdraw(user)) {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
-  if (!account?.bachsDestinationId || account.bachsAccountId !== user.bachsAccountId) {
-    throw conflict('NO_PAYOUT_ACCOUNT', 'Add and verify your payout bank account before withdrawing');
-  }
-  if (account.cooldownUntil && account.cooldownUntil > new Date()) {
-    throw conflict('ACCOUNT_COOLDOWN', 'Withdrawals are on hold for 24 hours after a payout account change');
-  }
+  // canWithdraw guarantees a Bachs account. The destination is fixed on the
+  // payout now so a later change to the beneficiary can't redirect it.
+  const target = await resolveTarget(req, user.bachsAccountId!);
 
   const reference = await uniquePayoutReference();
 
@@ -110,7 +110,10 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             reference,
             status: 'pending',
             activeSpaceId: spaceId,
-            accountMasked: `${account.bankName} ${account.accountNumberMasked}`,
+            accountMasked: `${target.bankName} ${target.accountNumberMasked}`,
+            accountName: target.accountName,
+            beneficiaryId: target.beneficiaryId,
+            destinationId: target.destinationId,
             note: req.note,
             requestedById: userId,
             provider: getPaymentProvider().name,
@@ -122,7 +125,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
           spaceId,
           { id: userId, name: user.name, role: 'lead' },
           'payout_requested',
-          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal (${reference})`,
+          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal to ${target.accountName} (${reference})`,
           tx,
         );
         return created;
@@ -138,6 +141,24 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee }, 'withdrawal created');
   await dispatchPayout(payout.id);
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
+}
+
+async function resolveTarget(req: WithdrawalRequest, accountId: string) {
+  if (req.beneficiaryId) {
+    const b = await db.payoutBeneficiary.findFirst({ where: { id: req.beneficiaryId, spaceId: req.spaceId } });
+    if (!b) throw new AppError(404, 'BENEFICIARY_NOT_FOUND', 'That beneficiary no longer exists');
+    return {
+      beneficiaryId: b.id,
+      bankName: b.bankName,
+      accountNumberMasked: b.accountNumberMasked,
+      accountName: b.accountName,
+      destinationId: await destinationFor(b, accountId),
+    };
+  }
+  if (req.account) {
+    return { beneficiaryId: null, ...(await oneOffDestination(accountId, req.account.bankCode, req.account.accountNumber)) };
+  }
+  throw new AppError(400, 'VALIDATION_ERROR', 'Choose a beneficiary or enter an account for this withdrawal');
 }
 
 async function debit(tx: Tx, p: Payout): Promise<void> {
@@ -177,16 +198,15 @@ async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
 export async function dispatchPayout(payoutId: string): Promise<void> {
   const payout = await db.payout.findUnique({ where: { id: payoutId } });
   if (!payout || payout.status !== 'pending') return;
-  const account = await db.bankAccount.findUnique({ where: { spaceId: payout.spaceId } });
-  if (!payout.providerAccountId || !account?.bachsDestinationId) {
-    await failPayout(payout.id, 'No verified payout account on file');
+  if (!payout.providerAccountId || !payout.destinationId) {
+    await failPayout(payout.id, 'No payout destination on this withdrawal');
     return;
   }
 
   try {
     const result = await getPaymentProvider().initiatePayout({
       accountId: payout.providerAccountId,
-      destinationId: account.bachsDestinationId,
+      destinationId: payout.destinationId,
       amountKobo: payout.netKobo,
       reference: payout.reference,
     });
@@ -213,7 +233,7 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
         err.code === 'INSUFFICIENT_BALANCE'
           ? 'Recent payments are still settling. Try again later.'
           : err.code === 'DESTINATION_PENDING_REVIEW'
-            ? 'Your payout account is still being reviewed.'
+            ? 'This beneficiary account is still being reviewed.'
             : err.message;
       await failPayout(payout.id, reason, err.code ?? undefined);
       return;
@@ -338,7 +358,7 @@ async function notifyReps(p: Payout, outcome: 'success' | 'failed'): Promise<voi
       ? {
           kind: 'payout_completed',
           title: 'Withdrawal completed',
-          detail: `₦${(p.netKobo / 100).toLocaleString('en-NG')} was sent to ${p.accountMasked}.`,
+          detail: `₦${(p.netKobo / 100).toLocaleString('en-NG')} was sent to ${p.accountName ? `${p.accountName}, ` : ''}${p.accountMasked}.`,
           href: '/dashboard/payout',
         }
       : {
