@@ -10,8 +10,11 @@ import {
   resubmitStudentId,
   submitGovernmentId,
   submitKyc,
+  submitPayoutDestination,
   type UploadedDocument,
 } from '../services/kyc.service';
+import { resolveBankDetails } from '../services/beneficiary.service';
+import { maskAccountNumber } from '../lib/encryption';
 
 /**
  * KYC request handlers, shared by `/me/kyc*` (rep applicants and reps, before
@@ -163,5 +166,34 @@ export const governmentIdHandlers: RequestHandler[] = [
       return;
     }
     ok(res, await submitGovernmentId(uid(req), doc), 202);
+  },
+];
+
+const payoutDestinationSchema = z.object({
+  bankCode: z.string().min(3).max(10),
+  accountNumber: z.string().regex(/^\d{10}$/, 'must be a 10-digit NUBAN'),
+});
+
+/** POST …/kyc/payout-destination/lookup — name enquiry for that account, without sending it. */
+export const payoutDestinationLookupHandlers: RequestHandler[] = [
+  sensitiveLimiter,
+  validate(payoutDestinationSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { bankCode, accountNumber } = req.body as z.infer<typeof payoutDestinationSchema>;
+    const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
+    ok(res, { bankCode, bankName, accountNumber: maskAccountNumber(accountNumber), accountName });
+  },
+];
+
+/**
+ * POST …/kyc/payout-destination — the rep's own bank account, when Bachs asks
+ * for one (`payout_destination` in `requirementsDue`) to finish onboarding.
+ */
+export const payoutDestinationHandlers: RequestHandler[] = [
+  sensitiveLimiter,
+  validate(payoutDestinationSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { bankCode, accountNumber } = req.body as z.infer<typeof payoutDestinationSchema>;
+    ok(res, await submitPayoutDestination(uid(req), bankCode, accountNumber));
   },
 ];

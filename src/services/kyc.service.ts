@@ -4,6 +4,8 @@ import { AppError, conflict, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { notify } from '../lib/notifications';
 import { getFileStore } from '../lib/storage';
+import { maskAccountNumber } from '../lib/encryption';
+import { resolveBankDetails } from './beneficiary.service';
 import { getPaymentProvider, ProviderError, type IdentityNumber, type IdentityResult } from '../providers/payment';
 
 /**
@@ -308,6 +310,28 @@ export async function submitGovernmentId(userId: string, doc: UploadedDocument):
   const updated = await db.user.update({ where: { id: user.id }, data: { governmentIdSubmittedAt: new Date() } });
   logger.info({ userId, providerRef: user.bachsPersonId }, 'government ID forwarded to provider');
   return toState(updated);
+}
+
+/**
+ * Give the provider the rep's own bank account, when it asks for one
+ * (`payout_destination` in requirementsDue). Name-checked first; the bank's
+ * name is what is sent. Then re-reads the requirements.
+ */
+export async function submitPayoutDestination(userId: string, bankCode: string, accountNumber: string): Promise<KycState> {
+  const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
+  if (!user.bachsAccountId || !user.bachsPersonId) {
+    throw conflict('KYC_NOT_STARTED', 'Submit your NIN and student ID first');
+  }
+  const { accountName } = await resolveBankDetails(bankCode, accountNumber);
+  await getPaymentProvider().submitAccountPayoutDestination({
+    accountId: user.bachsAccountId,
+    bankCode,
+    accountNumber,
+    accountName,
+  });
+  logger.info({ userId, providerRef: user.bachsAccountId, bank: bankCode, account: maskAccountNumber(accountNumber) }, 'payout destination sent to provider');
+  await refreshIdentity(user.bachsAccountId);
+  return toState(await db.user.findUniqueOrThrow({ where: { id: userId } }));
 }
 
 async function recordFailedAttempt(user: User, reason: string): Promise<void> {

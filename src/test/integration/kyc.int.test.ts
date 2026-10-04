@@ -165,3 +165,39 @@ describe('rep KYC: NIN at Bachs + student ID reviewed by Duevy', () => {
     expect(publish.body.error.code).toBe('KYC_REQUIRED');
   });
 });
+
+describe('rep KYC: payout_destination requirement', () => {
+  it("sends the rep's own bank account to Bachs and clears the requirement", async () => {
+    const { rep } = await makeSpace({ verified: false });
+    const token = await tokenFor(rep);
+    fake.requirementsDue = ['payout_destination'];
+
+    const before = await api('POST', '/v1/me/kyc/payout-destination', {
+      token,
+      body: { bankCode: '058', accountNumber: '0123456789' },
+    });
+    expect(before.status).toBe(409);
+    expect(before.body.error.code).toBe('KYC_NOT_STARTED');
+
+    const submitted = await apiMultipart('/v1/me/kyc', {
+      token,
+      fields: { nin: NIN, dob: DOB, gender: 'female' },
+      files: { studentIdCard: card },
+    });
+    expect(submitted.body.data.requirementsDue).toEqual(['payout_destination']);
+
+    const res = await api('POST', '/v1/me/kyc/payout-destination', {
+      token,
+      body: { bankCode: '058', accountNumber: '0123456789' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data.requirementsDue).toEqual([]);
+    const user = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
+    expect(fake.calls.find((c) => c.op === 'submitAccountPayoutDestination')?.args).toMatchObject({
+      accountId: user.bachsAccountId,
+      bankCode: '058',
+    });
+    expect(user.kycRequirementsDue).toEqual([]);
+  });
+});
+
