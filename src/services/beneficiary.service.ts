@@ -27,7 +27,7 @@ export async function resolveBankDetails(bankCode: string, accountNumber: string
   const banks = await listBanksCached();
   const bankName = banks.find((b) => b.code === bankCode)?.name;
   if (!bankName) {
-    throw new AppError(422, 'VALIDATION_ERROR', 'Unknown bank', [{ field: 'bankCode', issue: 'unknown bank code' }]);
+    throw new AppError(400, 'VALIDATION_ERROR', 'Unknown bank', [{ field: 'bankCode', issue: 'unknown bank code' }]);
   }
   const resolved = await getPaymentProvider().resolveAccount(bankCode, accountNumber);
   if (!resolved) throw new AppError(422, 'ACCOUNT_UNVERIFIABLE', 'Could not verify this account number with the selected bank');
@@ -124,6 +124,13 @@ export async function destinationFor(b: PayoutBeneficiary, accountId: string): P
     data: { bachsDestinationId: destination.destinationId, bachsAccountId: accountId },
   });
   return destination.destinationId;
+}
+
+/** A one-off withdrawal target: name-checked and registered with the provider, but not saved. */
+export async function oneOffDestination(accountId: string, bankCode: string, accountNumber: string) {
+  const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
+  const destination = await getPaymentProvider().registerPayoutDestination({ accountId, bankCode, accountNumber, accountName });
+  return { bankName, accountName, accountNumberMasked: maskAccountNumber(accountNumber), destinationId: destination.destinationId };
 }
 
 async function notifyRepsOfNewBeneficiary(spaceId: string, actorName: string, who: string): Promise<void> {

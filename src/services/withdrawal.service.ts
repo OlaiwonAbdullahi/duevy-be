@@ -9,7 +9,7 @@ import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getSpaceBalance, lockSpace } from './ledger.service';
 import { canWithdraw } from './kyc.service';
-import { destinationFor } from './beneficiary.service';
+import { destinationFor, oneOffDestination } from './beneficiary.service';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
@@ -44,7 +44,9 @@ export interface WithdrawalRequest {
   spaceId: string;
   userId: string;
   amountKobo: number;
-  beneficiaryId: string;
+  /** Where it goes: a saved beneficiary, or a one-off account that isn't saved. */
+  beneficiaryId?: string;
+  account?: { bankCode: string; accountNumber: string };
   note?: string;
 }
 
@@ -68,20 +70,18 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   }
   const breakdown = computeWithdrawal(amountKobo);
 
-  const [space, user, beneficiary] = await Promise.all([
+  const [space, user] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
     db.user.findUnique({ where: { id: userId } }),
-    db.payoutBeneficiary.findFirst({ where: { id: req.beneficiaryId, spaceId } }),
   ]);
   if (!space || !user) throw notFound('Space not found');
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
   if (!canWithdraw(user)) {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
-  if (!beneficiary) throw new AppError(404, 'BENEFICIARY_NOT_FOUND', 'Choose a beneficiary for this withdrawal');
-  // canWithdraw guarantees a Bachs account; the destination is fixed on the
+  // canWithdraw guarantees a Bachs account. The destination is fixed on the
   // payout now so a later change to the beneficiary can't redirect it.
-  const destinationId = await destinationFor(beneficiary, user.bachsAccountId!);
+  const target = await resolveTarget(req, user.bachsAccountId!);
 
   const reference = await uniquePayoutReference();
 
@@ -110,10 +110,10 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             reference,
             status: 'pending',
             activeSpaceId: spaceId,
-            accountMasked: `${beneficiary.bankName} ${beneficiary.accountNumberMasked}`,
-            accountName: beneficiary.accountName,
-            beneficiaryId: beneficiary.id,
-            destinationId,
+            accountMasked: `${target.bankName} ${target.accountNumberMasked}`,
+            accountName: target.accountName,
+            beneficiaryId: target.beneficiaryId,
+            destinationId: target.destinationId,
             note: req.note,
             requestedById: userId,
             provider: getPaymentProvider().name,
@@ -125,7 +125,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
           spaceId,
           { id: userId, name: user.name, role: 'lead' },
           'payout_requested',
-          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal to ${beneficiary.accountName} (${reference})`,
+          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal to ${target.accountName} (${reference})`,
           tx,
         );
         return created;
@@ -141,6 +141,24 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee }, 'withdrawal created');
   await dispatchPayout(payout.id);
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
+}
+
+async function resolveTarget(req: WithdrawalRequest, accountId: string) {
+  if (req.beneficiaryId) {
+    const b = await db.payoutBeneficiary.findFirst({ where: { id: req.beneficiaryId, spaceId: req.spaceId } });
+    if (!b) throw new AppError(404, 'BENEFICIARY_NOT_FOUND', 'That beneficiary no longer exists');
+    return {
+      beneficiaryId: b.id,
+      bankName: b.bankName,
+      accountNumberMasked: b.accountNumberMasked,
+      accountName: b.accountName,
+      destinationId: await destinationFor(b, accountId),
+    };
+  }
+  if (req.account) {
+    return { beneficiaryId: null, ...(await oneOffDestination(accountId, req.account.bankCode, req.account.accountNumber)) };
+  }
+  throw new AppError(400, 'VALIDATION_ERROR', 'Choose a beneficiary or enter an account for this withdrawal');
 }
 
 async function debit(tx: Tx, p: Payout): Promise<void> {

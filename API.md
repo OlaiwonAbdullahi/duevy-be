@@ -293,6 +293,7 @@ The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from
 ### 🔑 `POST /payout/request` (lead rep only)
 
 - Body: `{ "amount": 500000, "beneficiaryId": "…", "note"?: "…" }`. `amount` is the gross in kobo.
+- Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked and registered with Bachs the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
 - `201`: `Payout`.
 
 `Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, note, requestedById, requestedAt, processingAt, settledAt, failedAt, reversedAt, failureReason }`
@@ -303,6 +304,7 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 |---|---|
 | `403 KYC_NOT_VERIFIED` | The rep has not passed KYC. |
 | `404 BENEFICIARY_NOT_FOUND` | No beneficiary with that id in this space. |
+| `422 ACCOUNT_UNVERIFIABLE` | The one-off account couldn't be verified with the bank. |
 | `409 WITHDRAWAL_IN_PROGRESS` | Another withdrawal for this space is still in flight. |
 | `422 INSUFFICIENT_BALANCE` | The amount is more than the balance. |
 | `422 BELOW_MIN_PAYOUT` | Under the ₦1,000 minimum. |

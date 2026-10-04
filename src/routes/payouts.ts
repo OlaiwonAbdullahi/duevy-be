@@ -232,13 +232,21 @@ payoutsRouter.get('/payout/quote', async (req: Request, res: Response): Promise<
 // ---------------------------------------------------------------------------
 // POST /payout/request — lead rep only. Idempotency-Key required.
 // ---------------------------------------------------------------------------
+// Either a saved beneficiary, or a one-off account (bankCode + accountNumber)
+// that is name-checked but not saved.
 const requestSchema = z
   .object({
     amount: z.number().int().positive(),
-    beneficiaryId: z.string().min(1),
+    beneficiaryId: z.string().min(1).optional(),
+    bankCode: accountSchema.shape.bankCode.optional(),
+    accountNumber: accountSchema.shape.accountNumber.optional(),
     note: z.string().max(300).optional(),
   })
-  .strict();
+  .strict()
+  .refine((b) => (b.beneficiaryId ? !b.bankCode && !b.accountNumber : !!b.bankCode && !!b.accountNumber), {
+    message: 'send either beneficiaryId, or bankCode and accountNumber',
+    path: ['beneficiaryId'],
+  });
 
 payoutsRouter.post(
   '/payout/request',
@@ -248,8 +256,15 @@ payoutsRouter.post(
   idempotent,
   validate(requestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { amount, beneficiaryId, note } = req.body as z.infer<typeof requestSchema>;
-    const payout = await requestWithdrawal({ spaceId: spaceId(req), userId: uid(req), amountKobo: amount, beneficiaryId, note });
+    const { amount, beneficiaryId, bankCode, accountNumber, note } = req.body as z.infer<typeof requestSchema>;
+    const payout = await requestWithdrawal({
+      spaceId: spaceId(req),
+      userId: uid(req),
+      amountKobo: amount,
+      beneficiaryId,
+      account: bankCode && accountNumber ? { bankCode, accountNumber } : undefined,
+      note,
+    });
     ok(res, serializePayout(payout), 201);
   },
 );

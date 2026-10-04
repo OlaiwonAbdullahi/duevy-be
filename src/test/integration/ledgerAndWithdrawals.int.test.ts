@@ -204,6 +204,32 @@ describe('beneficiaries', () => {
     ).rejects.toMatchObject({ code: 'BENEFICIARY_NOT_FOUND' });
   });
 
+  it('HTTP: sends to a one-off account without saving it as a beneficiary', async () => {
+    const { rep, space } = await makeSpace();
+    await creditSpace(space.id, 1_000_000);
+    const token = await tokenFor(rep);
+    fake.resolvedName = 'BELLO PRINTS LTD';
+    const path = `/v1/spaces/${space.id}/payout/request`;
+
+    const res = await api('POST', path, {
+      token,
+      idempotencyKey: newKey(),
+      body: { amount: 300_000, bankCode: '058', accountNumber: '0555555555' },
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.data).toMatchObject({ status: 'processing', accountName: 'BELLO PRINTS LTD', beneficiaryId: null });
+    const payout = await db.payout.findUniqueOrThrow({ where: { reference: res.body.data.reference } });
+    const sent = fake.calls.find((c) => c.op === 'initiatePayout')?.args as { destinationId: string };
+    expect(sent.destinationId).toBe(payout.destinationId);
+    expect(await db.payoutBeneficiary.count({ where: { spaceId: space.id, accountName: 'BELLO PRINTS LTD' } })).toBe(0);
+
+    // Exactly one of beneficiaryId or bankCode + accountNumber.
+    const neither = await api('POST', path, { token, idempotencyKey: newKey(), body: { amount: 300_000 } });
+    expect(neither.status).toBe(400);
+    const half = await api('POST', path, { token, idempotencyKey: newKey(), body: { amount: 300_000, bankCode: '058' } });
+    expect(half.status).toBe(400);
+  });
+
   it("refuses another space's beneficiary", async () => {
     const a = await makeSpace();
     const b = await makeSpace();
