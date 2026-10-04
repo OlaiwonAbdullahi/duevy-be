@@ -11,7 +11,7 @@ import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTr
 import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
-import { listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
+import { adminKycSummary, listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
@@ -499,10 +499,37 @@ adminRouter.get('/reps', requireAdminPermission('userManagement'), async (req: R
 // ---------------------------------------------------------------------------
 // Rep application review queue — the detail an admin needs to approve/reject.
 // ---------------------------------------------------------------------------
-function serializeRepApplication(app: RepApplication, user?: { id: string; name: string; email: string; matricNo: string | null; level: string | null }) {
+/** Applicant fields read alongside an application, including what the KYC summary needs. */
+const applicantSelect = {
+  id: true,
+  name: true,
+  email: true,
+  emailVerified: true,
+  matricNo: true,
+  level: true,
+  kycStatus: true,
+  kycRejectionReason: true,
+  kycRequirementsDue: true,
+  kycSubmittedAt: true,
+  kycResolvedAt: true,
+  studentIdStatus: true,
+  studentIdFilePath: true,
+  studentIdMimeType: true,
+  studentIdUploadedAt: true,
+  studentIdReviewedAt: true,
+  studentIdReviewNote: true,
+} satisfies Prisma.UserSelect;
+
+type Applicant = Prisma.UserGetPayload<{ select: typeof applicantSelect }>;
+
+function serializeRepApplication(app: RepApplication, user?: Applicant) {
   return {
     userId: app.userId,
-    applicant: user ? { id: user.id, name: user.name, email: user.email, matricNo: user.matricNo, level: user.level } : null,
+    applicant: user
+      ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level }
+      : null,
+    // NIN verification (Bachs) and the student ID card, so the admin can give final approval.
+    kyc: user ? adminKycSummary(user) : null,
     status: app.status,
     requestedSpace: {
       name: app.spaceName,
@@ -534,7 +561,7 @@ adminRouter.get('/reps/applications', requireAdminPermission('userManagement'), 
 
   const users = await db.user.findMany({
     where: { id: { in: apps.map((a) => a.userId) } },
-    select: { id: true, name: true, email: true, matricNo: true, level: true },
+    select: applicantSelect,
   });
   const byId = new Map(users.map((u) => [u.id, u]));
 
@@ -549,7 +576,7 @@ adminRouter.get('/reps/:repId/application', requireAdminPermission('userManageme
     errors.notFound(res, 'No application on file for this user');
     return;
   }
-  const user = await db.user.findUnique({ where: { id: userId }, select: { id: true, name: true, email: true, matricNo: true, level: true } });
+  const user = await db.user.findUnique({ where: { id: userId }, select: applicantSelect });
   ok(res, serializeRepApplication(app, user ?? undefined));
 });
 
@@ -572,6 +599,16 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
   const app = await db.repApplication.findUnique({ where: { userId } });
   if (!app) {
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
+    return;
+  }
+  // Final approval comes after KYC: Bachs must have verified the NIN, and the
+  // student ID card must be on file (approving the application approves it).
+  if (user.kycStatus !== 'verified') {
+    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
+    return;
+  }
+  if (user.studentIdStatus !== 'pending' && user.studentIdStatus !== 'approved') {
+    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant hasn't uploaded an acceptable student ID yet");
     return;
   }
 
@@ -600,7 +637,24 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
       });
       await tx.spaceRep.create({ data: { userId, spaceId: created.id, role: 'lead' } });
       await tx.spaceMembership.create({ data: { userId, spaceId: created.id, kind: 'member' } });
-      await tx.user.update({ where: { id: userId }, data: { role: 'rep', isRep: true, repApplicationStatus: 'approved', referralCode } });
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          role: 'rep',
+          isRep: true,
+          repApplicationStatus: 'approved',
+          referralCode,
+          // Approving the application approves the student ID the admin just reviewed.
+          ...(user.studentIdStatus === 'pending'
+            ? {
+                studentIdStatus: 'approved',
+                studentIdReviewedAt: new Date(),
+                studentIdReviewedById: (req as AuthenticatedRequest).user.sub as string,
+                studentIdReviewNote: note ?? null,
+              }
+            : {}),
+        },
+      });
       await tx.repApplication.update({ where: { userId }, data: { status: 'approved', spaceId: created.id, reviewedAt: new Date(), reviewNote: note } });
       return created;
     },
