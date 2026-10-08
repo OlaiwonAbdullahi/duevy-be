@@ -88,7 +88,7 @@ const kycSchema = z
     lastName: z.string().trim().min(1).max(60).optional(),
     phone: z
       .string()
-      .regex(/^\+234\d{10}$/, 'must be +234 followed by 10 digits')
+      .regex(/^\+[1-9]\d{6,14}$/, 'must be an international number in E.164 form, e.g. +2348012345678')
       .optional(),
   })
   .strict();

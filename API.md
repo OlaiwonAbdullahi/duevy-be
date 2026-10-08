@@ -212,7 +212,7 @@ KYC has two parts, and a space collects only when **both** pass:
 | `studentIdCard` | yes | File: JPEG, PNG, WebP or PDF, max 5 MB, checked by its bytes. Stored privately in ImageKit for admin review. |
 | `governmentId` | no | File, same rules. Forwarded to Bachs, only useful when it asks for an ID document. |
 | `bvn` | no | 11 digits. Only if Bachs asks for it. |
-| `firstName`, `lastName`, `phone` | no | `phone` as `+234…`. Names default to the account name. |
+| `firstName`, `lastName`, `phone` | no | `phone` in E.164, any country (e.g. `+2348012345678`, `+447911123456`). Names default to the account name. |
 
 `202`:
 
