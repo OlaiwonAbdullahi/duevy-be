@@ -80,6 +80,15 @@ export interface KycState {
   /** Field keys Bachs still asks for, e.g. a BVN or an ID document. */
   requirementsDue: string[];
   governmentIdSubmittedAt: string | null;
+  /** The rep's own bank account on their Bachs account; `null` until sent. */
+  payoutDestination: {
+    bankCode: string;
+    bankName: string;
+    /** Masked, e.g. "•••• 6789". */
+    accountNumber: string;
+    accountName: string;
+    submittedAt: string;
+  } | null;
   studentId: {
     status: DocumentReviewStatus | null;
     uploadedAt: string | null;
@@ -101,6 +110,16 @@ function toState(u: User): KycState {
     providerReference: u.bachsPersonId,
     requirementsDue: u.kycRequirementsDue,
     governmentIdSubmittedAt: u.governmentIdSubmittedAt?.toISOString() ?? null,
+    payoutDestination:
+      u.payoutDestinationSubmittedAt && u.payoutDestinationBankCode
+        ? {
+            bankCode: u.payoutDestinationBankCode,
+            bankName: u.payoutDestinationBankName ?? '',
+            accountNumber: u.payoutDestinationAccountMasked ?? '',
+            accountName: u.payoutDestinationAccountName ?? '',
+            submittedAt: u.payoutDestinationSubmittedAt.toISOString(),
+          }
+        : null,
     studentId: {
       status: u.studentIdStatus,
       uploadedAt: u.studentIdUploadedAt?.toISOString() ?? null,
@@ -122,6 +141,7 @@ const EMPTY_STATE: KycState = {
   providerReference: null,
   requirementsDue: [],
   governmentIdSubmittedAt: null,
+  payoutDestination: null,
   studentId: { status: null, uploadedAt: null, reviewedAt: null, reviewNote: null },
   rejectionReason: null,
   retryLockedUntil: null,
@@ -313,21 +333,32 @@ export async function submitGovernmentId(userId: string, doc: UploadedDocument):
 }
 
 /**
- * Give the provider the rep's own bank account, when it asks for one
- * (`payout_destination` in requirementsDue). Name-checked first; the bank's
- * name is what is sent. Then re-reads the requirements.
+ * Give the provider the rep's own bank account (`payout_destination`).
+ * Collected during onboarding, and again whenever Bachs lists it in
+ * requirementsDue. Name-checked first; the bank's name is what is sent.
+ * Saved (masked) once Bachs accepts it, then the requirements are re-read.
  */
 export async function submitPayoutDestination(userId: string, bankCode: string, accountNumber: string): Promise<KycState> {
   const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
   if (!user.bachsAccountId || !user.bachsPersonId) {
     throw conflict('KYC_NOT_STARTED', 'Submit your NIN and student ID first');
   }
-  const { accountName } = await resolveBankDetails(bankCode, accountNumber);
+  const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
   await getPaymentProvider().submitAccountPayoutDestination({
     accountId: user.bachsAccountId,
     bankCode,
     accountNumber,
     accountName,
+  });
+  await db.user.update({
+    where: { id: userId },
+    data: {
+      payoutDestinationBankCode: bankCode,
+      payoutDestinationBankName: bankName,
+      payoutDestinationAccountMasked: maskAccountNumber(accountNumber),
+      payoutDestinationAccountName: accountName,
+      payoutDestinationSubmittedAt: new Date(),
+    },
   });
   logger.info({ userId, providerRef: user.bachsAccountId, bank: bankCode, account: maskAccountNumber(accountNumber) }, 'payout destination sent to provider');
   await refreshIdentity(user.bachsAccountId);

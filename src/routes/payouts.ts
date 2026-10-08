@@ -17,7 +17,13 @@ import {
   WITHDRAWAL_FEE_THRESHOLD_KOBO,
 } from '../lib/money';
 import { getKycState, getSpaceKycState } from '../services/kyc.service';
-import { governmentIdHandlers, payoutDestinationHandlers, resubmitStudentIdHandlers, submitKycHandlers } from './kycHandlers';
+import {
+  governmentIdHandlers,
+  payoutDestinationHandlers,
+  payoutDestinationLookupHandlers,
+  resubmitStudentIdHandlers,
+  submitKycHandlers,
+} from './kycHandlers';
 import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { quoteWithdrawal, requestWithdrawal } from '../services/withdrawal.service';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
@@ -211,6 +217,7 @@ payoutsRouter.delete(
 payoutsRouter.post('/payout/kyc', ...submitKycHandlers);
 payoutsRouter.post('/payout/kyc/student-id', ...resubmitStudentIdHandlers);
 payoutsRouter.post('/payout/kyc/government-id', ...governmentIdHandlers);
+payoutsRouter.post('/payout/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
 payoutsRouter.post('/payout/kyc/payout-destination', ...payoutDestinationHandlers);
 
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {

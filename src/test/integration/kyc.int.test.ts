@@ -185,6 +185,7 @@ describe('rep KYC: payout_destination requirement', () => {
       files: { studentIdCard: card },
     });
     expect(submitted.body.data.requirementsDue).toEqual(['payout_destination']);
+    expect(submitted.body.data.payoutDestination).toBeNull();
 
     const res = await api('POST', '/v1/me/kyc/payout-destination', {
       token,
@@ -192,6 +193,8 @@ describe('rep KYC: payout_destination requirement', () => {
     });
     expect(res.status).toBe(200);
     expect(res.body.data.requirementsDue).toEqual([]);
+    expect(res.body.data.payoutDestination).toMatchObject({ bankCode: '058' });
+    expect(res.body.data.payoutDestination.accountNumber).not.toContain('0123456789');
     const user = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
     expect(fake.calls.find((c) => c.op === 'submitAccountPayoutDestination')?.args).toMatchObject({
       accountId: user.bachsAccountId,

@@ -247,9 +247,9 @@ Forwards a government ID document to Bachs, for when `requirementsDue` asks for 
 
 ### `POST /payout/kyc/payout-destination` (also `/me/kyc/payout-destination`)
 
-The rep's own bank account, for when Bachs lists `payout_destination` in `requirementsDue`. Bachs won't finish onboarding (and payouts stay off) until it has one. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. The account is name-checked and the bank's name is sent to Bachs. `200` with the refreshed KYC state. Errors: `409 KYC_NOT_STARTED`, `422 ACCOUNT_UNVERIFIABLE`, `422 PAYOUT_DESTINATION_REJECTED` (Bachs refused it).
+The rep's own bank account. Collected during onboarding right after the NIN + student ID submission, and again whenever Bachs lists `payout_destination` in `requirementsDue`. Bachs won't finish onboarding (and payouts stay off) until it has one. Once accepted it's saved (masked) and returned as `payoutDestination` on the KYC state: `{ bankCode, bankName, accountNumber (masked), accountName, submittedAt }`, or `null` until sent. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. The account is name-checked and the bank's name is sent to Bachs. `200` with the refreshed KYC state. Errors: `409 KYC_NOT_STARTED`, `422 ACCOUNT_UNVERIFIABLE`, `422 PAYOUT_DESTINATION_REJECTED` (Bachs refused it).
 
-`POST /me/kyc/payout-destination/lookup` with the same body runs the name check without sending anything: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
+`POST /me/kyc/payout-destination/lookup` (also `/payout/kyc/payout-destination/lookup`) with the same body runs the name check without sending anything: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
 
 This is separate from beneficiaries: it only tells Bachs where the rep's account would pay out by default. Withdrawals still go to the beneficiary or account chosen each time.
 
