@@ -76,7 +76,12 @@ interface BachsCheckout {
 interface BachsAccount {
   id: string;
   capabilities?: Record<string, { status?: string } | undefined> | null;
-  requirements?: { currently_due?: string[]; past_due?: string[] } | null;
+  requirements?: {
+    currently_due?: string[];
+    past_due?: string[];
+    pending_verification?: string[];
+    errors?: unknown[];
+  } | null;
   /** Field-level problems with a `fields` submission (POST /v1/accounts/{id}). */
   errors?: { field?: string; code?: string; message?: string }[] | null;
 }
@@ -86,7 +91,7 @@ interface BachsPerson {
   verification?: { status?: string; failure_reason?: string | null };
 }
 interface BachsCapabilities {
-  items?: { name: string; status?: string }[];
+  items?: { name: string; status?: string; requested?: boolean }[];
 }
 interface BachsPayout {
   id: string;
@@ -112,6 +117,25 @@ function mapIdentityStatus(raw: string | undefined): IdentityStatus {
     default:
       return 'pending';
   }
+}
+
+/**
+ * The rep's identity verdict. Bachs can approve an individual account without
+ * ever moving the representative's own `verification.status` off
+ * "unverified", so the person record alone can leave a rep pending forever.
+ * An account with nothing outstanding and every requested capability active
+ * has passed onboarding (docs.bachs.io/connect/guides/monitor-onboarding:
+ * capability status, not empty requirements alone, is the signal).
+ */
+function identityVerdict(person: BachsPerson, account: BachsAccount, caps: BachsCapabilities): IdentityStatus {
+  const fromPerson = mapIdentityStatus(person.verification?.status);
+  if (fromPerson !== 'pending') return fromPerson;
+
+  const r = account.requirements ?? {};
+  const outstanding = [r.currently_due, r.past_due, r.pending_verification, r.errors].some((list) => (list?.length ?? 0) > 0);
+  const requested = (caps.items ?? []).filter((c) => c.requested !== false);
+  const allActive = requested.length > 0 && requested.every((c) => c.status === 'active');
+  return !outstanding && allActive ? 'verified' : 'pending';
 }
 
 function mapPayoutState(raw: string | undefined): PayoutState {
@@ -354,7 +378,7 @@ export class BachsProvider implements PaymentProvider {
     return {
       accountId,
       personId,
-      status: mapIdentityStatus(person.verification?.status),
+      status: identityVerdict(person, account, caps),
       payoutsActive: payouts?.status === 'active',
       failureReason: person.verification?.failure_reason ?? null,
       requirementsDue: [...new Set(due)],
