@@ -238,11 +238,56 @@ adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Reque
   );
 });
 
+/**
+ * Duevy's revenue and payment counts, all-time and for the last 30 days.
+ *  revenue      = service fees on paid checkouts + the withdrawal fees kept
+ *                 (feeSettlementKobo: Duevy's fee minus Bachs's payout fee)
+ *  transactions = paid student checkouts; volume is what students paid
+ */
+async function platformMetrics() {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const paidCheckouts = (from?: Date) =>
+    db.checkout.aggregate({
+      where: { status: 'paid', ...(from ? { paidAt: { gte: from } } : {}) },
+      _count: { _all: true },
+      _sum: { feeKobo: true, totalKobo: true },
+    });
+  const keptWithdrawalFees = (from?: Date) =>
+    db.payout.aggregate({
+      where: { status: 'success', feeSettledAt: from ? { gte: from } : { not: null } },
+      _sum: { feeSettlementKobo: true },
+    });
+  const [all, recent, wdAll, wdRecent, payouts] = await Promise.all([
+    paidCheckouts(),
+    paidCheckouts(since),
+    keptWithdrawalFees(),
+    keptWithdrawalFees(since),
+    db.payout.count({ where: { status: 'success' } }),
+  ]);
+  const checkoutFees = all._sum.feeKobo ?? 0;
+  const withdrawalFees = wdAll._sum.feeSettlementKobo ?? 0;
+  return {
+    revenue: {
+      total: checkoutFees + withdrawalFees,
+      checkoutFees,
+      withdrawalFees,
+      last30Days: (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0),
+    },
+    transactions: {
+      count: all._count._all,
+      volume: all._sum.totalKobo ?? 0,
+      last30Days: recent._count._all,
+      payouts,
+    },
+  };
+}
+
 adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void> => {
-  const [totalUsers, activeReps, pendingReps] = await Promise.all([
+  const [totalUsers, activeReps, pendingReps, metrics] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
+    platformMetrics(),
   ]);
 
   const allSpaces = await db.space.findMany({ where: { isArchived: false }, select: { id: true } });
@@ -335,6 +380,8 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
     duesTarget: fin.expected,
     floatHeld: Math.max(0, fin.held),
     overdue: { amount: overdueAmount, count: overdueCount },
+    revenue: metrics.revenue,
+    transactions: metrics.transactions,
     attention,
   });
 });
