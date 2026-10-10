@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepApplication } from '@prisma/client';
+import { type Prisma, type RepApplication, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
@@ -510,18 +510,57 @@ adminRouter.post(
 // ===========================================================================
 // §14.3 Reps
 // ===========================================================================
-async function buildAdminRep(user: { id: string; name: string; isSuspended: boolean; repApplicationStatus: string; role: string; isRep: boolean }) {
-  const reps = await db.spaceRep.findMany({ where: { userId: user.id }, select: { spaceId: true } });
-  const spaceIds = reps.map((r) => r.spaceId);
+/**
+ * One rep directory row: status and money, plus everything the rep gave us —
+ * sign-up details, the space they applied with, and KYC/payout state.
+ * Sensitive identity numbers (NIN, BVN, DOB) are never stored, so never shown.
+ */
+async function buildAdminRep(user: User) {
+  const [reps, application] = await Promise.all([
+    db.spaceRep.findMany({
+      where: { userId: user.id },
+      select: { role: true, space: { select: { id: true, name: true, short: true, payoutsFrozen: true } } },
+    }),
+    db.repApplication.findUnique({ where: { userId: user.id } }),
+  ]);
+  const spaceIds = reps.map((r) => r.space.id);
   const fin = await spacesFinancials(spaceIds);
   const verification = user.repApplicationStatus === 'approved' || user.isRep ? 'verified' : user.repApplicationStatus === 'pending' ? 'pending' : 'unverified';
   const status = user.isSuspended ? 'suspended' : user.repApplicationStatus === 'pending' ? 'pending' : 'active';
   return {
     id: user.id,
     name: user.name,
+    email: user.email,
+    emailVerified: user.emailVerified,
+    phone: user.phone,
+    matricNo: user.matricNo,
+    level: user.level,
+    institution: user.institution,
+    joinedAt: user.createdAt.toISOString(),
     departmentIds: spaceIds,
+    spaces: reps.map((r) => ({ id: r.space.id, name: r.space.name, short: r.space.short, role: r.role })),
     status,
     verification,
+    payoutsFrozen: reps.some((r) => r.role === 'lead' && r.space.payoutsFrozen),
+    kyc: {
+      status: user.kycStatus,
+      studentIdStatus: user.studentIdStatus,
+      payoutsActive: user.bachsPayoutsActive,
+      submittedAt: user.kycSubmittedAt?.toISOString() ?? null,
+      payoutAccount: user.payoutDestinationAccountMasked
+        ? { bankName: user.payoutDestinationBankName, accountMasked: user.payoutDestinationAccountMasked, accountName: user.payoutDestinationAccountName }
+        : null,
+    },
+    application: application
+      ? {
+          status: application.status,
+          requestedSpace: { name: application.spaceName, short: application.spaceShort, kind: application.spaceKind, school: application.school, faculty: application.faculty },
+          coRepInvites: application.coRepInvites,
+          referralCode: application.referralCode,
+          submittedAt: application.createdAt.toISOString(),
+          reviewedAt: application.reviewedAt?.toISOString() ?? null,
+        }
+      : null,
     heldAmount: Math.max(0, fin.held),
     uncollectedAmount: fin.uncollected,
     collectionRate: fin.collectionRate,
