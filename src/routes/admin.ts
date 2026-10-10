@@ -533,6 +533,7 @@ async function buildAdminRep(user: User) {
     email: user.email,
     emailVerified: user.emailVerified,
     phone: user.phone,
+    gender: user.gender,
     matricNo: user.matricNo,
     level: user.level,
     institution: user.institution,
@@ -594,6 +595,8 @@ const applicantSelect = {
   emailVerified: true,
   matricNo: true,
   level: true,
+  phone: true,
+  gender: true,
   kycStatus: true,
   kycRejectionReason: true,
   kycRequirementsDue: true,
@@ -613,7 +616,7 @@ function serializeRepApplication(app: RepApplication, user?: Applicant) {
   return {
     userId: app.userId,
     applicant: user
-      ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level }
+      ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level, phone: user.phone, gender: user.gender }
       : null,
     // NIN verification (Bachs) and the student ID card, so the admin can give final approval.
     kyc: user ? adminKycSummary(user) : null,

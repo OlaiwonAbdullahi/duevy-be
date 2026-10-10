@@ -41,7 +41,7 @@ export interface KycSubmission {
   /** Optional: only when Bachs asks for one (it is not required to start). */
   bvn?: string;
   dob: string; // YYYY-MM-DD
-  /** Collected as required, but Bachs has no field for it — validated and dropped. */
+  /** Bachs has no field for it; kept on the user for admins. */
   gender: 'male' | 'female';
   firstName?: string;
   lastName?: string;
@@ -268,6 +268,9 @@ export async function submitKyc(userId: string, input: KycSubmission): Promise<K
       bachsPayoutsActive: result.payoutsActive,
       kycRequirementsDue: result.requirementsDue,
       kycSubmittedAt: new Date(),
+      // Kept for admins (the rep directory and application review).
+      gender: input.gender,
+      ...(input.phone ? { phone: input.phone } : {}),
       kycResolvedAt: kycStatus === 'pending' ? null : new Date(),
       kycRejectionReason: kycStatus === 'rejected' ? result.failureReason ?? 'Verification failed' : null,
       governmentIdSubmittedAt,

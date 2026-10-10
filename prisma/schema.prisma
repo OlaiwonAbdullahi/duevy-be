@@ -321,6 +321,8 @@ model User {
   emailVerified           Boolean               @default(false)
   passwordHash            String?
   phone                   String?
+  // From the rep's KYC submission ("male" | "female"); shown to admins.
+  gender                  String?
   avatarUrl               String?
   // `role` is the coarse label carried in the access token (admin vs not).
   // Permissions are ADDITIVE: every user is a student; `isRep` is granted on
