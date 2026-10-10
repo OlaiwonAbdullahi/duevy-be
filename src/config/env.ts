@@ -15,9 +15,6 @@ const envSchema = z.object({
   JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('30d'),
 
-  // Redis
-  REDIS_URL: z.string().default('redis://localhost:6379'),
-
   // Google Sign-In (§2.3). Optional: while unset, POST /auth/google returns 501.
   GOOGLE_CLIENT_ID: z.string().optional(),
 
@@ -106,6 +103,24 @@ const envSchema = z.object({
   if (val.PAYMENT_PROVIDER === 'bachs') {
     for (const key of ['BACHS_SECRET_KEY', 'BACHS_WEBHOOK_SECRET'] as const) {
       if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=bachs' });
+    }
+  }
+  if (val.PAYMENT_PROVIDER === 'bachs' && val.BACHS_SECRET_KEY) {
+    // Dev and prod are separate databases with separate keys: sandbox keys
+    // everywhere except production, which takes the live key. Refuse a key
+    // that points at the wrong Bachs environment, and a live key outside
+    // production (a dev database must never move real money).
+    const live = val.BACHS_SECRET_KEY.startsWith('sk_live_');
+    const liveUrl = new URL(val.BACHS_BASE_URL).hostname === 'api.bachs.io';
+    if (live !== liveUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BACHS_BASE_URL'],
+        message: live ? 'an sk_live_ key needs https://api.bachs.io' : 'an sk_sandbox_ key needs https://sandbox-api.bachs.io',
+      });
+    }
+    if (live && val.NODE_ENV !== 'production') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BACHS_SECRET_KEY'], message: 'live Bachs keys only run with NODE_ENV=production' });
     }
   }
   if (val.FILE_STORAGE === 'imagekit') {

@@ -68,6 +68,28 @@ Seeded logins (password `Demo1234!`):
 | Rep (lead of "Computer Science Department", join code `CSC-LAU1`) | `rep@duevy.test` |
 | Student (member of that space) | `student@duevy.test` |
 
+## Dev and prod environments
+
+Two databases and two sets of keys, never mixed:
+
+| | Dev | Prod |
+|---|---|---|
+| Where it runs | your machine (`npm run dev`) | Render |
+| Config | `.env` (gitignored) | Render → Environment |
+| Database | dev Postgres (Supabase project `duevy-dev`) | prod Postgres (Supabase project `duevy-prod`) |
+| `NODE_ENV` | `development` | `production` |
+| Bachs | `sk_sandbox_…` + `https://sandbox-api.bachs.io` | `sk_live_…` + `https://api.bachs.io` |
+| Bachs webhook | sandbox endpoint → a tunnel to localhost (e.g. ngrok), or none | live endpoint → `https://api.duevy.app/v1/webhooks/bachs`, `event_source: all` |
+| JWT secrets | any | their own, never shared with dev |
+| Migrations | `npm run db:migrate` (creates them) | `npm run db:deploy` on every deploy (Render build command: `npm ci && npm run db:deploy`) |
+| First admin | `npm run db:seed` | `node scripts/create-admin.mjs <email> <name> <password>` |
+
+The server refuses to start with a live Bachs key outside `NODE_ENV=production`, or with a key that points at the wrong Bachs URL.
+
+Bachs IDs (accounts, persons, checkouts, payouts) exist in only one Bachs environment, so sandbox rows must never be copied into the prod database. Reps redo KYC in prod.
+
+Without a dev webhook, payments still settle in dev. The pay page checks Bachs directly, and the reconciliation job runs every minute. KYC updates (`account.updated`) only arrive by webhook.
+
 ## Environment variables
 
 Every variable is validated at boot in `src/config/env.ts`, and the server refuses to start if a required one is missing. `.env.example` lists them all with comments.
