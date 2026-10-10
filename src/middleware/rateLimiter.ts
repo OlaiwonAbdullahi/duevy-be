@@ -74,3 +74,14 @@ export const sensitiveLimiter = rateLimit({
     fail(res, 429, "RATE_LIMITED", "Too many requests, please slow down.");
   },
 });
+
+// Feedback form: 5 per 10 minutes per user — plenty for real feedback, not for spam.
+export const feedbackLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req: Request) =>
+    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "You've sent a lot of feedback recently — try again in a few minutes.");
+  },
+});

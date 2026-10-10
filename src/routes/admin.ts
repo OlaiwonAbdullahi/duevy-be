@@ -7,7 +7,7 @@ import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireAdmin, requireSuperAdmin, requireAdminPermission } from '../middleware/requireRole';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeTransaction, serializePayout } from '../lib/serializers';
+import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFeedback, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
@@ -1126,6 +1126,60 @@ adminRouter.post('/disputes/:id/resolve', requireAdminPermission('disputes'), va
     notify({ userId: dispute.openedById, kind: 'system', title: 'Dispute resolved', detail: `Your dispute was ${resolution}. ${note}`, href: '/dashboard' }).catch(() => {}),
   ]);
   ok(res, serializeDispute(updated));
+});
+
+// ===========================================================================
+// Product feedback (POST /feedback) — the admin inbox
+// ===========================================================================
+adminRouter.get('/feedback', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take, q } = parseListQuery(req);
+  const where: Prisma.FeedbackWhereInput = {};
+  if (req.query.status === 'new' || req.query.status === 'resolved') where.status = req.query.status;
+  if (req.query.category === 'bug' || req.query.category === 'idea' || req.query.category === 'other') where.category = req.query.category;
+  if (q) {
+    where.OR = [
+      { message: { contains: q, mode: 'insensitive' } },
+      { userName: { contains: q, mode: 'insensitive' } },
+      { userEmail: { contains: q, mode: 'insensitive' } },
+    ];
+  }
+
+  const [total, rows, unresolved] = await Promise.all([
+    db.feedback.count({ where }),
+    db.feedback.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take }),
+    db.feedback.count({ where: { status: 'new' } }),
+  ]);
+  ok(res, rows.map(serializeFeedback), 200, { ...buildMeta(page, perPage, total), unresolved });
+});
+
+const resolveFeedbackSchema = z.object({ note: z.string().trim().max(1000).optional() });
+
+adminRouter.post('/feedback/:id/resolve', requireAdminPermission('userManagement'), validate(resolveFeedbackSchema), async (req: Request, res: Response): Promise<void> => {
+  const id = req.params.id as string;
+  const { note } = req.body as z.infer<typeof resolveFeedbackSchema>;
+  const existing = await db.feedback.findUnique({ where: { id } });
+  if (!existing) {
+    errors.notFound(res, 'Feedback not found');
+    return;
+  }
+  const updated = await db.feedback.update({
+    where: { id },
+    data: { status: 'resolved', adminNote: note || null, resolvedAt: new Date(), resolvedById: (req as AuthenticatedRequest).user.sub as string },
+  });
+  await writeAdminAudit(req, 'feedback.resolve', { target: id, metadata: note ? { note } : undefined });
+  ok(res, serializeFeedback(updated));
+});
+
+adminRouter.post('/feedback/:id/reopen', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const id = req.params.id as string;
+  const existing = await db.feedback.findUnique({ where: { id } });
+  if (!existing) {
+    errors.notFound(res, 'Feedback not found');
+    return;
+  }
+  const updated = await db.feedback.update({ where: { id }, data: { status: 'new', resolvedAt: null, resolvedById: null } });
+  await writeAdminAudit(req, 'feedback.reopen', { target: id });
+  ok(res, serializeFeedback(updated));
 });
 
 // ===========================================================================

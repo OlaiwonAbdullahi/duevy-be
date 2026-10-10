@@ -218,6 +218,17 @@ enum DisputeStatus {
   resolved
 }
 
+enum FeedbackCategory {
+  bug
+  idea
+  other
+}
+
+enum FeedbackStatus {
+  new
+  resolved
+}
+
 enum DisputeType {
   payment_not_reflecting
   non_remittance
@@ -402,6 +413,7 @@ model User {
   discountCodes          DiscountCode[]
   adminPermissions       AdminPermission?
   disputes               Dispute[]
+  feedback               Feedback[]
   idempotencyKeys        IdempotencyKey[]
   sessions               Session[]
   assistantConversations AssistantConversation[]
@@ -1156,6 +1168,32 @@ model Dispute {
 
   @@index([status])
   @@map("disputes")
+}
+
+// Product feedback from any signed-in user (bug report, idea, anything else).
+// Name/email/role are copied at submission so the inbox reads the same even
+// if the account later changes.
+model Feedback {
+  id           String           @id @default(cuid())
+  userId       String
+  userName     String
+  userEmail    String
+  userRole     String
+  category     FeedbackCategory
+  message      String
+  page         String? // app path it was sent from, e.g. /dashboard/payout
+  userAgent    String?
+  status       FeedbackStatus   @default(new)
+  adminNote    String?
+  resolvedById String?
+  resolvedAt   DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@map("feedback")
 }
 
 // ---------------------------------------------------------------------------

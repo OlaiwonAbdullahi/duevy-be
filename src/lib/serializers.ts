@@ -14,6 +14,7 @@ import {
   type Dispute,
   type AssistantConversation,
   type AssistantMessage,
+  type Feedback,
 } from '@prisma/client';
 
 type UserWithSpaces = User & {
@@ -290,5 +291,21 @@ export function serializeAssistantMessage(m: AssistantMessage) {
     intent: m.intent,
     confidence: m.confidence,
     createdAt: m.createdAt.toISOString(),
+  };
+}
+
+/** A feedback submission (admin inbox; the submitter gets the same shape back). */
+export function serializeFeedback(f: Feedback) {
+  return {
+    id: f.id,
+    category: f.category,
+    message: f.message,
+    page: f.page,
+    userAgent: f.userAgent,
+    status: f.status,
+    adminNote: f.adminNote,
+    resolvedAt: f.resolvedAt?.toISOString() ?? null,
+    createdAt: f.createdAt.toISOString(),
+    user: { id: f.userId, name: f.userName, email: f.userEmail, role: f.userRole },
   };
 }

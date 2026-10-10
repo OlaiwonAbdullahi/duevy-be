@@ -326,6 +326,16 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 
 ---
 
+## Feedback
+
+### `POST /feedback`
+
+Any signed-in user. Body: `{ "category": "bug" | "idea" | "other", "message": "10–2000 chars", "page"?: "/dashboard/dues" }`. The `User-Agent` header is stored with it. Limited to 5 per 10 minutes per user (`429 RATE_LIMITED`).
+
+`201`: `{ id, category, message, page, userAgent, status: "new", adminNote, resolvedAt, createdAt, user: { id, name, email, role } }`.
+
+---
+
 ## Admin
 
 `role = admin` is required. Each route also checks the permission named in its row; a super admin has every permission.
@@ -345,6 +355,8 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 | `GET /admin/payouts?status=&spaceId=` | payouts | Every withdrawal. |
 | `GET /admin/health` | userManagement | `{ deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledWithdrawalFees, pendingStudentIds, healthy, recentWebhookFailures }` |
 | `POST /admin/reps/:repId/freeze-payouts` · `/unfreeze-payouts` | payouts | Freezes or unfreezes the rep's withdrawals. |
+| `GET /admin/feedback?status=&category=&q=` | userManagement | Feedback inbox, newest first; `status` is `new` or `resolved`, `category` is `bug`, `idea` or `other`. Rows as in `POST /feedback`. `meta.unresolved` is the count of `new` feedback (for a badge). |
+| `POST /admin/feedback/:id/resolve` · `/reopen` | userManagement | Marks it resolved (body: `{ note? }`, kept as `adminNote`) or back to `new`. Both are audit-logged. |
 
 ---
 

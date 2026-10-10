@@ -13,6 +13,7 @@ import { referralsRouter } from './referrals';
 import { disputesRouter } from './disputes';
 import { banksRouter } from './banks';
 import { assistantRouter } from './assistant';
+import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
 
 export const apiRouter = Router();
@@ -32,4 +33,5 @@ apiRouter.use('/admin', adminRouter);
 apiRouter.use('/referrals', requireFeature('referrals'), referralsRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
+apiRouter.use('/feedback', feedbackRouter);
 apiRouter.use('/assistant', requireFeature('assistant'), assistantRouter);
