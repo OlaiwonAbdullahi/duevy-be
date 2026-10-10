@@ -9,6 +9,8 @@ import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
 import { getCheckoutForUser } from '../services/checkout.service';
 import { getReceiptByNumber, listReceipts, renderCheckoutReceipt, renderReceiptByNumber } from '../services/receipt.service';
+import { reconcileCheckout } from '../jobs/reconciliation';
+import { logger } from '../lib/logger';
 
 export const transactionsRouter = Router();
 transactionsRouter.use(authenticate);
@@ -132,11 +134,28 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
 // GET /payments/{reference} · /payments/{reference}/status — a checkout's
 // state, for the "I've paid" screen. Mounted separately at /payments.
 //
-// Reads our own record only. The webhook (and the reconciliation job behind
-// it) is what moves a checkout; a client poll never can.
+// A pending checkout is first checked with the provider (at most once every
+// few seconds per checkout), so a student back from the checkout page sees
+// "paid" straight away even if the webhook is late. The provider's answer is
+// what moves it; nothing the client sends can.
 // ---------------------------------------------------------------------------
 export const paymentsRouter = Router();
 paymentsRouter.use(authenticate);
+
+const PROVIDER_CHECK_INTERVAL_MS = 10_000;
+const lastProviderCheck = new Map<string, number>();
+
+async function syncPendingCheckout(reference: string): Promise<void> {
+  const c = await db.checkout.findUnique({ where: { reference } });
+  if (!c || c.status !== 'pending' || !c.providerCheckoutId) return;
+  const now = Date.now();
+  if (now - (lastProviderCheck.get(reference) ?? 0) < PROVIDER_CHECK_INTERVAL_MS) return;
+  lastProviderCheck.set(reference, now);
+  if (lastProviderCheck.size > 5_000) lastProviderCheck.clear(); // bounded; a miss only costs one extra GET
+  await reconcileCheckout(c, { expireIfPastDue: false, source: 'status check' }).catch((err) =>
+    logger.warn({ ref: reference, err: (err as Error).message }, 'status check with provider failed'),
+  );
+}
 
 async function paymentStatus(req: Request, res: Response): Promise<void> {
   const id = uid(req);
@@ -148,6 +167,7 @@ async function paymentStatus(req: Request, res: Response): Promise<void> {
       errors.notFound(res, 'Payment not found');
       return;
     }
+    await syncPendingCheckout(reference);
     const view = await getCheckoutForUser(reference, id);
     const txn = await db.transaction.findUnique({ where: { reference } });
     const receipt = view.status === 'paid' ? await db.receipt.findFirst({ where: { checkout: { reference } }, select: { number: true } }) : null;

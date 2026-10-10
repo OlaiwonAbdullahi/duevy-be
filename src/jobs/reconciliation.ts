@@ -1,3 +1,4 @@
+import { type Checkout } from '@prisma/client';
 import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
@@ -14,7 +15,9 @@ import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/
  * records are resolved by hand.
  */
 
-const CHECK_PENDING_AFTER_MS = 10 * 60 * 1000;
+// Short: payment events can be slow or missing, and a student is usually
+// waiting on the pay page. Checking a pending checkout is one cheap GET.
+const CHECK_PENDING_AFTER_MS = 2 * 60 * 1000;
 const EXPIRY_GRACE_MS = 5 * 60 * 1000;
 const RETRY_DISPATCH_AFTER_MS = 2 * 60 * 1000;
 const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
@@ -30,21 +33,35 @@ export async function reconcileCheckouts(): Promise<void> {
 
   for (const c of pending) {
     try {
-      const pastExpiry = c.expiresAt.getTime() + EXPIRY_GRACE_MS < now;
-      if (!c.providerCheckoutId) {
-        // The account was never opened; nothing can be paid into it.
-        if (pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
-        continue;
-      }
-      const status = await provider.getCollectionStatus(c.providerCheckoutId);
-      if (status.state === 'paid') await fulfilCheckout(c.id, status.receivedKobo ?? c.totalKobo, 0, 'reconciliation');
-      else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, 'reconciliation');
-      else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
-      else if (pastExpiry) await expireCheckout(c.id);
+      await reconcileCheckout(c, { expireIfPastDue: true, source: 'reconciliation' });
     } catch (err) {
       logger.warn({ ref: c.reference, err: (err as Error).message }, 'checkout reconciliation failed');
     }
   }
+}
+
+/**
+ * Ask the provider about one pending checkout and apply what it says. Used by
+ * the job above and by the student's pay page (GET /payments/:ref/status), so
+ * a student back from the checkout page sees "paid" without waiting for the
+ * webhook. Only the provider's answer moves the checkout, never the caller.
+ */
+export async function reconcileCheckout(
+  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'providerCheckoutId' | 'totalKobo' | 'expiresAt'>,
+  opts: { expireIfPastDue: boolean; source: string },
+): Promise<void> {
+  if (c.status !== 'pending') return;
+  const pastExpiry = c.expiresAt.getTime() + EXPIRY_GRACE_MS < Date.now();
+  if (!c.providerCheckoutId) {
+    // The account was never opened; nothing can be paid into it.
+    if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
+    return;
+  }
+  const status = await getPaymentProvider().getCollectionStatus(c.providerCheckoutId);
+  if (status.state === 'paid') await fulfilCheckout(c.id, status.receivedKobo ?? c.totalKobo, 0, opts.source);
+  else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
+  else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
+  else if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id);
 }
 
 export async function reconcilePayouts(): Promise<void> {
