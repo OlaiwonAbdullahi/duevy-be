@@ -727,6 +727,8 @@ model Checkout {
   vaAccountNumber      String?
   vaBankName           String?
   vaAccountName        String?
+  // Or, on a hosted checkout, the provider's page the student is redirected to.
+  checkoutUrl          String?
   expiresAt            DateTime
   paidAt               DateTime?
   expiredAt            DateTime?
@@ -1324,4 +1326,15 @@ model AssistantMessage {
 
   @@index([conversationId, createdAt])
   @@map("assistant_messages")
+}
+
+// Platform-wide switches an admin can change at runtime, one row per key.
+//   checkout_mode: "hosted" | "custom" — how students pay (see settings.service.ts).
+model PlatformSetting {
+  key         String   @id
+  value       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("platform_settings")
 }

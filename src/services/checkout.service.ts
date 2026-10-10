@@ -11,6 +11,7 @@ import { generateId } from '../lib/id';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
 import { canCollect } from './kyc.service';
+import { getCheckoutMode } from './settings.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
@@ -41,6 +42,7 @@ const OPENING_GRACE_MS = 30_000;
 
 export function serializeCheckout(c: CheckoutWithItems) {
   const open = c.status === 'pending' && !!c.vaAccountNumber;
+  const hosted = c.status === 'pending' && !!c.checkoutUrl;
   return {
     reference: c.reference,
     status: c.status,
@@ -48,8 +50,8 @@ export function serializeCheckout(c: CheckoutWithItems) {
     amount: c.totalKobo,
     breakdown: { face: c.faceKobo, fee: c.feeKobo, total: c.totalKobo },
     items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo, fee: i.feeKobo })),
-    // Kept for existing clients; bank transfer is the only method.
-    checkoutUrl: null,
+    // Set on a hosted checkout: redirect the student here to pay.
+    checkoutUrl: hosted ? c.checkoutUrl : null,
     bankTransfer: open
       ? {
           accountNumber: c.vaAccountNumber,
@@ -196,7 +198,7 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
     return { checkout, reused: false };
   });
 
-  const checkout = outcome.checkout.vaAccountNumber
+  const checkout = outcome.checkout.vaAccountNumber || outcome.checkout.checkoutUrl
     ? outcome.checkout
     : await openCollectionAccount(outcome.checkout, user, outcome.reused);
 
@@ -228,6 +230,8 @@ async function openCollectionAccount(
       customer: { email: user.email, name: user.name },
       expiresInMinutes: env.CHECKOUT_EXPIRY_MINUTES,
       metadata: { checkoutId: checkout.id, spaceId: checkout.spaceId, dueCount: String(checkout.items.length) },
+      mode: await getCheckoutMode(),
+      returnUrl: `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(checkout.reference)}`,
     });
     if (account.totalKobo !== checkout.totalKobo) {
       throw new ProviderError('Provider total does not match the checkout total', null, 'PRICE_MISMATCH', false);
@@ -240,6 +244,7 @@ async function openCollectionAccount(
         vaAccountNumber: account.accountNumber,
         vaBankName: account.bankName,
         vaAccountName: account.accountName,
+        checkoutUrl: account.checkoutUrl,
         expiresAt: account.expiresAt,
       },
       include: withItems,

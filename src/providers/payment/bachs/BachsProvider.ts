@@ -45,6 +45,9 @@ const BANK_TRANSFER = 'NGN_BANK_TRANSFER';
 interface BachsCheckoutCreated {
   checkout_id: string;
   status?: string;
+  amount?: string | number;
+  checkout_url?: string | null;
+  expires_at?: string;
 }
 interface BachsCheckoutPriced {
   amount?: string | number;
@@ -182,6 +185,58 @@ export class BachsProvider implements PaymentProvider {
   // -------------------------------------------------------------------------
 
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
+    return input.mode === 'hosted' ? this.createHostedCheckout(input) : this.createCustomCheckout(input);
+  }
+
+  /**
+   * Hosted checkout: one call, then the student is redirected to Bachs's page.
+   * Bachs sends them back to `returnUrl` either way; the collection.* webhook,
+   * not the redirect, decides whether it was paid.
+   */
+  private async createHostedCheckout(input: CreateCollectionInput): Promise<CollectionAccount> {
+    const ref = input.reference;
+    const expectedTotal = input.faceKobo + input.platformFeeKobo;
+    const created = await this.client.request<BachsCheckoutCreated>({
+      method: 'POST',
+      path: '/v1/checkout-sessions',
+      op: 'checkout.create',
+      ref,
+      idempotencyKey: `chk-hosted-${ref}`,
+      body: {
+        pricing: { currency: 'NGN', base_currency: 'NGN', amount: koboToDecimal(expectedTotal) },
+        platform_fee: koboToDecimal(input.platformFeeKobo),
+        transfer_data: { destination: input.destinationAccountId },
+        payment_method_types: [BANK_TRANSFER],
+        customer: { email: input.customer.email, name: input.customer.name },
+        reference: ref,
+        success_url: input.returnUrl,
+        cancel_url: input.returnUrl,
+        expires_in_minutes: input.expiresInMinutes,
+        metadata: input.metadata,
+      },
+    });
+    if (!created.checkout_url) {
+      throw new ProviderError('The payment provider did not return a checkout page', null, 'NO_CHECKOUT_URL', false);
+    }
+    const expiresAt =
+      created.expires_at && !Number.isNaN(Date.parse(created.expires_at))
+        ? new Date(created.expires_at)
+        : new Date(Date.now() + input.expiresInMinutes * 60_000);
+
+    return {
+      providerCheckoutId: created.checkout_id,
+      providerChargeId: null,
+      accountNumber: null,
+      bankName: null,
+      accountName: null,
+      checkoutUrl: created.checkout_url,
+      totalKobo: optionalKobo(created.amount) ?? expectedTotal,
+      expiresAt,
+    };
+  }
+
+  /** Custom checkout: create, price for bank transfer, confirm → a one-time account we display. */
+  private async createCustomCheckout(input: CreateCollectionInput): Promise<CollectionAccount> {
     const ref = input.reference;
     const expectedTotal = input.faceKobo + input.platformFeeKobo;
 
@@ -254,6 +309,7 @@ export class BachsProvider implements PaymentProvider {
       accountNumber: bank.account_number,
       bankName: bank.bank_name ?? '',
       accountName: bank.account_name ?? '',
+      checkoutUrl: null,
       totalKobo: pricedTotal,
       expiresAt,
     };

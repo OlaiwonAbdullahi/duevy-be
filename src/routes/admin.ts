@@ -18,6 +18,7 @@ import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
+import { getPaymentSettings, setCheckoutMode } from '../services/settings.service';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
@@ -1367,6 +1368,30 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
 });
 
 // ===========================================================================
+// Payment settings — how students pay (hosted redirect vs. custom bank account)
+// ===========================================================================
+adminRouter.get('/settings/payments', async (_req: Request, res: Response): Promise<void> => {
+  ok(res, await getPaymentSettings());
+});
+
+const paymentSettingsSchema = z.object({ checkoutMode: z.enum(['hosted', 'custom']) });
+
+adminRouter.put('/settings/payments', requireSuperAdmin(), validate(paymentSettingsSchema), async (req: Request, res: Response): Promise<void> => {
+  const { checkoutMode } = req.body as z.infer<typeof paymentSettingsSchema>;
+  const before = await getPaymentSettings();
+  const adminId = (req as AuthenticatedRequest).user.sub as string;
+  const settings = await setCheckoutMode(checkoutMode, adminId);
+  if (before.checkoutMode !== checkoutMode) {
+    await writeAdminAudit(req, 'settings.checkout_mode', {
+      target: 'checkout_mode',
+      severity: 'warning',
+      metadata: { from: before.checkoutMode, to: checkoutMode },
+    });
+  }
+  ok(res, settings);
+});
+
+// ===========================================================================
 // §14.9 Reports
 // ===========================================================================
 function csv(rows: (string | number | null)[][]): string {
@@ -1514,4 +1539,5 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.status(200).send(body);
 });
 
-// The payment rail is chosen by configuration (PAYMENT_PROVIDER), not at runtime.
+// The payment rail is chosen by configuration (PAYMENT_PROVIDER), not at runtime;
+// only the checkout mode is switchable (PUT /admin/settings/payments).

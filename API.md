@@ -156,6 +156,13 @@ One bank transfer pays every due in the basket.
 }
 ```
 
+How the student pays depends on the admin's checkout mode (`GET|PUT /admin/settings/payments`):
+
+- `hosted`: `bankTransfer` is `null` and `checkoutUrl` is set. Redirect the student there. Bachs sends them back to `/dashboard/pay/:reference?checkout_id=…`.
+- `custom`: `bankTransfer` is set and `checkoutUrl` is `null`. Show the one-time account (example above).
+
+An open checkout keeps the mode it was created with.
+
 The fee is 2% of the face value (rounded half-up to the kobo) plus ₦20. The student pays the fee on top, and the space receives the full face value.
 
 Rules:
@@ -357,6 +364,8 @@ Any signed-in user. Body: `{ "category": "bug" | "idea" | "other", "message": "1
 | `POST /admin/reps/:repId/freeze-payouts` · `/unfreeze-payouts` | payouts | Freezes or unfreezes the rep's withdrawals. |
 | `GET /admin/feedback?status=&category=&q=` | userManagement | Feedback inbox, newest first; `status` is `new` or `resolved`, `category` is `bug`, `idea` or `other`. Rows as in `POST /feedback`. `meta.unresolved` is the count of `new` feedback (for a badge). |
 | `POST /admin/feedback/:id/resolve` · `/reopen` | userManagement | Marks it resolved (body: `{ note? }`, kept as `adminNote`) or back to `new`. Both are audit-logged. |
+| `GET /admin/settings/payments` | any admin | `{ checkoutMode: "hosted" \| "custom", updatedAt, updatedById }`. Defaults to `hosted`. |
+| `PUT /admin/settings/payments` | super admin | Body `{ checkoutMode: "hosted" \| "custom" }`. Applies to checkouts opened from then on. Audit-logged as `settings.checkout_mode`. |
 
 ---
 

@@ -85,12 +85,14 @@ export class FakeProvider implements PaymentProvider {
 
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
     this.record('createCollectionAccount', input);
+    const hosted = input.mode === 'hosted';
     return {
       providerCheckoutId: `chk_fake_${input.reference}`,
       providerChargeId: `ch_fake_${input.reference}`,
-      accountNumber: `99${randomInt(10_000_000, 99_999_999)}`,
-      bankName: 'Fake Bank',
-      accountName: 'Duevy Checkout',
+      accountNumber: hosted ? null : `99${randomInt(10_000_000, 99_999_999)}`,
+      bankName: hosted ? null : 'Fake Bank',
+      accountName: hosted ? null : 'Duevy Checkout',
+      checkoutUrl: hosted ? `https://checkout.fake.test/${input.reference}` : null,
       totalKobo: input.faceKobo + input.platformFeeKobo,
       expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
     };

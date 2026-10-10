@@ -70,14 +70,25 @@ export interface CreateCollectionInput {
   customer: { email: string; name: string };
   expiresInMinutes: number;
   metadata: Record<string, string>;
+  /** 'hosted' redirects the student to the provider's page; 'custom' opens a bank account we display. */
+  mode: CheckoutMode;
+  /** Where a hosted checkout sends the student back to, paid or not. */
+  returnUrl: string;
 }
 
+export type CheckoutMode = 'hosted' | 'custom';
+
+/**
+ * How the student pays: either a one-time bank account we show them, or a
+ * provider-hosted page we redirect them to (`checkoutUrl`).
+ */
 export interface CollectionAccount {
   providerCheckoutId: string;
   providerChargeId: string | null;
-  accountNumber: string;
-  bankName: string;
-  accountName: string;
+  accountNumber: string | null;
+  bankName: string | null;
+  accountName: string | null;
+  checkoutUrl: string | null;
   /** What the provider will expect the student to send. */
   totalKobo: number;
   expiresAt: Date;
