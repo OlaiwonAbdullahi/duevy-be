@@ -66,7 +66,8 @@ export async function listReceipts(userId: string, skip: number, take: number) {
 async function renderPdf(r: LoadedReceipt) {
   const c = r.checkout;
   const pdf = await renderReceiptPdf({
-    reference: `${r.number} · ${c.reference}`,
+    receiptNumber: r.number,
+    reference: c.reference,
     title: c.items.length === 1 ? c.items[0]!.due.title : `${c.items.length} dues`,
     lines: c.items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
     spaceName: r.space.name,

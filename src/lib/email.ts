@@ -29,7 +29,75 @@ export async function sendEmail(options: SendEmailOptions): Promise<void> {
 // Email templates
 // ---------------------------------------------------------------------------
 
-export function renderEmail(content: string, tone = '#0b6e4f'): string {
+/** Public assets for emails — must be absolute and reachable from any inbox. */
+const ASSET_BASE = 'https://www.duevy.app';
+const BRAND = '#0b6e4f';
+const BRAND_DEEP = '#08583f';
+const INK = '#1b2520';
+const INK_SOFT = '#7a847f';
+const PAPER = '#f4f2ec';
+const LINE = '#e6f2ec';
+const FONT = "'Manrope', 'Helvetica Neue', Helvetica, Arial, sans-serif";
+
+/**
+ * Callers write plain `<h1>`, `<p>`, `<p class="muted">`, `class="btn"` and
+ * `class="callout"`. Some clients (Gmail with non-Google accounts, Outlook)
+ * drop `<style>` blocks, so stamp the same styles inline as well.
+ */
+function inlineStyles(content: string, tone: string): string {
+  return content
+    .replace(/<h1>/g, `<h1 style="margin:0 0 12px;font-family:${FONT};font-size:22px;line-height:1.3;font-weight:700;letter-spacing:-0.01em;color:${INK};">`)
+    .replace(/<p class="muted">/g, `<p class="muted" style="margin:0 0 16px;font-family:${FONT};font-size:13px;line-height:1.6;color:${INK_SOFT};">`)
+    .replace(/<p>/g, `<p style="margin:0 0 16px;font-family:${FONT};font-size:15px;line-height:1.65;color:${INK};">`)
+    .replace(/class="btn"/g, `class="btn" style="display:inline-block;background:${tone};color:#ffffff;border-radius:9999px;padding:14px 32px;font-family:${FONT};font-size:14px;font-weight:600;text-decoration:none;margin:4px 0 20px;"`)
+    .replace(/class="callout"/g, `class="callout" style="background:${PAPER};border-radius:16px;padding:16px 18px;margin:0 0 20px;font-family:${FONT};font-size:14px;line-height:1.6;color:${INK};"`);
+}
+
+/**
+ * A big-figure hero card (amount, code…) on the doodle artwork — e.g. the
+ * amount on a receipt. Falls back to solid brand green where background images
+ * aren't shown (Outlook).
+ */
+export function emailHero(label: string, value: string, caption?: string): string {
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
+      <tr>
+        <td style="background:${BRAND_DEEP} url('${ASSET_BASE}/doodle-card.jpg') center / cover no-repeat;background-color:${BRAND_DEEP};border-radius:20px;padding:22px 24px;">
+          <div style="font-family:${FONT};font-size:12px;color:rgba(255,255,255,0.78);">${label}</div>
+          <div style="font-family:${FONT};font-size:32px;line-height:1.15;font-weight:700;letter-spacing:-0.02em;color:#ffffff;margin-top:6px;">${value}</div>
+          ${caption ? `<div style="font-family:${FONT};font-size:12px;color:rgba(255,255,255,0.78);margin-top:8px;">${caption}</div>` : ''}
+        </td>
+      </tr>
+    </table>`;
+}
+
+/** Label/value rows in a soft panel — receipt details, account info. */
+export function emailDetails(rows: [string, string][]): string {
+  const body = rows
+    .map(
+      ([label, value], i) => `
+      <tr>
+        <td style="padding:12px 0;${i ? 'border-top:1px solid #e4e0d6;' : ''}font-family:${FONT};font-size:13px;color:${INK_SOFT};">${label}</td>
+        <td align="right" style="padding:12px 0;${i ? 'border-top:1px solid #e4e0d6;' : ''}font-family:${FONT};font-size:13px;font-weight:600;color:${INK};word-break:break-all;">${value}</td>
+      </tr>`,
+    )
+    .join('');
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAPER};border-radius:16px;margin:0 0 20px;">
+      <tr><td style="padding:4px 18px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${body}</table>
+      </td></tr>
+    </table>`;
+}
+
+/**
+ * The shared email shell: a doodle-artwork header with the Duevy mark, the
+ * content on a white card, and a quiet footer. `tone` colours the accent strip
+ * and buttons (green by default; amber for resets, rose for warnings).
+ * `preheader` is the inbox preview line.
+ */
+export function renderEmail(content: string, tone = BRAND, opts: { preheader?: string } = {}): string {
+  const year = new Date().getFullYear();
   return `
 <!DOCTYPE html>
 <html lang="en">
@@ -37,45 +105,57 @@ export function renderEmail(content: string, tone = '#0b6e4f'): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light" />
+  <meta name="supported-color-schemes" content="light" />
   <title>Duevy</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
-    body { margin: 0; padding: 0; background: #fbfaf7; font-family: 'Manrope', 'Helvetica Neue', Arial, sans-serif; color: #1b2520; -webkit-font-smoothing: antialiased; }
-    .outer { padding: 32px 16px; }
-    .wrapper { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 24px; overflow: hidden; border: 1px solid #e6f2ec; box-shadow: 0 1px 3px rgba(27,37,32,0.05); }
-    .top-bar { height: 4px; background: ${tone}; }
-    .header { padding: 28px 36px 0; }
-    .logo-row { display: flex; align-items: center; }
-    .logo-row img { height: 28px; width: auto; vertical-align: middle; display: inline-block; }
-    .logo-row .wordmark { font-size: 20px; letter-spacing: -0.01em; color: #1b2520; vertical-align: middle; padding-left: 8px; }
-    .body { padding: 24px 36px 40px; }
-    h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 12px; color: #1b2520; }
-    p { font-size: 15px; line-height: 1.65; color: #1b2520; margin: 0 0 16px; }
-    p.muted { color: #7a847f; font-size: 13px; }
-    .callout { background: #f4f2ec; border: 1px solid #e6f2ec; border-radius: 16px; padding: 14px 18px; margin: 0 0 20px; font-size: 14px; color: #1b2520; }
-    .btn { display: inline-block; background: ${tone}; color: #ffffff !important; border-radius: 9999px; padding: 13px 30px; font-size: 14px; font-weight: 600; text-decoration: none; margin: 4px 0 20px; }
-    .divider { border: none; border-top: 1px solid #e6f2ec; margin: 0; }
-    .footer { padding: 22px 36px 32px; text-align: center; font-size: 12px; line-height: 1.6; color: #7a847f; }
-    .footer a { color: #7a847f; text-decoration: underline; }
+    body { margin: 0; padding: 0; background: ${PAPER}; -webkit-font-smoothing: antialiased; }
+    a.btn:hover { opacity: 0.92; }
+    @media (max-width: 600px) {
+      .card-pad { padding-left: 22px !important; padding-right: 22px !important; }
+      .outer-pad { padding: 16px 10px !important; }
+    }
   </style>
 </head>
-<body>
-  <div class="outer">
-    <div class="wrapper">
-      <div class="top-bar"></div>
-      <div class="header">
-        <div class="logo-row">
-          <img src="https://www.duevy.app/icons/logo2.svg" alt="Duevy" />
-          <span class="wordmark">Duevy.</span>
-        </div>
-      </div>
-      <div class="body">
-        ${content}
-      </div>
-      <hr class="divider" />
-      <div class="footer">Duevy — duevy.app<br />You're receiving this because it relates to your Duevy account.</div>
-    </div>
-  </div>
+<body style="margin:0;padding:0;background:${PAPER};">
+  ${opts.preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${opts.preheader}</div>` : ''}
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAPER};">
+    <tr>
+      <td class="outer-pad" align="center" style="padding:32px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:24px;border:1px solid ${LINE};overflow:hidden;">
+          <!-- Header: Duevy mark on the doodle artwork -->
+          <tr>
+            <td style="background:${BRAND_DEEP} url('${ASSET_BASE}/doodle-card.jpg') center / cover no-repeat;background-color:${BRAND_DEEP};padding:26px 32px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="vertical-align:middle;">
+                    <img src="${ASSET_BASE}/icons/icon-192.png" width="36" height="36" alt="Duevy" style="display:block;width:36px;height:36px;border-radius:10px;border:0;" />
+                  </td>
+                  <td style="vertical-align:middle;padding-left:10px;font-family:${FONT};font-size:20px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;">Duevy.</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <!-- Accent strip in the email's tone -->
+          <tr><td style="height:4px;line-height:4px;font-size:0;background:${tone};">&nbsp;</td></tr>
+          <!-- Body -->
+          <tr>
+            <td class="card-pad" style="padding:32px 36px 16px;font-family:${FONT};color:${INK};">
+              ${inlineStyles(content, tone)}
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td class="card-pad" style="padding:20px 36px 28px;border-top:1px solid ${LINE};text-align:center;font-family:${FONT};font-size:12px;line-height:1.7;color:${INK_SOFT};">
+              Need help? <a href="mailto:support@duevy.app" style="color:${BRAND};text-decoration:none;font-weight:600;">support@duevy.app</a><br />
+              You're receiving this because it relates to your Duevy account.<br />
+              © ${year} Duevy · <a href="${ASSET_BASE}" style="color:${INK_SOFT};text-decoration:underline;">duevy.app</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>`.trim();
 }
@@ -132,16 +212,32 @@ export async function sendDuePaymentReceiptEmail(
 ): Promise<void> {
   const amount = `₦${(input.amountPaidKobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
   const receiptLink = `${env.APP_BASE_URL}/v1/dues/${input.dueId}/receipt`;
-  const html = renderEmail(`
+  const paidAt = new Date().toLocaleString('en-NG', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Africa/Lagos',
+  });
+  const html = renderEmail(
+    `
     <h1>Payment confirmed</h1>
-    <p>Hi ${name}, your payment for <strong>${input.dueTitle}</strong> (${input.spaceName}) went through.</p>
-    <div class="callout">
-      <strong>${amount}</strong> paid<br />
-      Reference: ${input.reference}
-    </div>
-    <a href="${receiptLink}" class="btn">View receipt</a>
+    <p>Hi ${name}, your payment for <strong>${input.dueTitle}</strong> went through. Here's your receipt.</p>
+    ${emailHero('Amount paid', amount, input.spaceName)}
+    ${emailDetails([
+      ['Due', input.dueTitle],
+      ['Space', input.spaceName],
+      ['Reference', input.reference],
+      ['Date', paidAt],
+      ['Status', 'Paid'],
+    ])}
+    <a href="${receiptLink}" class="btn">Download receipt</a>
     <p class="muted">Keep this email as proof of payment. Questions? Reply here or reach us at support@duevy.app</p>
-  `);
+  `,
+    undefined,
+    { preheader: `${amount} paid for ${input.dueTitle} — your receipt is inside.` },
+  );
 
   await sendEmail({
     to,
