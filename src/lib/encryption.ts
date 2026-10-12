@@ -23,7 +23,10 @@ export function decrypt(payload: string): string {
   const [ivHex, tagHex, dataHex] = payload.split(':');
   const iv = Buffer.from(ivHex, 'hex');
   const tag = Buffer.from(tagHex, 'hex');
-  const decipher = createDecipheriv('aes-256-gcm', KEY, iv);
+  // Pin the tag length: GCM otherwise accepts truncated tags, which weakens
+  // the integrity check.
+  if (tag.length !== 16) throw new Error('Invalid auth tag length');
+  const decipher = createDecipheriv('aes-256-gcm', KEY, iv, { authTagLength: 16 });
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
 }

@@ -85,3 +85,15 @@ export const feedbackLimiter = rateLimit({
     fail(res, 429, "RATE_LIMITED", "You've sent a lot of feedback recently — try again in a few minutes.");
   },
 });
+
+// Referral invites: 20 requests per 24h per user — each request can email up
+// to 20 addresses, so this bounds how much mail one account can send.
+export const inviteLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 20,
+  keyGenerator: (req: Request) =>
+    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "You've sent a lot of invites today — try again tomorrow.");
+  },
+});

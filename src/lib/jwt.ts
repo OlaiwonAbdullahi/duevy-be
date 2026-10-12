@@ -45,7 +45,7 @@ export async function signRefreshToken(
 export async function verifyAccessToken(
   token: string,
 ): Promise<AccessTokenPayload> {
-  const { payload } = await jwtVerify(token, accessSecret);
+  const { payload } = await jwtVerify(token, accessSecret, { algorithms: ['HS256'] });
   return payload as AccessTokenPayload;
 }
 
@@ -53,7 +53,7 @@ export async function verifyAccessToken(
 export async function verifyRefreshToken(
   token: string,
 ): Promise<RefreshTokenPayload> {
-  const { payload } = await jwtVerify(token, refreshSecret);
+  const { payload } = await jwtVerify(token, refreshSecret, { algorithms: ['HS256'] });
   return payload as RefreshTokenPayload;
 }
 

@@ -1,6 +1,7 @@
 import { type Request, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
 import multer from 'multer';
+import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
@@ -179,6 +180,13 @@ export const payoutDestinationLookupHandlers: RequestHandler[] = [
   sensitiveLimiter,
   validate(payoutDestinationSchema),
   async (req: Request, res: Response): Promise<void> => {
+    // Name enquiry reveals an account holder's name, so only reps and rep
+    // applicants (who need it for their own payout destination) may use it.
+    const user = await db.user.findUnique({ where: { id: uid(req) }, select: { isRep: true, repApplicationStatus: true } });
+    if (!user || !(user.isRep || user.repApplicationStatus === 'pending' || user.repApplicationStatus === 'approved')) {
+      errors.forbidden(res, 'Bank name enquiry is available to reps only');
+      return;
+    }
     const { bankCode, accountNumber } = req.body as z.infer<typeof payoutDestinationSchema>;
     const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
     ok(res, { bankCode, bankName, accountNumber: maskAccountNumber(accountNumber), accountName });

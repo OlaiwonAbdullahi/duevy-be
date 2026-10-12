@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
-import { assistantLimiter } from '../middleware/rateLimiter';
+import { assistantLimiter, lookupLimiter } from '../middleware/rateLimiter';
 import { ok, errors, fail } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAssistantConversation, serializeAssistantMessage } from '../lib/serializers';
@@ -38,6 +38,7 @@ assistantRouter.get('/conversations', async (req: Request, res: Response): Promi
   const userId = uid(req);
   const { page, perPage, skip, take } = parseListQuery(req);
 
+  // Only each conversation's latest message is needed for the preview.
   const [total, conversations] = await Promise.all([
     db.assistantConversation.count({ where: { userId } }),
     db.assistantConversation.findMany({
@@ -45,29 +46,13 @@ assistantRouter.get('/conversations', async (req: Request, res: Response): Promi
       orderBy: { updatedAt: 'desc' },
       skip,
       take,
+      include: { messages: { orderBy: { createdAt: 'desc' }, take: 1, select: { content: true, createdAt: true } } },
     }),
   ]);
 
-  const ids = conversations.map((c) => c.id);
-  const recentMessages = ids.length
-    ? await db.assistantMessage.findMany({
-        where: { conversationId: { in: ids } },
-        orderBy: { createdAt: 'desc' },
-        select: { conversationId: true, content: true, createdAt: true },
-      })
-    : [];
-  // Messages come back newest-first across all conversations on the page — the
-  // first one seen per conversationId is that conversation's latest message.
-  const previewByConversation = new Map<string, { content: string; createdAt: Date }>();
-  for (const m of recentMessages) {
-    if (!previewByConversation.has(m.conversationId)) {
-      previewByConversation.set(m.conversationId, { content: m.content, createdAt: m.createdAt });
-    }
-  }
-
   ok(
     res,
-    conversations.map((c) => serializeAssistantConversation(c, previewByConversation.get(c.id) ?? null)),
+    conversations.map((c) => serializeAssistantConversation(c, c.messages[0] ?? null)),
     200,
     buildMeta(page, perPage, total),
   );
@@ -113,8 +98,12 @@ assistantRouter.post('/message', validate(messageSchema), async (req: Request, r
     orderBy: { createdAt: 'desc' },
     take: HISTORY_TURNS,
   });
-  const history: ConversationTurn[] = priorMessages
+  // Only the user's own turns go back to the LLM: assistant replies echo
+  // DB-derived content (space names, due titles) that could carry injected
+  // instructions.
+  const history: ConversationTurn[] = [...priorMessages]
     .reverse()
+    .filter((m) => m.role === 'user')
     .map((m) => ({ role: m.role, content: m.content }));
 
   const classification = await classify(message, history);
@@ -125,7 +114,8 @@ assistantRouter.post('/message', validate(messageSchema), async (req: Request, r
   // whatever was already extracted for this conversation's in-progress due,
   // and only let the current turn override fields it actually mentioned.
   if (classification.intent === 'create_due') {
-    const priorDraft = [...priorMessages].reverse().find((m) => m.role === 'assistant' && m.intent === 'create_due');
+    // priorMessages is newest-first, so this is the most recent draft.
+    const priorDraft = priorMessages.find((m) => m.role === 'assistant' && m.intent === 'create_due');
     const priorParams = (priorDraft?.params ?? null) as Partial<{
       spaceName: string | null;
       dueTitle: string | null;
@@ -184,7 +174,7 @@ const confirmSchema = z
     inviteCode: z.string().optional(),
     // create_due
     title: z.string().min(3).max(120).optional(),
-    amount: z.number().int().positive().optional(),
+    amount: z.number().int().positive().max(100_000_000).optional(), // kobo — same cap as POST /dues
     dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     category: z.enum(DUE_CATEGORIES).optional(),
   })
@@ -192,7 +182,7 @@ const confirmSchema = z
     message: 'either inviteCode, or title+amount+dueDate+category, must be provided',
   });
 
-assistantRouter.post('/confirm', validate(confirmSchema), async (req: Request, res: Response): Promise<void> => {
+assistantRouter.post('/confirm', lookupLimiter, validate(confirmSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = uid(req);
   const body = req.body as z.infer<typeof confirmSchema>;
 
@@ -224,6 +214,10 @@ assistantRouter.post('/confirm', validate(confirmSchema), async (req: Request, r
     category: body.category as (typeof DUE_CATEGORIES)[number],
   });
 
+  if (result.status === 'invalid_draft') {
+    errors.validation(res, [{ field: 'dueDate', issue: 'amount must be within limits and dueDate must be today or later' }]);
+    return;
+  }
   if (result.status === 'not_rep') {
     errors.forbidden(res, 'You are not a rep of this space');
     return;

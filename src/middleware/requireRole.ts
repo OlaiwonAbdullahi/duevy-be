@@ -43,11 +43,20 @@ export function requireSpaceRep(leadOnly = false) {
     // Reuse a previously-resolved rep row from earlier in the same request
     // (e.g. the router-level requireSpaceRep() stacked with a route-level
     // requireSpaceRep(true)) so this only ever costs one query per request.
+    // The rep's suspension flags ride along in the same query, so a suspended
+    // or deactivated rep loses money access immediately rather than when
+    // their access token expires.
     let rep = authedReq.spaceRep;
     if (!rep || rep.spaceId !== spaceId) {
-      rep = (await db.spaceRep.findUnique({
+      const row = await db.spaceRep.findUnique({
         where: { userId_spaceId: { userId: user.sub as string, spaceId } },
-      })) ?? undefined;
+        include: { user: { select: { isSuspended: true, isDeactivated: true } } },
+      });
+      if (row && (row.user.isSuspended || row.user.isDeactivated)) {
+        errors.forbidden(res, 'Your account is suspended');
+        return;
+      }
+      rep = row ?? undefined;
       authedReq.spaceRep = rep;
     }
 

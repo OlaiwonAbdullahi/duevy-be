@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepApplication, type User } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+import { Prisma, KycStatus, TxnStatus, TxnType, DisputeStatus, DisputeType, PollStatus, type RepApplication, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
@@ -31,72 +32,124 @@ const userSpaces = {
 // ---------------------------------------------------------------------------
 // Shared financial aggregation over a set of spaces.
 // ---------------------------------------------------------------------------
-async function spacesFinancials(spaceIds: string[]) {
-  if (spaceIds.length === 0) return { collected: 0, held: 0, expected: 0, uncollected: 0, collectionRate: 0 };
+type SpaceMoney = { collected: number; held: number; expected: number; collectedActive: number };
 
-  const [collectedAgg, paidOutAgg, activeDues, memberGroups] = await Promise.all([
-    db.duePayment.aggregate({ where: { due: { spaceId: { in: spaceIds } } }, _sum: { netToSpace: true } }),
-    db.ledgerEntry.groupBy({ by: ['direction'], where: { spaceId: { in: spaceIds } }, _sum: { amountKobo: true } }),
-    db.due.findMany({ where: { spaceId: { in: spaceIds }, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
-    db.spaceMembership.groupBy({ by: ['spaceId'], where: { spaceId: { in: spaceIds } }, _count: { _all: true } }),
-  ]);
-
-  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-  const paidPerDue = new Map(
-    (await db.duePayment.groupBy({ by: ['dueId'], where: { dueId: { in: activeDues.map((d) => d.id) } }, _sum: { netToSpace: true } }))
-      .map((p) => [p.dueId, p._sum.netToSpace ?? 0]),
-  );
-
+/** Roll per-space money up into the shape the admin views show. */
+function summarizeFinancials(parts: Iterable<SpaceMoney | undefined>) {
+  let collected = 0;
+  let held = 0;
   let expected = 0;
   let collectedActive = 0;
-  for (const d of activeDues) {
-    expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
-    collectedActive += paidPerDue.get(d.id) ?? 0;
+  for (const p of parts) {
+    if (!p) continue;
+    collected += p.collected;
+    held += p.held;
+    expected += p.expected;
+    collectedActive += p.collectedActive;
   }
-
-  const collected = collectedAgg._sum.netToSpace ?? 0;
   return {
     collected,
-    // The ledger is the balance: credits − debits across these spaces.
-    held:
-      (paidOutAgg.find((g) => g.direction === 'credit')?._sum.amountKobo ?? 0) -
-      (paidOutAgg.find((g) => g.direction === 'debit')?._sum.amountKobo ?? 0),
+    held,
     expected,
     uncollected: Math.max(0, expected - collectedActive),
     collectionRate: expected > 0 ? collectedActive / expected : 0,
   };
 }
 
-/** Count spaces with active dues collecting below 30% of what's expected. */
-async function countLowCollectionSpaces(spaceIds: string[]): Promise<number> {
-  if (spaceIds.length === 0) return 0;
+/**
+ * Money per space for a page of spaces, in a constant number of queries
+ * (no per-row aggregates). Spaces with no activity map to zeros.
+ */
+async function financialsBySpace(spaceIds: string[]): Promise<Map<string, SpaceMoney>> {
+  const out = new Map<string, SpaceMoney>(spaceIds.map((id) => [id, { collected: 0, held: 0, expected: 0, collectedActive: 0 }]));
+  if (spaceIds.length === 0) return out;
 
-  const [activeDues, memberGroups] = await Promise.all([
-    db.due.findMany({ where: { spaceId: { in: spaceIds }, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
+  const [dues, paidPerDue, ledgerGroups, memberGroups] = await Promise.all([
+    db.due.findMany({ where: { spaceId: { in: spaceIds } }, select: { id: true, spaceId: true, amount: true, status: true } }),
+    db.duePayment.groupBy({ by: ['dueId'], where: { due: { spaceId: { in: spaceIds } } }, _sum: { netToSpace: true } }),
+    db.ledgerEntry.groupBy({ by: ['spaceId', 'direction'], where: { spaceId: { in: spaceIds } }, _sum: { amountKobo: true } }),
     db.spaceMembership.groupBy({ by: ['spaceId'], where: { spaceId: { in: spaceIds } }, _count: { _all: true } }),
   ]);
-  if (activeDues.length === 0) return 0;
 
   const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-  const paidPerDue = new Map(
-    (await db.duePayment.groupBy({ by: ['dueId'], where: { dueId: { in: activeDues.map((d) => d.id) } }, _sum: { netToSpace: true } }))
-      .map((p) => [p.dueId, p._sum.netToSpace ?? 0]),
-  );
+  const paid = new Map(paidPerDue.map((p) => [p.dueId, p._sum.netToSpace ?? 0]));
+  for (const d of dues) {
+    const m = out.get(d.spaceId)!;
+    const net = paid.get(d.id) ?? 0;
+    m.collected += net;
+    if (d.status === 'active') {
+      m.expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
+      m.collectedActive += net;
+    }
+  }
+  // The ledger is the balance: credits − debits per space.
+  for (const g of ledgerGroups) {
+    const m = out.get(g.spaceId)!;
+    m.held += (g.direction === 'credit' ? 1 : -1) * (g._sum.amountKobo ?? 0);
+  }
+  return out;
+}
 
+/** Platform-wide financials over every space matching a filter (no id lists). */
+async function spacesFinancials(spaceWhere: Prisma.SpaceWhereInput) {
+  const [collectedAgg, ledgerAgg, activeDues, memberGroups, paidPerDue] = await Promise.all([
+    db.duePayment.aggregate({ where: { due: { space: spaceWhere } }, _sum: { netToSpace: true } }),
+    db.ledgerEntry.groupBy({ by: ['direction'], where: { space: spaceWhere }, _sum: { amountKobo: true } }),
+    db.due.findMany({ where: { space: spaceWhere, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
+    db.spaceMembership.groupBy({ by: ['spaceId'], where: { space: spaceWhere }, _count: { _all: true } }),
+    db.duePayment.groupBy({ by: ['dueId'], where: { due: { space: spaceWhere, status: 'active' } }, _sum: { netToSpace: true } }),
+  ]);
+
+  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
+  const paid = new Map(paidPerDue.map((p) => [p.dueId, p._sum.netToSpace ?? 0]));
+
+  // Per-space expected/collected for active dues, reused for the low-collection count.
   const bySpace = new Map<string, { expected: number; collected: number }>();
   for (const d of activeDues) {
     const agg = bySpace.get(d.spaceId) ?? { expected: 0, collected: 0 };
     agg.expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
-    agg.collected += paidPerDue.get(d.id) ?? 0;
+    agg.collected += paid.get(d.id) ?? 0;
     bySpace.set(d.spaceId, agg);
   }
 
-  let count = 0;
-  for (const { expected, collected } of bySpace.values()) {
-    if (expected > 0 && collected / expected < 0.3) count += 1;
+  let expected = 0;
+  let collectedActive = 0;
+  let lowCollectionCount = 0;
+  for (const s of bySpace.values()) {
+    expected += s.expected;
+    collectedActive += s.collected;
+    // Spaces with active dues collecting below 30% of what's expected.
+    if (s.expected > 0 && s.collected / s.expected < 0.3) lowCollectionCount += 1;
   }
-  return count;
+
+  return {
+    collected: collectedAgg._sum.netToSpace ?? 0,
+    // The ledger is the balance: credits − debits across these spaces.
+    held:
+      (ledgerAgg.find((g) => g.direction === 'credit')?._sum.amountKobo ?? 0) -
+      (ledgerAgg.find((g) => g.direction === 'debit')?._sum.amountKobo ?? 0),
+    expected,
+    uncollected: Math.max(0, expected - collectedActive),
+    collectionRate: expected > 0 ? collectedActive / expected : 0,
+    lowCollectionCount,
+  };
 }
+
+/**
+ * Parse req.query against a schema. Express 5's req.query is getter-only, so
+ * validate(schema, 'query') can't be used; on failure this sends the 400.
+ */
+function parseQuery<T extends z.ZodTypeAny>(req: Request, res: Response, schema: T): z.infer<T> | null {
+  const result = schema.safeParse(req.query);
+  if (!result.success) {
+    errors.validation(res, result.error.errors.map((e) => ({ field: e.path.join('.'), issue: e.message })));
+    return null;
+  }
+  return result.data;
+}
+
+/** Optional query string filter: empty string counts as absent. */
+const optionalQuery = <T extends z.ZodTypeAny>(schema: T) => z.preprocess((v) => (v === '' ? undefined : v), schema.optional());
 
 // ===========================================================================
 // §14.1 Overview
@@ -290,34 +343,38 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
     platformMetrics(),
   ]);
 
-  const allSpaces = await db.space.findMany({ where: { isArchived: false }, select: { id: true } });
-  const spaceIds = allSpaces.map((s) => s.id);
-  const [fin, lowCollectionCount, openDisputes] = await Promise.all([
-    spacesFinancials(spaceIds),
-    countLowCollectionSpaces(spaceIds),
-    db.dispute.findMany({ where: { status: { in: ['open', 'under_review'] } }, select: { slaDays: true, createdAt: true } }),
+  const now = new Date();
+  const [fin, breachedRows] = await Promise.all([
+    spacesFinancials({ isArchived: false }),
+    // Open disputes past their SLA window, counted in the database.
+    db.$queryRaw<{ n: number }[]>`
+      SELECT COUNT(*)::int AS n FROM "disputes"
+      WHERE "status" IN ('open', 'under_review')
+        AND "createdAt" + make_interval(days => "slaDays") < ${now}
+    `,
   ]);
-  const breachedDisputes = openDisputes.filter((d) => (Date.now() - d.createdAt.getTime()) / (24 * 60 * 60 * 1000) > d.slaDays).length;
+  const lowCollectionCount = fin.lowCollectionCount;
+  const breachedDisputes = breachedRows[0]?.n ?? 0;
 
   // Overdue: active dues past their date, still short of full collection.
-  const now = new Date();
+  const overdueWhere: Prisma.DueWhereInput = { status: 'active', dueDate: { lt: now } };
   const overdueDues = await db.due.findMany({
-    where: { status: 'active', dueDate: { lt: now } },
+    where: overdueWhere,
     select: { id: true, spaceId: true, amount: true },
   });
   let overdueAmount = 0;
   let overdueCount = 0;
   if (overdueDues.length) {
-    const memberGroups = await db.spaceMembership.groupBy({
-      by: ['spaceId'],
-      where: { spaceId: { in: overdueDues.map((d) => d.spaceId) } },
-      _count: { _all: true },
-    });
+    const [memberGroups, paidGroups] = await Promise.all([
+      db.spaceMembership.groupBy({
+        by: ['spaceId'],
+        where: { space: { dues: { some: overdueWhere } } },
+        _count: { _all: true },
+      }),
+      db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere }, _count: { _all: true } }),
+    ]);
     const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-    const paidCounts = new Map(
-      (await db.duePayment.groupBy({ by: ['dueId'], where: { dueId: { in: overdueDues.map((d) => d.id) } }, _count: { _all: true } }))
-        .map((p) => [p.dueId, p._count._all]),
-    );
+    const paidCounts = new Map(paidGroups.map((p) => [p.dueId, p._count._all]));
     for (const d of overdueDues) {
       const unpaid = Math.max(0, (memberCount.get(d.spaceId) ?? 0) - (paidCounts.get(d.id) ?? 0));
       if (unpaid > 0) {
@@ -389,15 +446,19 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
 // ===========================================================================
 // §14.2 Users
 // ===========================================================================
+const usersQuerySchema = z.object({ kycStatus: optionalQuery(z.nativeEnum(KycStatus)) });
+
 adminRouter.get('/users', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
+  const query = parseQuery(req, res, usersQuerySchema);
+  if (!query) return;
   const role = typeof req.query.role === 'string' ? req.query.role : undefined;
-  const kycStatus = typeof req.query.kycStatus === 'string' ? req.query.kycStatus : undefined;
+  const { kycStatus } = query;
   const suspended = req.query.suspended;
 
   const where: Prisma.UserWhereInput = {};
   if (role && ['student', 'rep', 'admin'].includes(role)) where.role = role as never;
-  if (kycStatus) where.kycStatus = kycStatus as never;
+  if (kycStatus) where.kycStatus = kycStatus;
   if (suspended === 'true') where.isSuspended = true;
   if (suspended === 'false') where.isSuspended = false;
   if (q) where.OR = [{ name: { contains: q, mode: 'insensitive' } }, { email: { contains: q, mode: 'insensitive' } }, { matricNo: { contains: q, mode: 'insensitive' } }];
@@ -462,7 +523,9 @@ adminRouter.post('/users/:userId/deactivate', requireAdminPermission('userManage
   res.status(204).end();
 });
 
-const kycSchema = z.object({ decision: z.enum(['verified', 'rejected']), note: z.string().max(500).optional() });
+// Identity is Bachs's decision: an admin may revoke a rep's verification
+// (block them) but can never mark someone verified.
+const kycSchema = z.object({ decision: z.literal('rejected'), note: z.string().max(500).optional() });
 
 adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManagement'), validate(kycSchema), async (req: Request, res: Response): Promise<void> => {
   const id = req.params.userId as string;
@@ -515,16 +578,35 @@ adminRouter.post(
  * sign-up details, the space they applied with, and KYC/payout state.
  * Sensitive identity numbers (NIN, BVN, DOB) are never stored, so never shown.
  */
-async function buildAdminRep(user: User) {
-  const [reps, application] = await Promise.all([
+async function buildAdminReps(users: User[]) {
+  const userIds = users.map((u) => u.id);
+  const [allReps, applications] = await Promise.all([
     db.spaceRep.findMany({
-      where: { userId: user.id },
-      select: { role: true, space: { select: { id: true, name: true, short: true, payoutsFrozen: true } } },
+      where: { userId: { in: userIds } },
+      select: { userId: true, role: true, space: { select: { id: true, name: true, short: true, payoutsFrozen: true } } },
     }),
-    db.repApplication.findUnique({ where: { userId: user.id } }),
+    db.repApplication.findMany({ where: { userId: { in: userIds } } }),
   ]);
+  const fins = await financialsBySpace([...new Set(allReps.map((r) => r.space.id))]);
+  const appByUser = new Map(applications.map((a) => [a.userId, a]));
+  return users.map((user) => {
+    const reps = allReps.filter((r) => r.userId === user.id);
+    return serializeAdminRep(user, reps, appByUser.get(user.id) ?? null, fins);
+  });
+}
+
+async function buildAdminRep(user: User) {
+  return (await buildAdminReps([user]))[0]!;
+}
+
+function serializeAdminRep(
+  user: User,
+  reps: { role: string; space: { id: string; name: string; short: string; payoutsFrozen: boolean } }[],
+  application: RepApplication | null,
+  fins: Map<string, SpaceMoney>,
+) {
   const spaceIds = reps.map((r) => r.space.id);
-  const fin = await spacesFinancials(spaceIds);
+  const fin = summarizeFinancials(spaceIds.map((id) => fins.get(id)));
   const verification = user.repApplicationStatus === 'approved' || user.isRep ? 'verified' : user.repApplicationStatus === 'pending' ? 'pending' : 'unverified';
   const status = user.isSuspended ? 'suspended' : user.repApplicationStatus === 'pending' ? 'pending' : 'active';
   return {
@@ -580,7 +662,7 @@ adminRouter.get('/reps', requireAdminPermission('userManagement'), async (req: R
     db.user.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take }),
   ]);
 
-  const rows = await Promise.all(users.map(buildAdminRep));
+  const rows = await buildAdminReps(users);
   ok(res, rows, 200, buildMeta(page, perPage, total));
 });
 
@@ -798,7 +880,10 @@ adminRouter.post('/reps/:repId/suspend', requireAdminPermission('userManagement'
     errors.notFound(res, 'Rep not found');
     return;
   }
-  await writeAdminAudit(req, 'rep.suspend', { target: userId, severity: 'warning', metadata: { reason } });
+  await Promise.all([
+    db.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } }),
+    writeAdminAudit(req, 'rep.suspend', { target: userId, severity: 'warning', metadata: { reason } }),
+  ]);
   res.status(204).end();
 });
 
@@ -849,26 +934,86 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
     db.space.findMany({ where, include: { _count: { select: { memberships: true } }, reps: { select: { userId: true } } }, orderBy: { createdAt: 'desc' }, skip, take }),
   ]);
 
-  const rows = await Promise.all(
-    spaces.map(async (s) => {
-      const fin = await spacesFinancials([s.id]);
-      return {
-        id: s.id,
-        name: s.name,
-        short: s.short,
-        kind: s.kind,
-        school: s.school,
-        memberCount: s._count.memberships,
-        duesTarget: fin.expected,
-        collectedAmount: fin.collected,
-        assignedRepIds: s.reps.map((r) => r.userId),
-        isArchived: s.isArchived,
-        payoutsFrozen: s.payoutsFrozen,
-      };
-    }),
-  );
+  const fins = await financialsBySpace(spaces.map((s) => s.id));
+  const rows = spaces.map((s) => {
+    const fin = fins.get(s.id);
+    return {
+      id: s.id,
+      name: s.name,
+      short: s.short,
+      kind: s.kind,
+      school: s.school,
+      memberCount: s._count.memberships,
+      duesTarget: fin?.expected ?? 0,
+      collectedAmount: fin?.collected ?? 0,
+      assignedRepIds: s.reps.map((r) => r.userId),
+      isArchived: s.isArchived,
+      payoutsFrozen: s.payoutsFrozen,
+      withdrawalPinSet: !!s.withdrawalPinHash,
+      withdrawalPinSetAt: s.withdrawalPinSetAt,
+      withdrawalPinLocked: !!s.withdrawalPinLockedUntil && s.withdrawalPinLockedUntil > new Date(),
+      withdrawalPinResetRequestedAt: s.withdrawalPinResetRequestedAt,
+    };
+  });
   ok(res, rows, 200, buildMeta(page, perPage, total));
 });
+
+// ---------------------------------------------------------------------------
+// PUT /admin/spaces/:spaceId/withdrawal-pin — set or replace the space's
+// 4-digit withdrawal security code. The admin shares it with the lead rep out
+// of band; only a hash is stored and it is never returned. Setting a code also
+// clears any lockout.
+// ---------------------------------------------------------------------------
+const WEAK_PINS = new Set(['0123', '1234', '2345', '3456', '4567', '5678', '6789', '9876', '8765', '7654', '6543', '5432', '4321', '3210']);
+const withdrawalPinSchema = z
+  .object({
+    pin: z
+      .string()
+      .regex(/^\d{4}$/, 'must be 4 digits')
+      .refine((p) => !/^(\d)\1{3}$/.test(p) && !WEAK_PINS.has(p), 'too easy to guess'),
+  })
+  .strict();
+
+adminRouter.put(
+  '/spaces/:spaceId/withdrawal-pin',
+  requireAdminPermission('payouts'),
+  validate(withdrawalPinSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const id = req.params.spaceId as string;
+    const { pin } = req.body as z.infer<typeof withdrawalPinSchema>;
+    const space = await db.space.findUnique({ where: { id }, select: { id: true, name: true, withdrawalPinHash: true, reps: { select: { userId: true } } } });
+    if (!space) {
+      errors.notFound(res, 'Space not found');
+      return;
+    }
+    const setAt = new Date();
+    await db.space.update({
+      where: { id },
+      data: {
+        withdrawalPinHash: await bcrypt.hash(pin, env.BCRYPT_ROUNDS),
+        withdrawalPinSetAt: setAt,
+        withdrawalPinFailedAttempts: 0,
+        withdrawalPinLockedUntil: null,
+        withdrawalPinResetRequestedAt: null,
+      },
+    });
+    const replaced = !!space.withdrawalPinHash;
+    await writeAdminAudit(req, replaced ? 'space.withdrawal_pin_reset' : 'space.withdrawal_pin_set', { target: id, severity: 'critical' });
+    // Every rep hears about it, so a code change they didn't ask for is noticed.
+    await Promise.all(
+      space.reps.map((r) =>
+        notify({
+          userId: r.userId,
+          kind: 'system',
+          title: replaced ? 'Withdrawal security code changed' : 'Withdrawal security code set',
+          detail: `A Duevy admin ${replaced ? 'changed' : 'set'} the withdrawal security code for ${space.name}. If you didn't request this, contact support.`,
+          href: '/dashboard/payout',
+        }),
+      ),
+    );
+    ok(res, { withdrawalPinSet: true, withdrawalPinSetAt: setAt });
+  },
+);
 
 const createSpaceSchema = z.object({
   name: z.string().min(2).max(120),
@@ -917,7 +1062,8 @@ adminRouter.patch('/spaces/:spaceId', requireAdminPermission('userManagement'), 
 
 const assignRepSchema = z.object({ userId: z.string().min(1), role: z.enum(['lead', 'co']) });
 
-adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userManagement'), validate(assignRepSchema), async (req: Request, res: Response): Promise<void> => {
+// A lead rep can withdraw the space's balance, so this needs payout authority too.
+adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userManagement'), requireAdminPermission('payouts'), validate(assignRepSchema), async (req: Request, res: Response): Promise<void> => {
   const spaceId = req.params.spaceId as string;
   const { userId, role } = req.body as z.infer<typeof assignRepSchema>;
 
@@ -930,18 +1076,40 @@ adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userMana
     errors.notFound(res, 'User not found');
     return;
   }
+  if (userId === ((req as AuthenticatedRequest).user.sub as string)) {
+    errors.forbidden(res, 'Admins cannot assign themselves as a rep');
+    return;
+  }
+  if (user.isSuspended || user.isDeactivated) {
+    errors.conflict(res, 'USER_INACTIVE', 'Suspended or deactivated users cannot be assigned as reps');
+    return;
+  }
 
   const referralCode = user.referralCode ?? (await generateReferralCode(user.name));
-  await db.$transaction(
+  const demotedLeadIds = await db.$transaction(
     async (tx) => {
+      // A space has exactly one lead: assigning a new one demotes the old.
+      let demoted: string[] = [];
+      if (role === 'lead') {
+        const others = await tx.spaceRep.findMany({ where: { spaceId, role: 'lead', userId: { not: userId } }, select: { userId: true } });
+        demoted = others.map((o) => o.userId);
+        if (demoted.length) {
+          await tx.spaceRep.updateMany({ where: { spaceId, role: 'lead', userId: { in: demoted } }, data: { role: 'co' } });
+        }
+      }
       await tx.spaceRep.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: { role }, create: { userId, spaceId, role } });
       await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, kind: 'member' } });
       // Attaching a rep promotes the account.
       await tx.user.update({ where: { id: userId }, data: { role: user.role === 'admin' ? 'admin' : 'rep', isRep: true, repApplicationStatus: 'approved', referralCode } });
+      return demoted;
     },
     { timeout: 20_000 },
   );
-  await writeAdminAudit(req, 'space.assign_rep', { target: spaceId, metadata: { userId, role } });
+  await writeAdminAudit(req, 'space.assign_rep', {
+    target: spaceId,
+    severity: role === 'lead' ? 'critical' : 'warning',
+    metadata: { userId, role, demotedLeadIds },
+  });
   ok(res, { userId, spaceId, role }, 201);
 });
 
@@ -964,19 +1132,30 @@ function adminTxnType(type: string): string {
   return { topup: 'deposit', due: 'dues_payment', withdrawal: 'payout' }[type] ?? type;
 }
 
+// Admin-facing type names, alongside the raw TxnType values.
+const ADMIN_TXN_TYPES: Record<string, TxnType> = { deposit: 'topup', dues_payment: 'due', payout: 'withdrawal', refund: 'refund' };
+
+const transactionsQuerySchema = z.object({
+  type: optionalQuery(z.string().transform((t, ctx) => {
+    const mapped = ADMIN_TXN_TYPES[t] ?? (Object.values(TxnType).includes(t as TxnType) ? (t as TxnType) : undefined);
+    if (!mapped) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'unknown transaction type' });
+    return mapped as TxnType;
+  })),
+  status: optionalQuery(z.nativeEnum(TxnStatus)),
+  from: optionalQuery(z.coerce.date()),
+  to: optionalQuery(z.coerce.date()),
+});
+
 adminRouter.get('/transactions', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
+  const query = parseQuery(req, res, transactionsQuerySchema);
+  if (!query) return;
   const where: Prisma.TransactionWhereInput = {};
-  const typeMap: Record<string, string> = { deposit: 'topup', dues_payment: 'due', payout: 'withdrawal', refund: 'refund' };
-  if (typeof req.query.type === 'string') where.type = (typeMap[req.query.type] ?? req.query.type) as never;
-  if (typeof req.query.status === 'string') where.status = req.query.status as never;
+  if (query.type) where.type = query.type;
+  if (query.status) where.status = query.status;
   if (typeof req.query.spaceId === 'string') where.spaceId = req.query.spaceId;
   if (typeof req.query.userId === 'string') where.userId = req.query.userId;
-  if (typeof req.query.from === 'string' || typeof req.query.to === 'string') {
-    where.createdAt = {};
-    if (typeof req.query.from === 'string') where.createdAt.gte = new Date(req.query.from);
-    if (typeof req.query.to === 'string') where.createdAt.lte = new Date(req.query.to);
-  }
+  if (query.from || query.to) where.createdAt = { gte: query.from, lte: query.to };
   if (q) where.OR = [{ reference: { contains: q, mode: 'insensitive' } }, { user: { name: { contains: q, mode: 'insensitive' } } }, { user: { email: { contains: q, mode: 'insensitive' } } }];
 
   const [total, rows] = await Promise.all([
@@ -1088,6 +1267,15 @@ adminRouter.post(
       return;
     }
 
+    // Only a member of the due's space can owe (and so be credited for) it.
+    const membership = await db.spaceMembership.findUnique({
+      where: { userId_spaceId: { userId, spaceId: due.spaceId } },
+    });
+    if (!membership) {
+      fail(res, 422, 'NOT_A_MEMBER', "This user isn't a member of the due's space");
+      return;
+    }
+
     const existing = await db.duePayment.findUnique({
       where: { userId_dueId: { userId, dueId: due.id } },
     });
@@ -1103,50 +1291,62 @@ adminRouter.post(
     const reference = suppliedReference ?? generateReference('MAN');
     const actorId = (req as AuthenticatedRequest).user.sub as string;
 
-    const transaction = await db.$transaction(async (tx) => {
-      const txn = await tx.transaction.create({
-        data: {
-          userId,
-          type: 'due',
-          title: due.title,
-          detail: due.space.name,
-          amount: -charge.total,
-          method: 'Manual (admin)',
-          status: 'completed',
-          reference,
+    let transaction;
+    try {
+      transaction = await db.$transaction(async (tx) => {
+        const txn = await tx.transaction.create({
+          data: {
+            userId,
+            type: 'due',
+            title: due.title,
+            detail: due.space.name,
+            amount: -charge.total,
+            method: 'Manual (admin)',
+            status: 'completed',
+            reference,
+            spaceId: due.spaceId,
+          },
+        });
+        const duePayment = await tx.duePayment.create({
+          data: {
+            userId,
+            dueId: due.id,
+            txnId: txn.id,
+            reference,
+            amountPaid: charge.total,
+            processingFee: 0,
+            duevyFee: charge.fee,
+            netToSpace: charge.face,
+          },
+        });
+        await lockSpace(tx, due.spaceId);
+        await appendLedgerEntry(tx, {
           spaceId: due.spaceId,
-        },
-      });
-      const duePayment = await tx.duePayment.create({
-        data: {
-          userId,
           dueId: due.id,
           txnId: txn.id,
+          duePaymentId: duePayment.id,
+          type: 'manual_credit',
+          direction: 'credit',
+          amountKobo: charge.face,
+          grossKobo: charge.total,
+          feeKobo: charge.fee,
+          netKobo: charge.face,
           reference,
-          amountPaid: charge.total,
-          processingFee: 0,
-          duevyFee: charge.fee,
-          netToSpace: charge.face,
-        },
+          description: reason,
+          actorId,
+        });
+        return txn;
       });
-      await lockSpace(tx, due.spaceId);
-      await appendLedgerEntry(tx, {
-        spaceId: due.spaceId,
-        dueId: due.id,
-        txnId: txn.id,
-        duePaymentId: duePayment.id,
-        type: 'manual_credit',
-        direction: 'credit',
-        amountKobo: charge.face,
-        grossKobo: charge.total,
-        feeKobo: charge.fee,
-        netKobo: charge.face,
-        reference,
-        description: reason,
-        actorId,
-      });
-      return txn;
-    });
+    } catch (err) {
+      // A duplicate reference, or a concurrent credit for the same user and due.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const target = String((err.meta as { target?: unknown } | undefined)?.target ?? '');
+        if (target.includes('reference')) errors.conflict(res, 'DUPLICATE_REFERENCE', 'A transaction with this reference already exists');
+        else errors.conflict(res, 'DUE_ALREADY_PAID', 'This due has already been settled for this user');
+        return;
+      }
+      throw err;
+    }
 
     await Promise.all([
       writeAdminAudit(req, 'due.manual_credit', {
@@ -1170,11 +1370,18 @@ adminRouter.post(
 // ===========================================================================
 // §14.6 Disputes
 // ===========================================================================
+const disputesQuerySchema = z.object({
+  status: optionalQuery(z.nativeEnum(DisputeStatus)),
+  type: optionalQuery(z.nativeEnum(DisputeType)),
+});
+
 adminRouter.get('/disputes', requireAdminPermission('disputes'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
+  const query = parseQuery(req, res, disputesQuerySchema);
+  if (!query) return;
   const where: Prisma.DisputeWhereInput = {};
-  if (typeof req.query.status === 'string') where.status = req.query.status as never;
-  if (typeof req.query.type === 'string') where.type = req.query.type as never;
+  if (query.status) where.status = query.status;
+  if (query.type) where.type = query.type;
   if (q) where.OR = [{ openedByName: { contains: q, mode: 'insensitive' } }, { openedByEmail: { contains: q, mode: 'insensitive' } }, { txnReference: { contains: q, mode: 'insensitive' } }];
 
   const [total, disputes] = await Promise.all([
@@ -1210,7 +1417,20 @@ adminRouter.post('/disputes/:id/resolve', requireAdminPermission('disputes'), va
     errors.notFound(res, 'Dispute not found');
     return;
   }
-  const updated = await db.dispute.update({ where: { id }, data: { status: 'resolved', resolution: `${resolution}: ${note}`, refundTxnId, resolvedAt: new Date() } });
+  if (refundTxnId && !(await db.transaction.findUnique({ where: { id: refundTxnId }, select: { id: true } }))) {
+    fail(res, 422, 'REFUND_TXN_NOT_FOUND', 'The refund transaction does not exist');
+    return;
+  }
+  // Conditional update so two admins can't both resolve the same dispute.
+  const resolved = await db.dispute.updateMany({
+    where: { id, status: { not: 'resolved' } },
+    data: { status: 'resolved', resolution: `${resolution}: ${note}`, refundTxnId, resolvedAt: new Date() },
+  });
+  if (resolved.count === 0) {
+    errors.conflict(res, 'DISPUTE_RESOLVED', 'This dispute is already resolved');
+    return;
+  }
+  const updated = await db.dispute.findUniqueOrThrow({ where: { id } });
   await Promise.all([
     writeAdminAudit(req, 'dispute.resolve', { target: id, severity: 'warning', metadata: { resolution, note } }),
     notify({ userId: dispute.openedById, kind: 'system', title: 'Dispute resolved', detail: `Your dispute was ${resolution}. ${note}`, href: '/dashboard' }).catch(() => {}),
@@ -1277,8 +1497,10 @@ adminRouter.post('/feedback/:id/reopen', requireAdminPermission('userManagement'
 // ===========================================================================
 adminRouter.get('/polls', async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
+  const query = parseQuery(req, res, z.object({ status: optionalQuery(z.nativeEnum(PollStatus)) }));
+  if (!query) return;
   const where: Prisma.PollWhereInput = {};
-  if (typeof req.query.status === 'string') where.status = req.query.status as never;
+  if (query.status) where.status = query.status;
   if (q) where.title = { contains: q, mode: 'insensitive' };
 
   const [total, polls] = await Promise.all([
@@ -1316,31 +1538,31 @@ adminRouter.get('/referrals/summaries', requireAdminPermission('userManagement')
   const total = grouped.length;
   const pageSlice = grouped.slice(skip, skip + take);
 
-  const referrers = await db.user.findMany({
-    where: { id: { in: pageSlice.map((g) => g.referrerId) } },
-    select: { id: true, name: true, email: true },
-  });
+  const referrerIds = pageSlice.map((g) => g.referrerId);
+  const [referrers, joinedGroups] = await Promise.all([
+    db.user.findMany({ where: { id: { in: referrerIds } }, select: { id: true, name: true, email: true } }),
+    db.referral.groupBy({ by: ['referrerId'], where: { referrerId: { in: referrerIds }, status: { in: ['joined', 'paid'] } }, _count: { _all: true } }),
+  ]);
   const byId = new Map(referrers.map((u) => [u.id, u]));
+  const joinedBy = new Map(joinedGroups.map((g) => [g.referrerId, g._count._all]));
 
-  const rows = await Promise.all(
-    pageSlice.map(async (g) => {
-      const joined = await db.referral.count({ where: { referrerId: g.referrerId, status: { in: ['joined', 'paid'] } } });
-      const invited = g._count._all;
-      // Simple heuristic: a low join-through rate on many invites looks riskier.
-      const ratio = invited > 0 ? joined / invited : 0;
-      const riskTier = invited >= 10 && ratio < 0.2 ? 'high' : invited >= 5 && ratio < 0.4 ? 'medium' : 'low';
-      const u = byId.get(g.referrerId);
-      return {
-        userId: g.referrerId,
-        userName: u?.name ?? 'Unknown',
-        email: u?.email ?? '',
-        invited,
-        joined,
-        earned: g._sum.reward ?? 0,
-        riskTier,
-      };
-    }),
-  );
+  const rows = pageSlice.map((g) => {
+    const joined = joinedBy.get(g.referrerId) ?? 0;
+    const invited = g._count._all;
+    // Simple heuristic: a low join-through rate on many invites looks riskier.
+    const ratio = invited > 0 ? joined / invited : 0;
+    const riskTier = invited >= 10 && ratio < 0.2 ? 'high' : invited >= 5 && ratio < 0.4 ? 'medium' : 'low';
+    const u = byId.get(g.referrerId);
+    return {
+      userId: g.referrerId,
+      userName: u?.name ?? 'Unknown',
+      email: u?.email ?? '',
+      invited,
+      joined,
+      earned: g._sum.reward ?? 0,
+      riskTier,
+    };
+  });
   ok(res, rows, 200, buildMeta(page, perPage, total));
 });
 
@@ -1392,16 +1614,16 @@ adminRouter.post('/referrals/flags/:flagId/resolve', requireAdminPermission('ove
 // ===========================================================================
 // §14.9 Audit logs & roles
 // ===========================================================================
-adminRouter.get('/audit-logs', async (req: Request, res: Response): Promise<void> => {
+const auditLogsQuerySchema = z.object({ from: optionalQuery(z.coerce.date()), to: optionalQuery(z.coerce.date()) });
+
+adminRouter.get('/audit-logs', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take } = parseListQuery(req);
+  const query = parseQuery(req, res, auditLogsQuerySchema);
+  if (!query) return;
   const where: Prisma.AdminAuditLogWhereInput = {};
   if (typeof req.query.severity === 'string') where.severity = req.query.severity;
   if (typeof req.query.actorId === 'string') where.actorId = req.query.actorId;
-  if (typeof req.query.from === 'string' || typeof req.query.to === 'string') {
-    where.createdAt = {};
-    if (typeof req.query.from === 'string') where.createdAt.gte = new Date(req.query.from);
-    if (typeof req.query.to === 'string') where.createdAt.lte = new Date(req.query.to);
-  }
+  if (query.from || query.to) where.createdAt = { gte: query.from, lte: query.to };
 
   const [total, logs] = await Promise.all([
     db.adminAuditLog.count({ where }),
@@ -1412,7 +1634,7 @@ adminRouter.get('/audit-logs', async (req: Request, res: Response): Promise<void
 
 const ROLE_KEYS = ['super_admin', 'compliance_officer', 'support_lead'] as const;
 
-adminRouter.get('/roles', async (_req: Request, res: Response): Promise<void> => {
+adminRouter.get('/roles', requireAdminPermission('userManagement'), async (_req: Request, res: Response): Promise<void> => {
   const rows = await Promise.all(
     ROLE_KEYS.map(async (role) => {
       const [userCount, sample] = await Promise.all([
@@ -1483,10 +1705,16 @@ adminRouter.put('/settings/payments', requireSuperAdmin(), validate(paymentSetti
 // ===========================================================================
 // §14.9 Reports
 // ===========================================================================
+/** One CSV cell. Text that a spreadsheet would run as a formula is prefixed with ' first. */
+function csvCell(c: string | number | null): string {
+  if (c === null) return '';
+  let v = String(c);
+  if (typeof c === 'string' && /^[=+\-@\t\r]/.test(v)) v = `'${v}`;
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
 function csv(rows: (string | number | null)[][]): string {
-  return rows
-    .map((r) => r.map((c) => (c === null ? '' : /[",\n]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : String(c))).join(','))
-    .join('\n');
+  return rows.map((r) => r.map(csvCell).join(',')).join('\n');
 }
 
 function serializeReport(r: {
@@ -1514,13 +1742,17 @@ function serializeReport(r: {
   };
 }
 
+const MAX_REPORT_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
+const MAX_LEDGER_ROWS = 50_000;
+
 const createReportSchema = z.object({
   scope: z.enum(['financial_summary', 'space_collection', 'rep_performance', 'full_ledger']),
   format: z.enum(['csv', 'pdf']),
-  from: z.string(),
-  to: z.string(),
+  from: z.coerce.date(),
+  to: z.coerce.date(),
   spaceId: z.string().optional(),
-});
+}).refine((d) => d.to >= d.from, { message: 'must be on or after from', path: ['to'] })
+  .refine((d) => d.to.getTime() - d.from.getTime() <= MAX_REPORT_RANGE_MS, { message: 'range cannot exceed 366 days', path: ['to'] });
 
 adminRouter.post('/reports', requireAdminPermission('userManagement'), validate(createReportSchema), async (req: Request, res: Response): Promise<void> => {
   const d = req.body as z.infer<typeof createReportSchema>;
@@ -1533,8 +1765,8 @@ adminRouter.post('/reports', requireAdminPermission('userManagement'), validate(
       scope: d.scope,
       format: d.format,
       status: 'ready',
-      fromDate: new Date(d.from),
-      toDate: new Date(d.to),
+      fromDate: d.from,
+      toDate: d.to,
       spaceId: d.spaceId,
       generatedAt: now,
       expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
@@ -1556,6 +1788,21 @@ adminRouter.get('/reports', requireAdminPermission('userManagement'), async (req
   ok(res, reports.map(serializeReport), 200, buildMeta(page, perPage, total));
 });
 
+/** Net collected and fees per space for payments in [from, to], in one GROUP BY. */
+async function collectedBySpace(from: Date, to: Date, spaceId?: string | null): Promise<Map<string, { net: number; fees: number }>> {
+  const rows = await db.$queryRaw<{ spaceId: string; net: bigint | null; fees: bigint | null }[]>`
+    SELECT d."spaceId" AS "spaceId",
+           SUM(dp."netToSpace") AS net,
+           SUM(dp."processingFee" + dp."duevyFee") AS fees
+    FROM "due_payments" dp
+    JOIN "dues" d ON d."id" = dp."dueId"
+    WHERE dp."paidAt" >= ${from} AND dp."paidAt" <= ${to}
+    ${spaceId ? Prisma.sql`AND d."spaceId" = ${spaceId}` : Prisma.empty}
+    GROUP BY d."spaceId"
+  `;
+  return new Map(rows.map((r) => [r.spaceId, { net: Number(r.net ?? 0), fees: Number(r.fees ?? 0) }]));
+}
+
 adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const report = await db.report.findUnique({ where: { id: req.params.id as string } });
   if (!report) {
@@ -1572,7 +1819,12 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   let rows: (string | number | null)[][];
 
   if (report.scope === 'full_ledger') {
-    const txns = await db.transaction.findMany({ where: { createdAt: range }, include: { user: { select: { name: true, email: true } } }, orderBy: { createdAt: 'desc' } });
+    const txns = await db.transaction.findMany({
+      where: { createdAt: range },
+      select: { reference: true, type: true, title: true, amount: true, method: true, status: true, createdAt: true, user: { select: { name: true, email: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_LEDGER_ROWS,
+    });
     rows = [
       ['Reference', 'Type', 'Title', 'Amount (kobo)', 'Method', 'Status', 'User', 'Email', 'Date'],
       ...txns.map((t) => [t.reference, t.type, t.title, t.amount, t.method, t.status, t.user.name, t.user.email, t.createdAt.toISOString()]),
@@ -1596,20 +1848,23 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
     ];
   } else if (report.scope === 'space_collection') {
     const where = report.spaceId ? { id: report.spaceId } : {};
-    const spaces = await db.space.findMany({ where, select: { id: true, name: true } });
+    const [spaces, bySpace] = await Promise.all([
+      db.space.findMany({ where, select: { id: true, name: true } }),
+      collectedBySpace(report.fromDate, report.toDate, report.spaceId),
+    ]);
     rows = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
     for (const s of spaces) {
-      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: s.id }, paidAt: range }, _sum: { netToSpace: true, processingFee: true, duevyFee: true } });
-      rows.push([s.name, agg._sum.netToSpace ?? 0, (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0)]);
+      const agg = bySpace.get(s.id);
+      rows.push([s.name, agg?.net ?? 0, agg?.fees ?? 0]);
     }
   } else {
     // rep_performance
-    const leads = await db.spaceRep.findMany({ where: { role: 'lead' }, include: { user: { select: { name: true } }, space: { select: { name: true } } } });
+    const [leads, bySpace] = await Promise.all([
+      db.spaceRep.findMany({ where: { role: 'lead' }, select: { spaceId: true, user: { select: { name: true } }, space: { select: { name: true } } } }),
+      collectedBySpace(report.fromDate, report.toDate),
+    ]);
     rows = [['Rep', 'Space', 'Net collected (kobo)']];
-    for (const l of leads) {
-      const agg = await db.duePayment.aggregate({ where: { due: { spaceId: l.spaceId }, paidAt: range }, _sum: { netToSpace: true } });
-      rows.push([l.user.name, l.space.name, agg._sum.netToSpace ?? 0]);
-    }
+    for (const l of leads) rows.push([l.user.name, l.space.name, bySpace.get(l.spaceId)?.net ?? 0]);
   }
 
   if (report.format === 'pdf') {

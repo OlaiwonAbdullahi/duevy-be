@@ -39,12 +39,17 @@ export async function maybeAwardReferral(referredUserId: string): Promise<void> 
   const reference = await uniqueRef();
   const code = await uniqueDiscountCode();
 
-  await db.$transaction([
-    db.referral.update({ where: { id: referral.id }, data: { status: 'paid', reward: REFERRAL_REWARD_KOBO } }),
-    db.discountCode.create({
+  const awarded = await db.$transaction(async (tx) => {
+    // Claim the referral atomically: only one concurrent caller flips joined → paid.
+    const claim = await tx.referral.updateMany({
+      where: { id: referral.id, status: 'joined' },
+      data: { status: 'paid', reward: REFERRAL_REWARD_KOBO },
+    });
+    if (claim.count === 0) return false;
+    await tx.discountCode.create({
       data: { code, userId: referral.referrerId, amountKobo: REFERRAL_REWARD_KOBO },
-    }),
-    db.transaction.create({
+    });
+    await tx.transaction.create({
       data: {
         userId: referral.referrerId,
         type: 'referral',
@@ -55,8 +60,10 @@ export async function maybeAwardReferral(referredUserId: string): Promise<void> 
         status: 'completed',
         reference,
       },
-    }),
-  ]);
+    });
+    return true;
+  });
+  if (!awarded) return;
 
   await notify({
     userId: referral.referrerId,

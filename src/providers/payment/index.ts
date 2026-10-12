@@ -13,9 +13,15 @@ let instance: PaymentProvider | null = null;
 export function getPaymentProvider(): PaymentProvider {
   if (instance) return instance;
   const secrets = [env.BACHS_WEBHOOK_SECRET, env.BACHS_WEBHOOK_SECRET_PREVIOUS].filter((s): s is string => !!s);
+  // The public 'whsec_fake' secret is only acceptable under tests; anywhere
+  // else a missing secret would let anyone forge signed webhooks.
+  if (!secrets.length) {
+    if (env.NODE_ENV !== 'test') throw new Error('BACHS_WEBHOOK_SECRET is required');
+    secrets.push('whsec_fake');
+  }
   instance =
     env.PAYMENT_PROVIDER === 'fake'
-      ? new FakeProvider(secrets.length ? secrets : ['whsec_fake'], env.WEBHOOK_TOLERANCE_SECONDS)
+      ? new FakeProvider(secrets, env.WEBHOOK_TOLERANCE_SECONDS)
       : new BachsProvider({
           baseUrl: env.BACHS_BASE_URL,
           secretKey: env.BACHS_SECRET_KEY as string,

@@ -199,7 +199,7 @@ const joinSchema = z.object({
   as: z.enum(['member', 'guest']).default('member'),
 });
 
-spacesRouter.post('/:spaceId/join', validate(joinSchema), async (req: Request, res: Response): Promise<void> => {
+spacesRouter.post('/:spaceId/join', lookupLimiter, validate(joinSchema), async (req: Request, res: Response): Promise<void> => {
   const uid = auth(req).sub as string;
   const spaceId = req.params.spaceId as string;
   const { code, as } = req.body as z.infer<typeof joinSchema>;
@@ -251,16 +251,22 @@ spacesRouter.delete('/:spaceId/membership', async (req: Request, res: Response):
     return;
   }
 
-  // Cannot leave with unpaid active dues in this space.
-  const paidDueIds = (
-    await db.duePayment.findMany({ where: { userId: uid }, select: { dueId: true } })
-  ).map((p) => p.dueId);
+  // A rep must give up the rep role first, or they'd keep rep powers over a space they left.
+  const rep = await db.spaceRep.findUnique({
+    where: { userId_spaceId: { userId: uid, spaceId } },
+    select: { id: true },
+  });
+  if (rep) {
+    errors.conflict(res, 'IS_REP', 'Remove rep role first');
+    return;
+  }
 
+  // Cannot leave with unpaid active dues in this space.
   const outstanding = await db.due.count({
     where: {
       spaceId,
       status: 'active',
-      id: { notIn: paidDueIds.length ? paidDueIds : undefined },
+      payments: { none: { userId: uid } },
     },
   });
   if (outstanding > 0) {

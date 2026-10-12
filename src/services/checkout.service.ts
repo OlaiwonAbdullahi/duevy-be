@@ -71,12 +71,13 @@ export function serializeCheckout(c: CheckoutWithItems) {
 
 const withItems = { items: { include: { due: { select: { title: true } } } } } as const;
 
-async function uniqueCheckoutReference(): Promise<string> {
+/** Pass the transaction client when inside one, so this doesn't hold a second pool connection. */
+async function uniqueCheckoutReference(client: Tx = db): Promise<string> {
   for (let i = 0; i < 6; i++) {
     const ref = generateReference();
     const [c, t] = await Promise.all([
-      db.checkout.findUnique({ where: { reference: ref }, select: { id: true } }),
-      db.transaction.findUnique({ where: { reference: ref }, select: { id: true } }),
+      client.checkout.findUnique({ where: { reference: ref }, select: { id: true } }),
+      client.transaction.findUnique({ where: { reference: ref }, select: { id: true } }),
     ]);
     if (!c && !t) return ref;
   }
@@ -98,13 +99,14 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
     throw new AppError(400, 'VALIDATION_ERROR', `Select between 1 and ${MAX_DUES_PER_CHECKOUT} dues`);
   }
 
-  const user = await db.user.findUnique({ where: { id: userId } });
+  const [user, dues] = await Promise.all([
+    db.user.findUnique({ where: { id: userId }, select: { email: true, name: true } }),
+    db.due.findMany({
+      where: { id: { in: dueIds } },
+      include: { space: { select: { id: true, name: true, isArchived: true } } },
+    }),
+  ]);
   if (!user) throw notFound('User not found');
-
-  const dues = await db.due.findMany({
-    where: { id: { in: dueIds } },
-    include: { space: { select: { id: true, name: true, isArchived: true } } },
-  });
   if (dues.length !== dueIds.length) throw notFound('One or more dues could not be found');
 
   const spaceIds = new Set(dues.map((d) => d.spaceId));
@@ -117,19 +119,26 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
   const notPayable = dues.find((d) => d.status !== 'active');
   if (notPayable) throw conflict('DUE_NOT_PAYABLE', `"${notPayable.title}" is not open for payment`);
 
+  // Independent lookups, checked below in the same order as before.
+  const [member, paid, lead] = await Promise.all([
+    db.spaceMembership.findUnique({ where: { userId_spaceId: { userId, spaceId: space.id } }, select: { userId: true } }),
+    db.duePayment.findFirst({
+      where: { userId, dueId: { in: dueIds } },
+      include: { due: { select: { title: true } } },
+    }),
+    db.spaceRep.findFirst({
+      where: { spaceId: space.id, role: 'lead' },
+      include: { user: { select: { kycStatus: true, bachsAccountId: true, studentIdStatus: true } } },
+    }),
+  ]);
+
   // No anonymous or guest payments: the payer must have joined the space.
-  const member = await db.spaceMembership.findUnique({ where: { userId_spaceId: { userId, spaceId: space.id } } });
   if (!member) throw forbidden('Join this space with its code before paying', 'NOT_A_MEMBER');
 
-  const paid = await db.duePayment.findFirst({
-    where: { userId, dueId: { in: dueIds } },
-    include: { due: { select: { title: true } } },
-  });
   if (paid) throw conflict('DUE_ALREADY_PAID', `"${paid.due.title}" has already been paid`);
 
   // Collections settle into the lead rep's provider account, so the space can
   // only collect once that rep has passed KYC.
-  const lead = await db.spaceRep.findFirst({ where: { spaceId: space.id, role: 'lead' }, include: { user: true } });
   if (!lead || !canCollect(lead.user)) {
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
@@ -158,7 +167,7 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
     const fee = checkoutFee(face);
     const ordered = dueIds.map((id) => dues.find((d) => d.id === id)!);
     const feeShares = allocate(fee, ordered.map((d) => d.amount));
-    const reference = await uniqueCheckoutReference();
+    const reference = await uniqueCheckoutReference(tx);
     const title = ordered.length === 1 ? ordered[0]!.title : `${ordered.length} dues`;
 
     const checkout = await tx.checkout.create({
@@ -315,11 +324,25 @@ export async function fulfilCheckout(
   receivedKobo: number,
   overpaidKobo = 0,
   source = 'webhook',
+  /** The provider charge the money arrived on, when the event names one. */
+  providerChargeId: string | null = null,
 ): Promise<FulfilOutcome> {
   const result = await db.$transaction(
     async (tx) => {
       const checkout = await lockCheckout(tx, checkoutId);
-      if (checkout.status === 'paid') return { outcome: 'already_paid' as const, checkout, flags: [] as string[] };
+      if (checkout.status === 'paid') {
+        // A payment on a different charge than the one that paid this checkout
+        // is a second payment, not a replay: keep it in front of an admin.
+        if (providerChargeId && checkout.providerChargeId && providerChargeId !== checkout.providerChargeId) {
+          const flag = `another payment of ${receivedKobo} kobo arrived on charge ${providerChargeId} after it was paid`;
+          await tx.checkout.update({
+            where: { id: checkoutId },
+            data: { needsReview: true, reviewReason: checkout.reviewReason ? `${checkout.reviewReason}; ${flag}` : flag },
+          });
+          return { outcome: 'already_paid' as const, checkout, flags: [flag] };
+        }
+        return { outcome: 'already_paid' as const, checkout, flags: [] as string[] };
+      }
 
       if (receivedKobo < checkout.totalKobo) {
         return { outcome: 'short' as const, checkout, flags: [] as string[] };
@@ -339,10 +362,18 @@ export async function fulfilCheckout(
       // linked to its first due line only (the legacy receipt route reads it).
       let txnToLink = txn && !(await tx.duePayment.findUnique({ where: { txnId: txn.id } })) ? txn.id : null;
 
+      // One query for every line's existing payment, instead of one per due.
+      const existingByDue = new Map(
+        (
+          await tx.duePayment.findMany({
+            where: { userId: checkout.userId, dueId: { in: items.map((i) => i.dueId) } },
+            select: { dueId: true, checkoutId: true, reference: true },
+          })
+        ).map((p) => [p.dueId, p]),
+      );
+
       for (const item of items) {
-        const existing = await tx.duePayment.findUnique({
-          where: { userId_dueId: { userId: checkout.userId, dueId: item.dueId } },
-        });
+        const existing = existingByDue.get(item.dueId);
         if (existing) {
           if (existing.checkoutId !== checkoutId) flags.push(`"${item.due.title}" was already paid (${existing.reference})`);
           continue;
@@ -414,12 +445,19 @@ export async function fulfilCheckout(
     return 'underpaid';
   }
   if (result.outcome === 'already_paid') {
-    logger.info({ ref: result.checkout.reference, source }, 'checkout already paid — duplicate outcome ignored');
+    if (result.flags.length) {
+      logger.warn({ ref: result.checkout.reference, source, providerChargeId }, 'payment on a different charge for a paid checkout');
+      await flagToAdmins('Payment needs review', `${result.checkout.reference}: ${result.flags.join('; ')}`);
+    } else {
+      logger.info({ ref: result.checkout.reference, source }, 'checkout already paid — duplicate outcome ignored');
+    }
     return 'already_paid';
   }
 
   logger.info({ ref: result.checkout.reference, source, received: receivedKobo, flags: result.flags }, 'checkout paid');
-  await afterPaid(result.checkout).catch((err) => logger.warn({ err, ref: result.checkout.reference }, 'post-payment side effects failed'));
+  // Fire-and-forget: notifications and the receipt email must not hold up the
+  // webhook worker. The payment itself is already committed.
+  void afterPaid(result.checkout).catch((err) => logger.warn({ err, ref: result.checkout.reference }, 'post-payment side effects failed'));
   if (result.flags.length) await flagToAdmins('Payment needs review', `${result.checkout.reference}: ${result.flags.join('; ')}`);
   return 'paid';
 }
@@ -428,8 +466,22 @@ export async function fulfilCheckout(
 export async function markUnderpaid(checkoutId: string, receivedKobo: number, expectedKobo: number, source = 'webhook'): Promise<boolean> {
   const changed = await db.$transaction(async (tx) => {
     const c = await lockCheckout(tx, checkoutId);
-    if (!canTransitionCheckout(c.status, 'underpaid')) return null;
-    return tx.checkout.update({
+    if (!canTransitionCheckout(c.status, 'underpaid')) {
+      // Money arrived on an expired (or already underpaid) checkout. The
+      // status can't move, but the money is real: record it and flag it
+      // rather than dropping it. A replay of the same amount is a no-op.
+      if (c.status === 'paid' || (c.status === 'underpaid' && c.receivedKobo === receivedKobo)) return null;
+      const flagged = await tx.checkout.update({
+        where: { id: checkoutId },
+        data: {
+          receivedKobo,
+          needsReview: true,
+          reviewReason: `short payment on a ${c.status} checkout: received ${receivedKobo} of ${expectedKobo} kobo`,
+        },
+      });
+      return { checkout: flagged, transitioned: false };
+    }
+    const updated = await tx.checkout.update({
       where: { id: checkoutId },
       data: {
         status: 'underpaid',
@@ -439,14 +491,20 @@ export async function markUnderpaid(checkoutId: string, receivedKobo: number, ex
         reviewReason: `underpaid: received ${receivedKobo} of ${expectedKobo} kobo`,
       },
     });
+    return { checkout: updated, transitioned: true };
   });
   if (!changed) return false;
-  logger.warn({ ref: changed.reference, received: receivedKobo, expected: expectedKobo, source }, 'checkout underpaid');
+  if (!changed.transitioned) {
+    logger.warn({ ref: changed.checkout.reference, received: receivedKobo, expected: expectedKobo, source }, 'short payment on a closed checkout');
+    await flagToAdmins('Payment needs review', `${changed.checkout.reference}: ${changed.checkout.reviewReason}`);
+    return false;
+  }
+  logger.warn({ ref: changed.checkout.reference, received: receivedKobo, expected: expectedKobo, source }, 'checkout underpaid');
   await flagToAdmins(
     'Underpaid transfer',
-    `${changed.reference}: received ₦${(receivedKobo / 100).toLocaleString('en-NG')} of ₦${(expectedKobo / 100).toLocaleString('en-NG')}.`,
+    `${changed.checkout.reference}: received ₦${(receivedKobo / 100).toLocaleString('en-NG')} of ₦${(expectedKobo / 100).toLocaleString('en-NG')}.`,
   );
-  await notifyMany([changed.userId], {
+  await notifyMany([changed.checkout.userId], {
     kind: 'system',
     tone: 'amber',
     title: 'Payment incomplete',
@@ -479,14 +537,13 @@ export async function statusOf(checkoutId: string): Promise<CheckoutStatus> {
 // ---------------------------------------------------------------------------
 
 async function afterPaid(checkout: Checkout): Promise<void> {
-  const [payer, items, space] = await Promise.all([
+  const [payer, items, space, reps] = await Promise.all([
     db.user.findUnique({ where: { id: checkout.userId }, select: { name: true, email: true } }),
     db.checkoutItem.findMany({ where: { checkoutId: checkout.id }, include: { due: { select: { title: true } } } }),
     db.space.findUnique({ where: { id: checkout.spaceId }, select: { name: true } }),
+    db.spaceRep.findMany({ where: { spaceId: checkout.spaceId }, select: { userId: true } }),
   ]);
   const title = items.length === 1 ? items[0]!.due.title : `${items.length} dues`;
-
-  const reps = await db.spaceRep.findMany({ where: { spaceId: checkout.spaceId }, select: { userId: true } });
   await notifyMany(
     reps.map((r) => r.userId),
     {

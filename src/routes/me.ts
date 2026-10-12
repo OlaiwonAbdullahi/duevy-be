@@ -11,7 +11,7 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { ok, fail, errors } from '../lib/response';
 import { hashToken } from '../lib/tokens';
-import { sendVerification } from '../services/auth.service';
+import { sniffDocumentType } from '../lib/storage';
 import { getKycState } from '../services/kyc.service';
 import {
   governmentIdHandlers,
@@ -54,13 +54,42 @@ const DEFAULT_NOTIFICATION_PREFS = {
 // ---------------------------------------------------------------------------
 const patchMeSchema = z.object({
   name: z.string().min(2).max(100).optional(),
-  email: z.string().email().transform((e) => e.toLowerCase()).optional(),
+  email: z.string().max(254).email().transform((e) => e.toLowerCase()).optional(),
   phone: z
     .string()
+    .max(16)
     .regex(/^\+[1-9]\d{1,14}$/, 'must be E.164 format, e.g. +2348012345678')
     .optional(),
-  avatarUrl: z.string().url().optional(),
+  // https or one of our own uploads only — never javascript:/data:/http: links.
+  avatarUrl: z
+    .string()
+    .max(2048)
+    .url()
+    .refine((u) => u.startsWith('https://') || u.startsWith(`${env.APP_BASE_URL}/uploads/`), {
+      message: 'must be an https:// URL or an uploaded image',
+    })
+    .optional(),
 });
+
+// The profile fields PATCH /me may echo back — never secrets or KYC internals.
+const PROFILE_SELECT = {
+  id: true,
+  name: true,
+  email: true,
+  emailVerified: true,
+  phone: true,
+  gender: true,
+  avatarUrl: true,
+  role: true,
+  isRep: true,
+  institution: true,
+  matricNo: true,
+  level: true,
+  kycStatus: true,
+  repApplicationStatus: true,
+  referralCode: true,
+  createdAt: true,
+} as const;
 
 // School/rep-controlled fields are rejected before validation strips them.
 const READ_ONLY_FIELDS = ['matricNo', 'level', 'department', 'role', 'emailVerified'];
@@ -86,7 +115,7 @@ meRouter.patch('/', rejectReadOnly, validate(patchMeSchema), async (req: Request
 
   const data = req.body as z.infer<typeof patchMeSchema>;
 
-  const current = await db.user.findUnique({ where: { id: uid } });
+  const current = await db.user.findUnique({ where: { id: uid }, select: { email: true, name: true } });
   if (!current) {
     errors.notFound(res, 'User not found');
     return;
@@ -97,27 +126,18 @@ meRouter.patch('/', rejectReadOnly, validate(patchMeSchema), async (req: Request
   if (data.phone !== undefined) update.phone = data.phone;
   if (data.avatarUrl !== undefined) update.avatarUrl = data.avatarUrl;
 
-  // Email change re-verifies the new address.
-  let emailChanged = false;
+  // Email is fixed at sign-up. Echoing the current address back is fine (a
+  // profile form may send every field); a different one is refused.
   if (data.email !== undefined && data.email !== current.email) {
-    const taken = await db.user.findUnique({ where: { email: data.email } });
-    if (taken) {
-      errors.conflict(res, 'EMAIL_IN_USE', 'That email is already in use');
-      return;
-    }
-    update.email = data.email;
-    update.emailVerified = false;
-    emailChanged = true;
+    fail(res, 422, 'EMAIL_CHANGE_NOT_ALLOWED', 'Your email address cannot be changed', [
+      { field: 'email', issue: 'read-only' },
+    ]);
+    return;
   }
 
-  const updated = await db.user.update({ where: { id: uid }, data: update });
+  const updated = await db.user.update({ where: { id: uid }, data: update, select: PROFILE_SELECT });
 
-  if (emailChanged) {
-    sendVerification(updated.id, updated.email, updated.name).catch(console.error);
-  }
-
-  const { passwordHash: _ph, ...safe } = updated;
-  ok(res, safe);
+  ok(res, updated);
 });
 
 // ---------------------------------------------------------------------------
@@ -127,22 +147,13 @@ const AVATAR_DIR = path.join(process.cwd(), 'uploads', 'avatars');
 fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
 const ALLOWED_AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-const EXT_BY_TYPE: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/webp': '.webp',
-};
+const AVATAR_URL_PREFIX = `${env.APP_BASE_URL}/uploads/avatars/`;
 
+// Held in memory so the real type can be sniffed from the bytes before
+// anything touches disk; the client's filename and Content-Type are ignored.
 const avatarUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, AVATAR_DIR),
-    filename: (_req, file, cb) =>
-      cb(null, `${randomBytes(16).toString('hex')}${EXT_BY_TYPE[file.mimetype] ?? ''}`),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
-  fileFilter: (_req, file, cb) => {
-    cb(null, ALLOWED_AVATAR_TYPES.includes(file.mimetype));
-  },
 }).single('file');
 
 meRouter.post('/avatar', (req: Request, res: Response): void => {
@@ -156,16 +167,34 @@ meRouter.post('/avatar', (req: Request, res: Response): void => {
       fail(res, 400, 'VALIDATION_ERROR', 'Upload failed');
       return;
     }
-    if (!req.file) {
+    const sniffed = req.file ? sniffDocumentType(req.file.buffer) : null;
+    if (!req.file || !sniffed || !ALLOWED_AVATAR_TYPES.includes(sniffed.mime)) {
       fail(res, 400, 'VALIDATION_ERROR', 'A JPEG, PNG, or WebP file is required', [
         { field: 'file', issue: 'required (jpeg/png/webp, ≤ 2 MB)' },
       ]);
       return;
     }
 
-    const avatarUrl = `${env.APP_BASE_URL}/uploads/avatars/${req.file.filename}`;
-    await db.user.update({ where: { id: userId(req) }, data: { avatarUrl } });
-    ok(res, { avatarUrl });
+    try {
+      const uid = userId(req);
+      const filename = `${randomBytes(16).toString('hex')}.${sniffed.ext}`;
+      await fs.promises.writeFile(path.join(AVATAR_DIR, filename), req.file.buffer);
+
+      const previous = await db.user.findUnique({ where: { id: uid }, select: { avatarUrl: true } });
+      const avatarUrl = `${AVATAR_URL_PREFIX}${filename}`;
+      await db.user.update({ where: { id: uid }, data: { avatarUrl } });
+
+      // Clean up the old upload — only a plain filename we generated, never a path.
+      const old = previous?.avatarUrl?.startsWith(AVATAR_URL_PREFIX) ? previous.avatarUrl.slice(AVATAR_URL_PREFIX.length) : null;
+      if (old && /^[a-f0-9]{32}\.(jpg|png|webp)$/.test(old)) {
+        fs.promises.unlink(path.join(AVATAR_DIR, old)).catch(() => {});
+      }
+
+      ok(res, { avatarUrl });
+    } catch (e) {
+      console.error('[avatar] upload failed', e);
+      fail(res, 500, 'INTERNAL_ERROR', 'Could not save the avatar');
+    }
   });
 });
 
@@ -257,16 +286,12 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
   const now = new Date();
 
   // Active dues in the caller's spaces that they have not yet paid.
-  const paidDueIds = (
-    await db.duePayment.findMany({ where: { userId: uid }, select: { dueId: true } })
-  ).map((p) => p.dueId);
-
   const openDuesAll = spaceIds.length
     ? await db.due.findMany({
         where: {
           spaceId: { in: spaceIds },
           status: 'active',
-          id: { notIn: paidDueIds.length ? paidDueIds : undefined },
+          payments: { none: { userId: uid } },
         },
         include: { space: { select: { id: true, name: true, short: true, hue: true } } },
       })

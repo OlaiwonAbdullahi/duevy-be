@@ -64,7 +64,7 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
   switch (event.kind) {
     case 'payment.succeeded': {
       const id = await findCheckoutId(event.reference, event.providerCheckoutId);
-      const outcome = await fulfilCheckout(id, event.receivedKobo, event.overpaidKobo, `webhook ${event.eventId}`);
+      const outcome = await fulfilCheckout(id, event.receivedKobo, event.overpaidKobo, `webhook ${event.eventId}`, event.providerChargeId);
       logger.info({ ...log, ref: event.reference, outcome }, 'payment event applied');
       return;
     }

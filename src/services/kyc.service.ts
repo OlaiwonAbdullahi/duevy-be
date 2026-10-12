@@ -1,4 +1,4 @@
-import { type DocumentReviewStatus, type KycStatus, type User } from '@prisma/client';
+import { type DocumentReviewStatus, type KycStatus, type Prisma, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { AppError, conflict, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
@@ -101,7 +101,30 @@ export interface KycState {
   resolvedAt: string | null;
 }
 
-function toState(u: User): KycState {
+/** The user fields {@link toState} reads, for loads that only need the KYC state. */
+const KYC_STATE_SELECT = {
+  kycStatus: true,
+  bachsAccountId: true,
+  bachsPayoutsActive: true,
+  bachsPersonId: true,
+  kycRequirementsDue: true,
+  governmentIdSubmittedAt: true,
+  payoutDestinationSubmittedAt: true,
+  payoutDestinationBankCode: true,
+  payoutDestinationBankName: true,
+  payoutDestinationAccountMasked: true,
+  payoutDestinationAccountName: true,
+  studentIdStatus: true,
+  studentIdUploadedAt: true,
+  studentIdReviewedAt: true,
+  studentIdReviewNote: true,
+  kycRejectionReason: true,
+  kycRetryLockedUntil: true,
+  kycSubmittedAt: true,
+  kycResolvedAt: true,
+} as const satisfies Prisma.UserSelect;
+
+function toState(u: Prisma.UserGetPayload<{ select: typeof KYC_STATE_SELECT }>): KycState {
   return {
     kycStatus: u.kycStatus,
     payoutsActive: u.bachsPayoutsActive,
@@ -164,7 +187,7 @@ export async function getKycState(userId: string): Promise<KycState> {
 
 /** KYC state of the space's lead rep — the account its collections settle into. */
 export async function getSpaceKycState(spaceId: string): Promise<KycState & { leadRepId: string | null }> {
-  const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: true } });
+  const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: { select: KYC_STATE_SELECT } } });
   if (!lead) return { ...EMPTY_STATE, leadRepId: null };
   return { ...toState(lead.user), leadRepId: lead.userId };
 }

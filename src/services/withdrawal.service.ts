@@ -1,4 +1,5 @@
-import { Prisma, type Payout } from '@prisma/client';
+import { Prisma, type Payout, type Space } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
@@ -20,6 +21,8 @@ import { destinationFor, oneOffDestination } from './beneficiary.service';
  *   net   = gross − fee, sent to the bank
  *
  * Safety, in order:
+ *  0. A 4-digit security code, set per space by a Duevy admin, must be quoted
+ *     (5 wrong attempts lock withdrawals for 30 minutes).
  *  1. Idempotency-Key on the route (a retried request replays).
  *  2. A transaction-scoped advisory lock per space: the balance check and the
  *     ledger debit happen atomically, so two requests can't both spend it.
@@ -48,6 +51,44 @@ export interface WithdrawalRequest {
   beneficiaryId?: string;
   account?: { bankCode: string; accountNumber: string };
   note?: string;
+  /** The space's 4-digit withdrawal security code. */
+  pin: string;
+}
+
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_LOCK_MS = 30 * 60 * 1000;
+
+/** Check the space's admin-set withdrawal code. Wrong guesses are counted
+ *  atomically; the fifth locks withdrawals for PIN_LOCK_MS. */
+async function verifyWithdrawalPin(space: Space, pin: string): Promise<void> {
+  if (!space.withdrawalPinHash) {
+    throw forbidden('This space has no withdrawal security code yet. Contact Duevy support to have one set.', 'WITHDRAWAL_PIN_NOT_SET');
+  }
+  if (space.withdrawalPinLockedUntil && space.withdrawalPinLockedUntil > new Date()) {
+    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Withdrawals are locked for 30 minutes.');
+  }
+  if (await bcrypt.compare(pin, space.withdrawalPinHash)) {
+    if (space.withdrawalPinFailedAttempts > 0) {
+      await db.space.update({ where: { id: space.id }, data: { withdrawalPinFailedAttempts: 0, withdrawalPinLockedUntil: null } });
+    }
+    return;
+  }
+  const { withdrawalPinFailedAttempts: attempts } = await db.space.update({
+    where: { id: space.id },
+    data: { withdrawalPinFailedAttempts: { increment: 1 } },
+    select: { withdrawalPinFailedAttempts: true },
+  });
+  if (attempts >= PIN_MAX_ATTEMPTS) {
+    await db.space.update({
+      where: { id: space.id },
+      data: { withdrawalPinFailedAttempts: 0, withdrawalPinLockedUntil: new Date(Date.now() + PIN_LOCK_MS) },
+    });
+    logger.warn({ spaceId: space.id }, 'withdrawal security code locked after repeated failures');
+    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Withdrawals are locked for 30 minutes.');
+  }
+  throw new AppError(403, 'INVALID_WITHDRAWAL_PIN', 'The security code is incorrect', [
+    { field: 'pin', issue: `incorrect; ${PIN_MAX_ATTEMPTS - attempts} attempt(s) left` },
+  ]);
 }
 
 export async function quoteWithdrawal(amountKobo: number) {
@@ -75,7 +116,11 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
     db.user.findUnique({ where: { id: userId } }),
   ]);
   if (!space || !user) throw notFound('Space not found');
+  if (user.isSuspended || user.isDeactivated) {
+    throw forbidden('Your account is suspended', 'ACCOUNT_SUSPENDED');
+  }
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
+  await verifyWithdrawalPin(space, req.pin);
   if (!canWithdraw(user)) {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }

@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
-import { ok, errors } from '../lib/response';
+import { sensitiveLimiter } from '../middleware/rateLimiter';
+import { ok, errors, fail } from '../lib/response';
 import { serializeDispute } from '../lib/serializers';
 
 export const disputesRouter = Router();
@@ -18,11 +19,11 @@ function uid(req: Request): string {
 // ---------------------------------------------------------------------------
 const fileSchema = z.object({
   type: z.enum(['payment_not_reflecting', 'non_remittance', 'refund_request']),
-  transactionReference: z.string().optional(),
+  transactionReference: z.string().max(60).optional(),
   description: z.string().min(10).max(2000),
 });
 
-disputesRouter.post('/', validate(fileSchema), async (req: Request, res: Response): Promise<void> => {
+disputesRouter.post('/', sensitiveLimiter, validate(fileSchema), async (req: Request, res: Response): Promise<void> => {
   const id = uid(req);
   const { type, transactionReference, description } = req.body as z.infer<typeof fileSchema>;
 
@@ -33,6 +34,15 @@ disputesRouter.post('/', validate(fileSchema), async (req: Request, res: Respons
   if (!user) {
     errors.notFound(res, 'User not found');
     return;
+  }
+
+  // A dispute can only point at one of the caller's own transactions.
+  if (transactionReference) {
+    const txn = await db.transaction.findFirst({ where: { reference: transactionReference, userId: id }, select: { id: true } });
+    if (!txn) {
+      fail(res, 422, 'TRANSACTION_NOT_FOUND', 'No transaction of yours matches that reference');
+      return;
+    }
   }
 
   const dispute = await db.dispute.create({
@@ -54,6 +64,6 @@ disputesRouter.post('/', validate(fileSchema), async (req: Request, res: Respons
 // GET /disputes — the caller's own filed disputes
 // ---------------------------------------------------------------------------
 disputesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
-  const disputes = await db.dispute.findMany({ where: { openedById: uid(req) }, orderBy: { createdAt: 'desc' } });
+  const disputes = await db.dispute.findMany({ where: { openedById: uid(req) }, orderBy: { createdAt: 'desc' }, take: 100 });
   ok(res, disputes.map(serializeDispute));
 });

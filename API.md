@@ -307,7 +307,7 @@ The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from
 
 ### 🔑 `POST /payout/request` (lead rep only)
 
-- Body: `{ "amount": 500000, "beneficiaryId": "…", "note"?: "…" }`. `amount` is the gross in kobo.
+- Body: `{ "amount": 500000, "beneficiaryId": "…", "pin": "4821", "note"?: "…" }`. `amount` is the gross in kobo. `pin` is the space's 4-digit withdrawal security code, set by a Duevy admin (`PUT /admin/spaces/:spaceId/withdrawal-pin`). Five wrong codes lock withdrawals for 30 minutes. `GET /payout/summary` reports `withdrawalPinSet` and `withdrawalPinLockedUntil`.
 - Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked and registered with Bachs the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
 - `201`: `Payout`.
 
@@ -324,6 +324,13 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 | `422 INSUFFICIENT_BALANCE` | The amount is more than the balance. |
 | `422 BELOW_MIN_PAYOUT` | Under the ₦1,000 minimum. |
 | `423 PAYOUTS_FROZEN` | An admin has frozen withdrawals for this space. |
+| `403 WITHDRAWAL_PIN_NOT_SET` | No admin has set this space's withdrawal security code yet. |
+| `403 INVALID_WITHDRAWAL_PIN` | Wrong code; `details[0].issue` says how many attempts are left. |
+| `423 WITHDRAWAL_PIN_LOCKED` | Five wrong codes; withdrawals are locked for 30 minutes (an admin setting a new code unlocks it). |
+
+### `POST /payout/pin-reset-request` (lead rep only)
+
+The rep forgot the withdrawal security code. Admins are notified in-app and the request is written to the space audit log. An admin confirms it's really the rep, then sets a new code with `PUT /admin/spaces/:spaceId/withdrawal-pin`, which clears the request. `201 { requested, requestedAt }`. A repeat within an hour returns `200` without alerting the admins again. `409 WITHDRAWAL_PIN_NOT_SET` if the space never had a code. `GET /payout/summary` and `GET /admin/spaces` expose `withdrawalPinResetRequestedAt`.
 
 `GET /payouts` lists withdrawals and `GET /payout/:payoutId` returns one.
 
@@ -344,6 +351,14 @@ Any signed-in user. Body: `{ "category": "bug" | "idea" | "other", "message": "1
 ---
 
 ## Admin
+
+### `PUT /admin/spaces/:spaceId/withdrawal-pin` (`payouts` permission)
+
+- Body: `{ "pin": "4821" }`, exactly 4 digits. Repeated digits and straight runs (`1234`, `4321`) are refused.
+- `200`: `{ withdrawalPinSet: true, withdrawalPinSetAt }`. Only a hash is stored, so the code can never be read back; share it with the lead rep directly. Setting a code clears any lockout, and every rep of the space is notified.
+- `GET /admin/spaces` rows carry `withdrawalPinSet`, `withdrawalPinSetAt` and `withdrawalPinLocked`.
+
+Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is Bachs's decision, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` (adding co-reps) and the dues `allowGuests` field are removed.
 
 `role = admin` is required. Each route also checks the permission named in its row; a super admin has every permission.
 

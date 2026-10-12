@@ -299,7 +299,22 @@ async function handleRepSummary(userId: string): Promise<RepSummaryResult> {
 }
 
 /** Executes create_due once the frontend has forwarded the rep's explicit confirmation tap (§ safety rules). */
+// Same bound as POST /spaces/:id/dues — ₦1,000,000 in kobo, well inside Int4.
+const MAX_DUE_AMOUNT_KOBO = 100_000_000;
+
+/** A draft is only executable with a sane amount and a deadline of today or later (matches POST /dues). */
+function isValidDueDraft(draft: CreateDueDraft): boolean {
+  if (!Number.isInteger(draft.amountKobo) || draft.amountKobo <= 0 || draft.amountKobo > MAX_DUE_AMOUNT_KOBO) return false;
+  const due = new Date(`${draft.dueDate}T00:00:00Z`);
+  if (Number.isNaN(due.getTime())) return false;
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  return due >= today;
+}
+
 export async function confirmCreateDue(userId: string, spaceId: string, draft: CreateDueDraft) {
+  if (!isValidDueDraft(draft)) return { status: 'invalid_draft' as const };
+
   const rep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } } });
   if (!rep) return { status: 'not_rep' as const };
 
@@ -317,6 +332,7 @@ export async function confirmCreateDue(userId: string, spaceId: string, draft: C
         dueDate: new Date(`${draft.dueDate}T00:00:00Z`),
         category: draft.category,
         status: 'draft',
+        assignedRepId: userId,
       },
     });
     await writeAudit(spaceId, { id: userId, name: user?.name ?? 'Rep' }, 'due_created', `Created due "${created.title}" via Duey`, tx);

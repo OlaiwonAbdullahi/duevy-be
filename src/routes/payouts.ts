@@ -25,6 +25,8 @@ import {
   submitKycHandlers,
 } from './kycHandlers';
 import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
+import { notifyMany } from '../lib/notifications';
+import { writeAudit } from '../lib/audit';
 import { quoteWithdrawal, requestWithdrawal } from '../services/withdrawal.service';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
 
@@ -45,10 +47,14 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, beneficiaryCount] = await Promise.all([
+  const [ledger, kyc, beneficiaryCount, pin] = await Promise.all([
     getSpaceLedgerSummary(sid),
     getSpaceKycState(sid),
     db.payoutBeneficiary.count({ where: { spaceId: sid } }),
+    db.space.findUnique({
+      where: { id: sid },
+      select: { withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinResetRequestedAt: true },
+    }),
   ]);
   ok(res, {
     available: ledger.balance,
@@ -61,6 +67,10 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     lifetime: ledger.withdrawn,
     kyc,
     beneficiaryCount,
+    // Withdrawals need the admin-set security code; tell the rep if it's missing or locked.
+    withdrawalPinSet: !!pin?.withdrawalPinHash,
+    withdrawalPinLockedUntil: pin?.withdrawalPinLockedUntil && pin.withdrawalPinLockedUntil > new Date() ? pin.withdrawalPinLockedUntil : null,
+    withdrawalPinResetRequestedAt: pin?.withdrawalPinResetRequestedAt ?? null,
     minPayout: MIN_PAYOUT_KOBO,
     fees: {
       below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_LOW_KOBO },
@@ -184,7 +194,10 @@ payoutsRouter.post(
   validate(beneficiarySchema),
   async (req: Request, res: Response): Promise<void> => {
     const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
-    const me = await db.user.findUniqueOrThrow({ where: { id: uid(req) } });
+    const me = await db.user.findUniqueOrThrow({
+      where: { id: uid(req) },
+      select: { id: true, name: true, bachsAccountId: true, kycStatus: true },
+    });
     if (!me.bachsAccountId || me.kycStatus !== 'verified') {
       errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
@@ -249,6 +262,8 @@ const requestSchema = z
     bankCode: accountSchema.shape.bankCode.optional(),
     accountNumber: accountSchema.shape.accountNumber.optional(),
     note: z.string().max(300).optional(),
+    // The space's withdrawal security code, set by a Duevy admin.
+    pin: z.string().regex(/^\d{4}$/, 'must be 4 digits'),
   })
   .strict()
   .refine((b) => (b.beneficiaryId ? !b.bankCode && !b.accountNumber : !!b.bankCode && !!b.accountNumber), {
@@ -264,7 +279,7 @@ payoutsRouter.post(
   idempotent,
   validate(requestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { amount, beneficiaryId, bankCode, accountNumber, note } = req.body as z.infer<typeof requestSchema>;
+    const { amount, beneficiaryId, bankCode, accountNumber, note, pin } = req.body as z.infer<typeof requestSchema>;
     const payout = await requestWithdrawal({
       spaceId: spaceId(req),
       userId: uid(req),
@@ -272,10 +287,60 @@ payoutsRouter.post(
       beneficiaryId,
       account: bankCode && accountNumber ? { bankCode, accountNumber } : undefined,
       note,
+      pin,
     });
     ok(res, serializePayout(payout), 201);
   },
 );
+
+// ---------------------------------------------------------------------------
+// POST /payout/pin-reset-request — lead rep forgot the withdrawal security
+// code. Only an admin can set a new one (after confirming it's really the
+// rep), so this just alerts the admins. Repeat requests within an hour are
+// acknowledged without alerting again.
+// ---------------------------------------------------------------------------
+const PIN_RESET_COOLDOWN_MS = 60 * 60 * 1000;
+
+payoutsRouter.post('/payout/pin-reset-request', requireSpaceRep(true), sensitiveLimiter, async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const space = await db.space.findUnique({
+    where: { id: sid },
+    select: { name: true, withdrawalPinHash: true, withdrawalPinResetRequestedAt: true },
+  });
+  if (!space) {
+    errors.notFound(res, 'Space not found');
+    return;
+  }
+  if (!space.withdrawalPinHash) {
+    errors.conflict(res, 'WITHDRAWAL_PIN_NOT_SET', 'This space has no security code yet. Contact Duevy support to have one set.');
+    return;
+  }
+  const last = space.withdrawalPinResetRequestedAt;
+  if (last && Date.now() - last.getTime() < PIN_RESET_COOLDOWN_MS) {
+    ok(res, { requested: true, requestedAt: last });
+    return;
+  }
+
+  const requestedAt = new Date();
+  const [user, admins] = await Promise.all([
+    db.user.findUniqueOrThrow({ where: { id: uid(req) }, select: { id: true, name: true } }),
+    db.user.findMany({ where: { role: 'admin', isSuspended: false, isDeactivated: false }, select: { id: true } }),
+  ]);
+  await db.space.update({ where: { id: sid }, data: { withdrawalPinResetRequestedAt: requestedAt } });
+  await writeAudit(sid, { ...user, role: 'lead' }, 'withdrawal_pin_reset_requested', `${user.name} asked for a new withdrawal security code`);
+  await notifyMany(
+    admins.map((a) => a.id),
+    {
+      kind: 'system',
+      tone: 'rose',
+      title: 'Withdrawal code reset requested',
+      detail: `${user.name}, lead rep of ${space.name}, forgot the withdrawal security code. Confirm it's really them before setting a new one.`,
+      href: '/admin/spaces',
+    },
+  ).catch(() => {});
+
+  ok(res, { requested: true, requestedAt }, 201);
+});
 
 // ---------------------------------------------------------------------------
 // GET /payouts · /payout/{payoutId}

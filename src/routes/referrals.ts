@@ -4,9 +4,11 @@ import { db } from '../config/db';
 import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
+import { inviteLimiter } from '../middleware/rateLimiter';
 import { ok, errors } from '../lib/response';
 import { generateReferralCode, REFERRAL_REWARD_KOBO } from '../lib/referral';
 import { sendEmail, renderEmail } from '../lib/email';
+import { escapeHtml } from '../lib/html';
 
 export const referralsRouter = Router();
 referralsRouter.use(authenticate);
@@ -42,20 +44,25 @@ referralsRouter.get('/', async (req: Request, res: Response): Promise<void> => {
     await db.user.update({ where: { id }, data: { referralCode: code } });
   }
 
-  const referrals = await db.referral.findMany({
-    where: { referrerId: id },
-    include: { referred: { select: { name: true } } },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  const joined = referrals.filter((r) => r.status === 'joined' || r.status === 'paid').length;
-  const earned = referrals.reduce((sum, r) => sum + r.reward, 0);
+  // Totals come from the DB; only the most recent referrals are listed.
+  const [referrals, invited, joined, earnedAgg] = await Promise.all([
+    db.referral.findMany({
+      where: { referrerId: id },
+      include: { referred: { select: { name: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    }),
+    db.referral.count({ where: { referrerId: id } }),
+    db.referral.count({ where: { referrerId: id, status: { in: ['joined', 'paid'] } } }),
+    db.referral.aggregate({ where: { referrerId: id }, _sum: { reward: true } }),
+  ]);
+  const earned = earnedAgg._sum.reward ?? 0;
 
   ok(res, {
     code,
     link: `${env.FRONTEND_URL}/join?ref=${code}`,
     rewardPerReferral: REFERRAL_REWARD_KOBO,
-    summary: { invited: referrals.length, joined, earned },
+    summary: { invited, joined, earned },
     referrals: referrals.map((r) => ({
       id: r.id,
       name: r.referred.name,
@@ -71,7 +78,7 @@ referralsRouter.get('/', async (req: Request, res: Response): Promise<void> => {
 // ---------------------------------------------------------------------------
 const invitesSchema = z.object({ emails: z.array(z.string().email()).min(1).max(20) });
 
-referralsRouter.post('/invites', validate(invitesSchema), async (req: Request, res: Response): Promise<void> => {
+referralsRouter.post('/invites', inviteLimiter, validate(invitesSchema), async (req: Request, res: Response): Promise<void> => {
   const id = uid(req);
   const user = await requireRepAccess(id);
   if (!user) {
@@ -85,18 +92,20 @@ referralsRouter.post('/invites', validate(invitesSchema), async (req: Request, r
     await db.user.update({ where: { id }, data: { referralCode: code } });
   }
   const link = `${env.FRONTEND_URL}/join?ref=${code}`;
-  const { emails } = req.body as z.infer<typeof invitesSchema>;
+  // Dedupe (case-insensitively) so one request can't mail the same inbox repeatedly.
+  const emails = [...new Set((req.body as z.infer<typeof invitesSchema>).emails.map((e) => e.trim().toLowerCase()))];
 
+  const html = renderEmail(`
+    <h1>You're invited to Duevy</h1>
+    <p>${escapeHtml(user.name)} thinks you'd make a great department rep on Duevy.</p>
+    <a href="${link}" class="btn">Sign up to get started</a>
+    <div class="callout">Referral code: <strong>${escapeHtml(code)}</strong></div>
+  `);
   for (const to of emails) {
     sendEmail({
       to,
       subject: `${user.name} invited you to become a rep on Duevy`,
-      html: renderEmail(`
-        <h1>You're invited to Duevy</h1>
-        <p>${user.name} thinks you'd make a great department rep on Duevy.</p>
-        <a href="${link}" class="btn">Sign up to get started</a>
-        <div class="callout">Referral code: <strong>${code}</strong></div>
-      `),
+      html,
     }).catch(console.error);
   }
 

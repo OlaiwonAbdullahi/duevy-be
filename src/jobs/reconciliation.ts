@@ -58,7 +58,15 @@ export async function reconcileCheckout(
     return;
   }
   const status = await getPaymentProvider().getCollectionStatus(c.providerCheckoutId);
-  if (status.state === 'paid') await fulfilCheckout(c.id, status.receivedKobo ?? c.totalKobo, 0, opts.source);
+  if (status.state === 'paid') {
+    // Never assume our own expected total arrived: an unknown amount could hide
+    // an underpayment. Leave it for the webhook or the next sweep.
+    if (status.receivedKobo === null) {
+      logger.warn({ ref: c.reference, source: opts.source }, 'provider reports paid without a received amount; not fulfilling');
+      return;
+    }
+    await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source);
+  }
   else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
   else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
   else if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id);

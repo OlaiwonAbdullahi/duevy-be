@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type RepRole } from '@prisma/client';
+import { type Prisma, type RepRole } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -54,6 +54,10 @@ const dueDateField = z
   .refine((s) => !Number.isNaN(new Date(`${s}T00:00:00Z`).getTime()), 'invalid date');
 
 const categoryField = z.enum(DUE_TYPES);
+
+// ₦1,000,000 in kobo. Due amounts live in an Int4 column and are multiplied
+// by member counts and fees, so an unbounded amount overflows into a 500.
+export const MAX_DUE_AMOUNT_KOBO = 100_000_000;
 
 /** `type` is the field name; `category` is accepted as its legacy alias. */
 function typeAlias(req: Request, _res: Response, next: () => void): void {
@@ -120,14 +124,13 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
 const createDueSchema = z.object({
   title: z.string().min(3).max(120),
   note: z.string().max(500).optional(),
-  amount: z.number().int().positive(),
+  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO),
   dueDate: dueDateField.refine((s) => {
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     return new Date(`${s}T00:00:00Z`) >= today;
   }, 'must be today or later'),
   category: categoryField,
-  allowGuests: z.boolean().default(false),
   publish: z.boolean().default(false),
 });
 
@@ -147,7 +150,6 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         amount: data.amount,
         dueDate: new Date(`${data.dueDate}T00:00:00Z`),
         category: data.category,
-        allowGuests: data.allowGuests,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
         assignedRepId: uid(req),
@@ -168,10 +170,9 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
 const patchDueSchema = z.object({
   title: z.string().min(3).max(120).optional(),
   note: z.string().max(500).optional(),
-  amount: z.number().int().positive().optional(),
+  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO).optional(),
   dueDate: dueDateField.optional(),
   category: categoryField.optional(),
-  allowGuests: z.boolean().optional(),
 });
 
 repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (req: Request, res: Response): Promise<void> => {
@@ -209,7 +210,6 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
       ...(data.amount !== undefined ? { amount: data.amount } : {}),
       ...(data.dueDate !== undefined ? { dueDate: new Date(`${data.dueDate}T00:00:00Z`) } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
-      ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
     },
   });
 
@@ -345,18 +345,48 @@ repDuesRouter.post(
 // ---------------------------------------------------------------------------
 type RosterStatus = 'all' | 'paid' | 'unpaid';
 
-async function buildRoster(sid: string, dueId: string, filter: RosterStatus, q?: string) {
-  const [memberships, payments] = await Promise.all([
+async function buildRoster(
+  sid: string,
+  dueId: string,
+  filter: RosterStatus,
+  q?: string,
+  pageOpts?: { skip: number; take: number },
+) {
+  // Filter and paginate memberships in the DB; payments are then fetched only
+  // for the page's users.
+  const userConds: Prisma.UserWhereInput[] = [];
+  if (filter === 'paid') userConds.push({ duePayments: { some: { dueId } } });
+  if (filter === 'unpaid') userConds.push({ duePayments: { none: { dueId } } });
+  if (q) {
+    userConds.push({
+      OR: [
+        { name: { contains: q, mode: 'insensitive' } },
+        { matricNo: { contains: q, mode: 'insensitive' } },
+        { email: { contains: q, mode: 'insensitive' } },
+      ],
+    });
+  }
+  const where: Prisma.SpaceMembershipWhereInput = { spaceId: sid, ...(userConds.length ? { user: { AND: userConds } } : {}) };
+
+  const [matching, memberships] = await Promise.all([
+    db.spaceMembership.count({ where }),
     db.spaceMembership.findMany({
-      where: { spaceId: sid },
+      where,
       include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
+      orderBy: [{ joinedAt: 'asc' }, { id: 'asc' }],
+      ...(pageOpts ? { skip: pageOpts.skip, take: pageOpts.take } : {}),
     }),
-    db.duePayment.findMany({ where: { dueId } }),
   ]);
 
+  const payments = memberships.length
+    ? await db.duePayment.findMany({
+        where: { dueId, userId: { in: memberships.map((m) => m.userId) } },
+        select: { userId: true, paidAt: true, reference: true },
+      })
+    : [];
   const paymentByUser = new Map(payments.map((p) => [p.userId, p]));
 
-  let students = memberships.map((m) => {
+  const students = memberships.map((m) => {
     const payment = paymentByUser.get(m.userId);
     return {
       id: m.user.id,
@@ -370,18 +400,7 @@ async function buildRoster(sid: string, dueId: string, filter: RosterStatus, q?:
     };
   });
 
-  if (filter !== 'all') students = students.filter((s) => s.status === filter);
-  if (q) {
-    const needle = q.toLowerCase();
-    students = students.filter(
-      (s) =>
-        s.name.toLowerCase().includes(needle) ||
-        (s.matricNo ?? '').toLowerCase().includes(needle) ||
-        s.email.toLowerCase().includes(needle),
-    );
-  }
-
-  return { memberCount: memberships.length, payments, students };
+  return { matching, students };
 }
 
 // ---------------------------------------------------------------------------
@@ -403,32 +422,39 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   const statusFilter = parsed.success ? parsed.data.status : 'all';
   const { page, perPage, skip, take, q } = parseListQuery(req);
 
-  const { memberCount, payments, students } = await buildRoster(sid, due.id, statusFilter, q);
+  const [{ matching, students }, memberCount, agg] = await Promise.all([
+    buildRoster(sid, due.id, statusFilter, q, { skip, take }),
+    db.spaceMembership.count({ where: { spaceId: sid } }),
+    db.duePayment.aggregate({
+      where: { dueId: due.id },
+      _count: { _all: true },
+      _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
+    }),
+  ]);
 
-  const collected = payments.reduce((s, p) => s + p.amountPaid, 0);
-  const fees = payments.reduce((s, p) => s + p.processingFee + p.duevyFee, 0);
-  const net = payments.reduce((s, p) => s + p.netToSpace, 0);
+  const paidCount = agg._count._all;
+  const collected = agg._sum.amountPaid ?? 0;
+  const fees = (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0);
+  const net = agg._sum.netToSpace ?? 0;
   // Expected is the gross the space would collect if every member paid.
   const expected = computeCharge(due.amount).total * memberCount;
-
-  const paged = students.slice(skip, skip + take);
 
   ok(
     res,
     {
       totals: {
-        paid: payments.length,
-        unpaid: Math.max(0, memberCount - payments.length),
+        paid: paidCount,
+        unpaid: Math.max(0, memberCount - paidCount),
         collected,
         fees,
         net,
         expected,
         rate: expected > 0 ? collected / expected : 0,
       },
-      students: paged,
+      students,
     },
     200,
-    buildMeta(page, perPage, students.length),
+    buildMeta(page, perPage, matching),
   );
 });
 
@@ -466,7 +492,9 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/remind — nudge unpaid members (§7.7)
 // ---------------------------------------------------------------------------
-const remindSchema = z.object({ userIds: z.array(z.string()).optional() });
+const remindSchema = z.object({ userIds: z.array(z.string()).max(500).optional() });
+
+const REMIND_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 repDuesRouter.post('/dues/:dueId/remind', validate(remindSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
@@ -478,20 +506,30 @@ repDuesRouter.post('/dues/:dueId/remind', validate(remindSchema), async (req: Re
     return;
   }
 
-  // One blast per due per 24h.
-  if (due.lastRemindedAt && Date.now() - due.lastRemindedAt.getTime() < 24 * 60 * 60 * 1000) {
+  // One blast per due per 24h. Claim the slot atomically before notifying so
+  // two concurrent requests can't both pass the cooldown check.
+  const claim = await db.due.updateMany({
+    where: {
+      id: due.id,
+      OR: [{ lastRemindedAt: null }, { lastRemindedAt: { lt: new Date(Date.now() - REMIND_COOLDOWN_MS) } }],
+    },
+    data: { lastRemindedAt: new Date() },
+  });
+  if (claim.count === 0) {
     fail(res, 429, 'REMINDER_COOLDOWN', 'This due was already reminded within the last 24 hours');
     return;
   }
 
-  const memberships = await db.spaceMembership.findMany({ where: { spaceId: sid }, select: { userId: true } });
-  const paid = new Set((await db.duePayment.findMany({ where: { dueId: due.id }, select: { userId: true } })).map((p) => p.userId));
-
-  let targets = memberships.map((m) => m.userId).filter((id) => !paid.has(id));
-  if (userIds && userIds.length) {
-    const allow = new Set(userIds);
-    targets = targets.filter((id) => allow.has(id));
-  }
+  // Unpaid members, optionally narrowed to the given users.
+  const memberships = await db.spaceMembership.findMany({
+    where: {
+      spaceId: sid,
+      ...(userIds && userIds.length ? { userId: { in: userIds } } : {}),
+      user: { duePayments: { none: { dueId: due.id } } },
+    },
+    select: { userId: true },
+  });
+  const targets = memberships.map((m) => m.userId);
 
   const count = await notifyMany(targets, {
     kind: 'due_reminder',
@@ -500,8 +538,6 @@ repDuesRouter.post('/dues/:dueId/remind', validate(remindSchema), async (req: Re
     detail: `You have an outstanding due of ₦${(due.amount / 100).toLocaleString('en-NG')}.`,
     href: '/dashboard/dues',
   });
-
-  await db.due.update({ where: { id: due.id }, data: { lastRemindedAt: new Date() } });
 
   ok(res, { reminded: count });
 });

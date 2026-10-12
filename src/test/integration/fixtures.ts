@@ -1,6 +1,7 @@
 import { type AddressInfo } from 'net';
 import { type Server } from 'http';
 import { randomUUID } from 'crypto';
+import bcrypt from 'bcryptjs';
 import { db } from '../../config/db';
 import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
@@ -8,6 +9,10 @@ import { encrypt, maskAccountNumber } from '../../lib/encryption';
 import { FakeProvider, setPaymentProvider } from '../../providers/payment';
 import { computeBachsSignature } from '../../providers/payment/bachs/signature';
 import { appendLedgerEntry } from '../../services/ledger.service';
+
+/** Withdrawal security code every fixture space is given (see makeSpace). */
+export const TEST_PIN = '2580';
+const TEST_PIN_HASH = bcrypt.hashSync(TEST_PIN, 4);
 
 export const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? 'whsec_test_secret';
 
@@ -39,7 +44,10 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
     },
   });
   const space = await db.space.create({
-    data: { name: `Space ${u}`, short: 'TST', kind: 'department', school: 'LAUTECH', joinCode: `TST-${u}`.slice(0, 24) },
+    data: {
+      name: `Space ${u}`, short: 'TST', kind: 'department', school: 'LAUTECH', joinCode: `TST-${u}`.slice(0, 24),
+      withdrawalPinHash: TEST_PIN_HASH, withdrawalPinSetAt: new Date(),
+    },
   });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
   await db.spaceMembership.create({ data: { userId: rep.id, spaceId: space.id } });

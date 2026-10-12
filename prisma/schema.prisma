@@ -291,6 +291,7 @@ enum AuditAction {
   payout_cancelled
   beneficiary_added
   beneficiary_removed
+  withdrawal_pin_reset_requested
 }
 
 enum AssistantIntent {
@@ -427,6 +428,7 @@ model User {
 
   @@index([institution])
   @@index([studentIdStatus])
+  @@index([role])
   @@map("users")
 }
 
@@ -514,6 +516,16 @@ model Space {
   archivedReason       String?
   payoutsFrozen        Boolean    @default(false)
   frozenReason         String?
+  // 4-digit withdrawal security code, set by a Duevy admin and shared with
+  // the lead rep out of band. Every withdrawal must quote it. Only a bcrypt
+  // hash is stored; 5 wrong attempts lock withdrawals for 30 minutes.
+  withdrawalPinHash           String?
+  withdrawalPinSetAt          DateTime?
+  withdrawalPinFailedAttempts Int        @default(0)
+  withdrawalPinLockedUntil    DateTime?
+  // When the lead rep last asked an admin for a new code ("Forgot code?").
+  // Cleared when an admin sets one.
+  withdrawalPinResetRequestedAt DateTime?
   // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
   // its own: collections settle into the LEAD REP's Connect account and the
   // space's share is tracked by its ledger. These stay so any balance still
@@ -751,6 +763,7 @@ model Checkout {
   @@index([userId, status])
   @@index([spaceId, status])
   @@index([status, expiresAt])
+  @@index([status, createdAt])
   @@index([needsReview])
   @@map("checkouts")
 }
@@ -1292,7 +1305,6 @@ model IdempotencyKey {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([key])
   @@index([expiresAt])
   @@map("idempotency_keys")
 }

@@ -32,8 +32,15 @@ export async function getPaymentSettings(): Promise<PaymentSettings> {
   };
 }
 
+/** Read on every new checkout; cached briefly so it isn't a query each time. */
+const CHECKOUT_MODE_TTL_MS = 30_000;
+let cachedCheckoutMode: { mode: CheckoutMode; expiresAt: number } | null = null;
+
 export async function getCheckoutMode(): Promise<CheckoutMode> {
-  return (await getPaymentSettings()).checkoutMode;
+  if (cachedCheckoutMode && cachedCheckoutMode.expiresAt > Date.now()) return cachedCheckoutMode.mode;
+  const mode = (await getPaymentSettings()).checkoutMode;
+  cachedCheckoutMode = { mode, expiresAt: Date.now() + CHECKOUT_MODE_TTL_MS };
+  return mode;
 }
 
 export async function setCheckoutMode(mode: CheckoutMode, adminId: string): Promise<PaymentSettings> {
@@ -43,5 +50,6 @@ export async function setCheckoutMode(mode: CheckoutMode, adminId: string): Prom
     update: { value, updatedById: adminId },
     create: { key: CHECKOUT_MODE_KEY, value, updatedById: adminId },
   });
+  cachedCheckoutMode = null;
   return getPaymentSettings();
 }

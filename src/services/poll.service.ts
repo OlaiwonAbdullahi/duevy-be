@@ -17,19 +17,19 @@ export async function applyPollVotes(
   args: { pollId: string; userId: string; selections: VoteSelection[]; amountPerVote: number; reference?: string },
 ): Promise<{ totalQuantity: number; spaceRevenue: number }> {
   let totalQuantity = 0;
+  for (const sel of args.selections) totalQuantity += sel.quantity;
 
+  await tx.pollVote.createMany({
+    data: args.selections.map((sel) => ({
+      userId: args.userId,
+      nomineeId: sel.nomineeId,
+      categoryId: sel.categoryId,
+      quantity: sel.quantity,
+      amountPaid: sel.quantity * args.amountPerVote, // face value credited to the space
+      txnRef: args.reference,
+    })),
+  });
   for (const sel of args.selections) {
-    totalQuantity += sel.quantity;
-    await tx.pollVote.create({
-      data: {
-        userId: args.userId,
-        nomineeId: sel.nomineeId,
-        categoryId: sel.categoryId,
-        quantity: sel.quantity,
-        amountPaid: sel.quantity * args.amountPerVote, // face value credited to the space
-        txnRef: args.reference,
-      },
-    });
     await tx.nominee.update({ where: { id: sel.nomineeId }, data: { votes: { increment: sel.quantity } } });
   }
 

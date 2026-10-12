@@ -1,5 +1,6 @@
 import { Resend } from 'resend';
 import { env } from '../config/env';
+import { escapeHtml } from './html';
 
 const resend = new Resend(env.RESEND_API_KEY);
 
@@ -10,11 +11,16 @@ interface SendEmailOptions {
   text?: string;
 }
 
+/** Strip CR/LF so a user-controlled value can never inject extra headers via the subject. */
+export function headerSafe(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ');
+}
+
 export async function sendEmail(options: SendEmailOptions): Promise<void> {
   const { error } = await resend.emails.send({
     from: env.RESEND_FROM_EMAIL,
     to: Array.isArray(options.to) ? options.to : [options.to],
-    subject: options.subject,
+    subject: headerSafe(options.subject),
     html: options.html,
     text: options.text,
   });
@@ -168,7 +174,7 @@ export async function sendVerificationEmail(
   const link = `${env.FRONTEND_URL}/verify-email?token=${token}`;
   const html = renderEmail(`
     <h1>Verify your email</h1>
-    <p>Hi ${name}, thanks for joining Duevy! Click the button below to verify your email address.</p>
+    <p>Hi ${escapeHtml(name)}, thanks for joining Duevy! Click the button below to verify your email address.</p>
     <a href="${link}" class="btn">Verify email</a>
     <p class="muted">This link expires in 24 hours. If you didn't create an account, you can safely ignore this email.</p>
   `);
@@ -190,7 +196,7 @@ export async function sendPasswordResetEmail(
   const html = renderEmail(
     `
     <h1>Reset your password</h1>
-    <p>Hi ${name}, we received a request to reset your Duevy password.</p>
+    <p>Hi ${escapeHtml(name)}, we received a request to reset your Duevy password.</p>
     <a href="${link}" class="btn">Reset password</a>
     <p class="muted">This link expires in 1 hour. If you didn't request this, you can safely ignore this email — your password won't change.</p>
   `,
@@ -220,15 +226,17 @@ export async function sendDuePaymentReceiptEmail(
     minute: '2-digit',
     timeZone: 'Africa/Lagos',
   });
+  const dueTitle = escapeHtml(input.dueTitle);
+  const spaceName = escapeHtml(input.spaceName);
   const html = renderEmail(
     `
     <h1>Payment confirmed</h1>
-    <p>Hi ${name}, your payment for <strong>${input.dueTitle}</strong> went through. Here's your receipt.</p>
-    ${emailHero('Amount paid', amount, input.spaceName)}
+    <p>Hi ${escapeHtml(name)}, your payment for <strong>${dueTitle}</strong> went through. Here's your receipt.</p>
+    ${emailHero('Amount paid', amount, spaceName)}
     ${emailDetails([
-      ['Due', input.dueTitle],
-      ['Space', input.spaceName],
-      ['Reference', input.reference],
+      ['Due', dueTitle],
+      ['Space', spaceName],
+      ['Reference', escapeHtml(input.reference)],
       ['Date', paidAt],
       ['Status', 'Paid'],
     ])}
@@ -236,7 +244,7 @@ export async function sendDuePaymentReceiptEmail(
     <p class="muted">Keep this email as proof of payment. Questions? Reply here or reach us at support@duevy.app</p>
   `,
     undefined,
-    { preheader: `${amount} paid for ${input.dueTitle} — your receipt is inside.` },
+    { preheader: `${amount} paid for ${dueTitle} — your receipt is inside.` },
   );
 
   await sendEmail({
@@ -254,7 +262,7 @@ export async function sendRepApplicationReceivedEmail(
 ): Promise<void> {
   const html = renderEmail(`
     <h1>Application received</h1>
-    <p>Hi ${name}, your rep application for <strong>${spaceName}</strong> is under review.</p>
+    <p>Hi ${escapeHtml(name)}, your rep application for <strong>${escapeHtml(spaceName)}</strong> is under review.</p>
     <p>Our team will verify your application within 1–2 business days. You'll get an email once a decision is made.</p>
     <p class="muted">Questions? Reply to this email or reach us at support@duevy.app</p>
   `);
@@ -274,7 +282,7 @@ export async function sendRepApprovedEmail(
   const link = `${env.FRONTEND_URL}/dashboard`;
   const html = renderEmail(`
     <h1>You're approved! 🎉</h1>
-    <p>Hi ${name}, your rep application for <strong>${spaceName}</strong> has been approved.</p>
+    <p>Hi ${escapeHtml(name)}, your rep application for <strong>${escapeHtml(spaceName)}</strong> has been approved.</p>
     <p>You can now access your rep dashboard and start managing dues.</p>
     <a href="${link}" class="btn">Go to dashboard</a>
   `);
@@ -294,8 +302,8 @@ export async function sendRepRejectedEmail(
   const html = renderEmail(
     `
     <h1>Application update</h1>
-    <p>Hi ${name}, we reviewed your rep application and unfortunately couldn't approve it at this time.</p>
-    <div class="callout"><strong>Reason:</strong> ${reason}</div>
+    <p>Hi ${escapeHtml(name)}, we reviewed your rep application and unfortunately couldn't approve it at this time.</p>
+    <div class="callout"><strong>Reason:</strong> ${escapeHtml(reason)}</div>
     <p>Your account has been set up as a student account. If you believe this is a mistake, please contact us at support@duevy.app</p>
   `,
     '#b01e4e',

@@ -26,8 +26,9 @@ const listQuery = z.object({
   direction: z.enum(['all', 'in', 'out']).default('all'),
   type: z.enum(['due', 'topup', 'referral', 'withdrawal', 'refund', 'vote']).optional(),
   status: z.enum(['completed', 'pending', 'failed']).optional(),
-  from: z.string().optional(),
-  to: z.string().optional(),
+  // Checked here so a malformed date is a 400, not an Invalid Date reaching Prisma.
+  from: z.string().max(40).refine((v) => !Number.isNaN(Date.parse(v)), 'must be a valid date').optional(),
+  to: z.string().max(40).refine((v) => !Number.isNaN(Date.parse(v)), 'must be a valid date').optional(),
 });
 
 transactionsRouter.get('/', async (req: Request, res: Response): Promise<void> => {

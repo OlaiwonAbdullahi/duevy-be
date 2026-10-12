@@ -12,9 +12,7 @@ import { serializeSpace, serializeStudent, serializeAuditLog } from '../lib/seri
 import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
-import { computeCharge } from '../lib/money';
 import { getSpaceBalance } from '../services/ledger.service';
-import { sendEmail, renderEmail } from '../lib/email';
 
 // Mounted at /spaces/:spaceId — mergeParams exposes spaceId to these handlers.
 export const circleRouter = Router({ mergeParams: true });
@@ -88,6 +86,16 @@ circleRouter.delete('/members/:userId', requireSpaceRep(true), async (req: Reque
     return;
   }
 
+  // Removing membership alone would leave a rep with powers over a space they're no longer in.
+  const isRep = await db.spaceRep.findUnique({
+    where: { userId_spaceId: { userId: targetId, spaceId: sid } },
+    select: { id: true },
+  });
+  if (isRep) {
+    errors.conflict(res, 'IS_REP', 'Remove rep role first');
+    return;
+  }
+
   await db.spaceMembership.delete({ where: { id: membership.id } });
   res.status(204).end();
 });
@@ -131,67 +139,6 @@ circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response)
     res,
     reps.map((r) => ({ id: r.user.id, name: r.user.name, email: r.user.email, role: r.role })),
   );
-});
-
-// ---------------------------------------------------------------------------
-// POST /reps/invite — add a co-rep (§5.6, lead)
-// ---------------------------------------------------------------------------
-const inviteSchema = z.object({
-  email: z.string().email().transform((e) => e.toLowerCase()),
-  role: z.literal('co').default('co'),
-});
-
-circleRouter.post('/reps/invite', requireSpaceRep(true), validate(inviteSchema), async (req: Request, res: Response): Promise<void> => {
-  const sid = spaceId(req);
-  const { email } = req.body as z.infer<typeof inviteSchema>;
-
-  const invitee = await db.user.findUnique({ where: { email } });
-  if (!invitee) {
-    fail(res, 422, 'USER_NOT_FOUND', 'The invitee must already have a Duevy account', [
-      { field: 'email', issue: 'no account found' },
-    ]);
-    return;
-  }
-
-  const existingRep = await db.spaceRep.findUnique({
-    where: { userId_spaceId: { userId: invitee.id, spaceId: sid } },
-  });
-  if (existingRep) {
-    errors.conflict(res, 'ALREADY_REP', 'That user is already a rep of this space');
-    return;
-  }
-
-  const space = await db.space.findUnique({ where: { id: sid }, select: { name: true } });
-
-  await db.$transaction(async (tx) => {
-    await tx.spaceRep.create({ data: { userId: invitee.id, spaceId: sid, role: 'co' } });
-    // A rep is also a member.
-    await tx.spaceMembership.upsert({
-      where: { userId_spaceId: { userId: invitee.id, spaceId: sid } },
-      update: {},
-      create: { userId: invitee.id, spaceId: sid, kind: 'member' },
-    });
-    await writeAudit(sid, await actor(req),'rep_invited', `Invited ${invitee.name} as a co-rep`, tx);
-  });
-
-  await notify({
-    userId: invitee.id,
-    kind: 'system',
-    title: 'You are now a co-rep',
-    detail: `You were added as a co-rep of ${space?.name ?? 'a space'}.`,
-    href: '/dashboard/manage',
-  });
-
-  sendEmail({
-    to: invitee.email,
-    subject: `You're now a co-rep on Duevy`,
-    html: renderEmail(`
-      <h1>You're now a co-rep</h1>
-      <p>Hi ${invitee.name}, you've been added as a co-rep of <strong>${space?.name ?? 'a space'}</strong> on Duevy.</p>
-    `),
-  }).catch(console.error);
-
-  ok(res, { id: invitee.id, name: invitee.name, email: invitee.email, role: 'co' }, 201);
 });
 
 // ---------------------------------------------------------------------------
@@ -255,20 +202,29 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   }
   const memberCount = space._count.memberships;
 
-  const activeDues = await db.due.findMany({ where: { spaceId: sid, status: 'active' } });
+  const [activeDues, newMembers] = await Promise.all([
+    db.due.findMany({ where: { spaceId: sid, status: 'active' } }),
+    db.spaceMembership.findMany({
+      where: { spaceId: sid },
+      include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
+      orderBy: { joinedAt: 'desc' },
+      take: 3,
+    }),
+  ]);
   const dueIds = activeDues.map((d) => d.id);
 
-  const payments = dueIds.length
-    ? await db.duePayment.findMany({ where: { dueId: { in: dueIds } }, select: { dueId: true, amountPaid: true } })
+  const grouped = dueIds.length
+    ? await db.duePayment.groupBy({
+        by: ['dueId'],
+        where: { dueId: { in: dueIds } },
+        _count: { _all: true },
+        _sum: { netToSpace: true },
+      })
     : [];
 
-  const paidByDue = new Map<string, { count: number; sum: number }>();
-  for (const p of payments) {
-    const agg = paidByDue.get(p.dueId) ?? { count: 0, sum: 0 };
-    agg.count += 1;
-    agg.sum += p.amountPaid;
-    paidByDue.set(p.dueId, agg);
-  }
+  const paidByDue = new Map<string, { count: number; sum: number }>(
+    grouped.map((g) => [g.dueId, { count: g._count._all, sum: g._sum.netToSpace ?? 0 }]),
+  );
 
   let collected = 0;
   let expected = 0;
@@ -276,7 +232,7 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   const activeDuesOut = activeDues.map((d) => {
     const agg = paidByDue.get(d.id) ?? { count: 0, sum: 0 };
     collected += agg.sum;
-    expected += computeCharge(d.amount).total * memberCount;
+    expected += d.amount * memberCount;
     unpaidCount += Math.max(0, memberCount - agg.count);
     return {
       id: d.id,
@@ -289,13 +245,6 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       paidCount: agg.count,
       memberCount,
     };
-  });
-
-  const newMembers = await db.spaceMembership.findMany({
-    where: { spaceId: sid },
-    include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
-    orderBy: { joinedAt: 'desc' },
-    take: 3,
   });
 
   ok(res, {
@@ -322,7 +271,13 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
   const callerId = uid(req);
   const { userId: targetId, password } = req.body as z.infer<typeof transferSchema>;
 
-  const caller = await db.user.findUnique({ where: { id: callerId } });
+  // Independent lookups — fetch together, then check in order.
+  const [caller, targetRep, callerRep, target] = await Promise.all([
+    db.user.findUnique({ where: { id: callerId }, select: { name: true, passwordHash: true } }),
+    db.spaceRep.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
+    db.spaceRep.findUnique({ where: { userId_spaceId: { userId: callerId, spaceId: sid } } }),
+    db.user.findUnique({ where: { id: targetId }, select: { name: true } }),
+  ]);
   if (!caller?.passwordHash || !(await bcrypt.compare(password, caller.passwordHash))) {
     fail(res, 400, 'INVALID_CREDENTIALS', 'Password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
     return;
@@ -333,7 +288,6 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
     return;
   }
 
-  const targetRep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } });
   if (!targetRep) {
     fail(res, 422, 'NOT_A_REP', 'The new lead must already be a rep of this space');
     return;
@@ -342,9 +296,6 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
     errors.conflict(res, 'ALREADY_LEAD', 'That user is already the lead');
     return;
   }
-
-  const callerRep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId: callerId, spaceId: sid } } });
-  const target = await db.user.findUnique({ where: { id: targetId }, select: { name: true } });
 
   await db.$transaction(async (tx) => {
     await tx.spaceRep.update({ where: { id: targetRep.id }, data: { role: 'lead' } });

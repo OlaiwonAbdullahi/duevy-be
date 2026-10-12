@@ -39,15 +39,42 @@ function clearRefreshCookie(res: Response) {
   res.clearCookie("refreshToken", { path: "/v1/auth/refresh" });
 }
 
+// Provider references, storage paths, admin notes and legacy PII never leave
+// the server in an auth response.
+function toSessionUser<T extends Partial<User>>(user: T) {
+  const {
+    passwordHash: _ph,
+    bachsAccountId: _ba,
+    bachsPersonId: _bp,
+    anchorCustomerId: _ac,
+    studentIdFileId: _sf,
+    studentIdFilePath: _sp,
+    studentIdReviewedById: _sr,
+    kycDocUrls: _kd,
+    addressLine1: _a1,
+    addressLine2: _a2,
+    city: _c,
+    state: _s,
+    postalCode: _pc,
+    suspendedReason: _su,
+    deactivatedReason: _de,
+    ...safe
+  } = user;
+  return safe;
+}
+
+// Compared against when the email is unknown, so a login takes the same time
+// whether or not the account exists (no user enumeration by timing).
+const DUMMY_HASH = bcrypt.hashSync("duevy-timing-equaliser", 10);
+
 // Shared by /auth/register and /auth/google — the department-setup fields
 // collected when the signer picks the `rep` role (§2.1/§2.3).
 const spaceDraftSchema = z.object({
-  name: z.string(),
+  name: z.string().trim().min(1).max(120),
   short: z.string().min(2).max(6),
   kind: z.enum(["department", "association", "faculty", "club"]),
-  school: z.string(),
-  faculty: z.string().optional(),
-  coRepInvites: z.array(z.string().email()).optional(),
+  school: z.string().trim().min(1).max(120),
+  faculty: z.string().trim().max(120).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -55,16 +82,16 @@ const spaceDraftSchema = z.object({
 // ---------------------------------------------------------------------------
 const registerSchema = z
   .object({
-    name: z.string().min(2).max(100),
-    matricNo: z.string().min(1),
+    name: z.string().trim().min(2).max(100),
+    matricNo: z.string().trim().min(1).max(32),
     email: z
       .string()
       .email()
       .transform((e) => e.toLowerCase()),
-    password: z.string().min(8),
+    password: z.string().min(8).max(72),
     acceptedTerms: z.literal(true),
     role: z.enum(["student", "rep"]).default("student"),
-    referralCode: z.string().optional(),
+    referralCode: z.string().max(32).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -118,7 +145,6 @@ authRouter.post(
             school: data.space.school,
             faculty: data.space.faculty,
             theme: "emerald", // not chosen at registration; the rep can change it later
-            coRepInvites: data.space.coRepInvites || [],
             referralCode: data.referralCode,
           },
         });
@@ -129,7 +155,7 @@ authRouter.post(
 
     sendVerification(user.id, user.email, user.name).catch(console.error);
 
-    const { passwordHash: _, ...userSafe } = user;
+    const userSafe = toSessionUser(user);
 
     if (user.repApplicationStatus === "pending") {
       // A rep applicant gets no session yet: they verify their email, then sign
@@ -167,10 +193,10 @@ type UserWithSpaces = User & { spaceMemberships: SpaceMembership[]; spaceReps: S
 
 const googleSchema = z
   .object({
-    idToken: z.string().min(1),
-    matricNo: z.string().min(1).optional(),
+    idToken: z.string().min(1).max(4096),
+    matricNo: z.string().trim().min(1).max(32).optional(),
     role: z.enum(["student", "rep"]).default("student"),
-    referralCode: z.string().optional(),
+    referralCode: z.string().max(32).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -238,8 +264,7 @@ authRouter.post(
               school: data.space.school,
               faculty: data.space.faculty,
               theme: "emerald", // not chosen at registration; the rep can change it later
-              coRepInvites: data.space.coRepInvites || [],
-              referralCode: data.referralCode,
+                referralCode: data.referralCode,
             },
           });
         }
@@ -273,7 +298,7 @@ authRouter.post(
     );
     setRefreshCookie(res, refreshToken);
 
-    const { passwordHash: _, ...userSafe } = user;
+    const userSafe = toSessionUser(user);
 
     if (user.repApplicationStatus === "pending") {
       res.status(403).json({
@@ -299,7 +324,7 @@ const loginSchema = z.object({
     .string()
     .email()
     .transform((e) => e.toLowerCase()),
-  password: z.string(),
+  password: z.string().max(1024),
 });
 
 authRouter.post(
@@ -314,11 +339,8 @@ authRouter.post(
       include: { spaceMemberships: true, spaceReps: true },
     });
 
-    if (
-      !user ||
-      !user.passwordHash ||
-      !(await bcrypt.compare(password, user.passwordHash))
-    ) {
+    const passwordOk = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+    if (!user || !user.passwordHash || !passwordOk) {
       errors.unauthorized(res, "Invalid email or password");
       return;
     }
@@ -363,7 +385,7 @@ authRouter.post(
     );
     setRefreshCookie(res, refreshToken);
 
-    const { passwordHash: _, ...userSafe } = user;
+    const userSafe = toSessionUser(user);
 
     if (user.repApplicationStatus === "pending") {
       res.status(403).json({
@@ -400,11 +422,25 @@ authRouter.post(
       const storedToken = await db.refreshToken.findUnique({
         where: { tokenHash },
       });
-      if (
-        !storedToken ||
-        storedToken.revokedAt ||
-        storedToken.expiresAt < new Date()
-      ) {
+      if (!storedToken || storedToken.userId !== payload.sub || storedToken.expiresAt < new Date()) {
+        clearRefreshCookie(res);
+        errors.unauthorized(res, "Invalid or expired refresh token");
+        return;
+      }
+
+      // Revoke the presented token (rotation). Conditional on it still being
+      // live, so two concurrent refreshes can't both mint a session.
+      const rotated = await db.refreshToken.updateMany({
+        where: { id: storedToken.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      if (rotated.count === 0) {
+        // A revoked token was replayed — treat it as stolen and end every
+        // session for this user.
+        await db.refreshToken.updateMany({
+          where: { userId: storedToken.userId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
         clearRefreshCookie(res);
         errors.unauthorized(res, "Invalid or expired refresh token");
         return;
@@ -425,12 +461,6 @@ authRouter.post(
         ...user.spaceMemberships.map((m) => m.spaceId),
         ...user.spaceReps.map((r) => r.spaceId),
       ];
-
-      // Revoke old token (rotation)
-      await db.refreshToken.update({
-        where: { id: storedToken.id },
-        data: { revokedAt: new Date() },
-      });
 
       // Issue new tokens
       const { accessToken, refreshToken } = await createTokens(
@@ -474,7 +504,7 @@ authRouter.post(
 // ---------------------------------------------------------------------------
 // POST /auth/verify-email
 // ---------------------------------------------------------------------------
-const verifyEmailSchema = z.object({ token: z.string() });
+const verifyEmailSchema = z.object({ token: z.string().max(128) });
 authRouter.post(
   "/verify-email",
   validate(verifyEmailSchema),
@@ -570,8 +600,8 @@ authRouter.post(
 // POST /auth/reset-password
 // ---------------------------------------------------------------------------
 const resetPasswordSchema = z.object({
-  token: z.string(),
-  password: z.string().min(8),
+  token: z.string().max(128),
+  password: z.string().min(8).max(72),
 });
 authRouter.post(
   "/reset-password",
@@ -590,11 +620,22 @@ authRouter.post(
       return;
     }
 
+    // Claim the token before doing anything else so it can only be used once.
+    const claimed = await db.passwordReset.updateMany({
+      where: { id: reset.id, usedAt: null },
+      data: { usedAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      fail(res, 400, "VALIDATION_ERROR", "Invalid or expired reset token");
+      return;
+    }
+
     const passwordHash = await bcrypt.hash(password, env.BCRYPT_ROUNDS);
 
     await db.$transaction([
-      db.passwordReset.update({
-        where: { id: reset.id },
+      // Any other outstanding reset links die with this one.
+      db.passwordReset.updateMany({
+        where: { userId: reset.userId, usedAt: null },
         data: { usedAt: new Date() },
       }),
       db.user.update({

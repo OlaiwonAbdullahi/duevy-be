@@ -83,22 +83,35 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const dues = await db.due.findMany({
-    where: {
-      spaceId: { in: spaceIds },
-      status: { in: ['active', 'closed'] },
-      ...(type ? { category: type } : {}),
-    },
-    orderBy: { dueDate: 'asc' },
-  });
+  // The viewer status is derived from payment + deadline, so it maps onto a
+  // DB filter and pagination can happen in the query.
+  const statusWhere =
+    filters.status === 'paid'
+      ? { payments: { some: { userId: id } } }
+      : filters.status === 'unpaid'
+        ? { payments: { none: { userId: id } }, dueDate: { gte: now } }
+        : filters.status === 'overdue'
+          ? { payments: { none: { userId: id } }, dueDate: { lt: now } }
+          : {};
+  const where = {
+    spaceId: { in: spaceIds },
+    status: { in: ['active' as const, 'closed' as const] },
+    ...(type ? { category: type } : {}),
+    ...statusWhere,
+  };
 
-  const payments = await db.duePayment.findMany({ where: { userId: id, dueId: { in: dues.map((d) => d.id) } } });
+  const [total, dues] = await Promise.all([
+    db.due.count({ where }),
+    db.due.findMany({ where, orderBy: [{ dueDate: 'asc' }, { id: 'asc' }], skip, take }),
+  ]);
+
+  const payments = dues.length
+    ? await db.duePayment.findMany({ where: { userId: id, dueId: { in: dues.map((d) => d.id) } } })
+    : [];
   const paymentByDue = new Map(payments.map((p) => [p.dueId, p]));
 
-  let items = dues.map((d) => serializeStudentDue(d, paymentByDue.get(d.id), now));
-  if (filters.status) items = items.filter((d) => d.status === filters.status);
-
-  ok(res, items.slice(skip, skip + take), 200, buildMeta(page, perPage, items.length));
+  const items = dues.map((d) => serializeStudentDue(d, paymentByDue.get(d.id), now));
+  ok(res, items, 200, buildMeta(page, perPage, total));
 });
 
 // ---------------------------------------------------------------------------

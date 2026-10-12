@@ -324,7 +324,10 @@ export class BachsProvider implements PaymentProvider {
     const payment = (c.payment_status ?? '').toLowerCase();
     const charge = (c.charge?.status ?? '').toLowerCase();
     const status = (c.status ?? '').toLowerCase();
-    const gross = optionalKobo(c.charge?.amount ?? c.amount);
+    // Only the charge carries what actually arrived. The session's own `amount`
+    // is what we asked for, so it is never a stand-in for the received amount:
+    // null here means "unknown", and reconciliation won't fulfil on it.
+    const gross = optionalKobo(c.charge?.amount);
 
     if (['succeeded', 'paid', 'accepted', 'overpaid'].includes(payment) || ['succeeded', 'accepted', 'overpaid'].includes(charge)) {
       return { state: 'paid', receivedKobo: gross };

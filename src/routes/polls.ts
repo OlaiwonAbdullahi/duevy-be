@@ -17,7 +17,18 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { writeAudit } from '../lib/audit';
 import { generateReference } from '../lib/money';
+import { sniffDocumentType } from '../lib/storage';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
+
+/** Client-supplied image URLs must be https or one of our own uploads — no javascript:/data:/http: links. */
+const safeImageUrl = () =>
+  z
+    .string()
+    .url()
+    .max(2048)
+    .refine((u) => u.startsWith('https://') || u.startsWith(`${env.APP_BASE_URL}/uploads/`), {
+      message: 'must be an https:// URL or an uploaded image',
+    });
 
 const pollInclude = { categories: { include: { nominees: true }, orderBy: { createdAt: 'asc' as const } } };
 
@@ -95,14 +106,14 @@ const createPollSchema = z
     membersOnly: z.boolean(),
     paid: z.boolean(),
     amountPerVote: z.number().int().positive().optional(),
-    coverImageUrl: z.string().url().optional(),
+    coverImageUrl: safeImageUrl().optional(),
     themeColor: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).optional(),
     categories: z
       .array(
         z.object({
           title: z.string().min(1),
-          imageUrl: z.string().url().optional(),
-          nominees: z.array(z.object({ name: z.string().min(1), imageUrl: z.string().url().optional() })).min(2),
+          imageUrl: safeImageUrl().optional(),
+          nominees: z.array(z.object({ name: z.string().min(1), imageUrl: safeImageUrl().optional() })).min(2),
         }),
       )
       .min(1),
@@ -155,26 +166,16 @@ const POLL_IMAGE_DIR = path.join(process.cwd(), 'uploads', 'polls');
 fs.mkdirSync(POLL_IMAGE_DIR, { recursive: true });
 
 const ALLOWED_POLL_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-const POLL_IMAGE_EXT_BY_TYPE: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/webp': '.webp',
-};
 
+// Held in memory so the real type can be sniffed from the bytes before
+// anything touches disk; the client's filename and Content-Type are ignored.
 const pollImageUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, POLL_IMAGE_DIR),
-    filename: (_req, file, cb) =>
-      cb(null, `${randomBytes(16).toString('hex')}${POLL_IMAGE_EXT_BY_TYPE[file.mimetype] ?? ''}`),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
-  fileFilter: (_req, file, cb) => {
-    cb(null, ALLOWED_POLL_IMAGE_TYPES.includes(file.mimetype));
-  },
 }).single('file');
 
 pollsRepRouter.post('/polls/image', (req: Request, res: Response): void => {
-  pollImageUpload(req, res, (err: unknown) => {
+  pollImageUpload(req, res, async (err: unknown) => {
     if (err instanceof multer.MulterError) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the 2 MB limit' : err.message;
       fail(res, 400, 'VALIDATION_ERROR', msg, [{ field: 'file', issue: msg }]);
@@ -184,25 +185,33 @@ pollsRepRouter.post('/polls/image', (req: Request, res: Response): void => {
       fail(res, 400, 'VALIDATION_ERROR', 'Upload failed');
       return;
     }
-    if (!req.file) {
+    const sniffed = req.file ? sniffDocumentType(req.file.buffer) : null;
+    if (!req.file || !sniffed || !ALLOWED_POLL_IMAGE_TYPES.includes(sniffed.mime)) {
       fail(res, 400, 'VALIDATION_ERROR', 'A JPEG, PNG, or WebP file is required', [
         { field: 'file', issue: 'required (jpeg/png/webp, ≤ 2 MB)' },
       ]);
       return;
     }
 
-    const imageUrl = `${env.APP_BASE_URL}/uploads/polls/${req.file.filename}`;
+    const filename = `${randomBytes(16).toString('hex')}.${sniffed.ext}`;
+    try {
+      await fs.promises.writeFile(path.join(POLL_IMAGE_DIR, filename), req.file.buffer);
+    } catch {
+      fail(res, 500, 'INTERNAL_ERROR', 'Could not save the image');
+      return;
+    }
+    const imageUrl = `${env.APP_BASE_URL}/uploads/polls/${filename}`;
     ok(res, { imageUrl });
   });
 });
 
-const patchImageSchema = z.object({ imageUrl: z.string().url().nullable() });
+const patchImageSchema = z.object({ imageUrl: safeImageUrl().nullable() });
 
 // PATCH /polls/:pollId/nominees/:nomineeId — attach/update a nominee's image,
 // bio, or vote code. Cosmetic only (unlike title/structure changes), so it's
 // allowed at any poll status.
 const patchNomineeSchema = z.object({
-  imageUrl: z.string().url().nullable().optional(),
+  imageUrl: safeImageUrl().nullable().optional(),
   bio: z.string().max(280).nullable().optional(),
   code: z.string().max(40).nullable().optional(),
 });
@@ -277,7 +286,7 @@ const patchPollSchema = z.object({
   membersOnly: z.boolean().optional(),
   paid: z.boolean().optional(),
   amountPerVote: z.number().int().positive().optional(),
-  coverImageUrl: z.string().url().nullable().optional(),
+  coverImageUrl: safeImageUrl().nullable().optional(),
   themeColor: z.enum(['emerald', 'ocean', 'royal', 'crimson', 'tangerine']).nullable().optional(),
 });
 
@@ -421,8 +430,8 @@ pollsPublicRouter.get('/:slug', optionalAuthenticate, async (req: Request, res: 
     for (const v of cast) byCat.set(v.categoryId, (byCat.get(v.categoryId) ?? 0) + v.quantity);
     payload.categories = payload.categories.map((c) => ({
       ...c,
-      // Members-only polls are one-per-category; others are uncapped (null).
-      remaining: poll!.membersOnly ? Math.max(0, 1 - (byCat.get(c.id) ?? 0)) : null,
+      // Free polls are one-per-category; paid polls are uncapped (null).
+      remaining: !poll!.paid ? Math.max(0, 1 - (byCat.get(c.id) ?? 0)) : null,
     }));
   }
 
@@ -432,10 +441,15 @@ pollsPublicRouter.get('/:slug', optionalAuthenticate, async (req: Request, res: 
 // POST /polls/:slug/votes — cast votes (§11.6)
 const voteSchema = z.object({
   selections: z
-    .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).default(1) }))
-    .min(1),
+    .array(z.object({ categoryId: z.string().min(1), nomineeId: z.string().min(1), quantity: z.number().int().min(1).max(1000).default(1) }))
+    .min(1)
+    .max(50)
+    .refine((sels) => new Set(sels.map((s) => s.categoryId)).size === sels.length, { message: 'each category may appear only once' }),
   method: z.enum(['online']).optional(),
 });
+
+/** Thrown inside the vote transaction when the caller already voted in one of the categories. */
+class AlreadyVotedError extends Error {}
 
 pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = uid(req);
@@ -465,27 +479,35 @@ pollsPublicRouter.post('/:slug/votes', authenticate, idempotent, validate(voteSc
     }
   }
 
-  let selections: VoteSelection[] = body.selections.map((s) => ({ ...s }));
-
   if (poll.membersOnly) {
     const member = await db.spaceMembership.findUnique({ where: { userId_spaceId: { userId, spaceId: poll.spaceId } } });
     if (!member) {
       fail(res, 403, 'MEMBERS_ONLY', 'This poll is open to members only');
       return;
     }
-    selections = selections.map((s) => ({ ...s, quantity: 1 })); // one vote per category
-    const cats = selections.map((s) => s.categoryId);
-    const existing = await db.pollVote.findFirst({ where: { userId, categoryId: { in: cats } } });
-    if (existing) {
-      errors.conflict(res, 'ALREADY_VOTED', 'You have already voted in this poll');
-      return;
-    }
   }
 
-  // Free poll — count immediately.
+  // Free poll — one vote per user per category, counted immediately.
   if (!poll.paid) {
+    const selections: VoteSelection[] = body.selections.map((s) => ({ ...s, quantity: 1 }));
+    const cats = selections.map((s) => s.categoryId);
     const reference = generateReference('VOTE');
-    await db.$transaction((tx) => applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: 0, reference }));
+    try {
+      await db.$transaction(async (tx) => {
+        // No unique constraint on (user, category), so serialize this user's
+        // votes on this poll to close the parallel-request race.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${userId}:${poll.id}`}::text))`;
+        const existing = await tx.pollVote.findFirst({ where: { userId, categoryId: { in: cats } }, select: { id: true } });
+        if (existing) throw new AlreadyVotedError();
+        await applyPollVotes(tx, { pollId: poll.id, userId, selections, amountPerVote: 0, reference });
+      });
+    } catch (err) {
+      if (err instanceof AlreadyVotedError) {
+        errors.conflict(res, 'ALREADY_VOTED', 'You have already voted in this poll');
+        return;
+      }
+      throw err;
+    }
     ok(res, { receiptId: reference, totalCharged: 0 }, 201);
     return;
   }

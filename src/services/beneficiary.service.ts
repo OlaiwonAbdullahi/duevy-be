@@ -1,4 +1,4 @@
-import type { PayoutBeneficiary } from '@prisma/client';
+import type { Prisma, PayoutBeneficiary } from '@prisma/client';
 import { db } from '../config/db';
 import { AppError, conflict, notFound } from '../lib/errors';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
@@ -7,6 +7,8 @@ import { writeAudit } from '../lib/audit';
 import { sendEmail, renderEmail } from '../lib/email';
 import { getPaymentProvider } from '../providers/payment';
 import { listBanksCached } from '../routes/banks';
+import { escapeHtml } from '../lib/html';
+import { lockSpace } from './ledger.service';
 
 /**
  * Beneficiaries: the bank accounts a space can withdraw to. Any account the
@@ -49,18 +51,10 @@ export async function addBeneficiary(input: {
   const label = input.label?.trim() || null;
 
   // The same account added twice is the same beneficiary; just refresh its label.
-  const existing = await listBeneficiaries(spaceId);
-  const duplicate = existing.find((b) => b.bankCode === bankCode && decrypt(b.accountNumber) === accountNumber);
-  if (duplicate) {
-    const beneficiary =
-      label && label !== duplicate.label
-        ? await db.payoutBeneficiary.update({ where: { id: duplicate.id }, data: { label } })
-        : duplicate;
-    return { beneficiary, created: false };
-  }
-  if (existing.length >= MAX_BENEFICIARIES) {
-    throw conflict('TOO_MANY_BENEFICIARIES', `A space can have at most ${MAX_BENEFICIARIES} beneficiaries. Remove one first.`);
-  }
+  // Checked here first so a duplicate or a full list never reaches the
+  // provider, then again under the space lock below (concurrent adds).
+  const precheck = await findDuplicateOrAssertRoom(db, spaceId, bankCode, accountNumber);
+  if (precheck) return { beneficiary: await refreshLabel(precheck, label), created: false };
 
   const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
   const destination = await getPaymentProvider().registerPayoutDestination({
@@ -71,26 +65,55 @@ export async function addBeneficiary(input: {
   });
 
   const masked = maskAccountNumber(accountNumber);
-  const beneficiary = await db.payoutBeneficiary.create({
-    data: {
-      spaceId,
-      label,
-      bankCode,
-      bankName,
-      accountNumber: encrypt(accountNumber),
-      accountNumberMasked: masked,
-      accountName,
-      bachsDestinationId: destination.destinationId,
-      bachsAccountId: actor.bachsAccountId,
-      createdById: actor.id,
-    },
+  const result = await db.$transaction(async (tx) => {
+    await lockSpace(tx, spaceId);
+    const duplicate = await findDuplicateOrAssertRoom(tx, spaceId, bankCode, accountNumber);
+    if (duplicate) return { beneficiary: duplicate, created: false };
+    const created = await tx.payoutBeneficiary.create({
+      data: {
+        spaceId,
+        label,
+        bankCode,
+        bankName,
+        accountNumber: encrypt(accountNumber),
+        accountNumberMasked: masked,
+        accountName,
+        bachsDestinationId: destination.destinationId,
+        bachsAccountId: actor.bachsAccountId,
+        createdById: actor.id,
+      },
+    });
+    return { beneficiary: created, created: true };
   });
+  // A concurrent request added the same account first.
+  if (!result.created) return { beneficiary: await refreshLabel(result.beneficiary, label), created: false };
+  const beneficiary = result.beneficiary;
   logger.info({ spaceId, beneficiaryId: beneficiary.id, bank: bankCode, account: masked, usable: destination.usable }, 'beneficiary added');
 
   const who = `${accountName} (${bankName} ${masked})`;
   await writeAudit(spaceId, { id: actor.id, name: actor.name, role: 'lead' }, 'beneficiary_added', `Added beneficiary ${who}`).catch(() => {});
   void notifyRepsOfNewBeneficiary(spaceId, actor.name, who);
   return { beneficiary, created: true };
+}
+
+/** The space's existing beneficiary for this account, or throws if the space is at its limit. */
+async function findDuplicateOrAssertRoom(
+  client: Prisma.TransactionClient,
+  spaceId: string,
+  bankCode: string,
+  accountNumber: string,
+): Promise<PayoutBeneficiary | null> {
+  const existing = await client.payoutBeneficiary.findMany({ where: { spaceId }, orderBy: { createdAt: 'desc' } });
+  const duplicate = existing.find((b) => b.bankCode === bankCode && decrypt(b.accountNumber) === accountNumber);
+  if (duplicate) return duplicate;
+  if (existing.length >= MAX_BENEFICIARIES) {
+    throw conflict('TOO_MANY_BENEFICIARIES', `A space can have at most ${MAX_BENEFICIARIES} beneficiaries. Remove one first.`);
+  }
+  return null;
+}
+
+function refreshLabel(b: PayoutBeneficiary, label: string | null): Promise<PayoutBeneficiary> | PayoutBeneficiary {
+  return label && label !== b.label ? db.payoutBeneficiary.update({ where: { id: b.id }, data: { label } }) : b;
 }
 
 export async function removeBeneficiary(spaceId: string, beneficiaryId: string, actor: { id: string; name: string }): Promise<void> {
@@ -141,7 +164,7 @@ async function notifyRepsOfNewBeneficiary(spaceId: string, actorName: string, wh
       subject: 'New Duevy payout beneficiary',
       html: renderEmail(
         `<h1>New payout beneficiary</h1>
-         <p>Hi ${r.user.name}, ${actorName} added <strong>${who}</strong> as a beneficiary for your space. Withdrawals can now be sent to this account.</p>
+         <p>Hi ${escapeHtml(r.user.name)}, ${escapeHtml(actorName)} added <strong>${escapeHtml(who)}</strong> as a beneficiary for your space. Withdrawals can now be sent to this account.</p>
          <p class="muted">If this wasn't expected, contact support immediately at support@duevy.app</p>`,
         '#b01e4e',
       ),

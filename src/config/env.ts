@@ -67,7 +67,11 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default('http://localhost:3001'),
 
   // Security
-  BCRYPT_ROUNDS: z.coerce.number().default(12),
+  // Number of reverse-proxy hops in front of the API (Render = 1). Needed so
+  // req.ip is the client's address and per-IP rate limits aren't shared by
+  // every user. Defaults to 1 in production, 0 (don't trust) elsewhere.
+  TRUST_PROXY: z.coerce.number().int().min(0).max(5).optional(),
+  BCRYPT_ROUNDS: z.coerce.number().int().min(10).max(15).default(12),
   // Optional dedicated key for encrypting stored bank account numbers.
   // Falls back to a key derived from JWT_REFRESH_SECRET when unset.
   ENCRYPTION_KEY: z.string().optional(),
