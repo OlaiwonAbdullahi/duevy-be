@@ -214,11 +214,26 @@ export async function sendPasswordResetEmail(
 export async function sendDuePaymentReceiptEmail(
   to: string,
   name: string,
-  input: { dueTitle: string; spaceName: string; amountPaidKobo: number; reference: string; dueId: string },
+  input: {
+    spaceName: string;
+    reference: string;
+    /** Null only if the receipt row couldn't be read; the email still goes out. */
+    receiptNumber: string | null;
+    /** Every due settled by this payment, at its face amount. */
+    items: { title: string; amountKobo: number }[];
+    faceKobo: number;
+    feeKobo: number;
+    /** What the student actually sent. */
+    amountPaidKobo: number;
+    paidAt: Date;
+  },
 ): Promise<void> {
-  const amount = `₦${(input.amountPaidKobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
-  const receiptLink = `${env.APP_BASE_URL}/v1/dues/${input.dueId}/receipt`;
-  const paidAt = new Date().toLocaleString('en-NG', {
+  const naira = (kobo: number) =>
+    `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const amount = naira(input.amountPaidKobo);
+  // The app's payment page shows the full receipt and its PDF download (behind sign-in).
+  const receiptLink = `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(input.reference)}`;
+  const paidAt = input.paidAt.toLocaleString('en-NG', {
     day: '2-digit',
     month: 'short',
     year: 'numeric',
@@ -226,32 +241,43 @@ export async function sendDuePaymentReceiptEmail(
     minute: '2-digit',
     timeZone: 'Africa/Lagos',
   });
-  const dueTitle = escapeHtml(input.dueTitle);
+  const single = input.items.length === 1;
+  const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
   const spaceName = escapeHtml(input.spaceName);
   const html = renderEmail(
     `
     <h1>Payment confirmed</h1>
-    <p>Hi ${escapeHtml(name)}, your payment for <strong>${dueTitle}</strong> went through. Here's your receipt.</p>
-    ${emailHero('Amount paid', amount, spaceName)}
+    <p>Hi ${escapeHtml(name)}, your payment for <strong>${escapeHtml(summary)}</strong>${spaceName ? ` in ${spaceName}` : ''} went through. Here's your receipt.</p>
+    ${emailHero('Amount paid', amount, spaceName || undefined)}
+    <div style="margin:0 0 8px;font-family:${FONT};font-size:12px;font-weight:600;color:${INK_SOFT};">${single ? 'Due paid' : 'Dues paid'}</div>
+    ${emailDetails(input.items.map((i) => [escapeHtml(i.title), naira(i.amountKobo)]))}
     ${emailDetails([
-      ['Due', dueTitle],
-      ['Space', spaceName],
+      [single ? 'Due amount' : 'Dues total', naira(input.faceKobo)],
+      ['Service fee', naira(input.feeKobo)],
+      ['Total paid', amount],
+      ...(input.receiptNumber ? ([['Receipt no.', escapeHtml(input.receiptNumber)]] as [string, string][]) : []),
       ['Reference', escapeHtml(input.reference)],
       ['Date', paidAt],
       ['Status', 'Paid'],
     ])}
-    <a href="${receiptLink}" class="btn">Download receipt</a>
+    <a href="${receiptLink}" class="btn">View receipt</a>
     <p class="muted">Keep this email as proof of payment. Questions? Reply here or reach us at support@duevy.app</p>
   `,
     undefined,
-    { preheader: `${amount} paid for ${dueTitle} — your receipt is inside.` },
+    { preheader: `${amount} paid for ${summary} — your receipt is inside.` },
   );
 
+  const lines = input.items.map((i) => `- ${i.title}: ${naira(i.amountKobo)}`).join('\n');
   await sendEmail({
     to,
-    subject: `Payment confirmed — ${input.dueTitle}`,
+    subject: `Payment confirmed — ${summary}`,
     html,
-    text: `Hi ${name},\n\nYour payment of ${amount} for ${input.dueTitle} (${input.spaceName}) is confirmed.\nReference: ${input.reference}\n\nView your receipt: ${receiptLink}`,
+    text:
+      `Hi ${name},\n\nYour payment of ${amount}${input.spaceName ? ` to ${input.spaceName}` : ''} is confirmed.\n\n` +
+      `${single ? 'Due paid' : 'Dues paid'}:\n${lines}\n\n` +
+      `${single ? 'Due amount' : 'Dues total'}: ${naira(input.faceKobo)}\nService fee: ${naira(input.feeKobo)}\nTotal paid: ${amount}\n` +
+      `${input.receiptNumber ? `Receipt no.: ${input.receiptNumber}\n` : ''}Reference: ${input.reference}\nDate: ${paidAt}\n\n` +
+      `View your receipt: ${receiptLink}`,
   });
 }
 

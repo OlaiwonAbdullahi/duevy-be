@@ -536,20 +536,30 @@ export async function statusOf(checkoutId: string): Promise<CheckoutStatus> {
 
 // ---------------------------------------------------------------------------
 
+/** "Dues A", "A and B", "A, B and C", "A, B and 2 more" — for notifications. */
+function listTitles(titles: string[]): string {
+  const quoted = titles.map((t) => `"${t}"`);
+  if (quoted.length <= 2) return quoted.join(' and ');
+  if (quoted.length === 3) return `${quoted[0]}, ${quoted[1]} and ${quoted[2]}`;
+  return `${quoted[0]}, ${quoted[1]} and ${quoted.length - 2} more`;
+}
+
 async function afterPaid(checkout: Checkout): Promise<void> {
-  const [payer, items, space, reps] = await Promise.all([
+  const [payer, items, space, reps, receipt] = await Promise.all([
     db.user.findUnique({ where: { id: checkout.userId }, select: { name: true, email: true } }),
     db.checkoutItem.findMany({ where: { checkoutId: checkout.id }, include: { due: { select: { title: true } } } }),
     db.space.findUnique({ where: { id: checkout.spaceId }, select: { name: true } }),
     db.spaceRep.findMany({ where: { spaceId: checkout.spaceId }, select: { userId: true } }),
+    // Issued in the same transaction that marked the checkout paid.
+    db.receipt.findFirst({ where: { checkoutId: checkout.id }, select: { number: true } }),
   ]);
-  const title = items.length === 1 ? items[0]!.due.title : `${items.length} dues`;
+  const what = listTitles(items.map((i) => i.due.title));
   await notifyMany(
     reps.map((r) => r.userId),
     {
       kind: 'payment_received',
       title: 'Payment received',
-      detail: `${payer?.name ?? 'A member'} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for "${title}".`,
+      detail: `${payer?.name ?? 'A member'} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
       // One due opens its collections roster; a basket goes to the dues list.
       href: items.length === 1 ? `/dashboard/create-dues?due=${items[0]!.dueId}` : '/dashboard/create-dues',
     },
@@ -557,16 +567,19 @@ async function afterPaid(checkout: Checkout): Promise<void> {
   await notifyMany([checkout.userId], {
     kind: 'payment_received',
     title: 'Payment confirmed',
-    detail: `Your payment for "${title}" was received.`,
-    href: '/dashboard/dues',
+    detail: `Your payment for ${what} was received.`,
+    href: `/dashboard/pay/${checkout.reference}`,
   });
   if (payer) {
     await sendDuePaymentReceiptEmail(payer.email, payer.name, {
-      dueTitle: title,
       spaceName: space?.name ?? '',
-      amountPaidKobo: checkout.receivedKobo ?? checkout.totalKobo,
       reference: checkout.reference,
-      dueId: items[0]!.dueId,
+      receiptNumber: receipt?.number ?? null,
+      items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
+      faceKobo: checkout.faceKobo,
+      feeKobo: checkout.feeKobo,
+      amountPaidKobo: checkout.receivedKobo ?? checkout.totalKobo,
+      paidAt: checkout.paidAt ?? new Date(),
     });
   }
 }
