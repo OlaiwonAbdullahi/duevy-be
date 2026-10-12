@@ -27,7 +27,9 @@ import {
 import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
-import { quoteWithdrawal, requestWithdrawal } from '../services/withdrawal.service';
+import { quoteWithdrawal, requestWithdrawal, setWithdrawalPinByRep, type PinChange } from '../services/withdrawal.service';
+import { sendEmail, renderEmail } from '../lib/email';
+import { escapeHtml } from '../lib/html';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated.
@@ -53,7 +55,7 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     db.payoutBeneficiary.count({ where: { spaceId: sid } }),
     db.space.findUnique({
       where: { id: sid },
-      select: { withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinResetRequestedAt: true },
+      select: { withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinHoldUntil: true },
     }),
   ]);
   ok(res, {
@@ -67,10 +69,10 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     lifetime: ledger.withdrawn,
     kyc,
     beneficiaryCount,
-    // Withdrawals need the admin-set security code; tell the rep if it's missing or locked.
+    // Withdrawals need the security code the lead rep sets; say if it's missing, locked or on hold.
     withdrawalPinSet: !!pin?.withdrawalPinHash,
     withdrawalPinLockedUntil: pin?.withdrawalPinLockedUntil && pin.withdrawalPinLockedUntil > new Date() ? pin.withdrawalPinLockedUntil : null,
-    withdrawalPinResetRequestedAt: pin?.withdrawalPinResetRequestedAt ?? null,
+    withdrawalPinHoldUntil: pin?.withdrawalPinHoldUntil && pin.withdrawalPinHoldUntil > new Date() ? pin.withdrawalPinHoldUntil : null,
     minPayout: MIN_PAYOUT_KOBO,
     fees: {
       below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_LOW_KOBO },
@@ -294,52 +296,72 @@ payoutsRouter.post(
 );
 
 // ---------------------------------------------------------------------------
-// POST /payout/pin-reset-request — lead rep forgot the withdrawal security
-// code. Only an admin can set a new one (after confirming it's really the
-// rep), so this just alerts the admins. Repeat requests within an hour are
-// acknowledged without alerting again.
+// PUT /payout/pin — the lead rep sets (or changes) the space's 4-digit
+// withdrawal security code. Needs their account password; changing an
+// existing code also needs the current one.
+// POST /payout/pin/reset — forgot the code: set a new one with the password
+// alone. Withdrawals are then held for 24 hours and every rep is told.
 // ---------------------------------------------------------------------------
-const PIN_RESET_COOLDOWN_MS = 60 * 60 * 1000;
+const pinCode = z.string().regex(/^\d{4}$/, 'must be 4 digits');
+const setPinSchema = z
+  .object({ pin: pinCode, password: z.string().min(1).max(1024), currentPin: pinCode.optional() })
+  .strict();
+const resetPinSchema = z.object({ pin: pinCode, password: z.string().min(1).max(1024) }).strict();
 
-payoutsRouter.post('/payout/pin-reset-request', requireSpaceRep(true), sensitiveLimiter, async (req: Request, res: Response): Promise<void> => {
+const PIN_AUDIT: Record<PinChange, { action: 'withdrawal_pin_set' | 'withdrawal_pin_changed' | 'withdrawal_pin_reset'; verb: string }> = {
+  set: { action: 'withdrawal_pin_set', verb: 'set' },
+  changed: { action: 'withdrawal_pin_changed', verb: 'changed' },
+  reset: { action: 'withdrawal_pin_reset', verb: 'reset' },
+};
+
+async function afterPinChange(req: Request, change: PinChange, holdUntil: Date | null): Promise<void> {
   const sid = spaceId(req);
-  const space = await db.space.findUnique({
-    where: { id: sid },
-    select: { name: true, withdrawalPinHash: true, withdrawalPinResetRequestedAt: true },
-  });
-  if (!space) {
-    errors.notFound(res, 'Space not found');
-    return;
-  }
-  if (!space.withdrawalPinHash) {
-    errors.conflict(res, 'WITHDRAWAL_PIN_NOT_SET', 'This space has no security code yet. Contact Duevy support to have one set.');
-    return;
-  }
-  const last = space.withdrawalPinResetRequestedAt;
-  if (last && Date.now() - last.getTime() < PIN_RESET_COOLDOWN_MS) {
-    ok(res, { requested: true, requestedAt: last });
-    return;
-  }
-
-  const requestedAt = new Date();
-  const [user, admins] = await Promise.all([
-    db.user.findUniqueOrThrow({ where: { id: uid(req) }, select: { id: true, name: true } }),
-    db.user.findMany({ where: { role: 'admin', isSuspended: false, isDeactivated: false }, select: { id: true } }),
+  const [actor, space] = await Promise.all([
+    db.user.findUniqueOrThrow({ where: { id: uid(req) }, select: { id: true, name: true, email: true } }),
+    db.space.findUniqueOrThrow({ where: { id: sid }, select: { name: true, reps: { select: { userId: true } } } }),
   ]);
-  await db.space.update({ where: { id: sid }, data: { withdrawalPinResetRequestedAt: requestedAt } });
-  await writeAudit(sid, { ...user, role: 'lead' }, 'withdrawal_pin_reset_requested', `${user.name} asked for a new withdrawal security code`);
+  const { action, verb } = PIN_AUDIT[change];
+  await writeAudit(sid, { id: actor.id, name: actor.name, role: 'lead' }, action, `${actor.name} ${verb} the withdrawal security code`);
+  // Every rep hears about it, so a change nobody asked for gets noticed.
   await notifyMany(
-    admins.map((a) => a.id),
+    space.reps.map((r) => r.userId),
     {
       kind: 'system',
-      tone: 'rose',
-      title: 'Withdrawal code reset requested',
-      detail: `${user.name}, lead rep of ${space.name}, forgot the withdrawal security code. Confirm it's really them before setting a new one.`,
-      href: '/admin/spaces',
+      tone: change === 'reset' ? 'rose' : 'brand',
+      title: `Withdrawal security code ${verb}`,
+      detail:
+        change === 'reset'
+          ? `${actor.name} reset the withdrawal code for ${space.name}. Withdrawals reopen in 24 hours. If this wasn't you, contact Duevy support now.`
+          : `${actor.name} ${verb} the withdrawal code for ${space.name}.`,
+      href: '/dashboard/payout',
     },
   ).catch(() => {});
+  if (change === 'reset') {
+    sendEmail({
+      to: actor.email,
+      subject: 'Your Duevy withdrawal code was reset',
+      html: renderEmail(`
+        <h1>Your withdrawal code was reset</h1>
+        <p>Hi ${escapeHtml(actor.name)}, the withdrawal security code for <strong>${escapeHtml(space.name)}</strong> was just reset.
+        Withdrawals reopen at ${escapeHtml(holdUntil?.toUTCString() ?? '')}.</p>
+        <p>If you didn't do this, change your password and contact support@duevy.app immediately.</p>
+      `),
+    }).catch(() => {});
+  }
+}
 
-  ok(res, { requested: true, requestedAt }, 201);
+payoutsRouter.put('/payout/pin', requireSpaceRep(true), sensitiveLimiter, validate(setPinSchema), async (req: Request, res: Response): Promise<void> => {
+  const { pin, password, currentPin } = req.body as z.infer<typeof setPinSchema>;
+  const { change, holdUntil } = await setWithdrawalPinByRep({ spaceId: spaceId(req), userId: uid(req), pin, password, currentPin });
+  await afterPinChange(req, change, holdUntil);
+  ok(res, { withdrawalPinSet: true, change, withdrawalPinHoldUntil: holdUntil });
+});
+
+payoutsRouter.post('/payout/pin/reset', requireSpaceRep(true), sensitiveLimiter, validate(resetPinSchema), async (req: Request, res: Response): Promise<void> => {
+  const { pin, password } = req.body as z.infer<typeof resetPinSchema>;
+  const { change, holdUntil } = await setWithdrawalPinByRep({ spaceId: spaceId(req), userId: uid(req), pin, password, forgot: true });
+  await afterPinChange(req, change, holdUntil);
+  ok(res, { withdrawalPinSet: true, change, withdrawalPinHoldUntil: holdUntil });
 });
 
 // ---------------------------------------------------------------------------

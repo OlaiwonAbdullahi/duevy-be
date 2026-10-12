@@ -21,8 +21,9 @@ import { destinationFor, oneOffDestination } from './beneficiary.service';
  *   net   = gross − fee, sent to the bank
  *
  * Safety, in order:
- *  0. A 4-digit security code, set per space by a Duevy admin, must be quoted
- *     (5 wrong attempts lock withdrawals for 30 minutes).
+ *  0. The 4-digit security code the lead rep set for the space must be quoted
+ *     (5 wrong attempts lock it for 30 minutes; a forgotten-code reset holds
+ *     withdrawals for 24 hours).
  *  1. Idempotency-Key on the route (a retried request replays).
  *  2. A transaction-scoped advisory lock per space: the balance check and the
  *     ledger debit happen atomically, so two requests can't both spend it.
@@ -51,21 +52,41 @@ export interface WithdrawalRequest {
   beneficiaryId?: string;
   account?: { bankCode: string; accountNumber: string };
   note?: string;
-  /** The space's 4-digit withdrawal security code. */
+  /** The space's 4-digit withdrawal security code (set by its lead rep). */
   pin: string;
 }
 
 const PIN_MAX_ATTEMPTS = 5;
 const PIN_LOCK_MS = 30 * 60 * 1000;
+/** After a "forgot code" reset, withdrawals wait this long so a stolen
+ *  password can't be turned straight into a withdrawal. */
+export const PIN_RESET_HOLD_MS = 24 * 60 * 60 * 1000;
 
-/** Check the space's admin-set withdrawal code. Wrong guesses are counted
- *  atomically; the fifth locks withdrawals for PIN_LOCK_MS. */
-async function verifyWithdrawalPin(space: Space, pin: string): Promise<void> {
+const SEQUENTIAL_PINS = new Set(['0123', '1234', '2345', '3456', '4567', '5678', '6789', '9876', '8765', '7654', '6543', '5432', '4321', '3210']);
+
+/** Repeated digits (1111) and straight runs (1234, 4321) are refused. */
+export function isWeakPin(pin: string): boolean {
+  return /^(\d)\1{3}$/.test(pin) || SEQUENTIAL_PINS.has(pin);
+}
+
+/** Prisma data that wipes a space's withdrawal code — used whenever the lead
+ *  rep changes, so a new lead always sets their own. */
+export const CLEARED_PIN = {
+  withdrawalPinHash: null,
+  withdrawalPinSetAt: null,
+  withdrawalPinFailedAttempts: 0,
+  withdrawalPinLockedUntil: null,
+  withdrawalPinHoldUntil: null,
+} satisfies Prisma.SpaceUpdateInput;
+
+/** Check a code against the space's hash. Wrong guesses are counted
+ *  atomically; the fifth locks the code for PIN_LOCK_MS. */
+async function checkPin(space: Space, pin: string): Promise<void> {
   if (!space.withdrawalPinHash) {
-    throw forbidden('This space has no withdrawal security code yet. Contact Duevy support to have one set.', 'WITHDRAWAL_PIN_NOT_SET');
+    throw forbidden('Set a withdrawal security code on the Payout page first.', 'WITHDRAWAL_PIN_NOT_SET');
   }
   if (space.withdrawalPinLockedUntil && space.withdrawalPinLockedUntil > new Date()) {
-    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Withdrawals are locked for 30 minutes.');
+    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Try again in 30 minutes, or reset your code.');
   }
   if (await bcrypt.compare(pin, space.withdrawalPinHash)) {
     if (space.withdrawalPinFailedAttempts > 0) {
@@ -84,11 +105,79 @@ async function verifyWithdrawalPin(space: Space, pin: string): Promise<void> {
       data: { withdrawalPinFailedAttempts: 0, withdrawalPinLockedUntil: new Date(Date.now() + PIN_LOCK_MS) },
     });
     logger.warn({ spaceId: space.id }, 'withdrawal security code locked after repeated failures');
-    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Withdrawals are locked for 30 minutes.');
+    throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Try again in 30 minutes, or reset your code.');
   }
   throw new AppError(403, 'INVALID_WITHDRAWAL_PIN', 'The security code is incorrect', [
     { field: 'pin', issue: `incorrect; ${PIN_MAX_ATTEMPTS - attempts} attempt(s) left` },
   ]);
+}
+
+/** A withdrawal needs the right code and no reset hold in force. */
+async function verifyWithdrawalPin(space: Space, pin: string): Promise<void> {
+  if (space.withdrawalPinHoldUntil && space.withdrawalPinHoldUntil > new Date()) {
+    throw new AppError(423, 'WITHDRAWAL_PIN_HOLD', 'Your security code was reset recently. Withdrawals reopen 24 hours after a reset.', [
+      { field: 'pin', issue: `available from ${space.withdrawalPinHoldUntil.toISOString()}` },
+    ]);
+  }
+  await checkPin(space, pin);
+}
+
+export type PinChange = 'set' | 'changed' | 'reset';
+
+/**
+ * The lead rep sets their space's withdrawal code. Always needs the account
+ * password. A first code is just set; changing one also needs the current
+ * code; `forgot` replaces it without the current code but starts a 24h hold.
+ */
+export async function setWithdrawalPinByRep(input: {
+  spaceId: string;
+  userId: string;
+  pin: string;
+  password: string;
+  currentPin?: string;
+  forgot?: boolean;
+}): Promise<{ change: PinChange; holdUntil: Date | null }> {
+  const [space, user] = await Promise.all([
+    db.space.findUnique({ where: { id: input.spaceId } }),
+    db.user.findUnique({ where: { id: input.userId }, select: { passwordHash: true } }),
+  ]);
+  if (!space || !user) throw notFound('Space not found');
+  if (!user.passwordHash) {
+    throw new AppError(409, 'PASSWORD_REQUIRED', 'Your account has no password yet. Sign out and use "Forgot password" to create one, then try again.');
+  }
+  if (!(await bcrypt.compare(input.password, user.passwordHash))) {
+    throw new AppError(403, 'INVALID_PASSWORD', 'Your password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
+  }
+  if (isWeakPin(input.pin)) {
+    throw new AppError(422, 'WEAK_PIN', 'Choose a less predictable code', [{ field: 'pin', issue: 'too easy to guess' }]);
+  }
+
+  let change: PinChange;
+  let holdUntil: Date | null = space.withdrawalPinHoldUntil && space.withdrawalPinHoldUntil > new Date() ? space.withdrawalPinHoldUntil : null;
+  if (!space.withdrawalPinHash) {
+    change = 'set';
+  } else if (input.forgot) {
+    change = 'reset';
+    holdUntil = new Date(Date.now() + PIN_RESET_HOLD_MS);
+  } else {
+    if (!input.currentPin) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Enter your current code, or reset it if you forgot it', [{ field: 'currentPin', issue: 'required' }]);
+    }
+    await checkPin(space, input.currentPin);
+    change = 'changed';
+  }
+
+  await db.space.update({
+    where: { id: space.id },
+    data: {
+      withdrawalPinHash: await bcrypt.hash(input.pin, 10),
+      withdrawalPinSetAt: new Date(),
+      withdrawalPinFailedAttempts: 0,
+      withdrawalPinLockedUntil: null,
+      withdrawalPinHoldUntil: holdUntil,
+    },
+  });
+  return { change, holdUntil };
 }
 
 export async function quoteWithdrawal(amountKobo: number) {

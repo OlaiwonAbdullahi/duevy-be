@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
+import { CLEARED_PIN } from '../services/withdrawal.service';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
@@ -12,7 +13,7 @@ import { serializeSpace, serializeStudent, serializeAuditLog } from '../lib/seri
 import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
-import { getSpaceBalance } from '../services/ledger.service';
+import { getSpaceBalance, getSpaceLedgerSummary } from '../services/ledger.service';
 
 // Mounted at /spaces/:spaceId — mergeParams exposes spaceId to these handlers.
 export const circleRouter = Router({ mergeParams: true });
@@ -202,7 +203,7 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   }
   const memberCount = space._count.memberships;
 
-  const [activeDues, newMembers] = await Promise.all([
+  const [activeDues, newMembers, ledger] = await Promise.all([
     db.due.findMany({ where: { spaceId: sid, status: 'active' } }),
     db.spaceMembership.findMany({
       where: { spaceId: sid },
@@ -210,6 +211,7 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       orderBy: { joinedAt: 'desc' },
       take: 3,
     }),
+    getSpaceLedgerSummary(sid),
   ]);
   const dueIds = activeDues.map((d) => d.id);
 
@@ -252,6 +254,9 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
     joinCode: space.joinCode,
     stats: {
       collected,
+      // Lifetime money received from students across every due (same as the
+      // payout page's "Total collected"); `collected` covers active dues only.
+      totalCollected: ledger.collected,
       outstanding: Math.max(0, expected - collected),
       unpaidCount,
       collectionRate: expected > 0 ? collected / expected : 0,
@@ -300,6 +305,8 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
   await db.$transaction(async (tx) => {
     await tx.spaceRep.update({ where: { id: targetRep.id }, data: { role: 'lead' } });
     if (callerRep) await tx.spaceRep.update({ where: { id: callerRep.id }, data: { role: 'co' } });
+    // The new lead sets their own withdrawal code; the old one stops working.
+    await tx.space.update({ where: { id: sid }, data: CLEARED_PIN });
     await writeAudit(sid, { id: callerId, name: caller.name, role: 'lead' }, 'lead_transferred', `Transferred lead to ${target?.name ?? 'a rep'}`, tx);
   });
 

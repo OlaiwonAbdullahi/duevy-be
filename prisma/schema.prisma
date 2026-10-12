@@ -291,7 +291,10 @@ enum AuditAction {
   payout_cancelled
   beneficiary_added
   beneficiary_removed
-  withdrawal_pin_reset_requested
+  withdrawal_pin_reset_requested // legacy: admin-set codes era, no longer written
+  withdrawal_pin_set
+  withdrawal_pin_changed
+  withdrawal_pin_reset
 }
 
 enum AssistantIntent {
@@ -516,16 +519,15 @@ model Space {
   archivedReason       String?
   payoutsFrozen        Boolean    @default(false)
   frozenReason         String?
-  // 4-digit withdrawal security code, set by a Duevy admin and shared with
-  // the lead rep out of band. Every withdrawal must quote it. Only a bcrypt
-  // hash is stored; 5 wrong attempts lock withdrawals for 30 minutes.
+  // 4-digit withdrawal security code the lead rep sets for the space (with
+  // their password). Every withdrawal must quote it. Only a bcrypt hash is
+  // stored. 5 wrong attempts lock it for 30 minutes; a forgotten-code reset
+  // holds withdrawals for 24 hours. Cleared whenever the lead rep changes.
   withdrawalPinHash           String?
   withdrawalPinSetAt          DateTime?
   withdrawalPinFailedAttempts Int        @default(0)
   withdrawalPinLockedUntil    DateTime?
-  // When the lead rep last asked an admin for a new code ("Forgot code?").
-  // Cleared when an admin sets one.
-  withdrawalPinResetRequestedAt DateTime?
+  withdrawalPinHoldUntil      DateTime?
   // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
   // its own: collections settle into the LEAD REP's Connect account and the
   // space's share is tracked by its ledger. These stay so any balance still

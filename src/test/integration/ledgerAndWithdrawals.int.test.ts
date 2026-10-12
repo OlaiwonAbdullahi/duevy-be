@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import bcrypt from 'bcryptjs';
 import { db } from '../../config/db';
 import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
@@ -245,23 +246,51 @@ describe('beneficiaries', () => {
     expect((await req(TEST_PIN)).status).toBe('processing');
   });
 
-  it('lets the lead rep ask admins for a new code, alerting them once per hour', async () => {
-    const { rep, space } = await makeSpace();
-    const admin = await db.user.create({ data: { name: 'Admin', email: `admin_${space.id}@test.duevy`, role: 'admin' } });
-    const path = `/v1/spaces/${space.id}/payout/pin-reset-request`;
+  it('lets the lead rep set, change and reset their own code (password required)', async () => {
+    const { rep, space, beneficiary } = await makeSpace();
+    await creditSpace(space.id, 1_000_000);
+    await db.space.update({ where: { id: space.id }, data: { withdrawalPinHash: null } });
+    await db.user.update({ where: { id: rep.id }, data: { passwordHash: bcrypt.hashSync('Secret123!', 4) } });
     const token = await tokenFor(rep);
+    const pinPath = `/v1/spaces/${space.id}/payout/pin`;
 
-    const first = await api('POST', path, { token });
-    expect(first.status).toBe(201);
-    const again = await api('POST', path, { token });
-    expect(again.status).toBe(200);
-    expect(await db.notification.count({ where: { userId: admin.id, title: 'Withdrawal code reset requested' } })).toBe(1);
+    // First code: password checked, weak codes refused.
+    expect((await api('PUT', pinPath, { token, body: { pin: '4826', password: 'wrong' } })).status).toBe(403);
+    expect((await api('PUT', pinPath, { token, body: { pin: '1234', password: 'Secret123!' } })).status).toBe(422);
+    const set = await api('PUT', pinPath, { token, body: { pin: '4826', password: 'Secret123!' } });
+    expect(set.status).toBe(200);
+    expect(set.body.data.change).toBe('set');
 
-    const summary = await api('GET', `/v1/spaces/${space.id}/payout/summary`, { token });
-    expect(summary.body.data.withdrawalPinResetRequestedAt).toBeTruthy();
+    // Changing needs the current code.
+    expect((await api('PUT', pinPath, { token, body: { pin: '7319', password: 'Secret123!' } })).status).toBe(400);
+    expect((await api('PUT', pinPath, { token, body: { pin: '7319', password: 'Secret123!', currentPin: '0000' } })).status).toBe(403);
+    const changed = await api('PUT', pinPath, { token, body: { pin: '7319', password: 'Secret123!', currentPin: '4826' } });
+    expect(changed.body.data.change).toBe('changed');
+    const req = (pin: string) => requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 200_000, pin });
+    await expect(req('4826')).rejects.toMatchObject({ code: 'INVALID_WITHDRAWAL_PIN' });
+
+    // Forgot it: reset with the password alone, then a 24h hold.
+    const reset = await api('POST', `${pinPath}/reset`, { token, body: { pin: '5072', password: 'Secret123!' } });
+    expect(reset.body.data.change).toBe('reset');
+    await expect(req('5072')).rejects.toMatchObject({ code: 'WITHDRAWAL_PIN_HOLD' });
+    await db.space.update({ where: { id: space.id }, data: { withdrawalPinHoldUntil: null } });
+    expect((await req('5072')).status).toBe('processing');
   });
 
-  it('refuses withdrawals until an admin sets a security code', async () => {
+  it('clears the code when the lead rep changes', async () => {
+    const { rep, space } = await makeSpace();
+    const other = await db.user.create({ data: { name: 'Bayo', email: `b_${space.id}@test.duevy`, passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    await db.spaceRep.create({ data: { userId: other.id, spaceId: space.id, role: 'co' } });
+    await db.user.update({ where: { id: rep.id }, data: { passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    const res = await api('POST', `/v1/spaces/${space.id}/transfer-lead`, {
+      token: await tokenFor(rep),
+      body: { userId: other.id, password: 'Secret123!' },
+    });
+    expect(res.status).toBeLessThan(300);
+    expect((await db.space.findUniqueOrThrow({ where: { id: space.id } })).withdrawalPinHash).toBeNull();
+  });
+
+  it('refuses withdrawals until the lead rep sets a security code', async () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 1_000_000);
     await db.space.update({ where: { id: space.id }, data: { withdrawalPinHash: null } });

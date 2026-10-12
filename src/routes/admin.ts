@@ -1,6 +1,5 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import bcrypt from 'bcryptjs';
 import { Prisma, KycStatus, TxnStatus, TxnType, DisputeStatus, DisputeType, PollStatus, type RepApplication, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
@@ -12,6 +11,7 @@ import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFe
 import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
+import { CLEARED_PIN } from '../services/withdrawal.service';
 import { adminKycSummary, listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
@@ -952,66 +952,42 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
       withdrawalPinSet: !!s.withdrawalPinHash,
       withdrawalPinSetAt: s.withdrawalPinSetAt,
       withdrawalPinLocked: !!s.withdrawalPinLockedUntil && s.withdrawalPinLockedUntil > new Date(),
-      withdrawalPinResetRequestedAt: s.withdrawalPinResetRequestedAt,
+      withdrawalPinHoldUntil: s.withdrawalPinHoldUntil && s.withdrawalPinHoldUntil > new Date() ? s.withdrawalPinHoldUntil : null,
     };
   });
   ok(res, rows, 200, buildMeta(page, perPage, total));
 });
 
 // ---------------------------------------------------------------------------
-// PUT /admin/spaces/:spaceId/withdrawal-pin — set or replace the space's
-// 4-digit withdrawal security code. The admin shares it with the lead rep out
-// of band; only a hash is stored and it is never returned. Setting a code also
-// clears any lockout.
+// DELETE /admin/spaces/:spaceId/withdrawal-pin — clear the space's withdrawal
+// security code (e.g. a compromised account). Admins never set or see codes:
+// the lead rep sets a new one themselves, with their password, before the
+// space can withdraw again.
 // ---------------------------------------------------------------------------
-const WEAK_PINS = new Set(['0123', '1234', '2345', '3456', '4567', '5678', '6789', '9876', '8765', '7654', '6543', '5432', '4321', '3210']);
-const withdrawalPinSchema = z
-  .object({
-    pin: z
-      .string()
-      .regex(/^\d{4}$/, 'must be 4 digits')
-      .refine((p) => !/^(\d)\1{3}$/.test(p) && !WEAK_PINS.has(p), 'too easy to guess'),
-  })
-  .strict();
-
-adminRouter.put(
+adminRouter.delete(
   '/spaces/:spaceId/withdrawal-pin',
   requireAdminPermission('payouts'),
-  validate(withdrawalPinSchema),
   async (req: Request, res: Response): Promise<void> => {
     const id = req.params.spaceId as string;
-    const { pin } = req.body as z.infer<typeof withdrawalPinSchema>;
-    const space = await db.space.findUnique({ where: { id }, select: { id: true, name: true, withdrawalPinHash: true, reps: { select: { userId: true } } } });
+    const space = await db.space.findUnique({ where: { id }, select: { name: true, reps: { select: { userId: true } } } });
     if (!space) {
       errors.notFound(res, 'Space not found');
       return;
     }
-    const setAt = new Date();
-    await db.space.update({
-      where: { id },
-      data: {
-        withdrawalPinHash: await bcrypt.hash(pin, env.BCRYPT_ROUNDS),
-        withdrawalPinSetAt: setAt,
-        withdrawalPinFailedAttempts: 0,
-        withdrawalPinLockedUntil: null,
-        withdrawalPinResetRequestedAt: null,
-      },
-    });
-    const replaced = !!space.withdrawalPinHash;
-    await writeAdminAudit(req, replaced ? 'space.withdrawal_pin_reset' : 'space.withdrawal_pin_set', { target: id, severity: 'critical' });
-    // Every rep hears about it, so a code change they didn't ask for is noticed.
+    await db.space.update({ where: { id }, data: CLEARED_PIN });
+    await writeAdminAudit(req, 'space.withdrawal_pin_cleared', { target: id, severity: 'critical' });
     await Promise.all(
       space.reps.map((r) =>
         notify({
           userId: r.userId,
           kind: 'system',
-          title: replaced ? 'Withdrawal security code changed' : 'Withdrawal security code set',
-          detail: `A Duevy admin ${replaced ? 'changed' : 'set'} the withdrawal security code for ${space.name}. If you didn't request this, contact support.`,
+          title: 'Withdrawal security code cleared',
+          detail: `Duevy cleared the withdrawal code for ${space.name}. The lead rep must set a new one on the Payout page before withdrawing.`,
           href: '/dashboard/payout',
         }),
       ),
     );
-    ok(res, { withdrawalPinSet: true, withdrawalPinSetAt: setAt });
+    ok(res, { withdrawalPinSet: false });
   },
 );
 
@@ -1096,6 +1072,9 @@ adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userMana
         if (demoted.length) {
           await tx.spaceRep.updateMany({ where: { spaceId, role: 'lead', userId: { in: demoted } }, data: { role: 'co' } });
         }
+        // A new lead sets their own withdrawal code; the old one dies with the handover.
+        const current = await tx.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } }, select: { role: true } });
+        if (current?.role !== 'lead') await tx.space.update({ where: { id: spaceId }, data: CLEARED_PIN });
       }
       await tx.spaceRep.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: { role }, create: { userId, spaceId, role } });
       await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, kind: 'member' } });

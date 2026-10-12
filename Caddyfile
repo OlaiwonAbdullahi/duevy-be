@@ -1,0 +1,3 @@
+api.duevy.app {
+    reverse_proxy api:3000
+}
