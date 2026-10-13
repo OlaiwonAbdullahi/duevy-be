@@ -38,8 +38,6 @@ const IMAGE = {
   doodle: path.join(ASSETS, 'images/doodle-card.jpg'),
   /** Mark + wordmark in white, for the green header (1488×428). */
   logoWhite: path.join(ASSETS, 'images/duevy-logo-white.png'),
-  /** The gradient "D" mark, for the footer (558×570). */
-  mark: path.join(ASSETS, 'images/duevy-mark.png'),
 };
 
 const COLOR = {
@@ -53,6 +51,8 @@ const COLOR = {
   brandDeep: '#08583f',
   onBrand: '#ffffff',
   onBrandMuted: '#cfe6dc',
+  /** The status dot on the app's payment sheet (emerald-300). */
+  paidDot: '#6ee7b7',
 };
 
 const PAGE_W = 419.53; // A5
@@ -270,17 +270,20 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
     doc.font('regular').fontSize(9).fillColor(COLOR.onBrandMuted).text('Total paid', 0, 62, { width: PAGE_W, align: 'center' });
     doc.font('bold').fontSize(30).fillColor(COLOR.onBrand).text(formatNaira(d.amountPaid), 0, 74, { width: PAGE_W, align: 'center' });
 
-    // PAID pill and the payment time, centred together under the amount.
+    // Status pill styled like the app's payment sheet — a frosted capsule with
+    // a mint dot — and the payment time, centred together under the amount.
     const when = formatPaidAt(d.paidAt);
-    doc.font('bold').fontSize(7.5);
-    const pillW = doc.widthOfString('PAID', { characterSpacing: 0.8 }) + 18;
+    doc.font('semibold').fontSize(8);
+    const labelW = doc.widthOfString('Paid');
+    const pillW = 10 + 4 + 6 + labelW + 10; // pad · dot · gap · label · pad
     doc.font('regular').fontSize(9);
     const whenW = doc.widthOfString(when);
     const rowX = (PAGE_W - (pillW + 8 + whenW)) / 2;
-    const rowY = 116;
-    doc.roundedRect(rowX, rowY, pillW, 17, 8.5).fill(COLOR.onBrand);
-    doc.font('bold').fontSize(7.5).fillColor(COLOR.brand).text('PAID', rowX, rowY + 4.6, { width: pillW, align: 'center', characterSpacing: 0.8 });
-    doc.font('regular').fontSize(9).fillColor(COLOR.onBrandMuted).text(when, rowX + pillW + 8, rowY + 3.8, { lineBreak: false });
+    const rowY = 115;
+    doc.save().roundedRect(rowX, rowY, pillW, 18, 9).fillOpacity(0.15).fill(COLOR.onBrand).restore();
+    doc.circle(rowX + 12, rowY + 9, 2.2).fill(COLOR.paidDot);
+    doc.font('semibold').fontSize(8).fillColor(COLOR.onBrand).text('Paid', rowX + 20, rowY + 4.6, { lineBreak: false });
+    doc.font('regular').fontSize(9).fillColor(COLOR.onBrandMuted).text(when, rowX + pillW + 8, rowY + 4.2, { lineBreak: false });
 
     // ── Ticket card ────────────────────────────────────────────────────────
     doc.roundedRect(CARD_X, CARD_TOP, CARD_W, cardBottom - CARD_TOP, 16).fill('#ffffff');
@@ -288,14 +291,11 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
 
     // ── Footer ─────────────────────────────────────────────────────────────
     const footerY = cardBottom + 20;
-    const markH = 15;
-    const markW = markH * (558 / 570);
-    const thanks = 'Thank you for your payment.';
-    doc.font('semibold').fontSize(9);
-    const thanksW = doc.widthOfString(thanks);
-    const startX = (PAGE_W - (markW + 7 + thanksW)) / 2;
-    tryImage(doc, IMAGE.mark, startX, footerY, { height: markH });
-    doc.fillColor(COLOR.ink).text(thanks, startX + markW + 7, footerY + 3, { lineBreak: false });
+    doc
+      .font('semibold')
+      .fontSize(9)
+      .fillColor(COLOR.ink)
+      .text('Thank you for your payment.', 0, footerY + 3, { width: PAGE_W, align: 'center' });
     doc
       .font('regular')
       .fontSize(7)
