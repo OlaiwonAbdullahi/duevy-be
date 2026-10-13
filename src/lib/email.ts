@@ -133,14 +133,7 @@ export function renderEmail(content: string, tone = BRAND, opts: { preheader?: s
           <!-- Header: Duevy mark on the doodle artwork -->
           <tr>
             <td style="background:${BRAND_DEEP} url('${ASSET_BASE}/doodle-card.jpg') center / cover no-repeat;background-color:${BRAND_DEEP};padding:26px 32px;">
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
-                <tr>
-                  <td style="vertical-align:middle;">
-                    <img src="${ASSET_BASE}/icons/icon-192.png" width="36" height="36" alt="Duevy" style="display:block;width:36px;height:36px;border-radius:10px;border:0;" />
-                  </td>
-                  <td style="vertical-align:middle;padding-left:10px;font-family:${FONT};font-size:20px;font-weight:600;letter-spacing:-0.01em;color:#ffffff;">Duevy.</td>
-                </tr>
-              </table>
+              <img src="${ASSET_BASE}/logos/duevy-logo-white.png" width="111" height="32" alt="Duevy" style="display:block;width:111px;height:32px;border:0;font-family:${FONT};font-size:20px;font-weight:600;color:#ffffff;" />
             </td>
           </tr>
           <!-- Accent strip in the email's tone -->
