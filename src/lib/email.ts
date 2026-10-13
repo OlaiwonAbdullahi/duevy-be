@@ -353,6 +353,42 @@ export async function sendRepApplicationReceivedEmail(
   });
 }
 
+/** Nudges for a rep applicant who hasn't finished verification (stage 1–3). */
+export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 2 | 3): Promise<void> {
+  const link = `${env.FRONTEND_URL}/onboarding`;
+  const first = escapeHtml(name.split(' ')[0]);
+  const copy = {
+    1: {
+      subject: 'Finish setting up your Duevy rep account',
+      heading: 'You\'re almost there',
+      body: `Hi ${first}, thanks for signing up as a rep on Duevy. One step is left: verify your identity so your department can start collecting dues. It takes about three minutes.`,
+    },
+    2: {
+      subject: 'Your department is waiting — finish your Duevy verification',
+      heading: 'Your department can\'t collect dues yet',
+      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your NIN, your student ID card and your bank account.`,
+    },
+    3: {
+      subject: 'Last reminder: complete your Duevy rep verification',
+      heading: 'Last reminder',
+      body: `Hi ${first}, it's been a week since you signed up as a rep and your verification still isn't complete. Finish it now to get your department collecting dues — or reply to this email if something's in the way and we'll help.`,
+    },
+  }[stage];
+
+  const html = renderEmail(
+    `
+    <h1>${copy.heading}</h1>
+    <p>${copy.body}</p>
+    <a href="${link}" class="btn">Complete verification</a>
+    <p class="muted">Already done? You can ignore this email.</p>
+  `,
+    BRAND,
+    { preheader: 'Verify your NIN, student ID and payout account in about three minutes.' },
+  );
+
+  await sendEmail({ to, subject: copy.subject, html });
+}
+
 export async function sendRepApprovedEmail(
   to: string,
   name: string,

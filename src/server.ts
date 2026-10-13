@@ -4,6 +4,7 @@ import { db } from './config/db';
 import { logger } from './lib/logger';
 import { startReconciliationJob } from './jobs/reconciliation';
 import { startWebhookWorker } from './jobs/webhookWorker';
+import { startKycReminderJob } from './jobs/kycReminders';
 import { getPaymentProvider } from './providers/payment';
 
 async function startServer() {
@@ -17,7 +18,7 @@ async function startServer() {
 
     // The webhook queue worker and the reconciliation sweep run in-process by
     // default. Set RUN_WORKERS=false to run them separately (npm run worker).
-    const timers = env.RUN_WORKERS ? [startWebhookWorker(), startReconciliationJob()] : [];
+    const timers = env.RUN_WORKERS ? [startWebhookWorker(), startReconciliationJob(), startKycReminderJob()] : [];
 
     const shutdown = async () => {
       logger.info('shutting down');

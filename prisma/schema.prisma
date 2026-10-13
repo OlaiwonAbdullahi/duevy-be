@@ -365,6 +365,10 @@ model User {
   // document), refreshed on every identity event, so the rep can be told.
   kycRequirementsDue      String[]              @default([])
   governmentIdSubmittedAt DateTime? // an ID document forwarded to Bachs on request
+  // "Finish your verification" emails to rep applicants who stall on KYC:
+  // 1 = 24h, 2 = 3 days, 3 = 7 days after sign-up (src/jobs/kycReminders.ts).
+  kycReminderStage        Int                   @default(0)
+  kycReminderSentAt       DateTime?
   // The rep's own bank account, sent to Bachs as their account's
   // payout_destination during onboarding. Only the masked number is kept.
   payoutDestinationBankCode      String?
