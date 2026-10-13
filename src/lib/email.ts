@@ -43,6 +43,7 @@ const INK = '#1b2520';
 const INK_SOFT = '#7a847f';
 const PAPER = '#f4f2ec';
 const LINE = '#e6f2ec';
+const BRAND_SOFT = '#eef6f2';
 const FONT = "'Manrope', 'Helvetica Neue', Helvetica, Arial, sans-serif";
 
 /**
@@ -211,74 +212,133 @@ export async function sendPasswordResetEmail(
   });
 }
 
-export async function sendDuePaymentReceiptEmail(
-  to: string,
-  name: string,
-  input: {
-    spaceName: string;
-    reference: string;
-    /** Null only if the receipt row couldn't be read; the email still goes out. */
-    receiptNumber: string | null;
-    /** Every due settled by this payment, at its face amount. */
-    items: { title: string; amountKobo: number }[];
-    faceKobo: number;
-    feeKobo: number;
-    /** What the student actually sent. */
-    amountPaidKobo: number;
-    paidAt: Date;
-  },
-): Promise<void> {
-  const naira = (kobo: number) =>
-    `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  const amount = naira(input.amountPaidKobo);
+export type DuePaymentReceipt = {
+  spaceName: string;
+  reference: string;
+  /** Null only if the receipt row couldn't be read; the email still goes out. */
+  receiptNumber: string | null;
+  /** Every due settled by this payment, at its face amount. */
+  items: { title: string; amountKobo: number }[];
+  faceKobo: number;
+  feeKobo: number;
+  /** What the student actually sent. */
+  amountPaidKobo: number;
+  paidAt: Date;
+};
+
+const nairaExact = (kobo: number) =>
+  `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** One receipt card: the dues paid, then dues total, fee and the total paid. */
+function emailReceiptCard(input: DuePaymentReceipt, amountPaid: string): string {
+  const single = input.items.length === 1;
+  const cell = `font-family:${FONT};font-size:14px;line-height:1.45;color:${INK};`;
+  const items = input.items
+    .map(
+      (item, i) => `
+      <tr>
+        <td style="${cell}padding:12px 0;${i ? `border-top:1px solid ${LINE};` : ''}">${escapeHtml(item.title)}</td>
+        <td align="right" style="${cell}padding:12px 0 12px 16px;${i ? `border-top:1px solid ${LINE};` : ''}font-weight:600;white-space:nowrap;vertical-align:top;">${nairaExact(item.amountKobo)}</td>
+      </tr>`,
+    )
+    .join('');
+  const total = (label: string, value: string) => `
+      <tr>
+        <td style="padding:4px 0;font-family:${FONT};font-size:13px;color:${INK_SOFT};">${label}</td>
+        <td align="right" style="padding:4px 0;font-family:${FONT};font-size:13px;font-weight:600;color:${INK};white-space:nowrap;">${value}</td>
+      </tr>`;
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${LINE};border-radius:16px;margin:0 0 20px;border-collapse:separate;">
+      <tr>
+        <td style="padding:14px 18px;background:${PAPER};border-radius:16px 16px 0 0;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td style="font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:${INK_SOFT};">${single ? 'Due paid' : `Dues paid (${input.items.length})`}</td>
+              <td align="right" style="font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:${INK_SOFT};">Amount</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:2px 18px 6px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${items}</table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:12px 18px 6px;border-top:1px solid ${LINE};">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            ${total(single ? 'Due amount' : 'Dues total', nairaExact(input.faceKobo))}
+            ${total('Service fee', nairaExact(input.feeKobo))}
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:6px 10px 10px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND_SOFT};border-radius:12px;">
+            <tr>
+              <td style="padding:12px 8px 12px 12px;font-family:${FONT};font-size:14px;font-weight:700;color:${INK};">Total paid</td>
+              <td align="right" style="padding:12px 12px 12px 8px;font-family:${FONT};font-size:17px;font-weight:700;color:${BRAND};white-space:nowrap;">${amountPaid}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>`;
+}
+
+/** Subject, HTML and text for a dues payment receipt — one due or a basket of many. */
+export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentReceipt) {
+  const amount = nairaExact(input.amountPaidKobo);
   // The app's payment page shows the full receipt and its PDF download (behind sign-in).
   const receiptLink = `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(input.reference)}`;
   const paidAt = input.paidAt.toLocaleString('en-NG', {
-    day: '2-digit',
+    day: 'numeric',
     month: 'short',
     year: 'numeric',
-    hour: '2-digit',
+    hour: 'numeric',
     minute: '2-digit',
+    hour12: true,
     timeZone: 'Africa/Lagos',
   });
   const single = input.items.length === 1;
   const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
   const spaceName = escapeHtml(input.spaceName);
+  const intro = single
+    ? `your payment for <strong>${escapeHtml(summary)}</strong>${spaceName ? ` to ${spaceName}` : ''} went through.`
+    : `your payment for <strong>${input.items.length} dues</strong>${spaceName ? ` to ${spaceName}` : ''} went through — every one of them is now marked paid.`;
+
   const html = renderEmail(
     `
     <h1>Payment confirmed</h1>
-    <p>Hi ${escapeHtml(name)}, your payment for <strong>${escapeHtml(summary)}</strong>${spaceName ? ` in ${spaceName}` : ''} went through. Here's your receipt.</p>
-    ${emailHero('Amount paid', amount, spaceName || undefined)}
-    <div style="margin:0 0 8px;font-family:${FONT};font-size:12px;font-weight:600;color:${INK_SOFT};">${single ? 'Due paid' : 'Dues paid'}</div>
-    ${emailDetails(input.items.map((i) => [escapeHtml(i.title), naira(i.amountKobo)]))}
+    <p>Hi ${escapeHtml(name)}, ${intro} Here's your receipt.</p>
+    ${emailHero('Total paid', amount, `<span style="display:inline-block;background:#ffffff;color:${BRAND};border-radius:9999px;padding:2px 10px;font-size:11px;font-weight:700;letter-spacing:0.06em;margin-right:8px;">PAID</span>${paidAt}`)}
+    ${emailReceiptCard(input, amount)}
     ${emailDetails([
-      [single ? 'Due amount' : 'Dues total', naira(input.faceKobo)],
-      ['Service fee', naira(input.feeKobo)],
-      ['Total paid', amount],
       ...(input.receiptNumber ? ([['Receipt no.', escapeHtml(input.receiptNumber)]] as [string, string][]) : []),
+      ...(spaceName ? ([['Paid to', spaceName]] as [string, string][]) : []),
+      ['Paid by', escapeHtml(name)],
+      ['Method', 'Bank transfer'],
       ['Reference', escapeHtml(input.reference)],
-      ['Date', paidAt],
-      ['Status', 'Paid'],
     ])}
     <a href="${receiptLink}" class="btn">View receipt</a>
-    <p class="muted">Keep this email as proof of payment. Questions? Reply here or reach us at support@duevy.app</p>
+    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the service fee is 2% + ₦20 per payment. Questions? Reply here or reach us at support@duevy.app</p>
   `,
     undefined,
     { preheader: `${amount} paid for ${summary} — your receipt is inside.` },
   );
 
-  const lines = input.items.map((i) => `- ${i.title}: ${naira(i.amountKobo)}`).join('\n');
-  await sendEmail({
-    to,
-    subject: `Payment confirmed — ${summary}`,
-    html,
-    text:
-      `Hi ${name},\n\nYour payment of ${amount}${input.spaceName ? ` to ${input.spaceName}` : ''} is confirmed.\n\n` +
-      `${single ? 'Due paid' : 'Dues paid'}:\n${lines}\n\n` +
-      `${single ? 'Due amount' : 'Dues total'}: ${naira(input.faceKobo)}\nService fee: ${naira(input.feeKobo)}\nTotal paid: ${amount}\n` +
-      `${input.receiptNumber ? `Receipt no.: ${input.receiptNumber}\n` : ''}Reference: ${input.reference}\nDate: ${paidAt}\n\n` +
-      `View your receipt: ${receiptLink}`,
-  });
+  const lines = input.items.map((i) => `- ${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
+  const text =
+    `Hi ${name},\n\nYour payment of ${amount}${input.spaceName ? ` to ${input.spaceName}` : ''} is confirmed.\n\n` +
+    `${single ? 'Due paid' : `Dues paid (${input.items.length})`}:\n${lines}\n\n` +
+    `${single ? 'Due amount' : 'Dues total'}: ${nairaExact(input.faceKobo)}\nService fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
+    `${input.receiptNumber ? `Receipt no.: ${input.receiptNumber}\n` : ''}Reference: ${input.reference}\nMethod: Bank transfer\nDate: ${paidAt}\n\n` +
+    `View your receipt: ${receiptLink}`;
+
+  return { subject: `Payment confirmed — ${summary}`, html, text };
+}
+
+export async function sendDuePaymentReceiptEmail(to: string, name: string, input: DuePaymentReceipt): Promise<void> {
+  await sendEmail({ to, ...buildDuePaymentReceiptEmail(name, input) });
 }
 
 export async function sendRepApplicationReceivedEmail(
