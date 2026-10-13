@@ -300,7 +300,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
       .font('regular')
       .fontSize(7)
       .fillColor(COLOR.faint)
-      .text('Computer-generated receipt — no signature needed · duevy.app · support@duevy.app', 0, footerY + 26, {
+      .text('duevy.app · support@duevy.app', 0, footerY + 26, {
         width: PAGE_W,
         align: 'center',
       });
