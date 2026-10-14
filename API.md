@@ -102,10 +102,11 @@ All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the s
 
 ### `POST /dues`
 
-- Body: `{ "title", "note"?, "amount": 500000, "dueDate": "YYYY-MM-DD", "type": "departmental_due", "publish"?: false }`.
+- Body: `{ "title", "note"?, "amount": 500000, "dueDate": "YYYY-MM-DD", "type": "departmental_due", "publish"?: false, "assignedRepId"?: "…" }`.
+- `assignedRepId` gives the due to a co-rep, who can then withdraw its collections. Only the lead can set it, and only to a co-rep of the space (`403` for a co-rep, `400 VALIDATION_ERROR` for anyone else). Left out, the due is assigned to whoever creates it. The co-rep is notified.
 - `201`: `RepDue`.
 
-`RepDue = { id, spaceId, title, note, amount, dueDate, type, category, status: "draft"|"active"|"closed", paidCount, memberCount, publishedAt, closedAt, createdAt }`
+`RepDue = { id, spaceId, title, note, amount, dueDate, type, category, status: "draft"|"active"|"closed", paidCount, memberCount, assignedRepId, publishedAt, closedAt, createdAt }`
 
 ### Other due endpoints
 

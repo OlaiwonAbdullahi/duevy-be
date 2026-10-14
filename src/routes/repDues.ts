@@ -132,12 +132,35 @@ const createDueSchema = z.object({
   }, 'must be today or later'),
   category: categoryField,
   publish: z.boolean().default(false),
+  // Lead only: the co-rep who can withdraw this due's collections. Defaults to the creator.
+  assignedRepId: z.string().min(1).optional(),
 });
 
 repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const data = req.body as z.infer<typeof createDueSchema>;
   const publishing = data.publish;
+
+  // Assigning to someone else is the lead's call, and only to a co-rep.
+  const me = uid(req);
+  const assignee = data.assignedRepId ?? me;
+  let assigneeName: string | null = null;
+  if (assignee !== me) {
+    if ((req as AuthenticatedRequest).spaceRep?.role !== 'lead') {
+      errors.forbidden(res, 'Only the lead rep can assign a due to someone else');
+      return;
+    }
+    const target = await db.spaceRep.findUnique({
+      where: { userId_spaceId: { userId: assignee, spaceId: sid } },
+      include: { user: { select: { name: true } } },
+    });
+    if (!target || target.role !== 'co') {
+      errors.validation(res, [{ field: 'assignedRepId', issue: 'must be an existing co-rep of this space' }]);
+      return;
+    }
+    assigneeName = target.user.name;
+  }
+
   if (publishing && !(await assertCanCollect(sid, res))) return;
 
   const due = await db.$transaction(async (tx) => {
@@ -152,14 +175,27 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         category: data.category,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
-        assignedRepId: uid(req),
+        assignedRepId: assignee,
       },
     });
     if (publishing) {
       await writeAudit(sid, await actor(req),'due_published', `Published due "${created.title}"`, tx);
     }
+    if (assigneeName) {
+      await writeAudit(sid, await actor(req), 'due_reassigned', `Assigned due "${created.title}" to ${assigneeName}`, tx);
+    }
     return created;
   });
+
+  if (assigneeName) {
+    await notify({
+      userId: assignee,
+      kind: 'system',
+      title: 'A due was assigned to you',
+      detail: `"${due.title}" is assigned to you — you can withdraw its collected funds.`,
+      href: '/dashboard/dues',
+    });
+  }
 
   ok(res, await repDuePayload(sid, due), 201);
 });

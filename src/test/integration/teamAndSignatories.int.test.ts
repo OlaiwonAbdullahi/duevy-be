@@ -92,6 +92,27 @@ describe('team management', () => {
     expect(asCo.status).toBe(403);
   });
 
+  it('the lead can assign a new due to a co-rep; a co-rep can only take it themselves', async () => {
+    const t = await team();
+    const body = (extra: Record<string, unknown>) => ({
+      title: 'Lab coat fee',
+      amount: 500_000,
+      dueDate: new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10),
+      category: 'departmental_due',
+      ...extra,
+    });
+    const created = await api('POST', `${t.base}/dues`, { token: t.leadToken, body: body({ assignedRepId: t.bola.id }) });
+    expect(created.status).toBe(201);
+    expect(created.body.data.assignedRepId).toBe(t.bola.id);
+
+    const outsider = await member(t.space.id, 'Dayo');
+    expect((await api('POST', `${t.base}/dues`, { token: t.leadToken, body: body({ assignedRepId: outsider.id }) })).status).toBe(400);
+    const bolaToken = await tokenFor(t.bola);
+    expect((await api('POST', `${t.base}/dues`, { token: bolaToken, body: body({ assignedRepId: t.chidi.id }) })).status).toBe(403);
+    const own = await api('POST', `${t.base}/dues`, { token: bolaToken, body: body({}) });
+    expect(own.body.data.assignedRepId).toBe(t.bola.id);
+  });
+
   it('a co-rep withdraws only from a due assigned to them, capped at what it collected, out of the lead account', async () => {
     const t = await team();
     const [due] = t.dues;
