@@ -24,15 +24,18 @@ import {
   resubmitStudentIdHandlers,
   submitKycHandlers,
 } from './kycHandlers';
-import { getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
+import { getDueBalances, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { quoteWithdrawal, requestWithdrawal, setWithdrawalPinByRep, type PinChange } from '../services/withdrawal.service';
 import { sendEmail, renderEmail } from '../lib/email';
 import { escapeHtml } from '../lib/html';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
+import { listSignatories, REQUIRED_SIGNATORIES, setSignatories, setWithdrawalAuthMode } from '../services/signatory.service';
+import { announceForApproval, approvePayout, getApprovalState, rejectPayout, sendApprovalOtp } from '../services/withdrawalApproval.service';
 
-// Mounted at /spaces/:spaceId; every route is rep-gated.
+// Mounted at /spaces/:spaceId; every route is rep-gated. Withdrawals are open
+// to co-reps for the dues assigned to them; settings stay lead-only.
 export const payoutsRouter = Router({ mergeParams: true });
 payoutsRouter.use(requireSpaceRep());
 
@@ -49,14 +52,16 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, beneficiaryCount, pin] = await Promise.all([
+  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval] = await Promise.all([
     getSpaceLedgerSummary(sid),
     getSpaceKycState(sid),
     db.payoutBeneficiary.count({ where: { spaceId: sid } }),
     db.space.findUnique({
       where: { id: sid },
-      select: { withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinHoldUntil: true },
+      select: { withdrawalAuthMode: true, withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinHoldUntil: true },
     }),
+    listSignatories(sid),
+    db.payout.findFirst({ where: { spaceId: sid, status: 'awaiting_approval' }, select: { id: true } }),
   ]);
   ok(res, {
     available: ledger.balance,
@@ -73,12 +78,35 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     withdrawalPinSet: !!pin?.withdrawalPinHash,
     withdrawalPinLockedUntil: pin?.withdrawalPinLockedUntil && pin.withdrawalPinLockedUntil > new Date() ? pin.withdrawalPinLockedUntil : null,
     withdrawalPinHoldUntil: pin?.withdrawalPinHoldUntil && pin.withdrawalPinHoldUntil > new Date() ? pin.withdrawalPinHoldUntil : null,
+    // `pin`: the security code above; `multisig`: 2 of the 3 signatories approve with emailed codes.
+    withdrawalAuthMode: pin?.withdrawalAuthMode ?? 'pin',
+    signatories,
+    signatoriesComplete: signatories.length >= REQUIRED_SIGNATORIES,
+    awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
     fees: {
       below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_LOW_KOBO },
       atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_HIGH_KOBO },
     },
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /payout/dues — the dues the caller can withdraw from, each with what is
+// left of its collections: every due for the lead, assigned ones for a co-rep.
+// ---------------------------------------------------------------------------
+payoutsRouter.get('/payout/dues', async (req: Request, res: Response): Promise<void> => {
+  const rep = (req as AuthenticatedRequest).spaceRep!;
+  const dues = await db.due.findMany({
+    where: { spaceId: spaceId(req), ...(rep.role === 'lead' ? {} : { assignedRepId: uid(req) }) },
+    select: { id: true, title: true, category: true, status: true, assignedRepId: true },
+    orderBy: { createdAt: 'desc' },
+  });
+  const balances = await getDueBalances(dues.map((d) => d.id));
+  ok(
+    res,
+    dues.map((d) => ({ id: d.id, title: d.title, type: d.category, status: d.status, assignedRepId: d.assignedRepId, available: Math.max(0, balances.get(d.id) ?? 0) })),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -253,7 +281,10 @@ payoutsRouter.get('/payout/quote', async (req: Request, res: Response): Promise<
 });
 
 // ---------------------------------------------------------------------------
-// POST /payout/request — lead rep only. Idempotency-Key required.
+// POST /payout/request — Idempotency-Key required. The lead can withdraw from
+// the whole space or one due; a co-rep only from a due assigned to them
+// (`dueId`). In `pin` mode it needs the security code and goes straight to the
+// bank; in `multisig` mode it waits as `awaiting_approval` for 2 signatures.
 // ---------------------------------------------------------------------------
 // Either a saved beneficiary, or a one-off account (bankCode + accountNumber)
 // that is name-checked but not saved.
@@ -264,8 +295,9 @@ const requestSchema = z
     bankCode: accountSchema.shape.bankCode.optional(),
     accountNumber: accountSchema.shape.accountNumber.optional(),
     note: z.string().max(300).optional(),
-    // The space's withdrawal security code, set by a Duevy admin.
-    pin: z.string().regex(/^\d{4}$/, 'must be 4 digits'),
+    dueId: z.string().min(1).optional(),
+    // The space's withdrawal security code, set by the lead rep. `pin` mode only.
+    pin: z.string().regex(/^\d{4}$/, 'must be 4 digits').optional(),
   })
   .strict()
   .refine((b) => (b.beneficiaryId ? !b.bankCode && !b.accountNumber : !!b.bankCode && !!b.accountNumber), {
@@ -275,25 +307,82 @@ const requestSchema = z
 
 payoutsRouter.post(
   '/payout/request',
-  requireSpaceRep(true),
   sensitiveLimiter,
   requireIdempotencyKey,
   idempotent,
   validate(requestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { amount, beneficiaryId, bankCode, accountNumber, note, pin } = req.body as z.infer<typeof requestSchema>;
+    const { amount, beneficiaryId, bankCode, accountNumber, note, pin, dueId } = req.body as z.infer<typeof requestSchema>;
     const payout = await requestWithdrawal({
       spaceId: spaceId(req),
       userId: uid(req),
       amountKobo: amount,
+      dueId,
       beneficiaryId,
       account: bankCode && accountNumber ? { bankCode, accountNumber } : undefined,
       note,
       pin,
     });
-    ok(res, serializePayout(payout), 201);
+    if (payout.status !== 'awaiting_approval') {
+      ok(res, serializePayout(payout), 201);
+      return;
+    }
+    const { otpSentToRequester } = await announceForApproval(payout, uid(req));
+    ok(res, { ...serializePayout(payout), approval: { ...(await getApprovalState(payout)), otpSentToRequester } }, 201);
   },
 );
+
+// ---------------------------------------------------------------------------
+// Signing a multisig withdrawal.
+// POST /payout/{payoutId}/otp — email me a 6-digit code for it (signatories).
+// POST /payout/{payoutId}/approve — { otp }; the second approval sends it.
+// POST /payout/{payoutId}/reject — { reason? }; a signatory rejects it, or
+// its requester withdraws it. Either way the balance is restored.
+// ---------------------------------------------------------------------------
+const approveSchema = z.object({ otp: z.string().regex(/^\d{6}$/, 'must be 6 digits') }).strict();
+const rejectSchema = z.object({ reason: z.string().trim().max(200).optional() }).strict();
+
+payoutsRouter.post('/payout/:payoutId/otp', sensitiveLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { expiresAt } = await sendApprovalOtp(req.params.payoutId as string, spaceId(req), uid(req));
+  ok(res, { sent: true, expiresAt });
+});
+
+payoutsRouter.post('/payout/:payoutId/approve', sensitiveLimiter, validate(approveSchema), async (req: Request, res: Response): Promise<void> => {
+  const { otp } = req.body as z.infer<typeof approveSchema>;
+  const { payout } = await approvePayout(req.params.payoutId as string, spaceId(req), uid(req), otp);
+  ok(res, { ...serializePayout(payout), approval: await getApprovalState(payout) });
+});
+
+payoutsRouter.post('/payout/:payoutId/reject', sensitiveLimiter, validate(rejectSchema), async (req: Request, res: Response): Promise<void> => {
+  const { reason } = req.body as z.infer<typeof rejectSchema>;
+  const payout = await rejectPayout(req.params.payoutId as string, spaceId(req), uid(req), reason);
+  ok(res, serializePayout(payout));
+});
+
+// ---------------------------------------------------------------------------
+// Withdrawal security settings (lead rep, password required).
+// PUT /payout/signatories — { userIds: [coRepId, coRepId], password }: the two
+// co-reps who sign withdrawals with the lead.
+// PUT /payout/security — { mode: 'pin' | 'multisig', password }: how
+// withdrawals are authorised. Turning multisig on needs 3 signatories.
+// While multisig is on, a signatory change holds withdrawals for 24 hours;
+// so does switching back to the security code.
+// ---------------------------------------------------------------------------
+const signatoriesSchema = z.object({ userIds: z.array(z.string().min(1)).max(2), password: z.string().min(1).max(1024) }).strict();
+const securitySchema = z.object({ mode: z.enum(['pin', 'multisig']), password: z.string().min(1).max(1024) }).strict();
+
+payoutsRouter.put('/payout/signatories', requireSpaceRep(true), sensitiveLimiter, validate(signatoriesSchema), async (req: Request, res: Response): Promise<void> => {
+  const { userIds, password } = req.body as z.infer<typeof signatoriesSchema>;
+  const { holdUntil } = await setSignatories({ spaceId: spaceId(req), userId: uid(req), signatoryIds: userIds, password });
+  const signatories = await listSignatories(spaceId(req));
+  ok(res, { signatories, signatoriesComplete: signatories.length >= REQUIRED_SIGNATORIES, withdrawalPinHoldUntil: holdUntil });
+});
+
+payoutsRouter.put('/payout/security', requireSpaceRep(true), sensitiveLimiter, validate(securitySchema), async (req: Request, res: Response): Promise<void> => {
+  const { mode, password } = req.body as z.infer<typeof securitySchema>;
+  const result = await setWithdrawalAuthMode({ spaceId: spaceId(req), userId: uid(req), mode, password });
+  ok(res, { withdrawalAuthMode: result.mode, changed: result.changed, withdrawalPinHoldUntil: result.holdUntil });
+});
 
 // ---------------------------------------------------------------------------
 // PUT /payout/pin — the lead rep sets (or changes) the space's 4-digit
@@ -383,5 +472,8 @@ payoutsRouter.get('/payout/:payoutId', async (req: Request, res: Response): Prom
     errors.notFound(res, 'Payout not found');
     return;
   }
-  ok(res, serializePayout(payout));
+  const approval = payout.status === 'awaiting_approval' || (await db.payoutApproval.count({ where: { payoutId: payout.id } })) > 0
+    ? await getApprovalState(payout)
+    : null;
+  ok(res, { ...serializePayout(payout), approval });
 });

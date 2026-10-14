@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
-import { CLEARED_PIN } from '../services/withdrawal.service';
+import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep } from '../middleware/requireRole';
@@ -13,7 +13,9 @@ import { serializeSpace, serializeStudent, serializeAuditLog } from '../lib/seri
 import { writeAudit } from '../lib/audit';
 import { notify } from '../lib/notifications';
 import { generateJoinCode } from '../lib/joincode';
+import { generateReferralCode } from '../lib/referral';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../services/ledger.service';
+import { PAYOUT_ACTIVE } from '../lib/stateMachine';
 
 // Mounted at /spaces/:spaceId — mergeParams exposes spaceId to these handlers.
 export const circleRouter = Router({ mergeParams: true });
@@ -127,19 +129,88 @@ circleRouter.post('/join-code/regenerate', requireSpaceRep(), async (req: Reques
 });
 
 // ---------------------------------------------------------------------------
-// GET /reps — list reps (§5.5)
+// GET /reps — list reps (§5.5), with who signs withdrawals and how many dues
+// each is assigned.
 // ---------------------------------------------------------------------------
 circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
-  const reps = await db.spaceRep.findMany({
-    where: { spaceId: spaceId(req) },
-    include: { user: { select: { id: true, name: true, email: true } } },
-    orderBy: [{ role: 'asc' }, { addedAt: 'asc' }],
-  });
+  const sid = spaceId(req);
+  const [reps, assigned] = await Promise.all([
+    db.spaceRep.findMany({
+      where: { spaceId: sid },
+      include: { user: { select: { id: true, name: true, email: true, kycStatus: true } } },
+      orderBy: [{ role: 'asc' }, { addedAt: 'asc' }],
+    }),
+    db.due.groupBy({ by: ['assignedRepId'], where: { spaceId: sid, assignedRepId: { not: null } }, _count: { _all: true } }),
+  ]);
+  const duesByRep = new Map(assigned.map((a) => [a.assignedRepId, a._count._all]));
 
   ok(
     res,
-    reps.map((r) => ({ id: r.user.id, name: r.user.name, email: r.user.email, role: r.role })),
+    reps.map((r) => ({
+      id: r.user.id,
+      name: r.user.name,
+      email: r.user.email,
+      role: r.role,
+      isSignatory: r.role === 'lead' || r.isSignatory,
+      kycVerified: r.user.kycStatus === 'verified',
+      assignedDues: duesByRep.get(r.userId) ?? 0,
+      addedAt: r.addedAt.toISOString(),
+    })),
   );
+});
+
+// ---------------------------------------------------------------------------
+// POST /reps — the lead adds a member of the space as a co-rep. A co-rep can
+// manage dues and withdraw from the dues the lead assigns them
+// (POST /dues/{dueId}/reassign); the lead can also nominate them as a
+// withdrawal signatory (PUT /payout/signatories).
+// ---------------------------------------------------------------------------
+const addRepSchema = z.object({ userId: z.string().min(1) }).strict();
+
+circleRouter.post('/reps', requireSpaceRep(true), validate(addRepSchema), async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const { userId: targetId } = req.body as z.infer<typeof addRepSchema>;
+
+  const [membership, existing, target] = await Promise.all([
+    db.spaceMembership.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
+    db.spaceRep.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
+    db.user.findUnique({ where: { id: targetId }, select: { id: true, name: true, email: true, role: true, referralCode: true, isSuspended: true, isDeactivated: true } }),
+  ]);
+  if (!target || !membership) {
+    errors.notFound(res, 'That user is not a member of this space');
+    return;
+  }
+  if (existing) {
+    errors.conflict(res, 'ALREADY_REP', 'That user is already a rep of this space');
+    return;
+  }
+  if (target.isSuspended || target.isDeactivated) {
+    errors.conflict(res, 'USER_INACTIVE', 'Suspended or deactivated users cannot be added as reps');
+    return;
+  }
+
+  const referralCode = target.referralCode ?? (await generateReferralCode(target.name));
+  const me = await actor(req);
+  const created = await db.$transaction(async (tx) => {
+    const r = await tx.spaceRep.create({ data: { userId: targetId, spaceId: sid, role: 'co' } });
+    // Attaching a rep promotes the account, as an admin assignment does.
+    await tx.user.update({
+      where: { id: targetId },
+      data: { role: target.role === 'admin' ? 'admin' : 'rep', isRep: true, repApplicationStatus: 'approved', referralCode },
+    });
+    await writeAudit(sid, me, 'rep_invited', `Added ${target.name} as a co-rep`, tx);
+    return r;
+  });
+
+  await notify({
+    userId: targetId,
+    kind: 'system',
+    title: 'You are now a co-rep',
+    detail: `${me.name} added you as a co-rep. You can now help manage dues for this space.`,
+    href: '/dashboard',
+  });
+
+  ok(res, { id: target.id, name: target.name, email: target.email, role: created.role, isSignatory: false, addedAt: created.addedAt.toISOString() }, 201);
 });
 
 // ---------------------------------------------------------------------------
@@ -166,6 +237,8 @@ circleRouter.delete('/reps/:userId', requireSpaceRep(true), async (req: Request,
   const target = await db.user.findUnique({ where: { id: targetId }, select: { name: true } });
   await db.$transaction(async (tx) => {
     await tx.spaceRep.delete({ where: { id: rep.id } });
+    // Their due assignments end with the role; the lead can reassign them.
+    await tx.due.updateMany({ where: { spaceId: sid, assignedRepId: targetId }, data: { assignedRepId: null } });
     await writeAudit(sid, await actor(req),'rep_removed', `Removed ${target?.name ?? 'a rep'} as a rep`, tx);
   });
 
@@ -303,12 +376,17 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
   }
 
   await db.$transaction(async (tx) => {
-    await tx.spaceRep.update({ where: { id: targetRep.id }, data: { role: 'lead' } });
-    if (callerRep) await tx.spaceRep.update({ where: { id: callerRep.id }, data: { role: 'co' } });
+    // The old lead takes the new lead's signatory seat (if they had one), so a
+    // multisig space keeps its three signatories through the handover.
+    await tx.spaceRep.update({ where: { id: targetRep.id }, data: { role: 'lead', isSignatory: false } });
+    if (callerRep) await tx.spaceRep.update({ where: { id: callerRep.id }, data: { role: 'co', isSignatory: targetRep.isSignatory } });
     // The new lead sets their own withdrawal code; the old one stops working.
     await tx.space.update({ where: { id: sid }, data: CLEARED_PIN });
     await writeAudit(sid, { id: callerId, name: caller.name, role: 'lead' }, 'lead_transferred', `Transferred lead to ${target?.name ?? 'a rep'}`, tx);
   });
+  // A withdrawal still waiting for signatures would pay out of the old lead's account.
+  const waiting = await db.payout.findMany({ where: { spaceId: sid, status: 'awaiting_approval' }, select: { id: true } });
+  for (const p of waiting) await cancelPayout(p.id, 'the lead rep changed');
 
   await Promise.all([
     notify({ userId: targetId, kind: 'system', title: 'You are now the lead rep', detail: `${caller.name} transferred lead to you.`, href: '/dashboard/manage' }),
@@ -344,7 +422,7 @@ circleRouter.post('/archive', requireSpaceRep(true), validate(archiveSchema), as
     return;
   }
 
-  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: { in: ['pending', 'processing'] } } });
+  const pendingPayout = await db.payout.count({ where: { spaceId: sid, status: { in: [...PAYOUT_ACTIVE] } } });
   if (pendingPayout > 0) {
     errors.conflict(res, 'PENDING_PAYOUT', 'Wait for pending/processing payouts to settle before archiving');
     return;

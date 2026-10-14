@@ -1,4 +1,4 @@
-import { Prisma, type Payout, type Space } from '@prisma/client';
+import { Prisma, type Payout, type RepRole, type Space } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
@@ -8,22 +8,30 @@ import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
-import { appendLedgerEntry, getSpaceBalance, lockSpace } from './ledger.service';
+import { appendLedgerEntry, getDueBalance, getSpaceBalance, lockSpace } from './ledger.service';
 import { canWithdraw } from './kyc.service';
 import { destinationFor, oneOffDestination } from './beneficiary.service';
+import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
- * beneficiaries — any bank account the space has added.
+ * beneficiaries — any bank account the space has added. A co-rep can withdraw
+ * a due's collections when the lead has assigned that due to them. Either way
+ * the money leaves the LEAD rep's provider account, where collections settle.
  *
  *   gross = what the rep asks for, debited from the space's ledger
  *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross
  *   net   = gross − fee, sent to the bank
  *
  * Safety, in order:
- *  0. The 4-digit security code the lead rep set for the space must be quoted
- *     (5 wrong attempts lock it for 30 minutes; a forgotten-code reset holds
- *     withdrawals for 24 hours).
+ *  0. The space's authorisation, by its withdrawalAuthMode:
+ *     - pin: the 4-digit security code the lead rep set must be quoted (5
+ *       wrong attempts lock it for 30 minutes).
+ *     - multisig: the withdrawal is created `awaiting_approval` and only sent
+ *       once 2 of the 3 signatories approve it with emailed one-time codes
+ *       (withdrawalApproval.service). Its funds are reserved meanwhile.
+ *     A security change (forgotten-code reset, signatory change, multisig
+ *     switched off) holds withdrawals for 24 hours.
  *  1. Idempotency-Key on the route (a retried request replays).
  *  2. A transaction-scoped advisory lock per space: the balance check and the
  *     ledger debit happen atomically, so two requests can't both spend it.
@@ -33,7 +41,8 @@ import { destinationFor, oneOffDestination } from './beneficiary.service';
  *     reversal credits the full gross back (payout_reversal).
  *  5. The provider call uses our reference as its idempotency key.
  *
- * Status: pending → processing → success | failed | reversed.
+ * Status: [awaiting_approval →] pending → processing → success | failed | reversed;
+ *         awaiting_approval → cancelled.
  */
 
 type Tx = Prisma.TransactionClient;
@@ -48,13 +57,19 @@ export interface WithdrawalRequest {
   spaceId: string;
   userId: string;
   amountKobo: number;
+  /** Draw on one due's collections. Required for a co-rep (the due must be
+   *  assigned to them); the lead omits it to draw on the whole space. */
+  dueId?: string;
   /** Where it goes: a saved beneficiary, or a one-off account that isn't saved. */
   beneficiaryId?: string;
   account?: { bankCode: string; accountNumber: string };
   note?: string;
-  /** The space's 4-digit withdrawal security code (set by its lead rep). */
-  pin: string;
+  /** The space's 4-digit withdrawal security code (set by its lead rep). `pin` mode only. */
+  pin?: string;
 }
+
+/** How long a multisig withdrawal waits for its signatures before it is cancelled. */
+export const APPROVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const PIN_MAX_ATTEMPTS = 5;
 const PIN_LOCK_MS = 30 * 60 * 1000;
@@ -112,14 +127,38 @@ async function checkPin(space: Space, pin: string): Promise<void> {
   ]);
 }
 
-/** A withdrawal needs the right code and no reset hold in force. */
-async function verifyWithdrawalPin(space: Space, pin: string): Promise<void> {
+/** No hold in force, then whatever the space's mode needs up front: the right
+ *  code (pin), or a full set of signatories to approve it later (multisig). */
+async function verifyAuthorisation(space: Space, pin: string | undefined): Promise<void> {
   if (space.withdrawalPinHoldUntil && space.withdrawalPinHoldUntil > new Date()) {
-    throw new AppError(423, 'WITHDRAWAL_PIN_HOLD', 'Your security code was reset recently. Withdrawals reopen 24 hours after a reset.', [
+    throw new AppError(423, 'WITHDRAWAL_PIN_HOLD', 'Withdrawal security changed recently. Withdrawals reopen 24 hours after the change.', [
       { field: 'pin', issue: `available from ${space.withdrawalPinHoldUntil.toISOString()}` },
     ]);
   }
+  if (space.withdrawalAuthMode === 'multisig') {
+    if ((await getSignatoryIds(space.id)).length < REQUIRED_SIGNATORIES) {
+      throw new AppError(409, 'SIGNATORIES_INCOMPLETE', 'This space needs 3 signatories to withdraw. The lead rep must nominate two co-reps as signatories.');
+    }
+    return;
+  }
+  if (!pin) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Enter the withdrawal security code', [{ field: 'pin', issue: 'required' }]);
+  }
   await checkPin(space, pin);
+}
+
+/** The lead may draw on the whole space or any due; a co-rep only on a due assigned to them. */
+async function authoriseScope(req: WithdrawalRequest, role: RepRole) {
+  if (!req.dueId) {
+    if (role !== 'lead') throw forbidden('Choose one of the dues assigned to you to withdraw from', 'DUE_REQUIRED');
+    return null;
+  }
+  const due = await db.due.findUnique({ where: { id: req.dueId }, select: { id: true, spaceId: true, title: true, assignedRepId: true } });
+  if (!due || due.spaceId !== req.spaceId) throw notFound('Due not found');
+  if (role !== 'lead' && due.assignedRepId !== req.userId) {
+    throw forbidden('You can only withdraw from dues assigned to you', 'DUE_NOT_ASSIGNED');
+  }
+  return due;
 }
 
 export type PinChange = 'set' | 'changed' | 'reset';
@@ -137,17 +176,9 @@ export async function setWithdrawalPinByRep(input: {
   currentPin?: string;
   forgot?: boolean;
 }): Promise<{ change: PinChange; holdUntil: Date | null }> {
-  const [space, user] = await Promise.all([
-    db.space.findUnique({ where: { id: input.spaceId } }),
-    db.user.findUnique({ where: { id: input.userId }, select: { passwordHash: true } }),
-  ]);
-  if (!space || !user) throw notFound('Space not found');
-  if (!user.passwordHash) {
-    throw new AppError(409, 'PASSWORD_REQUIRED', 'Your account has no password yet. Sign out and use "Forgot password" to create one, then try again.');
-  }
-  if (!(await bcrypt.compare(input.password, user.passwordHash))) {
-    throw new AppError(403, 'INVALID_PASSWORD', 'Your password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
-  }
+  await assertPassword(input.userId, input.password);
+  const space = await db.space.findUnique({ where: { id: input.spaceId } });
+  if (!space) throw notFound('Space not found');
   if (isWeakPin(input.pin)) {
     throw new AppError(422, 'WEAK_PIN', 'Choose a less predictable code', [{ field: 'pin', issue: 'too easy to guess' }]);
   }
@@ -200,22 +231,35 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   }
   const breakdown = computeWithdrawal(amountKobo);
 
-  const [space, user] = await Promise.all([
+  const [space, user, rep, lead] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
     db.user.findUnique({ where: { id: userId } }),
+    db.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } } }),
+    db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: true } }),
   ]);
   if (!space || !user) throw notFound('Space not found');
+  if (!rep) throw forbidden('You are not a rep of this space');
   if (user.isSuspended || user.isDeactivated) {
     throw forbidden('Your account is suspended', 'ACCOUNT_SUSPENDED');
   }
+  const due = await authoriseScope(req, rep.role);
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
-  await verifyWithdrawalPin(space, req.pin);
-  if (!canWithdraw(user)) {
+  await verifyAuthorisation(space, req.pin);
+  if (user.kycStatus !== 'verified') {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
+  // Collections settle into the lead rep's account, so that is what pays out.
+  if (!lead || !canWithdraw(lead.user)) {
+    throw forbidden(
+      rep.role === 'lead' ? 'Complete identity verification before withdrawing' : "The lead rep's account can't make withdrawals yet",
+      rep.role === 'lead' ? 'KYC_NOT_VERIFIED' : 'LEAD_KYC_NOT_VERIFIED',
+    );
+  }
+  const accountId = lead.user.bachsAccountId!;
   // canWithdraw guarantees a Bachs account. The destination is fixed on the
   // payout now so a later change to the beneficiary can't redirect it.
-  const target = await resolveTarget(req, user.bachsAccountId!);
+  const target = await resolveTarget(req, accountId);
+  const needsApproval = space.withdrawalAuthMode === 'multisig';
 
   const reference = await uniquePayoutReference();
 
@@ -234,6 +278,14 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             { field: 'amount', issue: `available balance is ${balance} kobo` },
           ]);
         }
+        if (due) {
+          const dueBalance = await getDueBalance(due.id, tx);
+          if (amountKobo > dueBalance) {
+            throw new AppError(422, 'INSUFFICIENT_BALANCE', `The amount is more than what is left of "${due.title}"`, [
+              { field: 'amount', issue: `available balance for this due is ${Math.max(0, dueBalance)} kobo` },
+            ]);
+          }
+        }
 
         const created = await tx.payout.create({
           data: {
@@ -242,7 +294,9 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             feeKobo: breakdown.fee,
             netKobo: breakdown.net,
             reference,
-            status: 'pending',
+            dueId: due?.id ?? null,
+            status: needsApproval ? 'awaiting_approval' : 'pending',
+            approvalExpiresAt: needsApproval ? new Date(Date.now() + APPROVAL_WINDOW_MS) : null,
             activeSpaceId: spaceId,
             accountMasked: `${target.bankName} ${target.accountNumberMasked}`,
             accountName: target.accountName,
@@ -251,15 +305,15 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             note: req.note,
             requestedById: userId,
             provider: getPaymentProvider().name,
-            providerAccountId: user.bachsAccountId,
+            providerAccountId: accountId,
           },
         });
         await debit(tx, created);
         await writeAudit(
           spaceId,
-          { id: userId, name: user.name, role: 'lead' },
+          { id: userId, name: user.name, role: rep.role },
           'payout_requested',
-          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal to ${target.accountName} (${reference})`,
+          `Requested a ₦${(amountKobo / 100).toLocaleString('en-NG')} withdrawal${due ? ` from "${due.title}"` : ''} to ${target.accountName} (${reference})${needsApproval ? ', awaiting signatory approval' : ''}`,
           tx,
         );
         return created;
@@ -272,8 +326,8 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
     throw err;
   }
 
-  logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee }, 'withdrawal created');
-  await dispatchPayout(payout.id);
+  logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee, status: payout.status }, 'withdrawal created');
+  if (payout.status === 'pending') await dispatchPayout(payout.id);
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
 }
 
@@ -298,6 +352,7 @@ async function resolveTarget(req: WithdrawalRequest, accountId: string) {
 async function debit(tx: Tx, p: Payout): Promise<void> {
   await appendLedgerEntry(tx, {
     spaceId: p.spaceId,
+    dueId: p.dueId,
     payoutId: p.id,
     type: 'payout',
     direction: 'debit',
@@ -310,6 +365,7 @@ async function debit(tx: Tx, p: Payout): Promise<void> {
   });
   await appendLedgerEntry(tx, {
     spaceId: p.spaceId,
+    dueId: p.dueId,
     payoutId: p.id,
     type: 'payout_fee',
     direction: 'debit',
@@ -319,7 +375,7 @@ async function debit(tx: Tx, p: Payout): Promise<void> {
   });
 }
 
-async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
+export async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
   await tx.$queryRaw`SELECT "id" FROM "payouts" WHERE "id" = ${payoutId} FOR UPDATE`;
   return tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
 }
@@ -431,18 +487,7 @@ export async function failPayout(payoutId: string, reason: string, code?: string
       },
     });
     // Restore the space's balance in full: what was sent AND the fee.
-    await appendLedgerEntry(tx, {
-      spaceId: p.spaceId,
-      payoutId: p.id,
-      type: 'payout_reversal',
-      direction: 'credit',
-      amountKobo: p.amount,
-      grossKobo: p.amount,
-      feeKobo: p.feeKobo,
-      netKobo: p.netKobo,
-      reference: p.reference,
-      description: to === 'reversed' ? 'Withdrawal reversed by the bank' : 'Withdrawal failed — balance restored',
-    });
+    await restoreBalance(tx, p, to === 'reversed' ? 'Withdrawal reversed by the bank' : 'Withdrawal failed — balance restored');
     return updated;
   });
   if (!done) return false;
@@ -457,6 +502,47 @@ export async function failPayout(payoutId: string, reason: string, code?: string
   }
   await notifyReps(done, 'failed');
   return true;
+}
+
+/** Credit a withdrawal's full gross (sent amount and fee) back to the space, and its due. */
+async function restoreBalance(tx: Tx, p: Payout, description: string): Promise<void> {
+  await appendLedgerEntry(tx, {
+    spaceId: p.spaceId,
+    dueId: p.dueId,
+    payoutId: p.id,
+    type: 'payout_reversal',
+    direction: 'credit',
+    amountKobo: p.amount,
+    grossKobo: p.amount,
+    feeKobo: p.feeKobo,
+    netKobo: p.netKobo,
+    reference: p.reference,
+    description,
+  });
+}
+
+/**
+ * A multisig withdrawal that never reached the bank: rejected by a signatory,
+ * withdrawn by its requester, or not approved in time. Idempotent; restores
+ * the reserved balance in full.
+ */
+export async function cancelPayout(payoutId: string, reason: string): Promise<Payout | null> {
+  const done = await db.$transaction(async (tx) => {
+    const p = await lockPayout(tx, payoutId);
+    if (!canTransitionPayout(p.status, 'cancelled')) return null;
+    await lockSpace(tx, p.spaceId);
+    const updated = await tx.payout.update({
+      where: { id: p.id },
+      data: { status: 'cancelled', activeSpaceId: null, approvalExpiresAt: null, cancelledAt: new Date(), failureReason: reason.slice(0, 300) },
+    });
+    await restoreBalance(tx, p, 'Withdrawal cancelled — balance restored');
+    await tx.payoutOtp.deleteMany({ where: { payoutId: p.id } });
+    return updated;
+  });
+  if (!done) return null;
+  logger.info({ ref: done.reference, reason }, 'withdrawal cancelled — balance restored');
+  await notifyReps(done, 'cancelled');
+  return done;
 }
 
 /**
@@ -484,7 +570,7 @@ export async function refreshPayout(payoutId: string): Promise<void> {
   else if (result.state === 'failed') await failPayout(p.id, result.failureReason ?? 'The bank could not complete the transfer');
 }
 
-async function notifyReps(p: Payout, outcome: 'success' | 'failed'): Promise<void> {
+async function notifyReps(p: Payout, outcome: 'success' | 'failed' | 'cancelled'): Promise<void> {
   const reps = await db.spaceRep.findMany({ where: { spaceId: p.spaceId }, select: { userId: true } });
   await notifyMany(
     reps.map((r) => r.userId),
@@ -495,7 +581,15 @@ async function notifyReps(p: Payout, outcome: 'success' | 'failed'): Promise<voi
           detail: `₦${(p.netKobo / 100).toLocaleString('en-NG')} was sent to ${p.accountName ? `${p.accountName}, ` : ''}${p.accountMasked}.`,
           href: '/dashboard/payout',
         }
-      : {
+      : outcome === 'cancelled'
+        ? {
+            kind: 'system',
+            tone: 'rose',
+            title: 'Withdrawal cancelled',
+            detail: `The ₦${(p.amount / 100).toLocaleString('en-NG')} withdrawal (${p.reference}) was cancelled: ${p.failureReason}. It has been returned to the space balance.`,
+            href: '/dashboard/payout',
+          }
+        : {
           kind: 'system',
           tone: 'rose',
           title: p.status === 'reversed' ? 'Withdrawal reversed' : 'Withdrawal failed',

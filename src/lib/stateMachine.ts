@@ -34,16 +34,20 @@ export const CHECKOUT_TRANSITIONS: Graph<CheckoutStatus> = {
 };
 
 /**
- * pending → processing → success | failed | reversed.
+ * [awaiting_approval →] pending → processing → success | failed | reversed.
+ * awaiting_approval: multi-signatory spaces; → pending once 2 signatories sign,
+ * → cancelled if one rejects, the requester withdraws it, or it times out.
  * pending → failed: the provider rejected the payout at creation.
  * success → reversed: the bank returned the money after reporting success.
  */
 export const PAYOUT_TRANSITIONS: Graph<PayoutStatus> = {
+  awaiting_approval: ['pending', 'cancelled'],
   pending: ['processing', 'failed'],
   processing: ['success', 'failed', 'reversed'],
   success: ['reversed'],
   failed: [],
   reversed: [],
+  cancelled: [],
 };
 
 function can<S extends string>(graph: Graph<S>, from: S, to: S): boolean {
@@ -67,4 +71,4 @@ export function assertPayoutTransition(from: PayoutStatus, to: PayoutStatus): vo
 }
 
 /** Statuses in which a payout's funds are still debited from the space. */
-export const PAYOUT_ACTIVE: readonly PayoutStatus[] = ['pending', 'processing'];
+export const PAYOUT_ACTIVE: readonly PayoutStatus[] = ['awaiting_approval', 'pending', 'processing'];

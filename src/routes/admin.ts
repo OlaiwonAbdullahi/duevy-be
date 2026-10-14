@@ -11,7 +11,7 @@ import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFe
 import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
-import { CLEARED_PIN } from '../services/withdrawal.service';
+import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
@@ -275,7 +275,7 @@ adminRouter.post('/checkouts/:reference/resolve', requireAdminPermission('overri
 adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take } = parseListQuery(req);
   const where: Prisma.PayoutWhereInput = {};
-  if (typeof req.query.status === 'string' && ['pending', 'processing', 'success', 'failed', 'reversed'].includes(req.query.status)) {
+  if (typeof req.query.status === 'string' && ['awaiting_approval', 'pending', 'processing', 'success', 'failed', 'reversed', 'cancelled'].includes(req.query.status)) {
     where.status = req.query.status as never;
   }
   if (typeof req.query.spaceId === 'string') where.spaceId = req.query.spaceId;
@@ -949,6 +949,7 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
       assignedRepIds: s.reps.map((r) => r.userId),
       isArchived: s.isArchived,
       payoutsFrozen: s.payoutsFrozen,
+      withdrawalAuthMode: s.withdrawalAuthMode,
       withdrawalPinSet: !!s.withdrawalPinHash,
       withdrawalPinSetAt: s.withdrawalPinSetAt,
       withdrawalPinLocked: !!s.withdrawalPinLockedUntil && s.withdrawalPinLockedUntil > new Date(),
@@ -1070,13 +1071,17 @@ adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userMana
         const others = await tx.spaceRep.findMany({ where: { spaceId, role: 'lead', userId: { not: userId } }, select: { userId: true } });
         demoted = others.map((o) => o.userId);
         if (demoted.length) {
-          await tx.spaceRep.updateMany({ where: { spaceId, role: 'lead', userId: { in: demoted } }, data: { role: 'co' } });
+          await tx.spaceRep.updateMany({ where: { spaceId, role: 'lead', userId: { in: demoted } }, data: { role: 'co', isSignatory: false } });
         }
         // A new lead sets their own withdrawal code; the old one dies with the handover.
         const current = await tx.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } }, select: { role: true } });
         if (current?.role !== 'lead') await tx.space.update({ where: { id: spaceId }, data: CLEARED_PIN });
       }
-      await tx.spaceRep.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: { role }, create: { userId, spaceId, role } });
+      await tx.spaceRep.upsert({
+        where: { userId_spaceId: { userId, spaceId } },
+        update: { role, ...(role === 'lead' ? { isSignatory: false } : {}) },
+        create: { userId, spaceId, role },
+      });
       await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, kind: 'member' } });
       // Attaching a rep promotes the account.
       await tx.user.update({ where: { id: userId }, data: { role: user.role === 'admin' ? 'admin' : 'rep', isRep: true, repApplicationStatus: 'approved', referralCode } });
@@ -1084,6 +1089,11 @@ adminRouter.post('/spaces/:spaceId/assign-rep', requireAdminPermission('userMana
     },
     { timeout: 20_000 },
   );
+  if (demotedLeadIds.length) {
+    // A withdrawal still waiting for signatures would pay out of the old lead's account.
+    const waiting = await db.payout.findMany({ where: { spaceId, status: 'awaiting_approval' }, select: { id: true } });
+    for (const p of waiting) await cancelPayout(p.id, 'the lead rep changed');
+  }
   await writeAdminAudit(req, 'space.assign_rep', {
     target: spaceId,
     severity: role === 'lead' ? 'critical' : 'warning',

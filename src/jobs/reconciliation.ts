@@ -4,6 +4,7 @@ import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
 import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/withdrawal.service';
+import { expireStaleApprovals } from '../services/withdrawalApproval.service';
 
 /**
  * Self-healing backstop for lost or delayed webhooks. The webhook is the fast
@@ -101,6 +102,9 @@ export async function reconcilePayouts(): Promise<void> {
   for (const p of unsettledFees) {
     await settleWithdrawalFee(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'fee settlement retry failed'));
   }
+
+  // Multisig withdrawals nobody approved in time: cancel and restore the balance.
+  await expireStaleApprovals();
 }
 
 /** Housekeeping: drop idempotency keys past their 24h window. */

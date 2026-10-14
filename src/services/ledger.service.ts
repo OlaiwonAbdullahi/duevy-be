@@ -1,6 +1,7 @@
 import { Prisma, type LedgerDirection, type LedgerEntryType } from '@prisma/client';
 import { db } from '../config/db';
 import { generateId } from '../lib/id';
+import { PAYOUT_ACTIVE } from '../lib/stateMachine';
 
 /**
  * The per-space ledger. Append-only (enforced by a database trigger) and the
@@ -84,6 +85,32 @@ export async function getSpaceBalance(spaceId: string, tx: Tx | typeof db = db):
   return Number(rows[0]?.balance ?? 0);
 }
 
+/**
+ * What one due can still pay out: its collections less the withdrawals made
+ * against it. Only due-scoped withdrawals carry a dueId, so a space-wide
+ * withdrawal by the lead doesn't lower this; withdrawals check it together
+ * with the space balance, so the two can never overdraw the space.
+ */
+export async function getDueBalance(dueId: string, tx: Tx | typeof db = db): Promise<number> {
+  const rows = await tx.$queryRaw<{ balance: bigint | null }[]>`
+    SELECT COALESCE(SUM(CASE WHEN "direction" = 'credit' THEN "amountKobo" ELSE -"amountKobo" END), 0)::bigint AS balance
+    FROM "ledger_entries"
+    WHERE "dueId" = ${dueId}`;
+  return Number(rows[0]?.balance ?? 0);
+}
+
+/** getDueBalance for several dues at once (dues with no entries are 0). */
+export async function getDueBalances(dueIds: string[]): Promise<Map<string, number>> {
+  const out = new Map(dueIds.map((id) => [id, 0]));
+  if (!dueIds.length) return out;
+  const rows = await db.ledgerEntry.groupBy({ by: ['dueId', 'direction'], where: { dueId: { in: dueIds } }, _sum: { amountKobo: true } });
+  for (const r of rows) {
+    const amount = r._sum.amountKobo ?? 0;
+    out.set(r.dueId!, (out.get(r.dueId!) ?? 0) + (r.direction === 'credit' ? amount : -amount));
+  }
+  return out;
+}
+
 export interface SpaceLedgerSummary {
   /** Withdrawable now. */
   balance: number;
@@ -100,14 +127,14 @@ export interface SpaceLedgerSummary {
 export async function getSpaceLedgerSummary(spaceId: string): Promise<SpaceLedgerSummary> {
   const [byType, inFlight] = await Promise.all([
     db.ledgerEntry.groupBy({ by: ['type'], where: { spaceId }, _sum: { amountKobo: true } }),
-    db.payout.aggregate({ where: { spaceId, status: { in: ['pending', 'processing'] } }, _sum: { amount: true } }),
+    db.payout.aggregate({ where: { spaceId, status: { in: [...PAYOUT_ACTIVE] } }, _sum: { amount: true } }),
   ]);
   const sum = (t: LedgerEntryType) => byType.find((r) => r.type === t)?._sum.amountKobo ?? 0;
 
   // A reversal restores a whole withdrawal (fee included). Split it back out
   // so lifetime figures describe money that actually left.
   const reversed = await db.payout.aggregate({
-    where: { spaceId, status: { in: ['failed', 'reversed'] }, ledgerEntries: { some: { type: 'payout_reversal' } } },
+    where: { spaceId, status: { in: ['failed', 'reversed', 'cancelled'] }, ledgerEntries: { some: { type: 'payout_reversal' } } },
     _sum: { netKobo: true, feeKobo: true },
   });
 

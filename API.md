@@ -305,19 +305,25 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 
 The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from the withdrawal.
 
-### 🔑 `POST /payout/request` (lead rep only)
+### 🔑 `POST /payout/request` (lead rep, or a co-rep for an assigned due)
 
-- Body: `{ "amount": 500000, "beneficiaryId": "…", "pin": "4821", "note"?: "…" }`. `amount` is the gross in kobo. `pin` is the space's 4-digit withdrawal security code, which the lead rep sets themselves (`PUT /payout/pin`). Five wrong codes lock it for 30 minutes. `GET /payout/summary` reports `withdrawalPinSet`, `withdrawalPinLockedUntil` and `withdrawalPinHoldUntil`.
+- Body: `{ "amount": 500000, "beneficiaryId": "…", "pin": "4821", "dueId"?: "…", "note"?: "…" }`. `amount` is the gross in kobo.
+- `dueId` draws on one due's collections. The lead may omit it to draw on the whole space. A co-rep must send it, and the due must be assigned to them (`POST /dues/:dueId/reassign`). The amount can't exceed what is left of that due (see `GET /payout/dues`). The money always leaves the lead rep's account, where collections settle.
+- `pin` is needed only in `pin` mode (see [Withdrawal security](#withdrawal-security)). It is the space's 4-digit security code, which the lead rep sets themselves (`PUT /payout/pin`). Five wrong codes lock it for 30 minutes. `GET /payout/summary` reports `withdrawalAuthMode`, `withdrawalPinSet`, `withdrawalPinLockedUntil` and `withdrawalPinHoldUntil`.
 - Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked and registered with Bachs the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
-- `201`: `Payout`.
+- `201`: `Payout`. In `multisig` mode it is `awaiting_approval` and carries `approval` (below), including `otpSentToRequester: true` when the requester is a signatory and has been emailed their code.
 
-`Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, note, requestedById, requestedAt, processingAt, settledAt, failedAt, reversedAt, failureReason }`
+`Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, dueId, note, requestedById, requestedAt, approvalExpiresAt, processingAt, settledAt, failedAt, reversedAt, cancelledAt, failureReason }`
 
-Withdrawal status moves `pending → processing → success | failed | reversed`. On `failed` or `reversed`, the full amount goes back to the balance.
+Withdrawal status moves `[awaiting_approval →] pending → processing → success | failed | reversed`. `awaiting_approval → cancelled` when a signatory rejects it, its requester withdraws it, it isn't approved within 24 hours, or the lead rep changes. On `failed`, `reversed` or `cancelled`, the full amount goes back to the balance (and to its due).
 
 | Error | When |
 |---|---|
 | `403 KYC_NOT_VERIFIED` | The rep has not passed KYC. |
+| `403 LEAD_KYC_NOT_VERIFIED` | A co-rep's request, but the lead rep's account can't make withdrawals yet. |
+| `403 DUE_REQUIRED` | A co-rep didn't send `dueId`. |
+| `403 DUE_NOT_ASSIGNED` | That due isn't assigned to the co-rep. |
+| `409 SIGNATORIES_INCOMPLETE` | `multisig` mode, but the space has fewer than 3 signatories. |
 | `404 BENEFICIARY_NOT_FOUND` | No beneficiary with that id in this space. |
 | `422 ACCOUNT_UNVERIFIABLE` | The one-off account couldn't be verified with the bank. |
 | `409 WITHDRAWAL_IN_PROGRESS` | Another withdrawal for this space is still in flight. |
@@ -327,7 +333,32 @@ Withdrawal status moves `pending → processing → success | failed | reversed`
 | `403 WITHDRAWAL_PIN_NOT_SET` | The lead rep hasn't set a withdrawal security code yet. |
 | `403 INVALID_WITHDRAWAL_PIN` | Wrong code; `details[0].issue` says how many attempts are left. |
 | `423 WITHDRAWAL_PIN_LOCKED` | Five wrong codes; locked for 30 minutes (a reset unlocks it). |
-| `423 WITHDRAWAL_PIN_HOLD` | The code was reset in the last 24 hours. |
+| `423 WITHDRAWAL_PIN_HOLD` | Withdrawal security changed in the last 24 hours: a code reset, a signatory change while approvals are on, or approvals switched off. |
+
+### `GET /payout/dues`
+
+The dues the caller can withdraw from: every due for the lead, the assigned ones for a co-rep. `200`: `[{ id, title, type, status, assignedRepId, available }]`, where `available` is the due's collections less the withdrawals made against it, in kobo.
+
+### Withdrawal security
+
+Each space picks how withdrawals are authorised (`withdrawalAuthMode` on `GET /payout/summary`):
+
+- `pin` (default): the 4-digit security code below.
+- `multisig`: the space has 3 signatories, the lead rep plus two co-reps the lead nominates. A withdrawal waits as `awaiting_approval`, with its funds reserved, until 2 signatories approve it. Each signatory approves with a one-time 6-digit code that Duevy emails them, along with the withdrawal's amount, destination, due and requester. The requester counts as one signature if they are a signatory. A co-rep who isn't a signatory needs two.
+
+`GET /payout/summary` also returns `signatories: [{ id, name, email, role }]`, `signatoriesComplete` and `awaitingApprovalPayoutId`.
+
+| Endpoint | Behaviour |
+|---|---|
+| `PUT /payout/signatories` | Lead only. `{ "userIds": [coRepId, coRepId], "password": "…" }` (0–2 co-reps). While approvals are on, you must keep two, and any change holds withdrawals for 24 hours and alerts every rep. `200`: `{ signatories, signatoriesComplete, withdrawalPinHoldUntil }`. |
+| `PUT /payout/security` | Lead only. `{ "mode": "pin" \| "multisig", "password": "…" }`. Turning `multisig` on needs 3 signatories (`409 SIGNATORIES_INCOMPLETE`). Switching back to `pin` holds withdrawals for 24 hours. Every rep is notified either way. `200`: `{ withdrawalAuthMode, changed, withdrawalPinHoldUntil }`. |
+| `POST /payout/:payoutId/otp` | A signatory asks for their code (valid 10 minutes, one request a minute: `429 OTP_RECENTLY_SENT`). `200`: `{ sent: true, expiresAt }`. |
+| `POST /payout/:payoutId/approve` | `{ "otp": "123456" }`. `200`: `Payout` with `approval`. The second approval sends the withdrawal to the bank (`status` becomes `processing`). Errors: `403 INVALID_OTP` (attempts left in `details`), `423 OTP_LOCKED` (5 wrong codes; request a new one), `400 OTP_EXPIRED`, `409 ALREADY_SIGNED`, `403 NOT_A_SIGNATORY`, `409 NOT_AWAITING_APPROVAL`, `409 APPROVAL_EXPIRED`. |
+| `POST /payout/:payoutId/reject` | `{ "reason"?: "…" }`. A signatory rejects it, or its requester withdraws it. No code needed. `200`: the cancelled `Payout`. |
+
+`approval = { required: 2, approvedCount, signatoryIds, approvals: [{ userId, name, decision: "approved" | "rejected", decidedAt }] }`. `GET /payout/:payoutId` includes it for withdrawals that went through approval (else `null`).
+
+Password errors on these endpoints are `403 INVALID_PASSWORD` and `409 PASSWORD_REQUIRED`.
 
 ### `PUT /payout/pin` (lead rep only)
 
@@ -342,7 +373,16 @@ Set or change the space's withdrawal security code.
 
 For a forgotten code: `{ "pin", "password" }` sets a new code without the current one. Withdrawals are then held for 24 hours (`withdrawalPinHoldUntil`), every rep is notified and the lead rep is emailed. `200`: `{ withdrawalPinSet: true, change: "reset", withdrawalPinHoldUntil }`.
 
-Every set, change and reset is written to the space audit log. The code is cleared whenever the lead rep changes (admin assignment or `POST /transfer-lead`), so a new lead sets their own.
+Every set, change and reset is written to the space audit log. The code is cleared whenever the lead rep changes (admin assignment or `POST /transfer-lead`), so a new lead sets their own. On `POST /transfer-lead` the old lead takes the new lead's signatory seat, so a `multisig` space keeps its 3 signatories.
+
+### Team
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /reps` | Any rep. `[{ id, name, email, role: "lead" \| "co", isSignatory, kycVerified, assignedDues, addedAt }]`. |
+| `POST /reps` | Lead only. `{ "userId": "…" }`: a member of the space becomes a co-rep. `201` with the rep. Errors: `404` (not a member), `409 ALREADY_REP`, `409 USER_INACTIVE`. |
+| `DELETE /reps/:userId` | Lead only. Removes a rep. Their due assignments are cleared. |
+| `POST /dues/:dueId/reassign` | Lead only. `{ "userId": coRepId }`: assigns the due to a co-rep, who can then withdraw its collections. |
 
 `GET /payouts` lists withdrawals and `GET /payout/:payoutId` returns one.
 
@@ -368,7 +408,7 @@ Any signed-in user. Body: `{ "category": "bug" | "idea" | "other", "message": "1
 
 Clears the space's withdrawal code, for example when a rep's account may be compromised. Admins never set or see codes. Withdrawals stop until the lead rep sets a new code, and every rep is notified. `200`: `{ withdrawalPinSet: false }`. `GET /admin/spaces` rows carry `withdrawalPinSet`, `withdrawalPinSetAt`, `withdrawalPinLocked` and `withdrawalPinHoldUntil`.
 
-Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is Bachs's decision, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` (adding co-reps) and the dues `allowGuests` field are removed.
+Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is Bachs's decision, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` and the dues `allowGuests` field are removed. Co-reps are now added with `POST /spaces/:spaceId/reps`.
 
 `role = admin` is required. Each route also checks the permission named in its row; a super admin has every permission.
 

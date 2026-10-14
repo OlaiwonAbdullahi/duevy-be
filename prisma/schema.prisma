@@ -112,11 +112,21 @@ enum TxnStatus {
 // A withdrawal's lifecycle. Legal moves live in src/lib/stateMachine.ts:
 // pending → processing → success | failed | reversed (plus pending → failed).
 enum PayoutStatus {
+  awaiting_approval // multi-signatory spaces: waiting for 2 signatories to sign with their OTPs
   pending
   processing
   success
   failed
   reversed
+  cancelled // rejected by a signatory, withdrawn by the requester, or not approved in time
+}
+
+// How a space's withdrawals are authorised. `pin`: the 4-digit code the lead
+// rep sets. `multisig`: 2 of the space's 3 signatories (the lead plus the two
+// co-reps they nominate) each confirm with a one-time code Duevy emails them.
+enum WithdrawalAuthMode {
+  pin
+  multisig
 }
 
 // A checkout's lifecycle: pending → paid | expired | underpaid (plus the
@@ -295,6 +305,8 @@ enum AuditAction {
   withdrawal_pin_set
   withdrawal_pin_changed
   withdrawal_pin_reset
+  signatories_updated
+  withdrawal_mode_changed
 }
 
 enum AssistantIntent {
@@ -319,29 +331,29 @@ enum AssistantRole {
 // ---------------------------------------------------------------------------
 
 model User {
-  id                      String                @id @default(cuid())
-  name                    String
-  email                   String                @unique
-  emailVerified           Boolean               @default(false)
-  passwordHash            String?
-  phone                   String?
+  id                             String                @id @default(cuid())
+  name                           String
+  email                          String                @unique
+  emailVerified                  Boolean               @default(false)
+  passwordHash                   String?
+  phone                          String?
   // From the rep's KYC submission ("male" | "female"); shown to admins.
-  gender                  String?
-  avatarUrl               String?
+  gender                         String?
+  avatarUrl                      String?
   // `role` is the coarse label carried in the access token (admin vs not).
   // Permissions are ADDITIVE: every user is a student; `isRep` is granted on
   // top once an admin approves their rep application, and is what rep-only
   // actions (creating a space) check. Space-level authority is SpaceRep.
-  role                    Role                  @default(student)
-  isRep                   Boolean               @default(false)
-  repApplicationStatus    RepApplicationStatus  @default(none)
-  adminSubRole            AdminSubRole?
+  role                           Role                  @default(student)
+  isRep                          Boolean               @default(false)
+  repApplicationStatus           RepApplicationStatus  @default(none)
+  adminSubRole                   AdminSubRole?
   // Multi-school ready; launch is LAUTECH only.
-  institution             String                @default("LAUTECH")
-  matricNo                String?
-  level                   String?
-  notificationPrefs       Json? // §3.4 — email/push toggles; null = defaults
-  referralCode            String?               @unique
+  institution                    String                @default("LAUTECH")
+  matricNo                       String?
+  level                          String?
+  notificationPrefs              Json? // §3.4 — email/push toggles; null = defaults
+  referralCode                   String?               @unique
   // Rep identity on Bachs Connect. Each rep is a recipient Connect account
   // (bachsAccountId) whose representative person (bachsPersonId — the
   // provider reference for KYC) carries the rep's NIN (and a BVN only if Bachs
@@ -350,25 +362,25 @@ model User {
   //
   // THE NIN, BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to
   // Bachs in the KYC request and nowhere else; only the outcome is stored.
-  bachsAccountId          String?               @unique
-  bachsPersonId           String?
+  bachsAccountId                 String?               @unique
+  bachsPersonId                  String?
   // Bachs reports these separately: the person's verification, and whether the
   // account may pay out. A rep can collect only when both are true.
-  kycStatus               KycStatus             @default(unverified)
-  bachsPayoutsActive      Boolean               @default(false)
-  kycSubmittedAt          DateTime?
-  kycResolvedAt           DateTime?
-  kycRejectionReason      String?
-  kycAttempts             Int                   @default(0)
-  kycRetryLockedUntil     DateTime? // §9.2 — 24h lock after 3 consecutive failures
+  kycStatus                      KycStatus             @default(unverified)
+  bachsPayoutsActive             Boolean               @default(false)
+  kycSubmittedAt                 DateTime?
+  kycResolvedAt                  DateTime?
+  kycRejectionReason             String?
+  kycAttempts                    Int                   @default(0)
+  kycRetryLockedUntil            DateTime? // §9.2 — 24h lock after 3 consecutive failures
   // Field keys Bachs still asks for on the rep's account (e.g. a BVN or an ID
   // document), refreshed on every identity event, so the rep can be told.
-  kycRequirementsDue      String[]              @default([])
-  governmentIdSubmittedAt DateTime? // an ID document forwarded to Bachs on request
+  kycRequirementsDue             String[]              @default([])
+  governmentIdSubmittedAt        DateTime? // an ID document forwarded to Bachs on request
   // "Finish your verification" emails to rep applicants who stall on KYC:
   // 1 = 24h, 2 = 3 days, 3 = 7 days after sign-up (src/jobs/kycReminders.ts).
-  kycReminderStage        Int                   @default(0)
-  kycReminderSentAt       DateTime?
+  kycReminderStage               Int                   @default(0)
+  kycReminderSentAt              DateTime?
   // The rep's own bank account, sent to Bachs as their account's
   // payout_destination during onboarding. Only the masked number is kept.
   payoutDestinationBankCode      String?
@@ -379,33 +391,33 @@ model User {
   // The rep's student ID card — Duevy's own check, not Bachs's. Uploaded at
   // KYC time to private storage (ImageKit) and reviewed by an admin; a space
   // can only collect once it is approved. Only the storage reference is kept.
-  studentIdFileId         String?
-  studentIdFilePath       String?
-  studentIdMimeType       String?
-  studentIdStatus         DocumentReviewStatus?
-  studentIdUploadedAt     DateTime?
-  studentIdReviewedAt     DateTime?
-  studentIdReviewedById   String?
-  studentIdReviewNote     String?
+  studentIdFileId                String?
+  studentIdFilePath              String?
+  studentIdMimeType              String?
+  studentIdStatus                DocumentReviewStatus?
+  studentIdUploadedAt            DateTime?
+  studentIdReviewedAt            DateTime?
+  studentIdReviewedById          String?
+  studentIdReviewNote            String?
   // --- Legacy (Anchor era). Read-only; kept so historical rows and any
   // balance still held at Anchor stay traceable. Nothing writes these.
-  anchorCustomerId        String?               @unique
-  kycTier                 KycTier               @default(tier_0)
-  kycPendingTier          KycTier?
-  kycDocUrls              String[]              @default([])
-  addressLine1            String?
-  addressLine2            String?
-  city                    String?
-  state                   String? // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
-  postalCode              String?
-  isSuspended             Boolean               @default(false)
-  suspendedReason         String?
-  isDeactivated           Boolean               @default(false)
-  deactivatedReason       String?
-  termsAcceptedAt         DateTime?
-  termsVersion            String?
-  createdAt               DateTime              @default(now())
-  updatedAt               DateTime              @updatedAt
+  anchorCustomerId               String?               @unique
+  kycTier                        KycTier               @default(tier_0)
+  kycPendingTier                 KycTier?
+  kycDocUrls                     String[]              @default([])
+  addressLine1                   String?
+  addressLine2                   String?
+  city                           String?
+  state                          String? // Anchor's enum casing, e.g. "OYO", "AKWA_IBOM"
+  postalCode                     String?
+  isSuspended                    Boolean               @default(false)
+  suspendedReason                String?
+  isDeactivated                  Boolean               @default(false)
+  deactivatedReason              String?
+  termsAcceptedAt                DateTime?
+  termsVersion                   String?
+  createdAt                      DateTime              @default(now())
+  updatedAt                      DateTime              @updatedAt
 
   // Relations
   refreshTokens          RefreshToken[]
@@ -430,6 +442,7 @@ model User {
   assignedDues           Due[]                   @relation("DueAssignedRep")
   requestedPayouts       Payout[]                @relation("PayoutRequestedBy")
   payoutApprovals        PayoutApproval[]
+  payoutOtps             PayoutOtp[]
   checkouts              Checkout[]
   receipts               Receipt[]
 
@@ -504,46 +517,52 @@ model PasswordReset {
 // ---------------------------------------------------------------------------
 
 model Space {
-  id                   String     @id @default(cuid())
-  name                 String
-  short                String // 2-6 chars, monogram
-  kind                 SpaceKind
-  hue                  EmblemHue  @default(emerald)
-  theme                SpaceTheme @default(emerald)
-  about                String?
-  faculty              String?
-  school               String // display name of the school
+  id                          String             @id @default(cuid())
+  name                        String
+  short                       String // 2-6 chars, monogram
+  kind                        SpaceKind
+  hue                         EmblemHue          @default(emerald)
+  theme                       SpaceTheme         @default(emerald)
+  about                       String?
+  faculty                     String?
+  school                      String // display name of the school
   // Institution code the space belongs to. Multi-school ready; launch is
   // LAUTECH only.
-  institution          String     @default("LAUTECH")
-  joinCode             String     @unique
-  requireApproval      Boolean    @default(false)
-  isArchived           Boolean    @default(false)
-  archivedAt           DateTime?
-  archivedReason       String?
-  payoutsFrozen        Boolean    @default(false)
-  frozenReason         String?
+  institution                 String             @default("LAUTECH")
+  joinCode                    String             @unique
+  requireApproval             Boolean            @default(false)
+  isArchived                  Boolean            @default(false)
+  archivedAt                  DateTime?
+  archivedReason              String?
+  payoutsFrozen               Boolean            @default(false)
+  frozenReason                String?
+  // How withdrawals are authorised: the security code below, or 2-of-3
+  // signatories with emailed one-time codes (see WithdrawalAuthMode).
+  withdrawalAuthMode          WithdrawalAuthMode @default(pin)
   // 4-digit withdrawal security code the lead rep sets for the space (with
-  // their password). Every withdrawal must quote it. Only a bcrypt hash is
-  // stored. 5 wrong attempts lock it for 30 minutes; a forgotten-code reset
-  // holds withdrawals for 24 hours. Cleared whenever the lead rep changes.
+  // their password). In `pin` mode every withdrawal must quote it. Only a
+  // bcrypt hash is stored. 5 wrong attempts lock it for 30 minutes. Cleared
+  // whenever the lead rep changes.
+  // withdrawalPinHoldUntil is the space's withdrawal hold, in either mode: a
+  // forgotten-code reset, a signatory change in multisig mode, or switching
+  // multisig off pauses withdrawals for 24 hours.
   withdrawalPinHash           String?
   withdrawalPinSetAt          DateTime?
-  withdrawalPinFailedAttempts Int        @default(0)
+  withdrawalPinFailedAttempts Int                @default(0)
   withdrawalPinLockedUntil    DateTime?
   withdrawalPinHoldUntil      DateTime?
   // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
   // its own: collections settle into the LEAD REP's Connect account and the
   // space's share is tracked by its ledger. These stay so any balance still
   // held in an Anchor deposit account can be traced and paid out by an admin.
-  anchorAccountId      String?    @unique
-  anchorAccountNumber  String?
-  anchorBankName       String?
-  anchorAccountStatus  String? // ACTIVE | BLOCKED | CLOSED | DEPRECATED
+  anchorAccountId             String?            @unique
+  anchorAccountNumber         String?
+  anchorBankName              String?
+  anchorAccountStatus         String? // ACTIVE | BLOCKED | CLOSED | DEPRECATED
   // The rep's payout bank account, registered with Anchor as a CounterParty.
-  anchorCounterPartyId String?
-  createdAt            DateTime   @default(now())
-  updatedAt            DateTime   @updatedAt
+  anchorCounterPartyId        String?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
 
   // Relations
   memberships    SpaceMembership[]
@@ -579,11 +598,14 @@ model SpaceMembership {
 }
 
 model SpaceRep {
-  id      String   @id @default(cuid())
-  userId  String
-  spaceId String
-  role    RepRole  @default(co)
-  addedAt DateTime @default(now())
+  id          String   @id @default(cuid())
+  userId      String
+  spaceId     String
+  role        RepRole  @default(co)
+  // A co-rep the lead nominated as one of the space's two other signatories.
+  // The lead is always a signatory; this flag is ignored on the lead's row.
+  isSignatory Boolean  @default(false)
+  addedAt     DateTime @default(now())
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
@@ -944,6 +966,8 @@ model Payout {
   // the platform, negative = the platform topped the account up.
   feeSettlementKobo Int?
   feeSettledAt      DateTime?
+  // awaiting_approval only: when it is cancelled if not yet approved.
+  approvalExpiresAt DateTime?
   requestedAt       DateTime     @default(now())
   processingAt      DateTime?
   cancelledAt       DateTime?
@@ -962,6 +986,7 @@ model Payout {
   beneficiary   PayoutBeneficiary? @relation(fields: [beneficiaryId], references: [id], onDelete: SetNull)
   requestedBy   User?              @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
   approvals     PayoutApproval[]
+  otps          PayoutOtp[]
   ledgerEntries LedgerEntry[]
 
   @@index([spaceId, requestedAt])
@@ -991,6 +1016,24 @@ model PayoutApproval {
 // table, so a correction is always a new compensating entry. The two unique
 // keys make every write idempotent: one collection credit per DuePayment and
 // one entry of each type per withdrawal, however often a webhook is replayed.
+// A one-time code emailed to a signatory to approve one withdrawal. Only a
+// bcrypt hash is stored; 10 minutes to live, 5 wrong tries and it is void.
+model PayoutOtp {
+  id        String   @id @default(cuid())
+  payoutId  String
+  userId    String
+  codeHash  String
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([payoutId, userId])
+  @@map("payout_otps")
+}
+
 model LedgerEntry {
   id           String          @id @default(cuid())
   spaceId      String

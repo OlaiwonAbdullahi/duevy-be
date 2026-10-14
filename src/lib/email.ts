@@ -430,3 +430,45 @@ export async function sendRepRejectedEmail(
     html,
   });
 }
+
+export type WithdrawalOtp = {
+  code: string;
+  spaceName: string;
+  amountKobo: number;
+  destination: string;
+  dueTitle: string | null;
+  requestedBy: string;
+  reference: string;
+  expiresInMinutes: number;
+};
+
+/** The one-time code a signatory enters to approve one withdrawal. Shows what
+ *  they are approving, so a request they don't recognise stands out. */
+export async function sendWithdrawalOtpEmail(to: string, name: string, w: WithdrawalOtp): Promise<void> {
+  const amount = `₦${(w.amountKobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+  const rows: [string, string][] = [
+    ['Space', escapeHtml(w.spaceName)],
+    ['Amount', amount],
+    ['To', escapeHtml(w.destination)],
+    ...(w.dueTitle ? [['From due', escapeHtml(w.dueTitle)] as [string, string]] : []),
+    ['Requested by', escapeHtml(w.requestedBy)],
+    ['Reference', escapeHtml(w.reference)],
+  ];
+  const html = renderEmail(
+    `
+    <h1>Approve a withdrawal</h1>
+    <p>Hi ${escapeHtml(name.split(' ')[0] ?? name)}, enter this code on Duevy to approve the withdrawal below.</p>
+    ${emailHero('Your approval code', w.code, `Expires in ${w.expiresInMinutes} minutes`)}
+    ${emailDetails(rows)}
+    <p class="muted">Never share this code — Duevy will never ask you for it. If you don't recognise this withdrawal, reject it on the Payout page and contact support@duevy.app.</p>
+  `,
+    BRAND,
+    { preheader: `Approval code for a ${amount} withdrawal from ${w.spaceName}` },
+  );
+  await sendEmail({
+    to,
+    subject: headerSafe(`${w.code} is your Duevy withdrawal approval code`),
+    html,
+    text: `Hi ${name},\n\nYour code to approve the ${amount} withdrawal from ${w.spaceName} to ${w.destination} (${w.reference}) is ${w.code}. It expires in ${w.expiresInMinutes} minutes.\n\nNever share this code. If you don't recognise this withdrawal, reject it on Duevy and contact support@duevy.app.`,
+  });
+}
