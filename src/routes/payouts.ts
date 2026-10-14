@@ -24,7 +24,7 @@ import {
   resubmitStudentIdHandlers,
   submitKycHandlers,
 } from './kycHandlers';
-import { getDueBalances, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
+import { getDueAvailability, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { quoteWithdrawal, requestWithdrawal, setWithdrawalPinByRep, type PinChange } from '../services/withdrawal.service';
@@ -93,7 +93,8 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
 
 // ---------------------------------------------------------------------------
 // GET /payout/dues — the dues the caller can withdraw from, each with what is
-// left of its collections: every due for the lead, assigned ones for a co-rep.
+// left of it (see getDueAvailability): every due for the lead, assigned ones
+// for a co-rep.
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/dues', async (req: Request, res: Response): Promise<void> => {
   const rep = (req as AuthenticatedRequest).spaceRep!;
@@ -102,10 +103,10 @@ payoutsRouter.get('/payout/dues', async (req: Request, res: Response): Promise<v
     select: { id: true, title: true, category: true, status: true, assignedRepId: true },
     orderBy: { createdAt: 'desc' },
   });
-  const balances = await getDueBalances(dues.map((d) => d.id));
+  const available = await getDueAvailability(spaceId(req));
   ok(
     res,
-    dues.map((d) => ({ id: d.id, title: d.title, type: d.category, status: d.status, assignedRepId: d.assignedRepId, available: Math.max(0, balances.get(d.id) ?? 0) })),
+    dues.map((d) => ({ id: d.id, title: d.title, type: d.category, status: d.status, assignedRepId: d.assignedRepId, available: available.get(d.id) ?? 0 })),
   );
 });
 

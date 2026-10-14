@@ -86,29 +86,45 @@ export async function getSpaceBalance(spaceId: string, tx: Tx | typeof db = db):
 }
 
 /**
- * What one due can still pay out: its collections less the withdrawals made
- * against it. Only due-scoped withdrawals carry a dueId, so a space-wide
- * withdrawal by the lead doesn't lower this; withdrawals check it together
- * with the space balance, so the two can never overdraw the space.
+ * What each due of a space can still pay out, in kobo.
+ *
+ * A due's own entries (its collections, withdrawals made against it and their
+ * reversals) give its net. Money that moved without a due — whole-balance
+ * withdrawals by the lead and their fees, refunds, manual credits — is then
+ * settled against the dues: a net outflow is taken from the dues the lead
+ * holds first, then from co-reps' dues, oldest due first in each. So the dues
+ * never add up to more than the space balance, and a co-rep's due keeps its
+ * money for as long as the lead's own dues can cover their withdrawals.
+ * Pass `tx` to read inside a locked transaction.
  */
-export async function getDueBalance(dueId: string, tx: Tx | typeof db = db): Promise<number> {
-  const rows = await tx.$queryRaw<{ balance: bigint | null }[]>`
-    SELECT COALESCE(SUM(CASE WHEN "direction" = 'credit' THEN "amountKobo" ELSE -"amountKobo" END), 0)::bigint AS balance
-    FROM "ledger_entries"
-    WHERE "dueId" = ${dueId}`;
-  return Number(rows[0]?.balance ?? 0);
-}
+export async function getDueAvailability(spaceId: string, tx: Tx | typeof db = db): Promise<Map<string, number>> {
+  const [sums, dues, lead] = await Promise.all([
+    tx.$queryRaw<{ dueId: string | null; balance: bigint | null }[]>`
+      SELECT "dueId", COALESCE(SUM(CASE WHEN "direction" = 'credit' THEN "amountKobo" ELSE -"amountKobo" END), 0)::bigint AS balance
+      FROM "ledger_entries"
+      WHERE "spaceId" = ${spaceId}
+      GROUP BY "dueId"`,
+    tx.due.findMany({ where: { spaceId }, select: { id: true, assignedRepId: true, createdAt: true } }),
+    tx.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, select: { userId: true } }),
+  ]);
+  const net = new Map(sums.map((r) => [r.dueId, Number(r.balance ?? 0)]));
 
-/** getDueBalance for several dues at once (dues with no entries are 0). */
-export async function getDueBalances(dueIds: string[]): Promise<Map<string, number>> {
-  const out = new Map(dueIds.map((id) => [id, 0]));
-  if (!dueIds.length) return out;
-  const rows = await db.ledgerEntry.groupBy({ by: ['dueId', 'direction'], where: { dueId: { in: dueIds } }, _sum: { amountKobo: true } });
-  for (const r of rows) {
-    const amount = r._sum.amountKobo ?? 0;
-    out.set(r.dueId!, (out.get(r.dueId!) ?? 0) + (r.direction === 'credit' ? amount : -amount));
+  let deficit = Math.max(0, -(net.get(null) ?? 0));
+  const leadHeld = (d: (typeof dues)[number]) => !d.assignedRepId || d.assignedRepId === lead?.userId;
+  const order = [...dues].sort(
+    (a, b) => Number(leadHeld(b)) - Number(leadHeld(a)) || a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id),
+  );
+  // A due that somehow went negative adds to what the others must cover.
+  for (const d of order) deficit += Math.max(0, -(net.get(d.id) ?? 0));
+
+  const available = new Map<string, number>();
+  for (const d of order) {
+    const own = Math.max(0, net.get(d.id) ?? 0);
+    const take = Math.min(own, deficit);
+    deficit -= take;
+    available.set(d.id, own - take);
   }
-  return out;
+  return available;
 }
 
 export interface SpaceLedgerSummary {

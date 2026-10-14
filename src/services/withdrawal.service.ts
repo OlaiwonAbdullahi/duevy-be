@@ -8,7 +8,7 @@ import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
-import { appendLedgerEntry, getDueBalance, getSpaceBalance, lockSpace } from './ledger.service';
+import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } from './ledger.service';
 import { canWithdraw } from './kyc.service';
 import { destinationFor, oneOffDestination } from './beneficiary.service';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
@@ -279,10 +279,10 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
           ]);
         }
         if (due) {
-          const dueBalance = await getDueBalance(due.id, tx);
-          if (amountKobo > dueBalance) {
+          const dueAvailable = (await getDueAvailability(spaceId, tx)).get(due.id) ?? 0;
+          if (amountKobo > dueAvailable) {
             throw new AppError(422, 'INSUFFICIENT_BALANCE', `The amount is more than what is left of "${due.title}"`, [
-              { field: 'amount', issue: `available balance for this due is ${Math.max(0, dueBalance)} kobo` },
+              { field: 'amount', issue: `available balance for this due is ${dueAvailable} kobo` },
             ]);
           }
         }

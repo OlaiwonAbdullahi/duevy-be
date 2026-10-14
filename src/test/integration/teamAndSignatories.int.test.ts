@@ -2,8 +2,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import bcrypt from 'bcryptjs';
 import { db } from '../../config/db';
 import { type FakeProvider } from '../../providers/payment';
-import { appendLedgerEntry, getDueBalance, getSpaceBalance } from '../../services/ledger.service';
-import { requestWithdrawal } from '../../services/withdrawal.service';
+import { appendLedgerEntry, getDueAvailability, getSpaceBalance } from '../../services/ledger.service';
+import { completePayout, requestWithdrawal } from '../../services/withdrawal.service';
 import { expireStaleApprovals } from '../../services/withdrawalApproval.service';
 import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, startHttp, stopHttp, tokenFor } from './fixtures';
 
@@ -40,6 +40,8 @@ async function member(spaceId: string, name: string) {
   await db.spaceMembership.create({ data: { userId: u.id, spaceId } });
   return u;
 }
+
+const dueLeft = async (spaceId: string, dueId: string) => (await getDueAvailability(spaceId)).get(dueId);
 
 /** Money collected for one due. */
 async function creditDue(spaceId: string, dueId: string, amountKobo: number) {
@@ -130,7 +132,7 @@ describe('team management', () => {
 
     const p = await req({ dueId: due!.id });
     expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, providerAccountId: t.lead.bachsAccountId });
-    expect(await getDueBalance(due!.id)).toBe(200_000);
+    expect(await dueLeft(t.space.id, due!.id)).toBe(200_000);
     expect(await getSpaceBalance(t.space.id)).toBe(2_200_000);
 
     // Chidi isn't assigned it.
@@ -141,6 +143,38 @@ describe('team management', () => {
     // Removing the rep ends their assignment.
     await api('DELETE', `${t.base}/reps/${t.bola.id}`, { token: t.leadToken });
     expect((await db.due.findUniqueOrThrow({ where: { id: due!.id } })).assignedRepId).toBeNull();
+  });
+});
+
+describe('what is left of each due', () => {
+  it('whole-balance withdrawals use up the dues, so they never show more than the balance', async () => {
+    const { rep, space, dues, beneficiary } = await makeSpace();
+    await creditDue(space.id, dues[0]!.id, 1_200_000); // ₦12,000 collected
+    await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 1_140_000, pin: TEST_PIN });
+    expect(await getSpaceBalance(space.id)).toBe(60_000);
+    expect(await dueLeft(space.id, dues[0]!.id)).toBe(60_000);
+    const listed = await api('GET', `/v1/spaces/${space.id}/payout/dues`, { token: await tokenFor(rep) });
+    expect(listed.body.data[0].available).toBe(60_000);
+  });
+
+  it("takes from the lead's dues before a co-rep's", async () => {
+    const t = await team();
+    const [leadDue, bolaDue] = await Promise.all(
+      ['Lead due', 'Bola due'].map((title) =>
+        db.due.create({ data: { spaceId: t.space.id, title, amount: 500_000, dueDate: new Date(Date.now() + 7 * 864e5), category: 'departmental_due', status: 'active' } }),
+      ),
+    );
+    await api('POST', `${t.base}/dues/${bolaDue!.id}/reassign`, { token: t.leadToken, body: { userId: t.bola.id } });
+    await creditDue(t.space.id, leadDue!.id, 500_000);
+    await creditDue(t.space.id, bolaDue!.id, 500_000);
+
+    const whole = await requestWithdrawal({ spaceId: t.space.id, userId: t.lead.id, beneficiaryId: t.beneficiary!.id, amountKobo: 600_000, pin: TEST_PIN });
+    await completePayout(whole.reference);
+    expect(await dueLeft(t.space.id, leadDue!.id)).toBe(0);
+    expect(await dueLeft(t.space.id, bolaDue!.id)).toBe(400_000);
+    await expect(
+      requestWithdrawal({ spaceId: t.space.id, userId: t.bola.id, dueId: bolaDue!.id, beneficiaryId: t.beneficiary!.id, amountKobo: 450_000, pin: TEST_PIN }),
+    ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
   });
 });
 
@@ -195,13 +229,13 @@ describe('signatory approval (multisig)', () => {
 
     const p = await requestWithdrawal({ spaceId: t.space.id, userId: dayo.id, dueId: due!.id, beneficiaryId: t.beneficiary!.id, amountKobo: 500_000 });
     expect(p.status).toBe('awaiting_approval');
-    expect(await getDueBalance(due!.id)).toBe(300_000);
+    expect(await dueLeft(t.space.id, due!.id)).toBe(300_000);
 
     expect((await sign(t.base, p.id, t.bola)).body.data.status).toBe('awaiting_approval');
     const rejected = await api('POST', `${t.base}/payout/${p.id}/reject`, { token: await tokenFor(t.chidi), body: { reason: 'not agreed' } });
     expect(rejected.body.data).toMatchObject({ status: 'cancelled' });
     expect(rejected.body.data.failureReason).toContain('rejected by Chidi');
-    expect(await getDueBalance(due!.id)).toBe(800_000);
+    expect(await dueLeft(t.space.id, due!.id)).toBe(800_000);
     expect(await getSpaceBalance(t.space.id)).toBe(800_000);
     expect(fake.calls.filter((c) => c.op === 'initiatePayout')).toHaveLength(0);
 

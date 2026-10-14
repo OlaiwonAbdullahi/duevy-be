@@ -338,7 +338,7 @@ Withdrawal status moves `[awaiting_approval →] pending → processing → succ
 
 ### `GET /payout/dues`
 
-The dues the caller can withdraw from: every due for the lead, the assigned ones for a co-rep. `200`: `[{ id, title, type, status, assignedRepId, available }]`, where `available` is the due's collections less the withdrawals made against it, in kobo.
+The dues the caller can withdraw from: every due for the lead, the assigned ones for a co-rep. `200`: `[{ id, title, type, status, assignedRepId, available }]`, where `available` is what is left of the due, in kobo: its collections less the withdrawals made against it, less its share of withdrawals from the whole balance. Whole-balance withdrawals use up the dues the lead holds first, then co-reps' dues, oldest first, so the dues never add up to more than the balance.
 
 ### Withdrawal security
 
