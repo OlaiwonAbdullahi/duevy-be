@@ -17,6 +17,7 @@ const defaults: Record<string, string> = {
   BACHS_WEBHOOK_SECRET: 'whsec_test_secret',
   RUN_WORKERS: 'false',
   FILE_STORAGE: 'memory',
+  FEATURE_PARTNERS: 'true',
 };
 
 for (const [key, value] of Object.entries(defaults)) {

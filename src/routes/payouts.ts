@@ -11,12 +11,14 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBeneficiary } from '../lib/serializers';
 import { maskAccountNumber } from '../lib/encryption';
 import {
+  discountedFee,
   MIN_PAYOUT_KOBO,
   WITHDRAWAL_FEE_HIGH_KOBO,
   WITHDRAWAL_FEE_LOW_KOBO,
   WITHDRAWAL_FEE_THRESHOLD_KOBO,
 } from '../lib/money';
 import { getKycState, getSpaceKycState } from '../services/kyc.service';
+import { getActiveDiscount, serializeSpacePartner } from '../services/partner.service';
 import {
   governmentIdHandlers,
   payoutDestinationHandlers,
@@ -52,7 +54,7 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval] = await Promise.all([
+  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval, partner] = await Promise.all([
     getSpaceLedgerSummary(sid),
     getSpaceKycState(sid),
     db.payoutBeneficiary.count({ where: { spaceId: sid } }),
@@ -62,7 +64,9 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     }),
     listSignatories(sid),
     db.payout.findFirst({ where: { spaceId: sid, status: 'awaiting_approval' }, select: { id: true } }),
+    getActiveDiscount(sid),
   ]);
+  const discountPercent = partner?.discountPercent ?? 0;
   ok(res, {
     available: ledger.balance,
     balance: ledger.balance,
@@ -84,10 +88,12 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     signatoriesComplete: signatories.length >= REQUIRED_SIGNATORIES,
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
+    // Already net of the space's partner discount, if any.
     fees: {
-      below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_LOW_KOBO },
-      atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: WITHDRAWAL_FEE_HIGH_KOBO },
+      below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_LOW_KOBO, discountPercent) },
+      atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_HIGH_KOBO, discountPercent) },
     },
+    partner: partner ? serializeSpacePartner(partner) : null,
   });
 });
 
@@ -278,7 +284,7 @@ payoutsRouter.get('/payout/quote', async (req: Request, res: Response): Promise<
     errors.validation(res, [{ field: 'amount', issue: 'must be a positive integer in kobo' }]);
     return;
   }
-  ok(res, await quoteWithdrawal(amount));
+  ok(res, await quoteWithdrawal(spaceId(req), amount));
 });
 
 // ---------------------------------------------------------------------------

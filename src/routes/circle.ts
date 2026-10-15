@@ -297,8 +297,17 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       })
     : [];
 
+  // Collected includes guests; the paid count is members only (it's set against memberCount).
+  const memberPaid = dueIds.length
+    ? await db.duePayment.groupBy({
+        by: ['dueId'],
+        where: { dueId: { in: dueIds }, user: { isGuest: false } },
+        _count: { _all: true },
+      })
+    : [];
+  const memberPaidByDue = new Map(memberPaid.map((g) => [g.dueId, g._count._all]));
   const paidByDue = new Map<string, { count: number; sum: number }>(
-    grouped.map((g) => [g.dueId, { count: g._count._all, sum: g._sum.netToSpace ?? 0 }]),
+    grouped.map((g) => [g.dueId, { count: memberPaidByDue.get(g.dueId) ?? 0, sum: g._sum.netToSpace ?? 0 }]),
   );
 
   let collected = 0;

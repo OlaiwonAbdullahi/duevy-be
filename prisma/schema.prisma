@@ -307,6 +307,13 @@ enum AuditAction {
   withdrawal_pin_reset
   signatories_updated
   withdrawal_mode_changed
+  partner_applied
+}
+
+enum PartnerRedemptionSource {
+  signup
+  settings
+  admin
 }
 
 enum AssistantIntent {
@@ -413,6 +420,9 @@ model User {
   isSuspended                    Boolean               @default(false)
   suspendedReason                String?
   isDeactivated                  Boolean               @default(false)
+  // Paid a guest-enabled due without signing up: no password, no memberships.
+  // Claimed (flipped to false) once they prove the email via password reset or Google.
+  isGuest                        Boolean               @default(false)
   deactivatedReason              String?
   termsAcceptedAt                DateTime?
   termsVersion                   String?
@@ -445,6 +455,7 @@ model User {
   payoutOtps             PayoutOtp[]
   checkouts              Checkout[]
   receipts               Receipt[]
+  partnerRedemptions     PartnerRedemption[]
 
   @@index([institution])
   @@index([studentIdStatus])
@@ -565,18 +576,19 @@ model Space {
   updatedAt                   DateTime           @updatedAt
 
   // Relations
-  memberships    SpaceMembership[]
-  reps           SpaceRep[]
-  joinRequests   SpaceJoinRequest[]
-  dues           Due[]
-  beneficiaries  PayoutBeneficiary[]
-  payouts        Payout[]
-  polls          Poll[]
-  auditLogs      SpaceAuditLog[]
-  repApplication RepApplication?
-  ledgerEntries  LedgerEntry[]
-  checkouts      Checkout[]
-  receipts       Receipt[]
+  memberships       SpaceMembership[]
+  reps              SpaceRep[]
+  joinRequests      SpaceJoinRequest[]
+  dues              Due[]
+  beneficiaries     PayoutBeneficiary[]
+  payouts           Payout[]
+  polls             Poll[]
+  auditLogs         SpaceAuditLog[]
+  repApplication    RepApplication?
+  ledgerEntries     LedgerEntry[]
+  checkouts         Checkout[]
+  receipts          Receipt[]
+  partnerRedemption PartnerRedemption?
 
   @@index([institution])
   @@map("spaces")
@@ -644,6 +656,8 @@ model RepApplication {
   theme        SpaceTheme
   coRepInvites String[]             @default([])
   referralCode String?
+  // Partner code entered at signup (validated then); redeemed for the space on approval.
+  partnerCode  String?
   status       RepApplicationStatus @default(pending)
   reviewNote   String?
   reviewedAt   DateTime?
@@ -933,61 +947,65 @@ model PayoutBeneficiary {
 }
 
 model Payout {
-  id                String       @id @default(cuid())
-  spaceId           String
-  dueId             String? // null = space-wide (lead-only); set = due-scoped
-  amount            Int // kobo — the GROSS debit against the space's ledger balance
-  reference         String       @unique // ours; also the provider reference and idempotency key
-  status            PayoutStatus @default(pending)
-  accountMasked     String // "GTBank •••• 4021"
+  id                  String       @id @default(cuid())
+  spaceId             String
+  dueId               String? // null = space-wide (lead-only); set = due-scoped
+  amount              Int // kobo — the GROSS debit against the space's ledger balance
+  reference           String       @unique // ours; also the provider reference and idempotency key
+  status              PayoutStatus @default(pending)
+  accountMasked       String // "GTBank •••• 4021"
   // Who it was sent to, fixed when the withdrawal is requested so a later
   // edit or removal of the beneficiary can't redirect it.
-  beneficiaryId     String?
-  accountName       String?
-  destinationId     String? // the provider payout destination it is sent to
-  note              String?
-  requestedById     String?
-  failureReason     String?
+  beneficiaryId       String?
+  accountName         String?
+  destinationId       String? // the provider payout destination it is sent to
+  note                String?
+  requestedById       String?
+  failureReason       String?
   // amount = feeKobo + netKobo. netKobo is sent to the bank; feeKobo is
   // Duevy's withdrawal fee. Both are debited from the ledger when the
   // withdrawal is created and credited back in full if it fails.
-  feeKobo           Int          @default(0)
-  netKobo           Int          @default(0)
+  feeKobo             Int          @default(0)
+  netKobo             Int          @default(0)
+  // Partner discount already taken off feeKobo, and the redemption it came from.
+  feeDiscountKobo     Int          @default(0)
+  partnerRedemptionId String?
   // Set to spaceId while the payout is pending/processing and cleared when it
   // ends. Unique, so a space can never have two withdrawals in flight — the
   // database-level backstop behind the advisory lock in withdrawal.service.
-  activeSpaceId     String?      @unique
-  provider          String       @default("bachs")
-  providerPayoutId  String?      @unique
-  providerAccountId String? // the rep's Connect account it was paid out of
-  providerFeeKobo   Int? // what Bachs charged on top, from the payout response
+  activeSpaceId       String?      @unique
+  provider            String       @default("bachs")
+  providerPayoutId    String?      @unique
+  providerAccountId   String? // the rep's Connect account it was paid out of
+  providerFeeKobo     Int? // what Bachs charged on top, from the payout response
   // Once the payout succeeds, Duevy's fee (less Bachs's own payout fee) is
   // moved from the rep's account to the platform. Signed: positive = swept to
   // the platform, negative = the platform topped the account up.
-  feeSettlementKobo Int?
-  feeSettledAt      DateTime?
+  feeSettlementKobo   Int?
+  feeSettledAt        DateTime?
   // awaiting_approval only: when it is cancelled if not yet approved.
-  approvalExpiresAt DateTime?
-  requestedAt       DateTime     @default(now())
-  processingAt      DateTime?
-  cancelledAt       DateTime?
-  settledAt         DateTime?
-  failedAt          DateTime?
-  reversedAt        DateTime?
+  approvalExpiresAt   DateTime?
+  requestedAt         DateTime     @default(now())
+  processingAt        DateTime?
+  cancelledAt         DateTime?
+  settledAt           DateTime?
+  failedAt            DateTime?
+  reversedAt          DateTime?
   // --- Legacy (Anchor era) fee split. Nothing writes these now.
-  duevyFeeKobo      Int          @default(0)
-  anchorFeeKobo     Int          @default(0)
-  stampDutyKobo     Int          @default(0)
-  netSentKobo       Int          @default(0)
-  anchorTransferId  String?
+  duevyFeeKobo        Int          @default(0)
+  anchorFeeKobo       Int          @default(0)
+  stampDutyKobo       Int          @default(0)
+  netSentKobo         Int          @default(0)
+  anchorTransferId    String?
 
-  space         Space              @relation(fields: [spaceId], references: [id])
-  due           Due?               @relation(fields: [dueId], references: [id], onDelete: SetNull)
-  beneficiary   PayoutBeneficiary? @relation(fields: [beneficiaryId], references: [id], onDelete: SetNull)
-  requestedBy   User?              @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
-  approvals     PayoutApproval[]
-  otps          PayoutOtp[]
-  ledgerEntries LedgerEntry[]
+  space             Space              @relation(fields: [spaceId], references: [id])
+  due               Due?               @relation(fields: [dueId], references: [id], onDelete: SetNull)
+  partnerRedemption PartnerRedemption? @relation(fields: [partnerRedemptionId], references: [id], onDelete: SetNull)
+  beneficiary       PayoutBeneficiary? @relation(fields: [beneficiaryId], references: [id], onDelete: SetNull)
+  requestedBy       User?              @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  approvals         PayoutApproval[]
+  otps              PayoutOtp[]
+  ledgerEntries     LedgerEntry[]
 
   @@index([spaceId, requestedAt])
   @@index([status, requestedAt])
@@ -1400,4 +1418,48 @@ model PlatformSetting {
   updatedAt   DateTime @updatedAt
 
   @@map("platform_settings")
+}
+
+// Partners (SUG, NACOS, …): a rep who signs up with — or later applies — a
+// partner's code gets a discount on their space's withdrawal fees. Admin-managed.
+model Partner {
+  id                           String    @id @default(cuid())
+  name                         String
+  short                        String
+  code                         String    @unique // uppercase
+  logoUrl                      String?
+  withdrawalFeeDiscountPercent Int // 1–100
+  durationDays                 Int? // how long a redemption lasts; null = permanent
+  maxRedemptions               Int? // null = unlimited
+  expiresAt                    DateTime? // the code can't be redeemed after this
+  isActive                     Boolean   @default(true)
+  createdById                  String?
+  createdAt                    DateTime  @default(now())
+  updatedAt                    DateTime  @updatedAt
+
+  redemptions PartnerRedemption[]
+
+  @@map("partners")
+}
+
+// One partner per space. The discount and end date are fixed when the code is
+// redeemed, so later edits to the partner don't change existing reps' terms.
+model PartnerRedemption {
+  id              String                  @id @default(cuid())
+  partnerId       String
+  spaceId         String                  @unique
+  redeemedById    String?
+  source          PartnerRedemptionSource
+  discountPercent Int
+  endsAt          DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime                @default(now())
+
+  partner    Partner  @relation(fields: [partnerId], references: [id])
+  space      Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  redeemedBy User?    @relation(fields: [redeemedById], references: [id], onDelete: SetNull)
+  payouts    Payout[]
+
+  @@index([partnerId])
+  @@map("partner_redemptions")
 }

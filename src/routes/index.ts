@@ -14,10 +14,13 @@ import { banksRouter } from './banks';
 import { assistantRouter } from './assistant';
 import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
+import { guestPayRouter } from './guestPay';
+import { partnersRouter } from './partners';
 
 export const apiRouter = Router();
 
 apiRouter.use('/auth', authRouter);
+apiRouter.use('/public', guestPayRouter);
 apiRouter.use('/me', meRouter);
 apiRouter.use('/spaces', spacesRouter);
 apiRouter.use('/wallet', walletRouter);
@@ -29,6 +32,7 @@ apiRouter.use('/notifications', notificationsRouter);
 apiRouter.use('/polls', pollsPublicRouter);
 apiRouter.use('/admin', adminRouter);
 apiRouter.use('/referrals', requireFeature('referrals'), referralsRouter);
+apiRouter.use('/partners', partnersRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
 apiRouter.use('/feedback', feedbackRouter);

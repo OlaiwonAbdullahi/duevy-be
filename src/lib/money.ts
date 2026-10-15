@@ -149,15 +149,28 @@ export function withdrawalFee(grossKobo: number): number {
 export interface WithdrawalBreakdown {
   /** Debited from the space's ledger. */
   gross: number;
-  /** Duevy's withdrawal fee, deducted from the gross. */
+  /** Duevy's withdrawal fee, deducted from the gross (after any partner discount). */
   fee: number;
+  /** The fee before the partner discount. */
+  feeBeforeDiscount: number;
+  /** Partner discount taken off the fee. */
+  discount: number;
   /** What lands in the rep's bank account. */
   net: number;
 }
 
-export function computeWithdrawal(grossKobo: number): WithdrawalBreakdown {
-  const fee = withdrawalFee(grossKobo);
-  return { gross: grossKobo, fee, net: grossKobo - fee };
+/** The withdrawal fee with a partner's percentage discount applied (discount rounded half-up). */
+export function discountedFee(feeKobo: number, discountPercent: number): number {
+  if (!Number.isInteger(discountPercent) || discountPercent < 0 || discountPercent > 100) {
+    throw new RangeError(`discountPercent must be an integer 0–100, got ${discountPercent}`);
+  }
+  return feeKobo - mulDivRoundHalfUp(feeKobo, discountPercent, 100);
+}
+
+export function computeWithdrawal(grossKobo: number, discountPercent = 0): WithdrawalBreakdown {
+  const feeBeforeDiscount = withdrawalFee(grossKobo);
+  const fee = discountedFee(feeBeforeDiscount, discountPercent);
+  return { gross: grossKobo, fee, feeBeforeDiscount, discount: feeBeforeDiscount - fee, net: grossKobo - fee };
 }
 
 // ---------------------------------------------------------------------------

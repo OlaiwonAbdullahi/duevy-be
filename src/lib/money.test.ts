@@ -5,6 +5,7 @@ import {
   computeCharge,
   computeWithdrawal,
   decimalToKobo,
+  discountedFee,
   koboToDecimal,
   withdrawalFee,
   WITHDRAWAL_FEE_THRESHOLD_KOBO,
@@ -51,8 +52,20 @@ describe('withdrawalFee — ₦100 under ₦50,000, ₦200 from ₦50,000', () =
   });
 
   it('deducts the fee from the withdrawal', () => {
-    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 10_000, net: 1_990_000 });
-    expect(computeWithdrawal(50_000 * NAIRA)).toEqual({ gross: 5_000_000, fee: 20_000, net: 4_980_000 });
+    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 10_000, feeBeforeDiscount: 10_000, discount: 0, net: 1_990_000 });
+    expect(computeWithdrawal(50_000 * NAIRA)).toEqual({ gross: 5_000_000, fee: 20_000, feeBeforeDiscount: 20_000, discount: 0, net: 4_980_000 });
+  });
+
+  it('applies a partner discount to the fee only', () => {
+    expect(computeWithdrawal(20_000 * NAIRA, 50)).toEqual({ gross: 2_000_000, fee: 5_000, feeBeforeDiscount: 10_000, discount: 5_000, net: 1_995_000 });
+    expect(computeWithdrawal(50_000 * NAIRA, 100)).toEqual({ gross: 5_000_000, fee: 0, feeBeforeDiscount: 20_000, discount: 20_000, net: 5_000_000 });
+  });
+
+  it('rounds the discount half-up and rejects bad percentages', () => {
+    expect(discountedFee(10_000, 33)).toBe(6_700);
+    expect(discountedFee(10_001, 50)).toBe(5_000); // 5000.5 off → 5001 off
+    expect(() => discountedFee(10_000, 101)).toThrow(RangeError);
+    expect(() => discountedFee(10_000, 12.5)).toThrow(RangeError);
   });
 });
 

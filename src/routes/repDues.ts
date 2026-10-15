@@ -41,11 +41,12 @@ async function loadDue(sid: string, dueId: string) {
 
 async function repDuePayload(sid: string, due: Awaited<ReturnType<typeof loadDue>>) {
   if (!due) throw new Error('due required');
-  const [paidCount, memberCount] = await Promise.all([
-    db.duePayment.count({ where: { dueId: due.id } }),
+  const [paidCount, guestPaidCount, memberCount] = await Promise.all([
+    db.duePayment.count({ where: { dueId: due.id, user: { isGuest: false } } }),
+    db.duePayment.count({ where: { dueId: due.id, user: { isGuest: true } } }),
     db.spaceMembership.count({ where: { spaceId: sid } }),
   ]);
-  return serializeRepDue(due, { paidCount, memberCount });
+  return serializeRepDue(due, { paidCount, guestPaidCount, memberCount });
 }
 
 const dueDateField = z
@@ -105,16 +106,33 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
   });
 
   const memberCount = await db.spaceMembership.count({ where: { spaceId: sid } });
-  const paidCounts = await db.duePayment.groupBy({
-    by: ['dueId'],
-    where: { dueId: { in: dues.map((d) => d.id) } },
-    _count: { _all: true },
-  });
+  // Paid counts are members only (they're compared with memberCount); guest
+  // payments are counted on their own.
+  const dueIds = dues.map((d) => d.id);
+  const [paidCounts, guestCounts] = await Promise.all([
+    db.duePayment.groupBy({
+      by: ['dueId'],
+      where: { dueId: { in: dueIds }, user: { isGuest: false } },
+      _count: { _all: true },
+    }),
+    db.duePayment.groupBy({
+      by: ['dueId'],
+      where: { dueId: { in: dueIds }, user: { isGuest: true } },
+      _count: { _all: true },
+    }),
+  ]);
   const paidByDue = new Map(paidCounts.map((p) => [p.dueId, p._count._all]));
+  const guestsByDue = new Map(guestCounts.map((p) => [p.dueId, p._count._all]));
 
   ok(
     res,
-    dues.map((d) => serializeRepDue(d, { paidCount: paidByDue.get(d.id) ?? 0, memberCount })),
+    dues.map((d) =>
+      serializeRepDue(d, {
+        paidCount: paidByDue.get(d.id) ?? 0,
+        guestPaidCount: guestsByDue.get(d.id) ?? 0,
+        memberCount,
+      }),
+    ),
   );
 });
 
@@ -134,6 +152,8 @@ const createDueSchema = z.object({
   publish: z.boolean().default(false),
   // Lead only: the co-rep who can withdraw this due's collections. Defaults to the creator.
   assignedRepId: z.string().min(1).optional(),
+  // Opens the due's public pay link to people outside the space (no account).
+  allowGuests: z.boolean().default(false),
 });
 
 repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Request, res: Response): Promise<void> => {
@@ -176,6 +196,7 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
         assignedRepId: assignee,
+        allowGuests: data.allowGuests,
       },
     });
     if (publishing) {
@@ -209,6 +230,7 @@ const patchDueSchema = z.object({
   amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO).optional(),
   dueDate: dueDateField.optional(),
   category: categoryField.optional(),
+  allowGuests: z.boolean().optional(),
 });
 
 repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (req: Request, res: Response): Promise<void> => {
@@ -246,6 +268,7 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
       ...(data.amount !== undefined ? { amount: data.amount } : {}),
       ...(data.dueDate !== undefined ? { dueDate: new Date(`${data.dueDate}T00:00:00Z`) } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
+      ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
     },
   });
 
@@ -381,6 +404,24 @@ repDuesRouter.post(
 // ---------------------------------------------------------------------------
 type RosterStatus = 'all' | 'paid' | 'unpaid';
 
+/** People outside the space who paid this due through its guest link. */
+async function guestPayers(dueId: string) {
+  const rows = await db.duePayment.findMany({
+    where: { dueId, user: { isGuest: true } },
+    include: { user: { select: { id: true, name: true, email: true, matricNo: true } } },
+    orderBy: { paidAt: 'desc' },
+    take: 500,
+  });
+  return rows.map((p) => ({
+    id: p.user.id,
+    name: p.user.name,
+    email: p.user.email,
+    matricNo: p.user.matricNo,
+    paidAt: p.paidAt.toISOString(),
+    reference: p.reference,
+  }));
+}
+
 async function buildRoster(
   sid: string,
   dueId: string,
@@ -458,17 +499,19 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   const statusFilter = parsed.success ? parsed.data.status : 'all';
   const { page, perPage, skip, take, q } = parseListQuery(req);
 
-  const [{ matching, students }, memberCount, agg] = await Promise.all([
+  const [{ matching, students }, memberCount, agg, guests] = await Promise.all([
     buildRoster(sid, due.id, statusFilter, q, { skip, take }),
     db.spaceMembership.count({ where: { spaceId: sid } }),
+    // Money totals include guests: that money really arrived.
     db.duePayment.aggregate({
       where: { dueId: due.id },
-      _count: { _all: true },
       _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
     }),
+    guestPayers(due.id),
   ]);
 
-  const paidCount = agg._count._all;
+  // Paid/unpaid compare against members, so guests are left out of them.
+  const paidCount = await db.duePayment.count({ where: { dueId: due.id, user: { isGuest: false } } });
   const collected = agg._sum.amountPaid ?? 0;
   const fees = (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0);
   const net = agg._sum.netToSpace ?? 0;
@@ -486,8 +529,10 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
         net,
         expected,
         rate: expected > 0 ? collected / expected : 0,
+        guestPaid: guests.length,
       },
       students,
+      guests,
     },
     200,
     buildMeta(page, perPage, matching),
@@ -512,12 +557,20 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
 
   const parsed = collectionsQuery.safeParse(req.query);
   const statusFilter = parsed.success ? parsed.data.status : 'all';
-  const { students } = await buildRoster(sid, due.id, statusFilter);
+  const [{ students }, guests] = await Promise.all([
+    buildRoster(sid, due.id, statusFilter),
+    statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(due.id),
+  ]);
 
   const header = ['Name', 'Matric No', 'Level', 'Email', 'Status', 'Paid At', 'Reference'];
-  const rows = students.map((s) =>
-    [s.name, s.matricNo, s.level, s.email, s.status, s.paidAt, s.reference].map(csvCell).join(','),
-  );
+  const rows = [
+    ...students.map((s) =>
+      [s.name, s.matricNo, s.level, s.email, s.status, s.paidAt, s.reference].map(csvCell).join(','),
+    ),
+    ...guests.map((g) =>
+      [g.name, g.matricNo, null, g.email, 'paid (guest)', g.paidAt, g.reference].map(csvCell).join(','),
+    ),
+  ];
   const csv = [header.join(','), ...rows].join('\n');
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');

@@ -12,6 +12,7 @@ import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } fro
 import { canWithdraw } from './kyc.service';
 import { destinationFor, oneOffDestination } from './beneficiary.service';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
+import { getActiveDiscount } from './partner.service';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
@@ -20,7 +21,8 @@ import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signato
  * the money leaves the LEAD rep's provider account, where collections settle.
  *
  *   gross = what the rep asks for, debited from the space's ledger
- *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross
+ *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross,
+ *           less the space's partner discount if it has one (partner.service)
  *   net   = gross − fee, sent to the bank
  *
  * Safety, in order:
@@ -211,9 +213,20 @@ export async function setWithdrawalPinByRep(input: {
   return { change, holdUntil };
 }
 
-export async function quoteWithdrawal(amountKobo: number) {
-  const b = computeWithdrawal(amountKobo);
-  return { amount: b.gross, fee: b.fee, net: b.net, minPayout: MIN_PAYOUT_KOBO, belowMinimum: amountKobo < MIN_PAYOUT_KOBO };
+export async function quoteWithdrawal(spaceId: string, amountKobo: number) {
+  const partner = await getActiveDiscount(spaceId);
+  const discountPercent = partner?.discountPercent ?? 0;
+  const b = computeWithdrawal(amountKobo, discountPercent);
+  return {
+    amount: b.gross,
+    fee: b.fee,
+    net: b.net,
+    feeBeforeDiscount: b.feeBeforeDiscount,
+    discount: b.discount,
+    discountPercent,
+    minPayout: MIN_PAYOUT_KOBO,
+    belowMinimum: amountKobo < MIN_PAYOUT_KOBO,
+  };
 }
 
 async function uniquePayoutReference(): Promise<string> {
@@ -229,7 +242,8 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   if (!Number.isSafeInteger(amountKobo) || amountKobo < MIN_PAYOUT_KOBO) {
     throw new AppError(422, 'BELOW_MIN_PAYOUT', `The minimum withdrawal is ₦${(MIN_PAYOUT_KOBO / 100).toLocaleString('en-NG')}`);
   }
-  const breakdown = computeWithdrawal(amountKobo);
+  const partner = await getActiveDiscount(spaceId);
+  const breakdown = computeWithdrawal(amountKobo, partner?.discountPercent ?? 0);
 
   const [space, user, rep, lead] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
@@ -293,6 +307,8 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             amount: breakdown.gross,
             feeKobo: breakdown.fee,
             netKobo: breakdown.net,
+            feeDiscountKobo: breakdown.discount,
+            partnerRedemptionId: breakdown.discount > 0 ? partner!.id : null,
             reference,
             dueId: due?.id ?? null,
             status: needsApproval ? 'awaiting_approval' : 'pending',
@@ -363,6 +379,8 @@ async function debit(tx: Tx, p: Payout): Promise<void> {
     reference: p.reference,
     description: `Withdrawal to ${p.accountMasked}`,
   });
+  // A 100% partner discount leaves no fee, and ledger entries must be positive.
+  if (p.feeKobo === 0) return;
   await appendLedgerEntry(tx, {
     spaceId: p.spaceId,
     dueId: p.dueId,

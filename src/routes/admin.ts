@@ -20,9 +20,13 @@ import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
 import { getPaymentSettings, setCheckoutMode } from '../services/settings.service';
+import { redeemForSpace } from '../services/partner.service';
+import { AppError } from '../lib/errors';
+import { adminPartnersRouter } from './partners';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
+adminRouter.use(adminPartnersRouter);
 
 const userSpaces = {
   spaceMemberships: { select: { space: { select: { name: true } } } },
@@ -371,7 +375,7 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
         where: { space: { dues: { some: overdueWhere } } },
         _count: { _all: true },
       }),
-      db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere }, _count: { _all: true } }),
+      db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
     ]);
     const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
     const paidCounts = new Map(paidGroups.map((p) => [p.dueId, p._count._all]));
@@ -847,7 +851,17 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     }
   }
 
-  await writeAdminAudit(req, 'rep.verify', { target: userId, metadata: { spaceId: space.id } });
+  // Redeem the partner code from signup for the new space (best-effort: a code
+  // that has since expired or run out doesn't block the approval).
+  let partnerNote: string | undefined;
+  if (app.partnerCode) {
+    partnerNote = await db
+      .$transaction((tx) => redeemForSpace(tx, { spaceId: space.id, code: app.partnerCode!, userId, source: 'signup' }))
+      .then((r) => `applied ${r.partner.code} (${r.discountPercent}%)`)
+      .catch((err) => `not applied ${app.partnerCode}: ${err instanceof AppError ? err.code : (err as Error).message}`);
+  }
+
+  await writeAdminAudit(req, 'rep.verify', { target: userId, metadata: { spaceId: space.id, ...(partnerNote ? { partner: partnerNote } : {}) } });
   sendRepApprovedEmail(user.email, user.name, space.name).catch(console.error);
 
   ok(res, await buildAdminRep({ ...user, role: 'rep', isRep: true, repApplicationStatus: 'approved' }));

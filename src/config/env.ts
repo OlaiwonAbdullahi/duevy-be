@@ -87,6 +87,7 @@ const envSchema = z.object({
   FEATURE_POLLS: z.string().transform((v) => v === 'true').default('false'),
   FEATURE_ASSISTANT: z.string().transform((v) => v === 'true').default('false'),
   FEATURE_REFERRALS: z.string().transform((v) => v === 'true').default('false'),
+  FEATURE_PARTNERS: z.string().transform((v) => v === 'true').default('false'),
 
   // Duey (AI assistant) classification backend — 'ollama' talks to a local/dev
   // Ollama instance; 'gemini' talks to Google's Gemini API natively (no

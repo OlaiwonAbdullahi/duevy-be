@@ -18,6 +18,7 @@ import { verifyGoogleIdToken } from "../lib/googleAuth";
 import { verifyRefreshToken } from "../lib/jwt";
 import { parseExpiryMs } from "../lib/jwt";
 import { authLimiter } from "../middleware/rateLimiter";
+import { findRedeemablePartner } from "../services/partner.service";
 
 export const authRouter = Router();
 
@@ -77,6 +78,15 @@ const spaceDraftSchema = z.object({
   faculty: z.string().trim().max(120).optional(),
 });
 
+// A rep's partner code (SUG, NACOS, …) is checked at signup so a typo is caught
+// on the form, and redeemed for their space when an admin approves them.
+// Throws a 422 for a bad code; ignored for students or when partners are off.
+async function checkPartnerCode(data: { role: "student" | "rep"; partnerCode?: string }): Promise<string | undefined> {
+  if (!env.FEATURE_PARTNERS || data.role !== "rep" || !data.partnerCode) return undefined;
+  const partner = await findRedeemablePartner(data.partnerCode);
+  return partner.code;
+}
+
 // ---------------------------------------------------------------------------
 // POST /auth/register
 // ---------------------------------------------------------------------------
@@ -92,6 +102,7 @@ const registerSchema = z
     acceptedTerms: z.literal(true),
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().max(32).optional(),
+    partnerCode: z.string().trim().max(20).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -110,6 +121,15 @@ authRouter.post(
     const data = req.body as z.infer<typeof registerSchema>;
 
     const existing = await db.user.findUnique({ where: { email: data.email } });
+    if (existing?.isGuest) {
+      // They've paid as a guest. Signup issues a session without proving the
+      // email, which would hand that payment history to anyone who typed it —
+      // so they claim it through the reset link sent to the inbox instead.
+      fail(res, 409, "GUEST_ACCOUNT_EXISTS", "You've paid on Duevy with this email. Use \"Forgot password\" to set a password and claim your account.", [
+        { field: "email", issue: "paid as a guest" },
+      ]);
+      return;
+    }
     if (existing) {
       fail(res, 409, "VALIDATION_ERROR", "Email already in use", [
         { field: "email", issue: "already in use" },
@@ -117,6 +137,7 @@ authRouter.post(
       return;
     }
 
+    const partnerCode = await checkPartnerCode(data);
     const passwordHash = await bcrypt.hash(data.password, env.BCRYPT_ROUNDS);
 
     // Begin transaction to create user and potentially rep application
@@ -146,6 +167,7 @@ authRouter.post(
             faculty: data.space.faculty,
             theme: "emerald", // not chosen at registration; the rep can change it later
             referralCode: data.referralCode,
+            partnerCode,
           },
         });
       }
@@ -197,6 +219,7 @@ const googleSchema = z
     matricNo: z.string().trim().min(1).max(32).optional(),
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().max(32).optional(),
+    partnerCode: z.string().trim().max(20).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -233,6 +256,15 @@ authRouter.post(
       include: { spaceMemberships: true, spaceReps: true },
     });
 
+    // Google has verified the email, so a guest payer's account is theirs.
+    if (user?.isGuest) {
+      user = await db.user.update({
+        where: { id: user.id },
+        data: { isGuest: false, emailVerified: true, ...(data.matricNo && !user.matricNo ? { matricNo: data.matricNo } : {}) },
+        include: { spaceMemberships: true, spaceReps: true },
+      });
+    }
+
     if (!user) {
       if (!data.matricNo) {
         errors.validation(res, [
@@ -241,6 +273,7 @@ authRouter.post(
         return;
       }
 
+      const partnerCode = await checkPartnerCode(data);
       const created = await db.$transaction(async (tx) => {
         const newUser = await tx.user.create({
           data: {
@@ -264,7 +297,8 @@ authRouter.post(
               school: data.space.school,
               faculty: data.space.faculty,
               theme: "emerald", // not chosen at registration; the rep can change it later
-                referralCode: data.referralCode,
+              referralCode: data.referralCode,
+              partnerCode,
             },
           });
         }
@@ -640,7 +674,9 @@ authRouter.post(
       }),
       db.user.update({
         where: { id: reset.userId },
-        data: { passwordHash },
+        // The reset link reached their inbox, so a guest payer can claim the
+        // account here: it becomes a normal, verified login.
+        data: { passwordHash, isGuest: false, emailVerified: true },
       }),
       // Invalidate all active refresh tokens for security
       db.refreshToken.updateMany({

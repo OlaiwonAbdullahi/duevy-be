@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Prisma, type Checkout, type CheckoutItem, type CheckoutStatus } from '@prisma/client';
 import { db } from '../config/db';
 import { env } from '../config/env';
@@ -93,7 +94,34 @@ export interface CheckoutResult {
   reused: boolean;
 }
 
-export async function createCheckout(userId: string, requestedDueIds: string[]): Promise<CheckoutResult> {
+/**
+ * Proof that the caller started this guest checkout. Guests have no session,
+ * so the status page and receipt are unlocked by this token instead: an HMAC
+ * of the reference, handed back only to whoever created the checkout.
+ */
+export function guestCheckoutToken(reference: string): string {
+  return createHmac('sha256', env.JWT_REFRESH_SECRET).update(`guest-checkout:${reference}`).digest('base64url');
+}
+
+export function isValidGuestCheckoutToken(reference: string, token: string): boolean {
+  const expected = Buffer.from(guestCheckoutToken(reference));
+  const given = Buffer.from(token);
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+
+export interface CreateCheckoutOptions {
+  /**
+   * A guest payer (no account, no membership). Allowed only on dues the rep
+   * has opened to guests, and the hosted page returns to the public pay page.
+   */
+  guest?: boolean;
+}
+
+export async function createCheckout(
+  userId: string,
+  requestedDueIds: string[],
+  opts: CreateCheckoutOptions = {},
+): Promise<CheckoutResult> {
   const dueIds = [...new Set(requestedDueIds)];
   if (dueIds.length === 0 || dueIds.length > MAX_DUES_PER_CHECKOUT) {
     throw new AppError(400, 'VALIDATION_ERROR', `Select between 1 and ${MAX_DUES_PER_CHECKOUT} dues`);
@@ -132,8 +160,14 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
     }),
   ]);
 
-  // No anonymous or guest payments: the payer must have joined the space.
-  if (!member) throw forbidden('Join this space with its code before paying', 'NOT_A_MEMBER');
+  if (opts.guest) {
+    // Guests skip membership, but only for dues the rep opened to guests.
+    const closed = dues.find((d) => !d.allowGuests);
+    if (closed) throw forbidden(`"${closed.title}" can only be paid by members of ${space.name}`, 'GUESTS_NOT_ALLOWED');
+  } else if (!member) {
+    // Members only: the payer must have joined the space.
+    throw forbidden('Join this space with its code before paying', 'NOT_A_MEMBER');
+  }
 
   if (paid) throw conflict('DUE_ALREADY_PAID', `"${paid.due.title}" has already been paid`);
 
@@ -209,7 +243,7 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
 
   const checkout = outcome.checkout.vaAccountNumber || outcome.checkout.checkoutUrl
     ? outcome.checkout
-    : await openCollectionAccount(outcome.checkout, user, outcome.reused);
+    : await openCollectionAccount(outcome.checkout, user, outcome.reused, returnUrlFor(outcome.checkout, opts));
 
   logger.info({ ref: checkout.reference, userId, spaceId: checkout.spaceId, total: checkout.totalKobo, reused: outcome.reused }, 'checkout ready');
   return { checkout: serializeCheckout(checkout), reused: outcome.reused };
@@ -220,10 +254,19 @@ export async function createCheckout(userId: string, requestedDueIds: string[]):
  * checkout: the provider calls carry idempotency keys derived from our
  * reference, so a retry replays rather than opening a second account.
  */
+/** Where a hosted checkout sends the payer back to when they're done. */
+function returnUrlFor(checkout: CheckoutWithItems, opts: CreateCheckoutOptions): string {
+  const ref = encodeURIComponent(checkout.reference);
+  if (!opts.guest) return `${env.FRONTEND_URL}/dashboard/pay/${ref}`;
+  const dueId = encodeURIComponent(checkout.items[0]!.dueId);
+  return `${env.FRONTEND_URL}/pay/${dueId}?ref=${ref}&t=${guestCheckoutToken(checkout.reference)}`;
+}
+
 async function openCollectionAccount(
   checkout: CheckoutWithItems,
   user: { email: string; name: string },
   reused: boolean,
+  returnUrl: string,
 ): Promise<CheckoutWithItems> {
   if (reused && Date.now() - checkout.createdAt.getTime() < OPENING_GRACE_MS) {
     throw conflict('CHECKOUT_OPENING', 'This payment is still being set up. Try again in a few seconds.');
@@ -240,7 +283,7 @@ async function openCollectionAccount(
       expiresInMinutes: env.CHECKOUT_EXPIRY_MINUTES,
       metadata: { checkoutId: checkout.id, spaceId: checkout.spaceId, dueCount: String(checkout.items.length) },
       mode: await getCheckoutMode(),
-      returnUrl: `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(checkout.reference)}`,
+      returnUrl,
     });
     if (account.totalKobo !== checkout.totalKobo) {
       throw new ProviderError('Provider total does not match the checkout total', null, 'PRICE_MISMATCH', false);
@@ -268,6 +311,17 @@ async function openCollectionAccount(
     logger.error({ ref: checkout.reference, code: err instanceof ProviderError ? err.code : undefined }, 'could not open checkout account');
     throw err;
   }
+}
+
+/** A guest checkout's status, for whoever holds its token. */
+export async function getGuestCheckout(reference: string, token: string) {
+  if (!isValidGuestCheckoutToken(reference, token)) throw notFound('Payment not found');
+  const checkout = await db.checkout.findUnique({
+    where: { reference },
+    include: { ...withItems, receipt: { select: { number: true } } },
+  });
+  if (!checkout) throw notFound('Payment not found');
+  return { ...serializeCheckout(checkout), receiptNumber: checkout.receipt?.number ?? null, userId: checkout.userId };
 }
 
 export async function getCheckoutForUser(reference: string, userId: string) {
@@ -546,7 +600,7 @@ function listTitles(titles: string[]): string {
 
 async function afterPaid(checkout: Checkout): Promise<void> {
   const [payer, items, space, reps, receipt] = await Promise.all([
-    db.user.findUnique({ where: { id: checkout.userId }, select: { name: true, email: true } }),
+    db.user.findUnique({ where: { id: checkout.userId }, select: { name: true, email: true, isGuest: true } }),
     db.checkoutItem.findMany({ where: { checkoutId: checkout.id }, include: { due: { select: { title: true } } } }),
     db.space.findUnique({ where: { id: checkout.spaceId }, select: { name: true } }),
     db.spaceRep.findMany({ where: { spaceId: checkout.spaceId }, select: { userId: true } }),
@@ -559,12 +613,13 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     {
       kind: 'payment_received',
       title: 'Payment received',
-      detail: `${payer?.name ?? 'A member'} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
+      detail: `${payer?.name ?? 'A member'}${payer?.isGuest ? ' (guest)' : ''} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
       // One due opens its collections roster; a basket goes to the dues list.
       href: items.length === 1 ? `/dashboard/create-dues?due=${items[0]!.dueId}` : '/dashboard/create-dues',
     },
   );
-  await notifyMany([checkout.userId], {
+  // Guests have no dashboard to see an in-app notice — the email is theirs.
+  if (!payer?.isGuest) await notifyMany([checkout.userId], {
     kind: 'payment_received',
     title: 'Payment confirmed',
     detail: `Your payment for ${what} was received.`,

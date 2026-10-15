@@ -55,6 +55,7 @@ export function serializePayout(p: Payout) {
     amount: p.amount,
     fee,
     net,
+    feeDiscount: p.feeDiscountKobo,
     reference: p.reference,
     status: p.status,
     account: p.accountMasked,
@@ -226,7 +227,10 @@ export function serializeSpace(
 }
 
 /** The rep-facing `RepDue` resource (§7) — Due plus progress counters. */
-export function serializeRepDue(due: Due, opts: { paidCount: number; memberCount: number }) {
+export function serializeRepDue(
+  due: Due,
+  opts: { paidCount: number; memberCount: number; guestPaidCount?: number },
+) {
   return {
     id: due.id,
     spaceId: due.spaceId,
@@ -238,7 +242,9 @@ export function serializeRepDue(due: Due, opts: { paidCount: number; memberCount
     category: due.category, // deprecated alias of `type`
     status: due.status,
     assignedRepId: due.assignedRepId,
+    allowGuests: due.allowGuests,
     paidCount: opts.paidCount,
+    guestPaidCount: opts.guestPaidCount ?? 0,
     memberCount: opts.memberCount,
     publishedAt: due.publishedAt?.toISOString() ?? null,
     closedAt: due.closedAt?.toISOString() ?? null,

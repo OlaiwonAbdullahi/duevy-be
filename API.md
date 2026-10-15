@@ -37,7 +37,7 @@ Base URL: `/v1`. Request and response bodies are JSON.
 
 ```json
 { "name": "Aisha Bello", "matricNo": "210805019", "email": "aisha@example.com", "password": "min 8 chars",
-  "acceptedTerms": true, "role": "student" | "rep",
+  "acceptedTerms": true, "role": "student" | "rep", "partnerCode"?: "NACOS",  // rep only, see Partners
   "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" }  // required when role = rep
 }
 ```
@@ -302,7 +302,7 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 
 ### `GET /payout/quote?amount=500000`
 
-`200`: `{ amount, fee, net, minPayout, belowMinimum }`.
+`200`: `{ amount, fee, net, feeBeforeDiscount, discount, discountPercent, minPayout, belowMinimum }`. `fee` is net of any partner discount (see Partners).
 
 The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from the withdrawal.
 
@@ -403,6 +403,47 @@ Any signed-in user. Body: `{ "category": "bug" | "idea" | "other", "message": "1
 
 ---
 
+## Partners
+
+Partners (SUG, NACOS, …) each have a code. A rep who signs up with a code, or whose lead rep applies one later, gets a percentage off the space's withdrawal fees. Behind `FEATURE_PARTNERS`; every route below `404`s when it is off.
+
+`PartnerPreview = { code, name, short, logoUrl, withdrawalFeeDiscountPercent, durationDays }`. `durationDays` is `null` for a discount with no end date.
+
+`SpacePartner = { id, partner: PartnerPreview, source: "signup" | "settings" | "admin", discountPercent, endsAt, active, createdAt }`. `discountPercent` and `endsAt` are fixed when the code is redeemed, so later edits to the partner don't change them. `active` turns `false` once `endsAt` passes.
+
+Code errors are all `422` with `details: [{ field: "partnerCode" }]`:
+
+| Error | When |
+|---|---|
+| `INVALID_PARTNER_CODE` | Unknown or deactivated code. |
+| `PARTNER_CODE_EXPIRED` | Past the partner's `expiresAt`. |
+| `PARTNER_CODE_EXHAUSTED` | `maxRedemptions` reached. |
+
+### `GET /partners/lookup?code=NACOS` (public)
+
+`200`: `PartnerPreview`, for the signup form's preview. Rate-limited to 10 a minute.
+
+### `GET /spaces/:spaceId/partner` (any rep of the space)
+
+`200`: `SpacePartner | null`. A revoked redemption returns `null`.
+
+### `POST /spaces/:spaceId/partner` (lead rep only)
+
+Body: `{ "code": "NACOS" }`. `201`: `SpacePartner`. A space has at most one partner: `409 PARTNER_ALREADY_APPLIED`, including after an admin revokes it. Written to the space audit log as `partner_applied`.
+
+### At signup
+
+`POST /auth/register` and `POST /auth/google` accept `partnerCode` (up to 20 characters) when `role = "rep"`. A bad code fails the signup with one of the errors above. A good one is redeemed for the rep's space when an admin approves the application (`source: "signup"`); if it has expired or run out by then, approval still goes through without it and the reason is in the `rep.verify` audit entry.
+
+### Effect on withdrawals
+
+- `GET /payout/quote` adds `feeBeforeDiscount`, `discount` and `discountPercent` (`0` with no partner). `fee` and `net` are already discounted.
+- `GET /payout/summary` adds `partner: SpacePartner | null` (only while active), and its `fees` tiers are already discounted.
+- `Payout` adds `feeDiscount` (kobo).
+- A 100% discount means no fee at all. When the discounted fee is below Bachs's own payout fee, the platform covers the difference at settlement.
+
+---
+
 ## Admin
 
 ### `DELETE /admin/spaces/:spaceId/withdrawal-pin` (`payouts` permission)
@@ -432,6 +473,12 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `POST /admin/feedback/:id/resolve` · `/reopen` | userManagement | Marks it resolved (body: `{ note? }`, kept as `adminNote`) or back to `new`. Both are audit-logged. |
 | `GET /admin/settings/payments` | any admin | `{ checkoutMode: "hosted" \| "custom", updatedAt, updatedById }`. Defaults to `hosted`. |
 | `PUT /admin/settings/payments` | super admin | Body `{ checkoutMode: "hosted" \| "custom" }`. Applies to checkouts opened from then on. Audit-logged as `settings.checkout_mode`. |
+| `GET /admin/partners?q=&status=all\|active\|inactive` | payouts | `[{ id, name, short, code, logoUrl, withdrawalFeeDiscountPercent, durationDays, maxRedemptions, expiresAt, isActive, redemptionCount, createdAt, updatedAt }]`. `redemptionCount` leaves out revoked ones. |
+| `POST /admin/partners` | payouts | Body: `{ name, short, code, withdrawalFeeDiscountPercent (1–100), logoUrl?, durationDays?, maxRedemptions?, expiresAt?, isActive? }`. `code` is 3–20 letters, numbers or dashes, stored uppercase. `409 PARTNER_CODE_TAKEN`. Audit-logged as `partner.create`. |
+| `PATCH /admin/partners/:partnerId` | payouts | Any of the fields above. Doesn't change spaces that already redeemed the code. Audit-logged as `partner.update`. |
+| `POST /admin/partners/logo` | payouts | `multipart/form-data` with a `file` part (JPEG, PNG or WebP, up to 2 MB). `200`: `{ logoUrl }`. |
+| `GET /admin/partners/:partnerId/redemptions` | payouts | `[{ id, space: { id, name, short }, redeemedBy: { id, name, email }, source, discountPercent, endsAt, revokedAt, createdAt }]` |
+| `POST /admin/partner-redemptions/:redemptionId/revoke` | payouts | Ends the space's discount now. Idempotent. Audit-logged as `partner.redemption_revoke`. |
 
 ---
 
