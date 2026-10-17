@@ -444,6 +444,25 @@ Body: `{ "code": "NACOS" }`. `201`: `SpacePartner`. A space has at most one part
 
 ---
 
+## Public metrics
+
+### `GET /public/metrics` (public)
+
+Aggregate-only traction figures for duevy.app/metrics. No auth. Cached for 10 minutes (stale figures are served if a refresh fails); `Cache-Control: public, max-age=300`. Never includes anything that identifies a user, space or due.
+
+`200`: `{ students, reps, spaces, campuses, volume, payments, payouts, monthly: [{ month: "YYYY-MM", volume, payments }], updatedAt }`.
+
+- `students`: non-admin, non-guest, non-deactivated accounts (reps included).
+- `reps`: approved reps who aren't suspended or deactivated.
+- `spaces` / `campuses`: unarchived spaces and their distinct institutions.
+- `volume` / `payments`: lifetime paid checkouts — what students paid (kobo, fees included) and how many.
+- `payouts`: successful withdrawals.
+- `monthly`: Lagos calendar months, oldest first, at most 12, starting at the first month with a payment.
+
+`503 METRICS_UNAVAILABLE` if the figures can't be computed and nothing is cached.
+
+---
+
 ## Admin
 
 ### `DELETE /admin/spaces/:spaceId/withdrawal-pin` (`payouts` permission)

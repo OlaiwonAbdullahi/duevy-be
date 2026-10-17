@@ -16,11 +16,13 @@ import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
 import { guestPayRouter } from './guestPay';
 import { partnersRouter } from './partners';
+import { publicMetricsRouter } from './publicMetrics';
 
 export const apiRouter = Router();
 
 apiRouter.use('/auth', authRouter);
 apiRouter.use('/public', guestPayRouter);
+apiRouter.use('/public', publicMetricsRouter);
 apiRouter.use('/me', meRouter);
 apiRouter.use('/spaces', spacesRouter);
 apiRouter.use('/wallet', walletRouter);
