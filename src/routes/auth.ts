@@ -452,61 +452,52 @@ authRouter.post(
     try {
       const payload = await verifyRefreshToken(token);
       const tokenHash = hashToken(token);
+      const now = new Date();
 
-      const storedToken = await db.refreshToken.findUnique({
-        where: { tokenHash },
-      });
-      if (!storedToken || storedToken.userId !== payload.sub || storedToken.expiresAt < new Date()) {
-        clearRefreshCookie(res);
-        errors.unauthorized(res, "Invalid or expired refresh token");
-        return;
-      }
+      // Revoke the presented token (rotation) and load the session user in one
+      // round trip. The revoke only matches a live, unexpired token of this
+      // user, so two concurrent refreshes can't both mint a session.
+      const [rotated, session] = await Promise.all([
+        db.refreshToken.updateMany({
+          where: { tokenHash, userId: payload.sub, revokedAt: null, expiresAt: { gte: now } },
+          data: { revokedAt: now },
+        }),
+        loadSessionUser(payload.sub),
+      ]);
 
-      // Revoke the presented token (rotation). Conditional on it still being
-      // live, so two concurrent refreshes can't both mint a session.
-      const rotated = await db.refreshToken.updateMany({
-        where: { id: storedToken.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
       if (rotated.count === 0) {
-        // A revoked token was replayed — treat it as stolen and end every
-        // session for this user.
-        await db.refreshToken.updateMany({
-          where: { userId: storedToken.userId, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
+        // Unknown, expired, or already revoked. Only a replay of a revoked
+        // token is treated as stolen, ending every session for this user.
+        const stored = await db.refreshToken.findUnique({ where: { tokenHash } });
+        if (stored && stored.userId === payload.sub && stored.expiresAt >= now && stored.revokedAt) {
+          await db.refreshToken.updateMany({
+            where: { userId: stored.userId, revokedAt: null },
+            data: { revokedAt: new Date() },
+          });
+        }
         clearRefreshCookie(res);
         errors.unauthorized(res, "Invalid or expired refresh token");
         return;
       }
 
-      const user = await db.user.findUnique({
-        where: { id: payload.sub },
-        include: { spaceMemberships: true, spaceReps: true },
-      });
-
-      if (!user || user.isSuspended || user.isDeactivated) {
+      if (!session || session.inactive) {
         clearRefreshCookie(res);
         errors.unauthorized(res, "Account inactive");
         return;
       }
 
-      const spaceIds = [
-        ...user.spaceMemberships.map((m) => m.spaceId),
-        ...user.spaceReps.map((r) => r.spaceId),
-      ];
-
       // Issue new tokens
       const { accessToken, refreshToken } = await createTokens(
-        user.id,
-        user.role,
-        spaceIds,
+        session.user.id,
+        session.user.role,
+        session.spaceIds,
         req.headers["user-agent"],
         req.ip,
       );
       setRefreshCookie(res, refreshToken);
 
-      ok(res, { accessToken });
+      // The user rides along so the client can skip a separate GET /auth/me.
+      ok(res, { accessToken, user: session.user });
     } catch (err) {
       clearRefreshCookie(res);
       errors.unauthorized(res, "Invalid refresh token");
@@ -696,72 +687,86 @@ authRouter.get(
   "/me",
   authenticate,
   async (req: Request, res: Response): Promise<void> => {
-    const userId = (req as AuthenticatedRequest).user.sub;
+    const session = await loadSessionUser((req as AuthenticatedRequest).user.sub);
+    if (!session) {
+      errors.notFound(res, "User not found");
+      return;
+    }
+    ok(res, session.user);
+  },
+);
 
-    const user = await db.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        emailVerified: true,
-        phone: true,
-        avatarUrl: true,
-        role: true,
-        isRep: true,
-        adminSubRole: true,
-        institution: true,
-        kycStatus: true,
-        repApplicationStatus: true,
-        matricNo: true,
-        level: true,
-        referralCode: true,
-        createdAt: true,
-        spaceMemberships: {
-          select: {
-            space: {
-              select: {
-                id: true,
-                name: true,
-                short: true,
-                kind: true,
-                hue: true,
-              },
-            },
-          },
-        },
-        spaceReps: {
-          select: {
-            space: {
-              select: {
-                id: true,
-                name: true,
-                short: true,
-                kind: true,
-                hue: true,
-                joinCode: true,
-              },
+/**
+ * The signed-in user in the shape GET /auth/me returns (with a flat `spaces`
+ * list), plus what the refresh route needs to mint tokens. Shared so
+ * POST /auth/refresh can hand back the same user.
+ */
+async function loadSessionUser(userId: string) {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      emailVerified: true,
+      phone: true,
+      avatarUrl: true,
+      role: true,
+      isRep: true,
+      adminSubRole: true,
+      institution: true,
+      kycStatus: true,
+      repApplicationStatus: true,
+      matricNo: true,
+      level: true,
+      referralCode: true,
+      createdAt: true,
+      isSuspended: true,
+      isDeactivated: true,
+      spaceMemberships: {
+        select: {
+          space: {
+            select: {
+              id: true,
+              name: true,
+              short: true,
+              kind: true,
+              hue: true,
             },
           },
         },
       },
-    });
+      spaceReps: {
+        select: {
+          space: {
+            select: {
+              id: true,
+              name: true,
+              short: true,
+              kind: true,
+              hue: true,
+              joinCode: true,
+            },
+          },
+        },
+      },
+    },
+  });
+  if (!user) return null;
 
-    if (!user) {
-      errors.notFound(res, "User not found");
-      return;
-    }
+  const spaces = [
+    ...user.spaceMemberships.map((m) => ({
+      ...m.space,
+      membership: "member",
+    })),
+    ...user.spaceReps.map((r) => ({ ...r.space, membership: "rep" })), // Simplify for now
+  ];
 
-    const spaces = [
-      ...user.spaceMemberships.map((m) => ({
-        ...m.space,
-        membership: "member",
-      })),
-      ...user.spaceReps.map((r) => ({ ...r.space, membership: "rep" })), // Simplify for now
-    ];
+  const { spaceMemberships: _, spaceReps: __, isSuspended, isDeactivated, ...userSafe } = user;
 
-    const { spaceMemberships: _, spaceReps: __, ...userSafe } = user;
-
-    ok(res, { ...userSafe, spaces });
-  },
-);
+  return {
+    user: { ...userSafe, spaces },
+    spaceIds: spaces.map((s) => s.id),
+    inactive: isSuspended || isDeactivated,
+  };
+}
