@@ -80,9 +80,9 @@ const spaceDraftSchema = z.object({
 
 // A rep's partner code (SUG, NACOS, …) is checked at signup so a typo is caught
 // on the form, and redeemed for their space when an admin approves them.
-// Throws a 422 for a bad code; ignored for students or when partners are off.
+// Throws a 422 for a bad code; ignored for students.
 async function checkPartnerCode(data: { role: "student" | "rep"; partnerCode?: string }): Promise<string | undefined> {
-  if (!env.FEATURE_PARTNERS || data.role !== "rep" || !data.partnerCode) return undefined;
+  if (data.role !== "rep" || !data.partnerCode) return undefined;
   const partner = await findRedeemablePartner(data.partnerCode);
   return partner.code;
 }

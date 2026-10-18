@@ -10,7 +10,6 @@ import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
 import { requireSpaceRep, requireAdminPermission } from '../middleware/requireRole';
-import { requireFeature } from '../middleware/requireFeature';
 import { lookupLimiter } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
@@ -33,8 +32,6 @@ import {
  *   adminPartnersRouter /admin/partners, /admin/partner-redemptions
  */
 
-const gate = requireFeature('partners');
-
 function uid(req: Request): string {
   return (req as AuthenticatedRequest).user.sub as string;
 }
@@ -51,7 +48,6 @@ const codeSchema = z
 // GET /partners/lookup?code= — preview a code before signing up with it.
 // ---------------------------------------------------------------------------
 export const partnersRouter = Router();
-partnersRouter.use(gate);
 
 partnersRouter.get('/lookup', lookupLimiter, async (req: Request, res: Response): Promise<void> => {
   // req.query is read-only in Express 5, so it's parsed here rather than by validate().
@@ -69,14 +65,13 @@ partnersRouter.get('/lookup', lookupLimiter, async (req: Request, res: Response)
 // ---------------------------------------------------------------------------
 export const spacePartnerRouter = Router({ mergeParams: true });
 
-spacePartnerRouter.get('/partner', gate, requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
+spacePartnerRouter.get('/partner', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
   const r = await getSpacePartner(req.params.spaceId as string);
   ok(res, r ? serializeSpacePartner(r) : null);
 });
 
 spacePartnerRouter.post(
   '/partner',
-  gate,
   requireSpaceRep(true),
   validate(z.object({ code: codeSchema })),
   async (req: Request, res: Response): Promise<void> => {
@@ -150,7 +145,7 @@ const patchPartnerSchema = z.object(partnerFields).partial();
 
 const listStatus = z.enum(['all', 'active', 'inactive']).catch('all');
 
-adminPartnersRouter.get('/partners', gate, requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
+adminPartnersRouter.get('/partners', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take, q } = parseListQuery(req);
   const status = listStatus.parse(req.query.status);
   const where: Prisma.PartnerWhereInput = {
@@ -178,7 +173,6 @@ function isCodeTaken(err: unknown): boolean {
 
 adminPartnersRouter.post(
   '/partners',
-  gate,
   requireAdminPermission('payouts'),
   validate(createPartnerSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -199,7 +193,6 @@ adminPartnersRouter.post(
 
 adminPartnersRouter.patch(
   '/partners/:partnerId',
-  gate,
   requireAdminPermission('payouts'),
   validate(patchPartnerSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -231,7 +224,7 @@ const ALLOWED_LOGO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 // Held in memory so the real type can be sniffed before anything touches disk.
 const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } }).single('file');
 
-adminPartnersRouter.post('/partners/logo', gate, requireAdminPermission('payouts'), (req: Request, res: Response): void => {
+adminPartnersRouter.post('/partners/logo', requireAdminPermission('payouts'), (req: Request, res: Response): void => {
   logoUpload(req, res, async (err: unknown) => {
     if (err instanceof multer.MulterError) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the 2 MB limit' : err.message;
@@ -278,7 +271,6 @@ function serializeAdminRedemption(r: Prisma.PartnerRedemptionGetPayload<{ includ
 
 adminPartnersRouter.get(
   '/partners/:partnerId/redemptions',
-  gate,
   requireAdminPermission('payouts'),
   async (req: Request, res: Response): Promise<void> => {
     const rows = await db.partnerRedemption.findMany({
@@ -292,7 +284,6 @@ adminPartnersRouter.get(
 
 adminPartnersRouter.post(
   '/partner-redemptions/:redemptionId/revoke',
-  gate,
   requireAdminPermission('payouts'),
   async (req: Request, res: Response): Promise<void> => {
     const id = req.params.redemptionId as string;
