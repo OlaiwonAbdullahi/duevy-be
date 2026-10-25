@@ -70,7 +70,7 @@ export interface CreateCollectionInput {
 
 /**
  * How the student pays: either a one-time bank account we show them, or a
- * provider-hosted page we redirect them to (`checkoutUrl`).
+ * provider-hosted page we redirect them to (`checkoutUrl`). Kredi: the account.
  */
 export interface CollectionAccount {
   providerCheckoutId: string;
@@ -215,7 +215,7 @@ export interface PaymentProvider {
   readonly name: string;
 
   // --- the core operations -------------------------------------------------
-  /** Open a payment for one checkout (a hosted page, or a one-time account). */
+  /** Open a payment for one checkout (a one-time account, or a hosted page). */
   createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount>;
   /** Open the rep's record at the provider, once Duevy has verified them. */
   verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult>;

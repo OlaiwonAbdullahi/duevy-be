@@ -153,7 +153,7 @@ export async function sendKrediWebhook(body: Record<string, unknown>, signed: { 
   return res.status;
 }
 
-/** A Kredi collection webhook: `amountKobo` arrived on the checkout's payment link. */
+/** A Kredi collection webhook: `amountKobo` arrived in the checkout's account. */
 export async function sendCollectionWebhook(reference: string, amountKobo: number, opts: { remitReference?: string; status?: string } = {}) {
   const remitReference = opts.remitReference ?? `remit_${reference}_${amountKobo}`;
   const amount = koboToDecimal(amountKobo);

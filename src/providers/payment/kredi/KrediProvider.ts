@@ -22,8 +22,9 @@ import { verifyKrediSignature } from './signature';
 /**
  * Kredi Pay as Duevy's payment rail (see docs/KREDI.md).
  *
- *  - Collections: one hosted payment link per checkout. The student's money
- *    settles into Duevy's merchant account; Kredi keeps a flat ₦20.
+ *  - Collections: one temporary account per checkout (generate_account), shown
+ *    on Duevy's own pay page. The student's money settles into Duevy's
+ *    merchant account; Kredi keeps a flat ₦20.
  *  - Payouts: Payout V2 `fundtransfer` from the merchant account to the
  *    beneficiary's bank. The per-space ledger decides how much a space may
  *    withdraw — Kredi holds one pooled balance.
@@ -31,14 +32,16 @@ import { verifyKrediSignature } from './signature';
  *    It is Kredi's record of who the rep is; no money is routed through it.
  */
 
-interface KrediLink {
-  link?: string;
-}
-interface KrediPaymentLogRow {
-  transaction_ref?: string;
-  amount?: string | number | null;
-  transaction_status?: number | string | null;
-  transaction_completion?: number | string | null;
+/** POST /api/generate_account, as the Kredi test environment returns it. */
+interface KrediGeneratedAccount {
+  id?: string;
+  transaction_ref?: string | null;
+  amount?: string;
+  /** The account name the customer sees, e.g. "Duevy Labs Ltd". */
+  name?: string;
+  account?: { nuban?: string; created_at?: string; expired_at?: string };
+  status?: number;
+  expiry?: { expired_in?: number; unit?: string; expired_at?: string };
 }
 interface KrediCustomer {
   id: string;
@@ -80,7 +83,9 @@ export interface KrediProviderConfig {
   apiKey: string;
   authToken: string;
   webhookSecrets: string[];
-  /** Where Kredi posts a payment link's collection webhook. */
+  /** The collection host (generate_account), separate from the payout host. */
+  collectionBaseUrl: string;
+  /** Where Kredi posts a collection's webhook. */
   collectionWebhookUrl: string;
 }
 
@@ -114,6 +119,20 @@ function splitName(full: string): { first: string; last: string } {
   return { first: parts[0] ?? 'Duevy', last: parts.length > 1 ? (parts[parts.length - 1] as string) : (parts[0] ?? 'Payer') };
 }
 
+const UNIT_MS: Record<string, number> = { minute: 60_000, minutes: 60_000, hour: 3_600_000, hours: 3_600_000 };
+
+/**
+ * created_at + expired_in (hours on test, 30 minutes on production per Kredi);
+ * falls back to our own window if Kredi leaves either out or uses another unit.
+ */
+function accountExpiry(data: KrediGeneratedAccount, fallbackMinutes: number): Date {
+  const created = data.account?.created_at ? Date.parse(data.account.created_at) : NaN;
+  const unitMs = UNIT_MS[(data.expiry?.unit ?? '').toLowerCase()];
+  const amount = data.expiry?.expired_in;
+  if (!Number.isNaN(created) && unitMs && typeof amount === 'number') return new Date(created + amount * unitMs);
+  return new Date(Date.now() + fallbackMinutes * 60_000);
+}
+
 function mapTransfer(reference: string, data: KrediTransfer | undefined, amountKobo: number): PayoutResult {
   const providerPayoutId = data?.cbaTransactionId ?? data?.transactionRef ?? reference;
   const code = Number(data?.code);
@@ -130,9 +149,11 @@ function mapTransfer(reference: string, data: KrediTransfer | undefined, amountK
 export class KrediProvider implements PaymentProvider {
   readonly name = 'kredi';
   private readonly client: KrediClient;
+  private readonly collections: KrediClient;
 
   constructor(private readonly config: KrediProviderConfig) {
     this.client = new KrediClient(config.baseUrl, config.apiKey, config.authToken);
+    this.collections = new KrediClient(config.collectionBaseUrl, config.apiKey, config.authToken);
   }
 
   // -------------------------------------------------------------------------
@@ -140,68 +161,63 @@ export class KrediProvider implements PaymentProvider {
   // -------------------------------------------------------------------------
 
   /**
-   * A hosted payment link for exactly face + fee. Kredi posts the collection
-   * webhook to `collectionWebhookUrl` and sends the student back to
-   * `returnUrl`; the webhook, not the redirect, decides whether it was paid.
+   * A temporary account for exactly face + fee, shown on Duevy's pay page.
+   * Kredi posts the collection webhook to `collectionWebhookUrl` when money
+   * arrives; that webhook decides whether the checkout is paid.
+   *
+   * The account's life comes from Kredi (48 hours on test, 30 minutes on
+   * production): `created_at` (UTC) plus `expiry.expired_in` in `expiry.unit`. `account.expired_at` has no timezone, so it
+   * isn't used.
    */
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
     const totalKobo = input.faceKobo + input.platformFeeKobo;
     const { first, last } = splitName(input.customer.name);
-    const customer = {
-      first_name: first,
-      last_name: last,
-      email: input.customer.email,
-      phone_number: localPhone(input.customer.phone),
-    };
-    const res = await this.client.request<KrediLink>({
+    const res = await this.collections.request<KrediGeneratedAccount>({
       method: 'POST',
-      path: '/api/link/generate',
+      path: '/api/generate_account',
       op: 'collection.create',
       ref: input.reference,
       body: {
         transaction_ref: input.reference,
-        amount: naira(totalKobo),
+        amount: koboToDecimal(totalKobo),
         currency: 'NGN',
-        webhook_url: this.config.collectionWebhookUrl,
         redirect_url: input.returnUrl,
-        customer,
-        // The reference lists the customer fields flat as well as nested.
-        ...customer,
+        webhook_url: this.config.collectionWebhookUrl,
+        customer: {
+          first_name: first,
+          last_name: last,
+          email: input.customer.email,
+          phone_number: localPhone(input.customer.phone),
+        },
       },
     });
-    const link = res.data?.link;
-    if (!link) throw new ProviderError('Kredi did not return a payment link', null, 'NO_LINK', true);
+    const data = res.data;
+    const nuban = data?.account?.nuban;
+    if (!data?.id || !nuban) throw new ProviderError('Kredi did not return an account', null, 'NO_ACCOUNT', true);
+    if (data.amount !== undefined && decimalToKobo(data.amount) !== totalKobo) {
+      throw new ProviderError('Kredi priced the account differently', null, 'PRICE_MISMATCH', false);
+    }
     return {
-      providerCheckoutId: input.reference,
+      providerCheckoutId: data.id,
       providerChargeId: null,
-      accountNumber: null,
+      accountNumber: nuban,
+      // Not in the response; Kredi to confirm what customers should be shown.
       bankName: null,
-      accountName: null,
-      checkoutUrl: link,
+      accountName: data.name ?? null,
+      checkoutUrl: null,
       totalKobo,
-      expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
+      expiresAt: accountExpiry(data, input.expiresInMinutes),
     };
   }
 
   /**
-   * The payment log, searched by our reference. A completed row is paid; we
-   * take the amount it was paid for (the hosted page collects the exact sum).
+   * Kredi has no documented way to look a collection up by our reference (the
+   * payment log doesn't filter on it, and errors on the collection host), so
+   * the collection webhook is the only signal. Until there is one, this
+   * reports `open` and reconciliation leaves the checkout to its expiry —
+   * money arriving after that is still honoured.
    */
-  async getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus> {
-    const res = await this.client.request<KrediPaymentLogRow[]>({
-      method: 'GET',
-      path: '/api/payment',
-      query: { keyword: providerCheckoutId, perpage: '20' },
-      op: 'collection.status',
-      ref: providerCheckoutId,
-    });
-    const rows = Array.isArray(res.data) ? res.data : [];
-    const row = rows.find((r) => r.transaction_ref === providerCheckoutId || r.transaction_ref?.endsWith(`|${providerCheckoutId}`));
-    if (!row) return { state: 'open', receivedKobo: null };
-    if (Number(row.transaction_completion) === 1) {
-      const amount = row.amount ?? null;
-      return { state: 'paid', receivedKobo: amount === null ? null : decimalToKobo(amount) };
-    }
+  async getCollectionStatus(_providerCheckoutId: string): Promise<CollectionStatus> {
     return { state: 'open', receivedKobo: null };
   }
 

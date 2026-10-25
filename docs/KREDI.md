@@ -23,10 +23,12 @@ Kredi's costs live in `krediPayoutCostKobo` and `KREDI_INWARD_COST_KOBO` (report
 
 ## Checkout
 
-1. `POST /api/link/generate` with `transaction_ref` = our checkout reference, `amount` = face + fee (naira), `webhook_url` = `${APP_BASE_URL}/v1/webhooks/kredi`, `redirect_url` = the pay page. The student is redirected to the returned link.
+1. `POST /api/generate_account` on the **collection host** (`KREDI_COLLECTION_BASE_URL`; test: `https://collection-api.test.kredimfb.com`) with `transaction_ref` = our checkout reference, `amount` = face + fee (naira string, e.g. `"5095.00"`), `webhook_url` = `${APP_BASE_URL}/v1/webhooks/kredi`, `redirect_url`, `customer`. Headers: `x-api-key` and `Authorization: Bearer <token>` (the bare token is refused). Kredi sent this endpoint directly; it isn't in the public docs.
+   - Response (from the test environment): `data.id` (stored as `providerCheckoutId`), `data.account.nuban`, `data.name` (the account name, "Duevy Labs Ltd"), `data.amount`, `data.expiry.expired_in` + `data.expiry.unit` (48 hours on test; 30 minutes on production, per Kredi). Expiry = `account.created_at` + that. `transaction_ref` comes back `null`.
+   - Duevy's pay page shows the account number, account name, amount and expiry (`bankTransfer` on the checkout). There's no bank name in the response yet.
 2. Kredi posts a **collection webhook** to that URL: `merchantRef` (our reference), `amount`/`amountReceived`, `status: "successful"`, `remitReference` (one per transfer).
 3. The checkout service compares the amount with the total: equal → paid; less → underpaid (no due marked paid, admins notified); more → paid with the excess flagged; after expiry → paid and flagged. A second, different `remitReference` into a paid checkout is flagged for a refund.
-4. Backstop: reconciliation polls `GET /api/payment?keyword=<reference>` every minute for checkouts pending over 2 minutes; a row with `transaction_completion = 1` is paid.
+4. There is no documented way to look a collection up by our reference, so the webhook is the only signal: reconciliation doesn't query Kredi for collections, and a checkout nobody paid simply expires with its account (30 minutes on production). Money that arrives after that is still honoured.
 
 ## Withdrawal
 
@@ -65,8 +67,11 @@ Each is a one-place change once answered.
 2. Which secret signs webhooks (the dashboard webhook secret or the API secret), and how the amount is rendered in the hashed string. We accept `"2.00"`, `"2"` and the raw JSON value (`signature.ts`); fire `POST /api/webhook/test` at the sandbox to pin it down.
 3. The exact stamp duty on transfers of ₦10,000 and above (assumed ₦50 in `krediPayoutCostKobo`).
 4. Whether `beneficiary_bvn` is strictly required on V2 `fundtransfer` (some banks' name enquiry returns none) and whether `beneficiary_kyc_level` is.
-5. What the payment log's `transaction_status` and `transaction_completion` values mean (we treat `transaction_completion = 1` as paid), how long a payment link lives, how the hosted page handles under- and overpayment, whether a link can be regenerated for the same `transaction_ref`, and whether the page also takes cards (a different cost).
-6. Whether customer creation validates the BVN against the name. Didit checks it first, so this only affects error handling.
+5. `generate_account` returns `transaction_ref: null`: confirm the collection webhook's `merchantRef` is our `transaction_ref` (or tell us what it is), and whether a test payment can be simulated.
+6. The bank name to show customers for `generate_account` accounts, and the live collection host.
+7. How to check a collection's status by our reference (`GET /api/payment` errors on the collection host and its `keyword` doesn't list `transaction_ref`).
+8. `GET /api/kredipay/banks` on `walletv2-api.test.kredimfb.com` returns `403 "Access forbidden to malicious requests"`: is our server IP allowlisted for Payout V2? `GET /api/wallet/account/balance` errors (`gl_id` on null): is the test merchant fully set up?
+9. Whether customer creation validates the BVN against the name. Didit checks it first, so this only affects error handling.
 
 **Didit**
 

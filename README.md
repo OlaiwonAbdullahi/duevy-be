@@ -38,7 +38,7 @@ Money is **pooled**: every payment lands in Duevy's Kredi merchant account, and 
    - fee = 1.5% of the face + ₦20, capped at ₦250
    - total = face + fee
 
-   It then opens a Kredi **payment link** for the total, keyed by the checkout reference, and redirects the student to it. Kredi keeps ₦20 per payment.
+   It then asks Kredi for a **temporary account** for the total (`generate_account`, open 30 minutes on production) and shows it on Duevy's pay page; the student pays it by bank transfer. Kredi keeps ₦20 per payment.
 4. **Webhook.** A successful collection webhook marks the dues paid, credits the space's ledger with the face amount, and issues a receipt.
    - Underpaid, overpaid, late, duplicate and second payments are all handled; see [`docs/KREDI.md`](docs/KREDI.md).
 5. **Ledger.** Each space has an append-only ledger, and the balance is always the sum of its entries. A database trigger rejects any UPDATE or DELETE.
@@ -62,7 +62,7 @@ npm run dev               # http://localhost:3000, all routes under /v1
 
 `npm install` runs `postinstall`, which runs the build (`prisma generate` + `tsc`).
 
-**Running locally without Kredi, Didit or ImageKit.** Set `PAYMENT_PROVIDER=fake`, `IDENTITY_PROVIDER=fake` and `FILE_STORAGE=memory`. The fake provider opens fake payment links and resolves names instantly, but webhooks still use the real Kredi signature scheme. The fake identity checker accepts the code `123456` and matches every BVN. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
+**Running locally without Kredi, Didit or ImageKit.** Set `PAYMENT_PROVIDER=fake`, `IDENTITY_PROVIDER=fake` and `FILE_STORAGE=memory`. The fake provider opens fake accounts and resolves names instantly, but webhooks still use the real Kredi signature scheme. The fake identity checker accepts the code `123456` and matches every BVN. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
 
 Seeded logins (password `Demo1234!`):
 
@@ -91,7 +91,7 @@ Two databases and two sets of keys, never mixed:
 
 The server refuses to start with the live Kredi host outside `NODE_ENV=production`, or the test host in production.
 
-Kredi references (customers, payment links, transfers) exist in only one Kredi environment, so test rows must never be copied into the prod database. Reps redo KYC in prod.
+Kredi references (customers, collection accounts, transfers) exist in only one Kredi environment, so test rows must never be copied into the prod database. Reps redo KYC in prod.
 
 Without a dev webhook, payments still settle in dev. The pay page checks Kredi directly, and the reconciliation job runs every minute. KYC needs no webhook: the Didit and Kredi calls answer synchronously.
 
@@ -105,7 +105,8 @@ Every variable is validated at boot in `src/config/env.ts`, and the server refus
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | yes | At least 32 characters each. |
 | `RESEND_API_KEY` | yes | Email delivery. |
 | `PAYMENT_PROVIDER` | no (`kredi`) | `kredi` or `fake`. `fake` is refused in production. |
-| `KREDI_BASE_URL` | with `kredi` | Test `https://walletv2-api.test.kredimfb.com`; live from Kredi. |
+| `KREDI_BASE_URL` | with `kredi` | Payout V2 host. Test `https://walletv2-api.test.kredimfb.com`; live from Kredi. |
+| `KREDI_COLLECTION_BASE_URL` | with `kredi` | Collection host (`generate_account`). Test `https://collection-api.test.kredimfb.com`; live from Kredi. |
 | `KREDI_API_KEY`, `KREDI_AUTH_TOKEN` | with `kredi` | From the Kredi dashboard. A new token invalidates the old one. |
 | `KREDI_WEBHOOK_SECRET` | with `kredi` | The secret Kredi signs webhooks with. |
 | `KREDI_WEBHOOK_SECRET_PREVIOUS` | no | The outgoing secret during a rotation. |
@@ -114,7 +115,7 @@ Every variable is validated at boot in `src/config/env.ts`, and the server refus
 | `DIDIT_PHONE_CHANNEL` | no (`sms`) | `sms`, `whatsapp`, `telegram` or `voice`. |
 | `DIDIT_BVN_SERVICE` | no | The Nigeria BVN service id from the Didit console. |
 | `BVN_HASH_PEPPER` | yes (outside tests) | 32+ characters. Keys the one-way BVN fingerprint; never change it once reps have verified. |
-| `CHECKOUT_EXPIRY_MINUTES` | no (60) | How long a checkout's payment link is treated as open, 1–1440. |
+| `CHECKOUT_EXPIRY_MINUTES` | no (30) | Fallback life of a checkout's account if Kredi doesn't report one (Kredi: 30 minutes on production, 48 hours on test), 1–1440. |
 | `RUN_WORKERS` | no (`true`) | Run the webhook worker and reconciliation inside the API. Set `false` and run `npm run worker` separately. |
 | `LOG_LEVEL` | no (`info`) | pino level. |
 | `ENCRYPTION_KEY` | recommended | Encrypts stored bank account numbers. |
@@ -164,7 +165,7 @@ REMIT_REFERENCE=same npm run webhook:test -- paid DVY-XXXX-XXXX 5095   # repeat 
 
 **Against the Kredi test environment:**
 
-1. Expose the API with a tunnel, e.g. `cloudflared tunnel --url http://localhost:3000` or `ngrok http 3000`, and set `APP_BASE_URL` to it — payment links carry `${APP_BASE_URL}/v1/webhooks/kredi` as their webhook URL.
+1. Expose the API with a tunnel, e.g. `cloudflared tunnel --url http://localhost:3000` or `ngrok http 3000`, and set `APP_BASE_URL` to it — each generated account carries `${APP_BASE_URL}/v1/webhooks/kredi` as its webhook URL.
 2. On the Kredi dashboard (Settings → API/Webhook), set the payout (outward) webhook to the same URL and its secret to `KREDI_WEBHOOK_SECRET`.
 3. `POST /api/webhook/test` on Kredi sends a sample collection webhook to any URL.
 

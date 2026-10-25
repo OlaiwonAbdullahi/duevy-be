@@ -9,7 +9,7 @@ export const webhooksRouter = Router();
 
 /**
  * POST /webhooks/kredi — public; authenticated by signature only. Kredi posts
- * collection webhooks here (the URL is set on each payment link) and payout
+ * collection webhooks here (the URL is set on each generated account) and payout
  * webhooks (the URL is set on the Kredi dashboard).
  *
  * Does the minimum and returns 200 fast:

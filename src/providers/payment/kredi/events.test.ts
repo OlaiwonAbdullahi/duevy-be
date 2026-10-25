@@ -32,6 +32,7 @@ describe('normaliseKrediEvent — collections', () => {
 
   it('ignores non-final statuses and collections that are not ours', () => {
     expect(normaliseKrediEvent({ ...base, status: 'pending' }).kind).toBe('ignored');
+    expect(normaliseKrediEvent({ ...base, status: 'expired' }).kind).toBe('ignored');
     expect(normaliseKrediEvent({ ...base, merchantRef: undefined, accountType: 'collection' }).kind).toBe('ignored');
   });
 

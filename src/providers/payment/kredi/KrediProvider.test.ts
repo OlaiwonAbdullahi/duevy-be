@@ -22,6 +22,7 @@ function stubKredi(routes: Record<string, Route>) {
 const provider = () =>
   new KrediProvider({
     baseUrl: 'https://walletv2-api.test.kredimfb.com',
+    collectionBaseUrl: 'https://collection-api.test.kredimfb.com',
     apiKey: 'api_key',
     authToken: 'token',
     webhookSecrets: ['s'],
@@ -36,8 +37,25 @@ const destination = { bankCode: '000013', accountNumber: '0123456789', accountNa
 afterEach(() => vi.unstubAllGlobals());
 
 describe('KrediProvider — collections', () => {
-  it('opens a payment link for face + fee, keyed by our reference', async () => {
-    const calls = stubKredi({ 'POST /api/link/generate': () => ({ body: { status: 'success', data: { link: 'https://pay.kredi.test/abc' } } }) });
+  // The response below is what the Kredi test environment returned for generate_account.
+  const generated = (amount: string) => () => ({
+    body: {
+      status: 200,
+      message: 'Payment account generated successfully',
+      data: {
+        id: '17929193636addc743d70c9',
+        transaction_ref: null,
+        amount,
+        name: 'Duevy Labs Ltd',
+        account: { id: 138, nuban: '0827533187', created_at: '2026-10-25T09:09:23.000000Z', expired_at: '2026-10-27 10:09:23' },
+        status: 0,
+        expiry: { expired_in: 48, unit: 'hours', expired_at: 'Tue, 27 October 2026 10:09:23' },
+      },
+    },
+  });
+
+  it('opens a temporary account for face + fee on the collection host', async () => {
+    const calls = stubKredi({ 'POST /api/generate_account': generated('5095.00') });
     const account = await provider().createCollectionAccount({
       reference: 'DVY-AAAA-BBBB',
       faceKobo: 500_000,
@@ -47,10 +65,21 @@ describe('KrediProvider — collections', () => {
       metadata: {},
       returnUrl: 'https://duevy.test/pay',
     });
-    expect(account).toMatchObject({ checkoutUrl: 'https://pay.kredi.test/abc', providerCheckoutId: 'DVY-AAAA-BBBB', totalKobo: 509_500 });
+    expect(account).toEqual({
+      providerCheckoutId: '17929193636addc743d70c9',
+      providerChargeId: null,
+      accountNumber: '0827533187',
+      bankName: null,
+      accountName: 'Duevy Labs Ltd',
+      checkoutUrl: null,
+      totalKobo: 509_500,
+      // created_at (UTC) + 48 hours
+      expiresAt: new Date('2026-10-27T09:09:23.000Z'),
+    });
+    expect(calls[0]!.url.host).toBe('collection-api.test.kredimfb.com');
     expect(calls[0]!.body).toMatchObject({
       transaction_ref: 'DVY-AAAA-BBBB',
-      amount: 5095,
+      amount: '5095.00',
       currency: 'NGN',
       webhook_url: 'https://api.duevy.test/v1/webhooks/kredi',
       customer: { first_name: 'Ada', last_name: 'Obi', phone_number: '08012345678' },
@@ -58,18 +87,41 @@ describe('KrediProvider — collections', () => {
     expect(calls[0]!.headers).toMatchObject({ 'x-api-key': 'api_key', Authorization: 'Bearer token' });
   });
 
-  it('reads a completed payment-log row as paid', async () => {
+  it('reads a 30-minute production expiry', async () => {
     stubKredi({
-      'GET /api/payment': () => ({
-        body: { data: [{ transaction_ref: '38044|DVY-AAAA-BBBB', amount: '5095.00', transaction_status: 2, transaction_completion: 1 }] },
+      'POST /api/generate_account': () => ({
+        body: {
+          status: 200,
+          data: { id: 'x1', amount: '5095.00', name: 'Duevy Labs Ltd', account: { nuban: '0827533187', created_at: '2026-10-25T09:00:00.000000Z' }, expiry: { expired_in: 30, unit: 'minutes' } },
+        },
       }),
     });
-    expect(await provider().getCollectionStatus('DVY-AAAA-BBBB')).toEqual({ state: 'paid', receivedKobo: 509_500 });
+    const account = await provider().createCollectionAccount({
+      reference: 'DVY-AAAA-DDDD', faceKobo: 500_000, platformFeeKobo: 9_500,
+      customer: { email: 'a@b.c', name: 'Ada Obi' }, expiresInMinutes: 30, metadata: {}, returnUrl: 'https://duevy.test/pay',
+    });
+    expect(account.expiresAt).toEqual(new Date('2026-10-25T09:30:00.000Z'));
   });
 
-  it('reads an unknown or incomplete payment as open', async () => {
-    stubKredi({ 'GET /api/payment': () => ({ body: { data: [{ transaction_ref: 'DVY-AAAA-BBBB', transaction_completion: 0 }] } }) });
-    expect(await provider().getCollectionStatus('DVY-AAAA-BBBB')).toEqual({ state: 'open', receivedKobo: null });
+  it('refuses an account priced differently from the checkout', async () => {
+    stubKredi({ 'POST /api/generate_account': generated('10.00') });
+    await expect(
+      provider().createCollectionAccount({
+        reference: 'DVY-AAAA-CCCC',
+        faceKobo: 500_000,
+        platformFeeKobo: 9_500,
+        customer: { email: 'a@b.c', name: 'Ada Obi' },
+        expiresInMinutes: 60,
+        metadata: {},
+        returnUrl: 'https://duevy.test/pay',
+      }),
+    ).rejects.toMatchObject({ code: 'PRICE_MISMATCH', retryable: false });
+  });
+
+  it('makes no status call it has no documented endpoint for', async () => {
+    const calls = stubKredi({});
+    expect(await provider().getCollectionStatus('17929193636addc743d70c9')).toEqual({ state: 'open', receivedKobo: null });
+    expect(calls).toHaveLength(0);
   });
 });
 

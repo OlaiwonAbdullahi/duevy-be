@@ -136,7 +136,7 @@ This shows who has paid and who has not. `GET /dues/:dueId/collections/export` r
 
 ### 🔑 `POST /dues/pay`
 
-One payment on a Kredi payment link pays every due in the basket.
+One bank transfer into a temporary Kredi account pays every due in the basket.
 
 ```json
 { "dueIds": ["due_…", "due_…"] }
@@ -151,13 +151,13 @@ One payment on a Kredi payment link pays every due in the basket.
   "amount": 661750,
   "breakdown": { "face": 650000, "fee": 11750, "total": 661750 },
   "items": [{ "dueId": "…", "title": "…", "amount": 500000, "fee": 9038 }],
-  "bankTransfer": null,
-  "checkoutUrl": "https://…/hosted/pay/…",
+  "bankTransfer": { "accountNumber": "0827533187", "bankName": "", "accountName": "Duevy Labs Ltd", "amountKobo": 661750, "expiresAt": "…" },
+  "checkoutUrl": null,
   "expiresAt": "…", "paidAt": null, "receivedKobo": null, "overpaidKobo": 0, "reused": false
 }
 ```
 
-Redirect the student to `checkoutUrl`, Kredi's hosted payment page. Kredi sends them back to `/dashboard/pay/:reference` (guests: the public pay page) whether or not they paid; the status below says which. `bankTransfer` is kept in the shape for older clients and is always `null`.
+Show the student `bankTransfer`: a temporary Kredi account for exactly `amountKobo`, open until `expiresAt` (30 minutes on production; 48 hours on Kredi's test environment). They pay it by bank transfer; the status below changes when Kredi's webhook arrives. `bankName` is empty until Kredi confirms what to show. `checkoutUrl` is kept for older clients and is always `null`.
 
 The fee is 1.5% of the face value (rounded half-up to the kobo) plus ₦20, capped at ₦250 in total. The student pays the fee on top, and the space receives the full face value.
 
@@ -528,7 +528,7 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 
 ### `POST /webhooks/kredi`
 
-Public. It authenticates only by signature: `signature-key` = SHA-512 of `"<amount>-<secret>-<reference>"` (the collection's `remitReference`, or the payout's `merchantReference`). Kredi posts collection webhooks here (each payment link carries this URL) and payout webhooks (set on the Kredi dashboard).
+Public. It authenticates only by signature: `signature-key` = SHA-512 of `"<amount>-<secret>-<reference>"` (the collection's `remitReference`, or the payout's `merchantReference`). Kredi posts collection webhooks here (each generated account carries this URL) and payout webhooks (set on the Kredi dashboard).
 
 | Response | When |
 |---|---|
@@ -550,7 +550,7 @@ Anything else — including transfers into virtual accounts — is acknowledged 
 
 ## Removed or changed in this release
 
-- **Bachs → Kredi.** `POST /webhooks/bachs` is gone; use `/webhooks/kredi`. Checkouts are hosted payment links only, and `GET|PUT /admin/settings/payments` (checkout mode) is removed. `GET /payout/summary` returns `fees.tiers` instead of `fees.below` / `fees.atOrAbove`. The student fee is 1.5% + ₦20 (max ₦250); the withdrawal fee is ₦50 / ₦120 / ₦200.
+- **Bachs → Kredi.** `POST /webhooks/bachs` is gone; use `/webhooks/kredi`. Checkouts show a temporary Kredi account on Duevy's pay page, and `GET|PUT /admin/settings/payments` (checkout mode) is removed. `GET /payout/summary` returns `fees.tiers` instead of `fees.below` / `fees.atOrAbove`. The student fee is 1.5% + ₦20 (max ₦250); the withdrawal fee is ₦50 / ₦120 / ₦200.
 - **KYC.** NIN and `governmentId` are no longer collected, and `POST /payout/kyc/government-id` is removed. Verify the phone first (`POST /payout/kyc/phone/send` and `/verify`); `POST /payout/kyc` then takes `bvn`, `dob`, `gender`, `address`, `consent` and the student ID card. The KYC state has `steps` instead of `providerReference`, `requirementsDue` and `governmentIdSubmittedAt`.
 - `POST /webhooks/anchor` is gone.
 - `POST /payout/kyc/upgrade` is removed, along with KYC tiers and the ₦300,000 balance ceiling.

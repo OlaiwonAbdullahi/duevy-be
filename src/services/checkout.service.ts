@@ -15,7 +15,7 @@ import { canCollect } from './kyc.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
- * in ONE payment on a Kredi payment link opened for this checkout. The money
+ * with ONE bank transfer into a temporary Kredi account opened for this checkout. The money
  * pools in Duevy's merchant account; the ledger credits the space.
  *
  *   face  = Σ due amounts                     → credited to the space in full
@@ -257,9 +257,8 @@ function returnUrlFor(checkout: CheckoutWithItems, opts: CreateCheckoutOptions):
 }
 
 /**
- * Ask the provider for the payment link. Safe to call again for the same
- * checkout: the link is keyed by our reference, which Kredi echoes back on
- * the collection webhook, so whichever link the student pays credits it.
+ * Ask the provider for the account. Called only while the checkout has none;
+ * the account is stored on the checkout and shown until it pays or expires.
  */
 async function openCollectionAccount(
   checkout: CheckoutWithItems,

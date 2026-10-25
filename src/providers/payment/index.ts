@@ -27,6 +27,7 @@ export function getPaymentProvider(): PaymentProvider {
           apiKey: env.KREDI_API_KEY as string,
           authToken: env.KREDI_AUTH_TOKEN as string,
           webhookSecrets: secrets,
+          collectionBaseUrl: env.KREDI_COLLECTION_BASE_URL as string,
           collectionWebhookUrl: `${env.APP_BASE_URL}/v1/webhooks/kredi`,
         });
   return instance;

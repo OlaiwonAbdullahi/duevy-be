@@ -74,12 +74,12 @@ export class FakeProvider implements PaymentProvider {
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
     this.record('createCollectionAccount', input);
     return {
-      providerCheckoutId: input.reference,
+      providerCheckoutId: `fake_${input.reference}`,
       providerChargeId: null,
-      accountNumber: null,
+      accountNumber: `08${String(++this.seq).padStart(8, '0')}`,
       bankName: null,
-      accountName: null,
-      checkoutUrl: `https://checkout.fake.test/${input.reference}`,
+      accountName: 'Duevy Labs Ltd',
+      checkoutUrl: null,
       totalKobo: input.faceKobo + input.platformFeeKobo,
       expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
     };

@@ -32,6 +32,9 @@ const envSchema = z.object({
   // dashboard (Settings → API/Webhook); generating a new token invalidates the
   // old one, so rotate KREDI_AUTH_TOKEN everywhere at once.
   KREDI_BASE_URL: z.string().url().optional(),
+  // Collections (generate_account) live on their own host. Test:
+  // https://collection-api.test.kredimfb.com
+  KREDI_COLLECTION_BASE_URL: z.string().url().optional(),
   KREDI_API_KEY: z.string().optional(),
   KREDI_AUTH_TOKEN: z.string().optional(),
   // The secret Kredi signs webhooks with (signature-key = sha512 of
@@ -53,8 +56,9 @@ const envSchema = z.object({
   // Changing it orphans every stored fingerprint.
   BVN_HASH_PEPPER: z.string().min(32).optional(),
 
-  // How long a checkout's payment link is treated as open (1–1440).
-  CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
+  // Fallback life of a checkout's account when Kredi doesn't report one (1–1440).
+  // Kredi's production accounts last 30 minutes.
+  CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(30),
   // Run the webhook/job worker and reconciliation inside the API process.
   // Turn off when they run as a separate process (npm run worker).
   RUN_WORKERS: z
@@ -120,20 +124,22 @@ const envSchema = z.object({
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
   if (val.PAYMENT_PROVIDER === 'kredi') {
-    for (const key of ['KREDI_BASE_URL', 'KREDI_API_KEY', 'KREDI_AUTH_TOKEN', 'KREDI_WEBHOOK_SECRET'] as const) {
+    for (const key of ['KREDI_BASE_URL', 'KREDI_COLLECTION_BASE_URL', 'KREDI_API_KEY', 'KREDI_AUTH_TOKEN', 'KREDI_WEBHOOK_SECRET'] as const) {
       if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=kredi' });
     }
   }
-  if (val.PAYMENT_PROVIDER === 'kredi' && val.KREDI_BASE_URL) {
-    // Dev and prod are separate databases with separate keys: the test host
-    // everywhere except production, which takes the live one. A dev database
-    // must never move real money.
-    const testHost = new URL(val.KREDI_BASE_URL).hostname.includes('.test.');
+  // Dev and prod are separate databases with separate keys: the test hosts
+  // everywhere except production, which takes the live ones. A dev database
+  // must never move real money.
+  for (const key of ['KREDI_BASE_URL', 'KREDI_COLLECTION_BASE_URL'] as const) {
+    const url = val[key];
+    if (val.PAYMENT_PROVIDER !== 'kredi' || !url) continue;
+    const testHost = new URL(url).hostname.includes('.test.');
     if (val.NODE_ENV === 'production' && testHost) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['KREDI_BASE_URL'], message: 'production needs the live Kredi API, not the test host' });
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'production needs the live Kredi API, not the test host' });
     }
     if (val.NODE_ENV !== 'production' && !testHost) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['KREDI_BASE_URL'], message: 'the live Kredi API only runs with NODE_ENV=production' });
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'the live Kredi API only runs with NODE_ENV=production' });
     }
   }
   if (val.IDENTITY_PROVIDER === 'didit' && !val.DIDIT_API_KEY) {

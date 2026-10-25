@@ -5,7 +5,7 @@ import { type ProviderEvent } from '../types';
  * Kredi webhook body → our ProviderEvent. Kredi sends bare bodies with no
  * event envelope, so the kind is read from the shape:
  *
- *  - Collection (a payment-link payment): `merchantRef` (our checkout
+ *  - Collection (a payment into a checkout's account): `merchantRef` (our checkout
  *    reference), `amount`, `amountReceived`, `status`, `remitReference`.
  *    status "successful" → paid. Whether it covered the checkout total is
  *    decided by the checkout service, which treats a short amount as underpaid.
@@ -13,7 +13,7 @@ import { type ProviderEvent } from '../types';
  *    `krediReference`, `transactionStatus.code` — 200 succeeded, 401 failed;
  *    100 (processing) and 400 (incomplete, Kredi re-queries) are not final.
  *  - Inward transfers to a virtual account carry no reference of ours and are
- *    ignored: Duevy only collects through payment links.
+ *    ignored: Duevy only collects through generated accounts.
  *
  * The dedupe id is built from Kredi's own references, so a redelivery of the
  * same event collapses to one row.
@@ -72,9 +72,9 @@ function normaliseCollection(b: Record<string, unknown>, remitReference: string 
   const reference = str(b.merchantRef);
   if (!reference) return { ...base, kind: 'ignored' };
 
+  // The docs only show "successful"; anything else is not a payment.
   const status = (str(b.status) ?? '').toLowerCase();
-  if (status === 'expired') return { ...base, kind: 'payment.expired', reference, providerCheckoutId: reference };
-  if (status !== 'successful' && status !== 'success') return { ...base, kind: 'ignored' };
+  if (status !== 'successful') return { ...base, kind: 'ignored' };
 
   const rawAmount = b.amountReceived ?? b.amount;
   if (rawAmount === null || rawAmount === undefined || rawAmount === '') {

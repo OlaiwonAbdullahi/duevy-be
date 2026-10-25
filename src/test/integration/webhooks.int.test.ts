@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { createCheckout } from '../../services/checkout.service';
+import { createCheckout, expireCheckout } from '../../services/checkout.service';
 import { getSpaceBalance } from '../../services/ledger.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { reconcileCheckout } from '../../jobs/reconciliation';
@@ -18,7 +18,9 @@ describe('webhook idempotency', () => {
     const { checkout } = await createCheckout(students[0]!.id, dues.map((d) => d.id));
     // 1.5% of ₦6,500 = ₦97.50, plus ₦20.
     expect(checkout.breakdown).toEqual({ face: 650_000, fee: 9_750 + 2_000, total: 661_750 });
-    expect(checkout.checkoutUrl).toBe(`https://checkout.fake.test/${checkout.reference}`);
+    expect(checkout.checkoutUrl).toBeNull();
+    expect(checkout.bankTransfer).toMatchObject({ accountName: 'Duevy Labs Ltd', amountKobo: 661_750 });
+    expect(checkout.bankTransfer!.accountNumber).toMatch(/^\d{10}$/);
 
     // The same transfer (remitReference) delivered five times — three of them concurrently.
     const remit = { remitReference: `dup_${checkout.reference}` };
@@ -105,8 +107,8 @@ describe('payment outcomes', () => {
   it('expiry closes the checkout; money arriving afterwards is still honoured', async () => {
     const { space, students, dues } = await makeSpace();
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
-    await sendCollectionWebhook(checkout.reference, checkout.amount, { status: 'expired', remitReference: `exp_${checkout.reference}` });
-    await drainWebhookQueue();
+    const row = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
+    await expireCheckout(row.id);
     expect((await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } })).status).toBe('expired');
 
     await sendCollectionWebhook(checkout.reference, checkout.amount, { remitReference: `late_${checkout.reference}` });
