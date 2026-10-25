@@ -22,23 +22,31 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Payment rail. 'bachs' is the only live provider; 'fake' is an in-memory
-  // stand-in for local development, the seed and the test suite. See
-  // src/providers/payment/.
-  PAYMENT_PROVIDER: z.enum(['bachs', 'fake']).default('bachs'),
+  // Payment rail: Bank78 (78financials-bank78.github.io/bank78-public-api-docs).
+  // Sandbox https://sandbox.bank78.co; live https://api.bank78.co. The client
+  // id/secret and API key come from the merchant dashboard (API Credentials).
+  BANK78_BASE_URL: z.string().url().default('https://sandbox.bank78.co'),
+  BANK78_CLIENT_ID: z.string().min(1),
+  BANK78_CLIENT_SECRET: z.string().min(1),
+  BANK78_API_KEY: z.string().min(1),
+  // The Webhook Secret set on the merchant profile. During a rotation keep the
+  // outgoing one in _PREVIOUS until Bank78 stops signing with it.
+  BANK78_WEBHOOK_SECRET: z.string().min(1),
+  BANK78_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  // Live Bank78 moves real money, so it only runs under NODE_ENV=production
+  // unless this is set deliberately.
+  BANK78_ALLOW_LIVE_OUTSIDE_PRODUCTION: z
+    .string()
+    .transform((v) => v === 'true')
+    .default('false'),
 
-  // Bachs (docs.bachs.io) — Connect platform. sk_sandbox_… against the sandbox
-  // URL, sk_live_… against https://api.bachs.io; going live is a key swap.
-  BACHS_BASE_URL: z.string().url().default('https://sandbox-api.bachs.io'),
-  BACHS_SECRET_KEY: z.string().optional(),
-  // The signing secret of the webhook endpoint registered for /v1/webhooks/bachs
-  // (returned once, at endpoint creation). During a rotation Bachs keeps the old
-  // secret valid for 24h, so the outgoing one can be kept here meanwhile.
-  BACHS_WEBHOOK_SECRET: z.string().optional(),
-  BACHS_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  // Didit (docs.didit.me) — rep KYC: NIN database validation and phone OTP.
+  DIDIT_BASE_URL: z.string().url().default('https://verification.didit.me'),
+  DIDIT_API_KEY: z.string().min(1),
+
   // Reject signed deliveries whose timestamp is further than this from now.
   WEBHOOK_TOLERANCE_SECONDS: z.coerce.number().int().positive().default(300),
-  // How long a checkout's one-time bank account stays open (Bachs allows 1–1440).
+  // How long a checkout's one-time bank account stays open, in minutes.
   CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
   // Run the webhook/job worker and reconciliation inside the API process.
   // Turn off when they run as a separate process (npm run worker).
@@ -104,28 +112,14 @@ const envSchema = z.object({
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
-  if (val.PAYMENT_PROVIDER === 'bachs') {
-    for (const key of ['BACHS_SECRET_KEY', 'BACHS_WEBHOOK_SECRET'] as const) {
-      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=bachs' });
-    }
-  }
-  if (val.PAYMENT_PROVIDER === 'bachs' && val.BACHS_SECRET_KEY) {
-    // Dev and prod are separate databases with separate keys: sandbox keys
-    // everywhere except production, which takes the live key. Refuse a key
-    // that points at the wrong Bachs environment, and a live key outside
-    // production (a dev database must never move real money).
-    const live = val.BACHS_SECRET_KEY.startsWith('sk_live_');
-    const liveUrl = new URL(val.BACHS_BASE_URL).hostname === 'api.bachs.io';
-    if (live !== liveUrl) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['BACHS_BASE_URL'],
-        message: live ? 'an sk_live_ key needs https://api.bachs.io' : 'an sk_sandbox_ key needs https://sandbox-api.bachs.io',
-      });
-    }
-    if (live && val.NODE_ENV !== 'production') {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BACHS_SECRET_KEY'], message: 'live Bachs keys only run with NODE_ENV=production' });
-    }
+  // Dev and prod are separate databases: sandbox everywhere except production.
+  // A dev database must never move real money.
+  if (new URL(val.BANK78_BASE_URL).hostname === 'api.bank78.co' && val.NODE_ENV !== 'production' && !val.BANK78_ALLOW_LIVE_OUTSIDE_PRODUCTION) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['BANK78_BASE_URL'],
+      message: 'live Bank78 (api.bank78.co) only runs with NODE_ENV=production; use https://sandbox.bank78.co',
+    });
   }
   if (val.FILE_STORAGE === 'imagekit') {
     for (const key of ['IMAGEKIT_PRIVATE_KEY', 'IMAGEKIT_URL_ENDPOINT'] as const) {
@@ -134,9 +128,6 @@ const envSchema = z.object({
   }
   if (val.NODE_ENV === 'production' && val.FILE_STORAGE === 'memory') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['FILE_STORAGE'], message: 'memory storage cannot run in production' });
-  }
-  if (val.NODE_ENV === 'production' && val.PAYMENT_PROVIDER === 'fake') {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYMENT_PROVIDER'], message: 'the fake provider cannot run in production' });
   }
   if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });

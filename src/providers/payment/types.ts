@@ -8,54 +8,26 @@
  * Keep it thin: one method per thing the business does, no provider concepts.
  */
 
-export type IdentityStatus = 'pending' | 'verified' | 'rejected';
-
-export interface IdentityProfile {
-  /** Our user id — echoed in provider metadata for support. */
+export interface WalletProfile {
+  /** Our user id — Bank78's sub-account userId, so a retry finds the same wallet. */
   userId: string;
-  email: string;
   firstName: string;
   lastName: string;
-  displayName: string;
-  phone?: string | null;
+  email: string;
+  phone: string;
+  /** Pass-through only: never stored, never logged. */
+  nin?: string;
+  /** Bank78 requires it to open a sub-account. Pass-through only. */
+  bvn: string;
 }
 
-/** A government identifier. Pass-through only: never stored, never logged. */
-export interface IdentityNumber {
-  type: 'nin' | 'bvn';
-  value: string;
-}
-
-export interface VerifyIdentityInput {
-  profile: IdentityProfile;
-  /** At least a NIN. A BVN is added only when the provider asks for one. */
-  idNumbers: IdentityNumber[];
-  /** YYYY-MM-DD. Pass-through only. */
-  dob: string;
-  /** Re-use the rep's existing provider account/person on a retry. */
-  existingAccountId?: string | null;
-  existingPersonId?: string | null;
-}
-
-export interface IdentityResult {
-  /** The rep's account at the provider — where collections settle. */
-  accountId: string;
-  /** The provider's reference for this verification (the person record). */
-  personId: string;
-  status: IdentityStatus;
-  /** Whether the account may pay out right now. */
-  payoutsActive: boolean;
-  failureReason?: string | null;
-  /** What the provider still asks for, as its field keys (e.g. "persons.per_x.bvn"). */
-  requirementsDue: string[];
-}
-
-export interface IdentityDocumentInput {
-  accountId: string;
-  personId: string;
-  buffer: Buffer;
-  fileName: string;
-  mimeType: string;
+/** A rep's wallet: the provider account collections are routed to and withdrawals paid from. */
+export interface Wallet {
+  accountNumber: string;
+  bankName: string;
+  active: boolean;
+  /** Null when the provider did not report it. */
+  availableKobo: number | null;
 }
 
 export interface CreateCollectionInput {
@@ -65,30 +37,18 @@ export interface CreateCollectionInput {
   faceKobo: number;
   /** Duevy's fee, charged on top. The student pays faceKobo + platformFeeKobo. */
   platformFeeKobo: number;
-  /** The rep's provider account the face amount is routed to. */
-  destinationAccountId: string;
   customer: { email: string; name: string };
   expiresInMinutes: number;
   metadata: Record<string, string>;
-  /** 'hosted' redirects the student to the provider's page; 'custom' opens a bank account we display. */
-  mode: CheckoutMode;
-  /** Where a hosted checkout sends the student back to, paid or not. */
-  returnUrl: string;
 }
 
-export type CheckoutMode = 'hosted' | 'custom';
-
-/**
- * How the student pays: either a one-time bank account we show them, or a
- * provider-hosted page we redirect them to (`checkoutUrl`).
- */
+/** How the student pays: a one-time bank account opened for this checkout. */
 export interface CollectionAccount {
   providerCheckoutId: string;
   providerChargeId: string | null;
-  accountNumber: string | null;
-  bankName: string | null;
-  accountName: string | null;
-  checkoutUrl: string | null;
+  accountNumber: string;
+  bankName: string;
+  accountName: string;
   /** What the provider will expect the student to send. */
   totalKobo: number;
   expiresAt: Date;
@@ -113,6 +73,7 @@ export interface Bank {
 export interface RegisterDestinationInput {
   accountId: string;
   bankCode: string;
+  bankName: string;
   accountNumber: string;
   accountName: string;
 }
@@ -126,7 +87,7 @@ export interface PayoutDestination {
 }
 
 export interface InitiatePayoutInput {
-  /** The rep's provider account the payout is drawn from. */
+  /** The rep's wallet the payout is drawn from. */
   accountId: string;
   destinationId: string;
   /** What lands in the bank account. */
@@ -140,16 +101,16 @@ export type PayoutState = 'pending' | 'processing' | 'succeeded' | 'failed';
 export interface PayoutResult {
   providerPayoutId: string;
   state: PayoutState;
-  /** What the provider charged on top, debited from the same account. */
+  /** What the provider charged on top, debited from the same wallet. */
   providerFeeKobo: number | null;
   failureReason: string | null;
 }
 
-export interface SettleFeeInput {
-  /** The rep's provider account. */
+export interface RouteCollectionInput {
+  /** The rep's wallet the collection is credited to. */
   accountId: string;
-  /** Positive: move from the rep's account to the platform. Negative: platform tops the account up. */
   amountKobo: number;
+  /** Ours. Also the provider idempotency key, so a retry can never credit twice. */
   reference: string;
 }
 
@@ -206,10 +167,6 @@ export type ProviderEvent =
       providerPayoutId: string | null;
       reason: string | null;
     })
-  | (EventBase & {
-      kind: 'identity.updated';
-      accountId: string;
-    })
   | (EventBase & { kind: 'ignored' });
 
 export type ProviderEventKind = ProviderEvent['kind'];
@@ -218,6 +175,18 @@ export class InvalidSignatureError extends Error {
   constructor(message = 'Webhook signature verification failed') {
     super(message);
     this.name = 'InvalidSignatureError';
+  }
+}
+
+/** An authenticated webhook we could not make sense of. Stored as dead for a human. */
+export class MalformedEventError extends Error {
+  constructor(
+    public readonly eventId: string | null,
+    public readonly eventType: string | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'MalformedEventError';
   }
 }
 
@@ -242,32 +211,26 @@ export class ProviderError extends Error {
 export interface PaymentProvider {
   readonly name: string;
 
-  // --- the five core operations --------------------------------------------
+  // --- collections -----------------------------------------------------------
   /** Open a one-time bank account for one checkout. */
   createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount>;
-  /** Submit a rep's identity (BVN + DOB). The outcome arrives later by webhook. */
-  verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult>;
-  /** Name enquiry. Null when the bank cannot resolve the account. */
-  resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount | null>;
-  /** Send money from a rep's account to their registered bank account. */
-  initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult>;
+  getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus>;
+  /** Credit a paid checkout's face amount to the lead rep's wallet. */
+  routeCollection(input: RouteCollectionInput): Promise<{ transferId: string | null }>;
   /** Verify the signature over the raw body and normalise the event. Throws InvalidSignatureError. */
   parseWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): ProviderEvent;
 
-  // --- supporting reads/writes the core flows depend on ---------------------
+  // --- rep wallets -------------------------------------------------------------
+  /** Open (or find, on a retry) the rep's wallet. */
+  createWallet(profile: WalletProfile): Promise<Wallet>;
+  getWallet(accountId: string): Promise<Wallet>;
+
+  // --- payouts -----------------------------------------------------------------
   listBanks(): Promise<Bank[]>;
-  getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult>;
-  /** Attach a government ID document to the rep's person, when the provider asks for one. */
-  uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }>;
+  /** Name enquiry. Null when the bank cannot resolve the account. */
+  resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount | null>;
   registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination>;
-  /**
-   * Put the rep's own bank account on their provider account, satisfying the
-   * `payout_destination` onboarding requirement. Distinct from
-   * registerPayoutDestination, which adds a place a withdrawal can be sent.
-   */
-  submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void>;
-  getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus>;
+  /** Send money from a rep's wallet to a registered bank account. */
+  initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult>;
   getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult>;
-  /** Move Duevy's withdrawal fee (net of the provider's own payout fee) between the rep's account and the platform. */
-  settleFee(input: SettleFeeInput): Promise<{ transferId: string }>;
 }

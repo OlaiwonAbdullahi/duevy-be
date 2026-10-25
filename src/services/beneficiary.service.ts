@@ -42,7 +42,7 @@ export function listBeneficiaries(spaceId: string): Promise<PayoutBeneficiary[]>
 
 export async function addBeneficiary(input: {
   spaceId: string;
-  actor: { id: string; name: string; bachsAccountId: string };
+  actor: { id: string; name: string; walletAccountNumber: string };
   bankCode: string;
   accountNumber: string;
   label?: string;
@@ -58,8 +58,9 @@ export async function addBeneficiary(input: {
 
   const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
   const destination = await getPaymentProvider().registerPayoutDestination({
-    accountId: actor.bachsAccountId,
+    accountId: actor.walletAccountNumber,
     bankCode,
+    bankName,
     accountNumber,
     accountName,
   });
@@ -78,8 +79,8 @@ export async function addBeneficiary(input: {
         accountNumber: encrypt(accountNumber),
         accountNumberMasked: masked,
         accountName,
-        bachsDestinationId: destination.destinationId,
-        bachsAccountId: actor.bachsAccountId,
+        destinationId: destination.destinationId,
+        walletAccountNumber: actor.walletAccountNumber,
         createdById: actor.id,
       },
     });
@@ -131,20 +132,21 @@ export async function removeBeneficiary(spaceId: string, beneficiaryId: string, 
 
 /**
  * The provider destination for paying this beneficiary out of `accountId` (the
- * current lead rep's Bachs account). A destination belongs to one Bachs
- * account, so after a lead change it is registered again on the new one.
+ * current lead rep's wallet). It is registered against one wallet, so after a
+ * lead change it is registered again for the new one.
  */
 export async function destinationFor(b: PayoutBeneficiary, accountId: string): Promise<string> {
-  if (b.bachsDestinationId && b.bachsAccountId === accountId) return b.bachsDestinationId;
+  if (b.destinationId && b.walletAccountNumber === accountId) return b.destinationId;
   const destination = await getPaymentProvider().registerPayoutDestination({
     accountId,
     bankCode: b.bankCode,
+    bankName: b.bankName,
     accountNumber: decrypt(b.accountNumber),
     accountName: b.accountName,
   });
   await db.payoutBeneficiary.update({
     where: { id: b.id },
-    data: { bachsDestinationId: destination.destinationId, bachsAccountId: accountId },
+    data: { destinationId: destination.destinationId, walletAccountNumber: accountId },
   });
   return destination.destinationId;
 }
@@ -152,7 +154,7 @@ export async function destinationFor(b: PayoutBeneficiary, accountId: string): P
 /** A one-off withdrawal target: name-checked and registered with the provider, but not saved. */
 export async function oneOffDestination(accountId: string, bankCode: string, accountNumber: string) {
   const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
-  const destination = await getPaymentProvider().registerPayoutDestination({ accountId, bankCode, accountNumber, accountName });
+  const destination = await getPaymentProvider().registerPayoutDestination({ accountId, bankCode, bankName, accountNumber, accountName });
   return { bankName, accountName, accountNumberMasked: maskAccountNumber(accountNumber), destinationId: destination.destinationId };
 }
 

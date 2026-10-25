@@ -13,17 +13,22 @@ import { canWithdraw } from './kyc.service';
 import { destinationFor, oneOffDestination } from './beneficiary.service';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
 import { getActiveDiscount } from './partner.service';
+import { getLastPayoutFee, recordPayoutFee } from './settings.service';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
  * beneficiaries — any bank account the space has added. A co-rep can withdraw
  * a due's collections when the lead has assigned that due to them. Either way
- * the money leaves the LEAD rep's provider account, where collections settle.
+ * the money leaves the LEAD rep's wallet, where collections are routed.
  *
  *   gross = what the rep asks for, debited from the space's ledger
- *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross,
- *           less the space's partner discount if it has one (partner.service)
+ *   fee   = Duevy's withdrawal fee — none for now (lib/money.ts)
  *   net   = gross − fee, sent to the bank
+ *
+ * Bank78 charges its own transfer fee on top, from the same wallet. It is only
+ * known once Bank78 answers, so it is debited from the ledger when the
+ * withdrawal succeeds; the last fee seen is held back from the balance so a
+ * whole-balance withdrawal leaves room for it.
  *
  * Safety, in order:
  *  0. The space's authorisation, by its withdrawalAuthMode:
@@ -269,13 +274,15 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
       rep.role === 'lead' ? 'KYC_NOT_VERIFIED' : 'LEAD_KYC_NOT_VERIFIED',
     );
   }
-  const accountId = lead.user.bachsAccountId!;
-  // canWithdraw guarantees a Bachs account. The destination is fixed on the
+  const accountId = lead.user.walletAccountNumber!;
+  // canWithdraw guarantees a wallet. The destination is fixed on the
   // payout now so a later change to the beneficiary can't redirect it.
   const target = await resolveTarget(req, accountId);
   const needsApproval = space.withdrawalAuthMode === 'multisig';
 
   const reference = await uniquePayoutReference();
+  // Bank78's fee comes out of the same wallet; leave room for it.
+  const bankFee = (await getLastPayoutFee()) ?? 0;
 
   let payout: Payout;
   try {
@@ -286,17 +293,17 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
         const active = await tx.payout.findUnique({ where: { activeSpaceId: spaceId }, select: { reference: true } });
         if (active) throw new WithdrawalInProgressError(active.reference);
 
-        const balance = await getSpaceBalance(spaceId, tx);
+        const balance = (await getSpaceBalance(spaceId, tx)) - bankFee;
         if (amountKobo > balance) {
           throw new AppError(422, 'INSUFFICIENT_BALANCE', 'The amount is more than the space’s available balance', [
-            { field: 'amount', issue: `available balance is ${balance} kobo` },
+            { field: 'amount', issue: `available balance is ${Math.max(balance, 0)} kobo after the ${bankFee} kobo bank transfer fee` },
           ]);
         }
         if (due) {
-          const dueAvailable = (await getDueAvailability(spaceId, tx)).get(due.id) ?? 0;
+          const dueAvailable = ((await getDueAvailability(spaceId, tx)).get(due.id) ?? 0) - bankFee;
           if (amountKobo > dueAvailable) {
             throw new AppError(422, 'INSUFFICIENT_BALANCE', `The amount is more than what is left of "${due.title}"`, [
-              { field: 'amount', issue: `available balance for this due is ${dueAvailable} kobo` },
+              { field: 'amount', issue: `available balance for this due is ${Math.max(dueAvailable, 0)} kobo after the ${bankFee} kobo bank transfer fee` },
             ]);
           }
         }
@@ -463,20 +470,41 @@ export async function completePayout(reference: string, providerFeeKobo?: number
       logger.error({ ref: reference, status: p.status }, 'success reported for a withdrawal already closed');
       return null;
     }
-    return tx.payout.update({
+    const fee = providerFeeKobo ?? p.providerFeeKobo ?? 0;
+    const updated = await tx.payout.update({
       where: { id: p.id },
       data: {
         status: 'success',
         settledAt: new Date(),
         activeSpaceId: null,
-        ...(providerFeeKobo !== undefined && providerFeeKobo !== null ? { providerFeeKobo } : {}),
+        providerFeeKobo: fee,
+        // No Duevy fee to sweep; recorded as settled so nothing waits on it.
+        feeSettledAt: new Date(),
+        feeSettlementKobo: 0,
       },
     });
+    // Bank78 took its transfer fee from the wallet; take it from the ledger too.
+    // It is the payout's one payout_fee entry: Duevy's own fee is zero
+    // (lib/money.ts) — if that ever changes, give this its own ledger type.
+    if (fee > 0) {
+      await lockSpace(tx, p.spaceId);
+      await appendLedgerEntry(tx, {
+        spaceId: p.spaceId,
+        dueId: p.dueId,
+        payoutId: p.id,
+        type: 'payout_fee',
+        direction: 'debit',
+        amountKobo: fee,
+        reference: p.reference,
+        description: 'Bank78 transfer fee',
+      });
+    }
+    return updated;
   });
   if (!done) return false;
 
-  logger.info({ ref: reference }, 'withdrawal succeeded');
-  await settleWithdrawalFee(done.id).catch((err) => logger.warn({ ref: reference, err: (err as Error).message }, 'fee settlement deferred'));
+  logger.info({ ref: reference, bankFee: done.providerFeeKobo }, 'withdrawal succeeded');
+  if (done.providerFeeKobo) await recordPayoutFee(done.providerFeeKobo).catch(() => {});
   await notifyReps(done, 'success');
   return true;
 }
@@ -511,13 +539,6 @@ export async function failPayout(payoutId: string, reason: string, code?: string
   if (!done) return false;
 
   logger.warn({ ref: done.reference, status: done.status, reason, code }, 'withdrawal failed — balance restored');
-  // A reversed withdrawal whose fee had already been swept: give the fee back
-  // to the rep's provider account, since the ledger restored it to the space.
-  if (done.status === 'reversed' && done.feeSettledAt && done.feeSettlementKobo && done.providerAccountId) {
-    await getPaymentProvider()
-      .settleFee({ accountId: done.providerAccountId, amountKobo: -done.feeSettlementKobo, reference: `${done.reference}-REV` })
-      .catch((err) => logger.error({ ref: done.reference, err: (err as Error).message }, 'fee refund on reversal failed — reconcile by hand'));
-  }
   await notifyReps(done, 'failed');
   return true;
 }
@@ -561,22 +582,6 @@ export async function cancelPayout(payoutId: string, reason: string): Promise<Pa
   logger.info({ ref: done.reference, reason }, 'withdrawal cancelled — balance restored');
   await notifyReps(done, 'cancelled');
   return done;
-}
-
-/**
- * After a successful withdrawal the rep's provider account has been debited
- * net + the provider's own payout fee; the ledger debited net + Duevy's fee.
- * Moving (Duevy fee − provider fee) to the platform makes the two agree.
- */
-export async function settleWithdrawalFee(payoutId: string): Promise<void> {
-  const p = await db.payout.findUnique({ where: { id: payoutId } });
-  if (!p || p.status !== 'success' || p.feeSettledAt || !p.providerAccountId) return;
-  const amount = p.feeKobo - (p.providerFeeKobo ?? 0);
-  if (amount !== 0) {
-    await getPaymentProvider().settleFee({ accountId: p.providerAccountId, amountKobo: amount, reference: p.reference });
-  }
-  await db.payout.update({ where: { id: p.id }, data: { feeSettledAt: new Date(), feeSettlementKobo: amount } });
-  logger.info({ ref: p.reference, amount }, 'withdrawal fee settled');
 }
 
 /** Reconciliation: resolve a processing withdrawal from the provider's own record. */

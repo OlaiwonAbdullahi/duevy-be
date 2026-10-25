@@ -12,15 +12,18 @@ import { generateId } from '../lib/id';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
 import { canCollect } from './kyc.service';
-import { getCheckoutMode } from './settings.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
- * with ONE bank transfer into a one-time account opened for this checkout.
+ * with ONE bank transfer into a one-time Bank78 account opened for this checkout.
  *
- *   face  = Σ due amounts          → credited to the space in full
- *   fee   = 2% of face + ₦20       → Duevy's, paid by the student on top
- *   total = face + fee             → what the student transfers
+ *   face  = Σ due amounts            → credited to the space in full
+ *   fee   = 1.5% of face + Bank78's  → paid by the student on top
+ *   total = face + fee               → what the student transfers
+ *
+ * The transfer lands in Duevy's Bank78 merchant account. Once paid, the face
+ * amount is routed into the lead rep's wallet (routeCheckoutFunds); the fee
+ * stays behind.
  *
  * Every amount is computed here, from the dues in the database. Nothing about
  * money is read from the request.
@@ -112,7 +115,7 @@ export function isValidGuestCheckoutToken(reference: string, token: string): boo
 export interface CreateCheckoutOptions {
   /**
    * A guest payer (no account, no membership). Allowed only on dues the rep
-   * has opened to guests, and the hosted page returns to the public pay page.
+   * has opened to guests.
    */
   guest?: boolean;
 }
@@ -156,7 +159,7 @@ export async function createCheckout(
     }),
     db.spaceRep.findFirst({
       where: { spaceId: space.id, role: 'lead' },
-      include: { user: { select: { kycStatus: true, bachsAccountId: true, studentIdStatus: true } } },
+      include: { user: { select: { kycStatus: true, walletAccountNumber: true, studentIdStatus: true } } },
     }),
   ]);
 
@@ -171,8 +174,8 @@ export async function createCheckout(
 
   if (paid) throw conflict('DUE_ALREADY_PAID', `"${paid.due.title}" has already been paid`);
 
-  // Collections settle into the lead rep's provider account, so the space can
-  // only collect once that rep has passed KYC.
+  // Collections are routed into the lead rep's wallet, so the space can only
+  // collect once that rep has passed KYC.
   if (!lead || !canCollect(lead.user)) {
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
@@ -215,7 +218,6 @@ export async function createCheckout(
         totalKobo: face + fee,
         dueSetKey,
         provider: getPaymentProvider().name,
-        destinationAccountId: lead.user.bachsAccountId,
         // Provisional; replaced by the provider's own expiry once the account opens.
         expiresAt: new Date(Date.now() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
         items: {
@@ -241,9 +243,9 @@ export async function createCheckout(
     return { checkout, reused: false };
   });
 
-  const checkout = outcome.checkout.vaAccountNumber || outcome.checkout.checkoutUrl
+  const checkout = outcome.checkout.vaAccountNumber
     ? outcome.checkout
-    : await openCollectionAccount(outcome.checkout, user, outcome.reused, returnUrlFor(outcome.checkout, opts));
+    : await openCollectionAccount(outcome.checkout, user, outcome.reused);
 
   logger.info({ ref: checkout.reference, userId, spaceId: checkout.spaceId, total: checkout.totalKobo, reused: outcome.reused }, 'checkout ready');
   return { checkout: serializeCheckout(checkout), reused: outcome.reused };
@@ -251,39 +253,26 @@ export async function createCheckout(
 
 /**
  * Ask the provider for the one-time account. Safe to call again for the same
- * checkout: the provider calls carry idempotency keys derived from our
- * reference, so a retry replays rather than opening a second account.
+ * checkout: the account is reserved under our reference, so a retry picks up
+ * the same account rather than opening a second one.
  */
-/** Where a hosted checkout sends the payer back to when they're done. */
-function returnUrlFor(checkout: CheckoutWithItems, opts: CreateCheckoutOptions): string {
-  const ref = encodeURIComponent(checkout.reference);
-  if (!opts.guest) return `${env.FRONTEND_URL}/dashboard/pay/${ref}`;
-  const dueId = encodeURIComponent(checkout.items[0]!.dueId);
-  return `${env.FRONTEND_URL}/pay/${dueId}?ref=${ref}&t=${guestCheckoutToken(checkout.reference)}`;
-}
-
 async function openCollectionAccount(
   checkout: CheckoutWithItems,
   user: { email: string; name: string },
   reused: boolean,
-  returnUrl: string,
 ): Promise<CheckoutWithItems> {
   if (reused && Date.now() - checkout.createdAt.getTime() < OPENING_GRACE_MS) {
     throw conflict('CHECKOUT_OPENING', 'This payment is still being set up. Try again in a few seconds.');
   }
-  if (!checkout.destinationAccountId) throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet");
 
   try {
     const account = await getPaymentProvider().createCollectionAccount({
       reference: checkout.reference,
       faceKobo: checkout.faceKobo,
       platformFeeKobo: checkout.feeKobo,
-      destinationAccountId: checkout.destinationAccountId,
       customer: { email: user.email, name: user.name },
       expiresInMinutes: env.CHECKOUT_EXPIRY_MINUTES,
       metadata: { checkoutId: checkout.id, spaceId: checkout.spaceId, dueCount: String(checkout.items.length) },
-      mode: await getCheckoutMode(),
-      returnUrl,
     });
     if (account.totalKobo !== checkout.totalKobo) {
       throw new ProviderError('Provider total does not match the checkout total', null, 'PRICE_MISMATCH', false);
@@ -296,7 +285,6 @@ async function openCollectionAccount(
         vaAccountNumber: account.accountNumber,
         vaBankName: account.bankName,
         vaAccountName: account.accountName,
-        checkoutUrl: account.checkoutUrl,
         expiresAt: account.expiresAt,
       },
       include: withItems,
@@ -472,6 +460,9 @@ export async function fulfilCheckout(
           paidAt: new Date(),
           receivedKobo,
           overpaidKobo: excess,
+          // The credit that paid it (Bank78's sessionId), so a later credit
+          // on a different session is recognised as a second payment.
+          providerChargeId: checkout.providerChargeId ?? providerChargeId,
           needsReview: flags.length > 0 || checkout.needsReview,
           reviewReason: flags.length ? flags.join('; ') : checkout.reviewReason,
         },
@@ -512,8 +503,66 @@ export async function fulfilCheckout(
   // Fire-and-forget: notifications and the receipt email must not hold up the
   // webhook worker. The payment itself is already committed.
   void afterPaid(result.checkout).catch((err) => logger.warn({ err, ref: result.checkout.reference }, 'post-payment side effects failed'));
+  // Move the money into the rep's wallet. Reconciliation retries it if this fails.
+  void routeCheckoutFunds(checkoutId).catch((err) => logger.warn({ ref: result.checkout.reference, err: (err as Error).message }, 'routing to rep wallet deferred'));
   if (result.flags.length) await flagToAdmins('Payment needs review', `${result.checkout.reference}: ${result.flags.join('; ')}`);
   return 'paid';
+}
+
+export type RouteOutcome = 'routed' | 'skipped';
+
+/**
+ * Credit a paid checkout's collections to the lead rep's wallet. What moves is
+ * exactly what the space's ledger was credited (a due already paid elsewhere
+ * isn't); any excess and Duevy's fee stay in the merchant account. Idempotent:
+ * the transfer reference is derived from ours, and routedAt is set once.
+ */
+export async function routeCheckoutFunds(checkoutId: string): Promise<RouteOutcome> {
+  // The row lock is held across the transfer so the webhook path and the
+  // reconciliation sweep can never send it twice; a concurrent caller skips.
+  return db.$transaction(
+    async (tx) => {
+      const locked = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "checkouts" WHERE "id" = ${checkoutId} FOR UPDATE SKIP LOCKED`;
+      if (locked.length === 0) return 'skipped';
+      const c = await tx.checkout.findUniqueOrThrow({
+        where: { id: checkoutId },
+        select: { id: true, reference: true, spaceId: true, status: true, routedAt: true },
+      });
+      if (c.status !== 'paid' || c.routedAt) return 'skipped';
+
+      const lead = await tx.spaceRep.findFirst({
+        where: { spaceId: c.spaceId, role: 'lead' },
+        include: { user: { select: { walletAccountNumber: true } } },
+      });
+      const wallet = lead?.user.walletAccountNumber;
+      if (!wallet) {
+        logger.error({ ref: c.reference, spaceId: c.spaceId }, 'paid checkout has no lead rep wallet to route to');
+        return 'skipped';
+      }
+
+      const credited = await tx.ledgerEntry.aggregate({
+        where: { reference: c.reference, type: 'due_payment', spaceId: c.spaceId },
+        _sum: { amountKobo: true },
+      });
+      const amountKobo = credited._sum.amountKobo ?? 0;
+      const reference = `RT-${c.reference}`;
+
+      let transferId: string | null = null;
+      if (amountKobo > 0) {
+        try {
+          ({ transferId } = await getPaymentProvider().routeCollection({ accountId: wallet, amountKobo, reference }));
+        } catch (err) {
+          // Bank78 answering "duplicate" means an earlier attempt already went through.
+          if (!(err instanceof ProviderError && (err.code === '94' || err.code === '26'))) throw err;
+          transferId = reference;
+        }
+      }
+      await tx.checkout.update({ where: { id: c.id }, data: { routedAt: new Date(), routeTransferId: transferId } });
+      logger.info({ ref: c.reference, wallet, amountKobo, transferId }, 'collection routed to rep wallet');
+      return 'routed' as const;
+    },
+    { timeout: 30_000 },
+  );
 }
 
 /** Less than the total arrived. No due is marked paid; an admin decides. */

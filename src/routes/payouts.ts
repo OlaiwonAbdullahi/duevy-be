@@ -13,18 +13,16 @@ import { maskAccountNumber } from '../lib/encryption';
 import {
   discountedFee,
   MIN_PAYOUT_KOBO,
-  WITHDRAWAL_FEE_HIGH_KOBO,
-  WITHDRAWAL_FEE_LOW_KOBO,
-  WITHDRAWAL_FEE_THRESHOLD_KOBO,
+  WITHDRAWAL_FEE_KOBO,
 } from '../lib/money';
 import { getKycState, getSpaceKycState } from '../services/kyc.service';
+import { getLastPayoutFee } from '../services/settings.service';
 import { getActiveDiscount, serializeSpacePartner } from '../services/partner.service';
 import {
-  governmentIdHandlers,
-  payoutDestinationHandlers,
-  payoutDestinationLookupHandlers,
   resubmitStudentIdHandlers,
+  sendPhoneCodeHandlers,
   submitKycHandlers,
+  verifyPhoneCodeHandlers,
 } from './kycHandlers';
 import { getDueAvailability, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
@@ -89,9 +87,12 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
     // Already net of the space's partner discount, if any.
+    // Duevy takes no withdrawal fee for now; Bank78 charges its own transfer
+    // fee, taken from the balance once the withdrawal succeeds. bankFeeKobo is
+    // the last one Bank78 charged — an estimate, null until the first payout.
     fees: {
-      below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_LOW_KOBO, discountPercent) },
-      atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_HIGH_KOBO, discountPercent) },
+      duevyFeeKobo: discountedFee(WITHDRAWAL_FEE_KOBO, discountPercent),
+      bankFeeKobo: await getLastPayoutFee(),
     },
     partner: partner ? serializeSpacePartner(partner) : null,
   });
@@ -233,15 +234,15 @@ payoutsRouter.post(
     const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
     const me = await db.user.findUniqueOrThrow({
       where: { id: uid(req) },
-      select: { id: true, name: true, bachsAccountId: true, kycStatus: true },
+      select: { id: true, name: true, walletAccountNumber: true, kycStatus: true },
     });
-    if (!me.bachsAccountId || me.kycStatus !== 'verified') {
+    if (!me.walletAccountNumber || me.kycStatus !== 'verified') {
       errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
     }
     const { beneficiary, created } = await addBeneficiary({
       spaceId: spaceId(req),
-      actor: { id: me.id, name: me.name, bachsAccountId: me.bachsAccountId },
+      actor: { id: me.id, name: me.name, walletAccountNumber: me.walletAccountNumber },
       bankCode,
       accountNumber,
       label,
@@ -266,9 +267,8 @@ payoutsRouter.delete(
 // ---------------------------------------------------------------------------
 payoutsRouter.post('/payout/kyc', ...submitKycHandlers);
 payoutsRouter.post('/payout/kyc/student-id', ...resubmitStudentIdHandlers);
-payoutsRouter.post('/payout/kyc/government-id', ...governmentIdHandlers);
-payoutsRouter.post('/payout/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
-payoutsRouter.post('/payout/kyc/payout-destination', ...payoutDestinationHandlers);
+payoutsRouter.post('/payout/kyc/phone/send', ...sendPhoneCodeHandlers);
+payoutsRouter.post('/payout/kyc/phone/verify', ...verifyPhoneCodeHandlers);
 
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
   const [space, mine] = await Promise.all([getSpaceKycState(spaceId(req)), getKycState(uid(req))]);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   allocate,
+  bank78CollectionFee,
   checkoutFee,
   computeCharge,
   computeWithdrawal,
@@ -8,30 +9,32 @@ import {
   discountedFee,
   koboToDecimal,
   withdrawalFee,
-  WITHDRAWAL_FEE_THRESHOLD_KOBO,
 } from './money';
 
 const NAIRA = 100;
 
-describe('checkoutFee — 2% + ₦20, on top', () => {
-  it('charges 2% plus ₦20 and leaves the face amount whole', () => {
+describe('checkoutFee — 1.5% + Bank78, on top', () => {
+  it('charges 1.5% and leaves the face amount whole', () => {
     const c = computeCharge(5_000 * NAIRA);
     expect(c.face).toBe(500_000);
-    expect(c.fee).toBe(10_000 + 2_000); // ₦100 + ₦20
-    expect(c.total).toBe(512_000); // student pays ₦5,120, space receives ₦5,000
+    expect(c.fee).toBe(7_500); // ₦75
+    expect(c.total).toBe(507_500); // student pays ₦5,075, space receives ₦5,000
   });
 
-  it('rounds the 2% half-up to the kobo', () => {
-    expect(checkoutFee(25)).toBe(1 + 2_000); // 0.5 kobo → 1
-    expect(checkoutFee(24)).toBe(0 + 2_000); // 0.48 kobo → 0
-    expect(checkoutFee(12_345)).toBe(247 + 2_000); // 246.9 → 247
+  it('rounds the 1.5% half-up to the kobo', () => {
+    expect(checkoutFee(100)).toBe(2); // 1.5 kobo → 2
+    expect(checkoutFee(33)).toBe(0); // 0.495 kobo → 0
+    expect(checkoutFee(12_345)).toBe(185); // 185.175 → 185
   });
 
-  it('charges the ₦20 once per checkout, not once per due', () => {
+  it('adds what Bank78 charges to collect (nothing until Bank78 publishes a rate)', () => {
+    expect(bank78CollectionFee(500_000)).toBe(0);
+    expect(checkoutFee(500_000)).toBe(7_500 + bank78CollectionFee(500_000));
+  });
+
+  it('is charged once per checkout on the whole basket', () => {
     const dues = [300_000, 150_000, 50_000];
-    const basket = dues.reduce((a, b) => a + b, 0);
-    expect(checkoutFee(basket)).toBe(10_000 + 2_000);
-    expect(checkoutFee(basket)).toBeLessThan(dues.reduce((a, d) => a + checkoutFee(d), 0));
+    expect(checkoutFee(dues.reduce((a, b) => a + b, 0))).toBe(7_500);
   });
 
   it('is zero for an empty basket and rejects non-integer or negative kobo', () => {
@@ -41,27 +44,18 @@ describe('checkoutFee — 2% + ₦20, on top', () => {
   });
 });
 
-describe('withdrawalFee — ₦100 under ₦50,000, ₦200 from ₦50,000', () => {
-  it('uses the low fee just under the threshold', () => {
-    expect(withdrawalFee(WITHDRAWAL_FEE_THRESHOLD_KOBO - 1)).toBe(10_000); // ₦49,999.99
+describe('withdrawalFee — no Duevy fee for now', () => {
+  it('is zero at any amount', () => {
+    expect(withdrawalFee(1_000 * NAIRA)).toBe(0);
+    expect(withdrawalFee(1_000_000 * NAIRA)).toBe(0);
   });
 
-  it('uses the high fee at exactly ₦50,000 and above', () => {
-    expect(withdrawalFee(WITHDRAWAL_FEE_THRESHOLD_KOBO)).toBe(20_000);
-    expect(withdrawalFee(1_000_000 * NAIRA)).toBe(20_000);
+  it('sends the whole withdrawal to the bank', () => {
+    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 0, feeBeforeDiscount: 0, discount: 0, net: 2_000_000 });
+    expect(computeWithdrawal(20_000 * NAIRA, 50)).toEqual({ gross: 2_000_000, fee: 0, feeBeforeDiscount: 0, discount: 0, net: 2_000_000 });
   });
 
-  it('deducts the fee from the withdrawal', () => {
-    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 10_000, feeBeforeDiscount: 10_000, discount: 0, net: 1_990_000 });
-    expect(computeWithdrawal(50_000 * NAIRA)).toEqual({ gross: 5_000_000, fee: 20_000, feeBeforeDiscount: 20_000, discount: 0, net: 4_980_000 });
-  });
-
-  it('applies a partner discount to the fee only', () => {
-    expect(computeWithdrawal(20_000 * NAIRA, 50)).toEqual({ gross: 2_000_000, fee: 5_000, feeBeforeDiscount: 10_000, discount: 5_000, net: 1_995_000 });
-    expect(computeWithdrawal(50_000 * NAIRA, 100)).toEqual({ gross: 5_000_000, fee: 0, feeBeforeDiscount: 20_000, discount: 20_000, net: 5_000_000 });
-  });
-
-  it('rounds the discount half-up and rejects bad percentages', () => {
+  it('rounds a partner discount half-up and rejects bad percentages', () => {
     expect(discountedFee(10_000, 33)).toBe(6_700);
     expect(discountedFee(10_001, 50)).toBe(5_000); // 5000.5 off → 5001 off
     expect(() => discountedFee(10_000, 101)).toThrow(RangeError);
@@ -84,7 +78,7 @@ describe('allocate', () => {
 });
 
 describe('decimal boundary', () => {
-  it('formats kobo as the decimal string Bachs expects', () => {
+  it('formats kobo as a two-decimal string', () => {
     expect(koboToDecimal(700_000)).toBe('7000.00');
     expect(koboToDecimal(5)).toBe('0.05');
     expect(koboToDecimal(0)).toBe('0.00');

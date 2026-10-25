@@ -28,7 +28,7 @@ const KYC_OUTSTANDING: Prisma.UserWhereInput = {
     { kycStatus: 'rejected' },
     { studentIdStatus: null },
     { studentIdStatus: 'rejected' },
-    { payoutDestinationSubmittedAt: null },
+    { phoneVerifiedAt: null },
   ],
 };
 

@@ -2,10 +2,9 @@
 
 REST API for **Duevy**, a dues collection platform for Nigerian universities. Students join their department or association with a join code and pay its dues. Reps collect the money and withdraw it.
 
-Payments run on **Bachs Connect** ([docs.bachs.io](https://docs.bachs.io)). Launch is LAUTECH only, but the data model is multi-school.
+Payments run on **Bank78** ([public API docs](https://78financials-bank78.github.io/bank78-public-api-docs/)); rep KYC runs on **Didit** ([docs.didit.me](https://docs.didit.me)). Launch is LAUTECH only, but the data model is multi-school.
 
 - API reference: [`API.md`](API.md)
-- How the Bachs integration works, and the open questions: [`docs/BACHS.md`](docs/BACHS.md)
 
 ## Tech stack
 
@@ -13,7 +12,8 @@ Payments run on **Bachs Connect** ([docs.bachs.io](https://docs.bachs.io)). Laun
 - **Database:** PostgreSQL (Supabase) through Prisma
 - **Validation:** Zod for request bodies and env vars
 - **Auth:** JWT access tokens plus httpOnly refresh cookies (jose, bcrypt)
-- **Payments:** Bachs Connect, behind a provider interface in `src/providers/payment`
+- **Payments:** Bank78, behind a provider interface in `src/providers/payment`
+- **KYC:** Didit (phone OTP + NIN database validation), `src/lib/didit.ts`
 - **Jobs:** a database-backed queue for webhooks plus a reconciliation sweep. No Redis is required.
 - **Logging:** pino (structured JSON), with sensitive fields redacted
 - **Email:** Resend
@@ -24,25 +24,24 @@ Payments run on **Bachs Connect** ([docs.bachs.io](https://docs.bachs.io)). Laun
 1. **Rep onboarding.** A rep signs up, their application is `pending`, and an admin approves it, which sets `isRep`.
    - An approved rep can create a space and draft dues straight away.
    - Publishing dues, and so collecting, needs KYC.
-2. **KYC.** Two checks, both needed before the rep's spaces can collect:
-   - **Identity, by Bachs.** The rep submits their NIN, date of birth and gender. Duevy creates a Bachs **Connect account** for the rep with them as its representative, and the verdict arrives by webhook. A BVN or ID document is sent only if Bachs asks for one; what Bachs still wants is shown to the rep.
+2. **KYC.** Three checks, all needed before the rep's spaces can collect:
+   - **Phone, by Didit.** The rep enters their Nigerian mobile number, Didit texts a one-time code, and the rep confirms it. Virtual, disposable and already-used numbers are refused.
+   - **Identity, by Didit.** The rep submits their NIN, BVN, date of birth and gender. Didit checks each number, with the name and date of birth, against the registries there and then. Approval opens the rep's **wallet**: a Bank78 sub-account (Bank78 requires the BVN for it).
    - **Student status, by Duevy.** In the same submission the rep uploads their student ID card. It is stored privately in ImageKit, and an admin approves or rejects it.
-   - The NIN, BVN and date of birth are never stored or logged. Only the statuses, Bachs's references and the ImageKit file reference are kept.
+   - The NIN, BVN, date of birth and OTP code are never stored or logged. Only the statuses, Didit's request id, the wallet account number and the ImageKit file reference are kept.
 3. **Checkout.** A student picks one or more dues from one space. Duevy computes the amounts:
    - face = the sum of the dues
-   - fee = 2% of the face + ₦20
+   - fee = 1.5% of the face + Bank78's collection fee (0 until Bank78 publishes one; `bank78CollectionFee` in `src/lib/money.ts`)
    - total = face + fee
 
-   It then opens a Bachs **destination charge** for the total:
-   - `platform_fee` is set to the fee, and the destination is the rep's account.
-   - Bachs returns a one-time bank account, and the student pays everything with **one bank transfer**.
-4. **Webhook.** `collection.succeeded` marks the dues paid, credits the space's ledger with the face amount, and issues a receipt.
-   - Underpaid, overpaid, expired and duplicate events are all handled; see [`docs/BACHS.md`](docs/BACHS.md).
-5. **Ledger.** Each space has an append-only ledger, and the balance is always the sum of its entries. A database trigger rejects any UPDATE or DELETE.
-6. **Withdrawal.** The rep withdraws to their own bank account. The account name must match the rep's name.
-   - Fee: ₦100 under ₦50,000, ₦200 from ₦50,000, deducted from the withdrawal.
+   It then opens a Bank78 **dynamic virtual account** for exactly the total (amount constraint: Exact). The student pays everything with **one bank transfer**, which lands in Duevy's Bank78 merchant account.
+4. **Webhook.** `virtual-nuban-transaction-credit` marks the dues paid, credits the space's ledger with the face amount, and issues a receipt. Duplicate deliveries, a second credit, money after expiry and short or long credits are all handled.
+5. **Routing.** The face amount is then transferred from the merchant account into the lead rep's wallet; Duevy's fee stays behind. Reconciliation retries a transfer that didn't go through.
+6. **Ledger.** Each space has an append-only ledger, and the balance is always the sum of its entries. A database trigger rejects any UPDATE or DELETE.
+7. **Withdrawal.** The rep withdraws from their wallet to any beneficiary account.
+   - No Duevy fee for now. Bank78 charges its own transfer fee on top, which is debited from the ledger when the withdrawal succeeds. The last fee Bank78 charged is held back from the balance so a whole-balance withdrawal can still pay it.
    - Safeguards: the request needs an idempotency key, the space is locked, and only one withdrawal can be in flight.
-   - The amount is debited from the ledger when the withdrawal is created. If it fails or is reversed, the full amount is credited back.
+   - The amount is debited from the ledger when the withdrawal is created. If it fails or is reversed, it is credited back.
 
 All money is integer kobo. Fees are always computed on the server.
 
@@ -58,7 +57,7 @@ npm run dev               # http://localhost:3000, all routes under /v1
 
 `npm install` runs `postinstall`, which runs the build (`prisma generate` + `tsc`).
 
-**Running locally without Bachs or ImageKit.** Set `PAYMENT_PROVIDER=fake` and `FILE_STORAGE=memory`. The fake provider opens fake bank accounts and resolves names instantly, but webhooks still use the real Bachs signature scheme. With `fake`, the seed also KYC-verifies the test rep and creates one paid checkout, so every dashboard has data.
+**Running locally.** Use the Bank78 sandbox and a Didit sandbox key; `FILE_STORAGE=memory` stands in for ImageKit. The seed leaves the test rep unverified, so KYC runs for real. `npm run smoke:bank78` checks the Bank78 credentials and every call Duevy makes against the sandbox.
 
 Seeded logins (password `Demo1234!`):
 
@@ -78,17 +77,18 @@ Two databases and two sets of keys, never mixed:
 | Config | `.env` (gitignored) | Render → Environment |
 | Database | dev Postgres (Supabase project `duevy-dev`) | prod Postgres (Supabase project `duevy-prod`) |
 | `NODE_ENV` | `development` | `production` |
-| Bachs | `sk_sandbox_…` + `https://sandbox-api.bachs.io` | `sk_live_…` + `https://api.bachs.io` |
-| Bachs webhook | sandbox endpoint → a tunnel to localhost (e.g. ngrok), or none | live endpoint → `https://api.duevy.app/v1/webhooks/bachs`, `event_source: all` |
+| Bank78 | `https://sandbox.bank78.co` + sandbox credentials | `https://api.bank78.co` + live credentials |
+| Bank78 webhook | sandbox merchant profile → a tunnel to localhost (e.g. ngrok), or none | live merchant profile → `https://api.duevy.app/v1/webhooks/bank78`, API version 2 |
+| Didit | sandbox application key | live application key |
 | JWT secrets | any | their own, never shared with dev |
 | Migrations | `npm run db:migrate` (creates them) | `npm run db:deploy` on every deploy (Render build command: `npm ci && npm run db:deploy`) |
 | First admin | `npm run db:seed` | `node scripts/create-admin.mjs <email> <name> <password>` |
 
-The server refuses to start with a live Bachs key outside `NODE_ENV=production`, or with a key that points at the wrong Bachs URL.
+The server refuses to start against live Bank78 (`api.bank78.co`) outside `NODE_ENV=production`, unless `BANK78_ALLOW_LIVE_OUTSIDE_PRODUCTION=true` is set deliberately.
 
-Bachs IDs (accounts, persons, checkouts, payouts) exist in only one Bachs environment, so sandbox rows must never be copied into the prod database. Reps redo KYC in prod.
+Bank78 accounts (wallets, virtual accounts) exist in only one Bank78 environment, so sandbox rows must never be copied into the prod database. Reps redo KYC in prod.
 
-Without a dev webhook, payments still settle in dev. The pay page checks Bachs directly, and the reconciliation job runs every minute. KYC updates (`account.updated`) only arrive by webhook.
+Bank78 has no "was this account paid" lookup, so **payments only settle by webhook**: in dev, point the sandbox merchant profile at a tunnel, or use `npm run webhook:test`. Reconciliation expires unpaid checkouts, retries routing to wallets and re-queries withdrawals.
 
 ## Environment variables
 
@@ -99,11 +99,13 @@ Every variable is validated at boot in `src/config/env.ts`, and the server refus
 | `DATABASE_URL`, `DIRECT_URL` | yes | Postgres. `DIRECT_URL` is the non-pooled URL used for migrations. |
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | yes | At least 32 characters each. |
 | `RESEND_API_KEY` | yes | Email delivery. |
-| `PAYMENT_PROVIDER` | no (`bachs`) | `bachs` or `fake`. `fake` is refused in production. |
-| `BACHS_BASE_URL` | no | Sandbox `https://sandbox-api.bachs.io`; live `https://api.bachs.io`. |
-| `BACHS_SECRET_KEY` | with `bachs` | `sk_sandbox_…` or `sk_live_…`. |
-| `BACHS_WEBHOOK_SECRET` | with `bachs` | The signing secret of the endpoint registered for `/v1/webhooks/bachs`. |
-| `BACHS_WEBHOOK_SECRET_PREVIOUS` | no | The outgoing secret during a 24h rotation. |
+| `BANK78_BASE_URL` | no (sandbox) | Sandbox `https://sandbox.bank78.co`; live `https://api.bank78.co`. |
+| `BANK78_CLIENT_ID`, `BANK78_CLIENT_SECRET`, `BANK78_API_KEY` | yes | Merchant dashboard → API Credentials. |
+| `BANK78_WEBHOOK_SECRET` | yes | The Webhook Secret on the merchant profile, for `/v1/webhooks/bank78`. |
+| `BANK78_WEBHOOK_SECRET_PREVIOUS` | no | The outgoing secret during a rotation. |
+| `BANK78_ALLOW_LIVE_OUTSIDE_PRODUCTION` | no (`false`) | Allow live Bank78 outside `NODE_ENV=production`. |
+| `DIDIT_API_KEY` | yes | Didit application API key (rep KYC). |
+| `DIDIT_BASE_URL` | no | `https://verification.didit.me`. |
 | `WEBHOOK_TOLERANCE_SECONDS` | no (300) | Maximum age of a signed delivery. |
 | `CHECKOUT_EXPIRY_MINUTES` | no (60) | Lifetime of a checkout's bank account, 1–1440. |
 | `RUN_WORKERS` | no (`true`) | Run the webhook worker and reconciliation inside the API. Set `false` and run `npm run worker` separately. |
@@ -128,42 +130,41 @@ npm run test:all    # both
 
 What the integration suite covers:
 
-- **Webhook idempotency.** One event delivered 5 times, some of them concurrently, plus the same outcome under a second event id. The result is exactly one paid checkout, one ledger credit per due, and one receipt. A forged signature gets 401.
+- **Webhook idempotency.** One credit delivered 5 times, some of them concurrently. The result is exactly one paid checkout, one ledger credit per due, and one receipt. A forged signature gets 401.
+- **Routing.** A paid checkout's face amount reaches the rep's wallet exactly once, even when two attempts race; a failed transfer is retried by reconciliation.
 - **Payment outcomes.**
-  - Underpaid: nothing is marked paid.
-  - Overpaid: the dues are paid at face value and the excess is flagged.
-  - Expired: the checkout closes, and money that arrives later is still honoured.
+  - A second credit on a paid checkout: flagged for review, not applied again.
+  - Short credit: nothing is marked paid. Long credit: paid at face value, excess flagged.
+  - Expired: money that arrives later is still honoured, and flagged.
   - Unknown reference: the event is retried with backoff.
 - **Ledger.** The balance is derived from entries, a reversal restores it, and UPDATE or DELETE is refused by the database.
 - **Withdrawal locking.** With five concurrent requests, exactly one succeeds and the other four get `WITHDRAWAL_IN_PROGRESS`. Also covered: insufficient balance, a provider refusal (balance restored), a timeout (left pending, never assumed failed), payout webhooks, and Idempotency-Key replay and reuse over HTTP.
-- **KYC.** NIN plus student ID card in one multipart submission; a Bachs webhook confirms the identity and an admin approves the card, and collection opens only when both are done. Also covered: replacing a rejected card (the old file is deleted), forwarding a government ID when Bachs asks, rejecting files that aren't really images or PDFs, and checking that the NIN and date of birth appear nowhere in the database.
+- **KYC.** Phone OTP, then NIN + BVN plus student ID card; Didit decides both numbers, the wallet opens, and collection opens only once an admin approves the card. Also covered: NIN before phone is refused, wrong/declined/blocked codes, a declined BVN, the 3-strikes retry lock (no BVN check once the NIN fails), Didit being down (503, not counted), a failed wallet retried by resubmitting, replacing a rejected card, rejecting files that aren't really images or PDFs, and checking that the NIN and date of birth appear nowhere in the database.
 
 ## Testing webhooks locally
 
-`scripts/send-test-webhook.ts` posts a correctly signed Bachs-format event, signed with `BACHS_WEBHOOK_SECRET`, to the running API:
+`scripts/send-test-webhook.ts` posts a correctly signed Bank78 (API v2) event, signed with `BANK78_WEBHOOK_SECRET`, to the running API:
 
 ```bash
 # Start a checkout as the seeded student, then pay it:
-npm run webhook:test -- paid      DVY-XXXX-XXXX 6650        # amount in naira = the checkout total
-npm run webhook:test -- underpaid DVY-XXXX-XXXX 3000 6650
-npm run webhook:test -- overpaid  DVY-XXXX-XXXX 7000 6650
-npm run webhook:test -- expired   DVY-XXXX-XXXX
-npm run webhook:test -- payout-paid   WD-2026-XXXXXX
-npm run webhook:test -- payout-failed WD-2026-XXXXXX
-npm run webhook:test -- identity  acct_fake_seed_rep        # makes the API re-read KYC state
-EVENT_ID=evt_same npm run webhook:test -- paid DVY-XXXX-XXXX 6650   # repeat to test dedupe
+npm run webhook:test -- paid         DVY-XXXX-XXXX 5075        # amount in naira = the checkout total
+npm run webhook:test -- payout-paid  WD-2026-XXXXXX 50         # Bank78's fee in naira
+npm run webhook:test -- wrong-amount DVY-XXXX-XXXX 5000 5075   # Bank78 refusing a wrong amount (ignored)
+SESSION_ID=same npm run webhook:test -- paid DVY-XXXX-XXXX 5075   # repeat to test dedupe
 ```
 
-`WEBHOOK_URL` overrides the target (the default is `http://localhost:$PORT/v1/webhooks/bachs`).
+`WEBHOOK_URL` overrides the target (the default is `http://localhost:$PORT/v1/webhooks/bank78`).
 
-**Against the Bachs sandbox:**
+**Against the Bank78 sandbox:**
 
-1. Expose the API with a tunnel, e.g. `cloudflared tunnel --url http://localhost:3000` or `ngrok http 3000`.
-2. In the Bachs dashboard, register `https://<tunnel>/v1/webhooks/bachs` with **`event_source: all`**. Without it, Connect events such as KYC and capability changes never arrive.
-3. Put the endpoint's signing secret in `BACHS_WEBHOOK_SECRET`.
-4. For sandbox payments, Bachs's custom checkout `confirm` accepts `simulated_outcome` (`success`, `failed` or `underpaid`). `POST /v1/webhooks/replay` re-sends an event.
+1. `npm run smoke:bank78` — token, bank list, name enquiry, a wallet, a dynamic account, sandbox funding, routing and a payout, each reported PASS/FAIL. It always uses the sandbox host.
+2. Expose the API with a tunnel, e.g. `cloudflared tunnel --url http://localhost:3000` or `ngrok http 3000`.
+3. On the sandbox merchant profile set the Webhook URL to `https://<tunnel>/v1/webhooks/bank78`, set a Webhook Secret (put it in `BANK78_WEBHOOK_SECRET`) and choose API version 2.
+4. Fund a checkout's account with Bank78's sandbox `POST /virtual-nuban/api/transaction-notification-fund`; the credit webhook follows.
 
-The webhook route only verifies the signature, stores the event (deduplicated by Bachs's event id) and returns 200. Processing happens in `src/jobs/webhookWorker.ts`. Events that keep failing land in `dead` and show on `GET /v1/admin/health`.
+`npm run smoke:didit -- <phone> [nin bvn first last YYYY-MM-DD]` sends a real OTP and checks it, and optionally validates a NIN and a BVN.
+
+The webhook route only verifies the signature, stores the event (deduplicated by its stable reference: the credit's `sessionId`, the transfer's `reference`) and returns 200. Processing happens in `src/jobs/webhookWorker.ts`. Events that keep failing land in `dead` and show on `GET /v1/admin/health`.
 
 ## Scripts
 
@@ -178,6 +179,8 @@ The webhook route only verifies the signature, stores the event (deduplicated by
 | `npm run db:seed` | Seed development data. Refuses to run in production. |
 | `npm run db:studio` | Prisma Studio |
 | `npm run webhook:test -- …` | Send a signed test webhook |
+| `npm run smoke:bank78` | Exercise every Bank78 call against the sandbox |
+| `npm run smoke:didit -- …` | Send and check a real Didit OTP; optionally a NIN check |
 
 ## Project structure
 
@@ -185,7 +188,7 @@ The webhook route only verifies the signature, stores the event (deduplicated by
 src/
 ├── app.ts / server.ts / worker.ts   Express app, API entry point, standalone worker entry point
 ├── config/                          env validation, Prisma client
-├── providers/payment/               PaymentProvider interface + Bachs and fake implementations
+├── providers/payment/               PaymentProvider interface + the Bank78 implementation
 ├── services/                        checkout, ledger, withdrawal, kyc, receipt, webhookProcessor, …
 ├── jobs/                            webhookWorker (DB queue), reconciliation (backstop for lost webhooks)
 ├── routes/                          one router per resource
@@ -201,4 +204,4 @@ prisma/
 ## Notes
 
 - **Out of MVP scope:** polls, the assistant, referrals and co-rep features exist behind feature flags, but their payment paths are disabled. This includes paid voting and discount codes at checkout. The payout approval quorum is gone.
-- **Anchor-era columns** (`anchor*`, `kycTier`, the remittance fields) are kept read-only. Payouts and webhook events from before the cutover are tagged `provider = 'anchor'`, and the Bachs reconciliation never touches them. See [`docs/BACHS.md`](docs/BACHS.md) for cutover steps.
+- **Anchor-era columns** (`anchor*`, `kycTier`, the remittance fields) are kept read-only. Payouts and webhook events from before the cutover are tagged `provider = 'anchor'` (or `'bachs'`), and reconciliation never touches them.

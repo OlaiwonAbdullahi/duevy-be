@@ -8,18 +8,20 @@ import { env } from '../config/env';
 export const webhooksRouter = Router();
 
 /**
- * POST /webhooks/bachs — public; authenticated by signature only.
+ * POST /webhooks/bank78 — public; authenticated by signature only. Set it as
+ * the Webhook URL on the Bank78 merchant profile, with a Webhook Secret
+ * (BANK78_WEBHOOK_SECRET) and merchant API version 2 payloads.
  *
  * Does the minimum and returns 200 fast:
  *   1. Verify the signature over the exact raw bytes (401 if it fails).
- *   2. Enqueue, deduplicated by Bachs's event id (a duplicate is a no-op).
+ *   2. Enqueue, deduplicated by the event's stable reference (a duplicate is a no-op).
  *   3. 200. The work happens in src/jobs/webhookWorker.ts.
  *
- * A 5xx is returned only if we could not durably store the event, so Bachs
+ * A 5xx is returned only if we could not durably store the event, so Bank78
  * retries it. Anything authenticated but unreadable is stored as `dead` for a
  * human and acknowledged — retrying it would never succeed.
  */
-webhooksRouter.post('/bachs', async (req: Request, res: Response): Promise<void> => {
+webhooksRouter.post('/bank78', async (req: Request, res: Response): Promise<void> => {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
   const provider = getPaymentProvider();
 

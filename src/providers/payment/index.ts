@@ -1,37 +1,27 @@
 import { env } from '../../config/env';
-import { BachsProvider } from './bachs/BachsProvider';
-import { FakeProvider } from './fake/FakeProvider';
+import { Bank78Provider } from './bank78/Bank78Provider';
 import { type PaymentProvider } from './types';
 
 export * from './types';
-export { FakeProvider } from './fake/FakeProvider';
-export { MalformedEventError } from './bachs/events';
 
 let instance: PaymentProvider | null = null;
 
-/** The configured payment rail (PAYMENT_PROVIDER). One instance per process. */
+/** The payment rail (Bank78). One instance per process. */
 export function getPaymentProvider(): PaymentProvider {
   if (instance) return instance;
-  const secrets = [env.BACHS_WEBHOOK_SECRET, env.BACHS_WEBHOOK_SECRET_PREVIOUS].filter((s): s is string => !!s);
-  // The public 'whsec_fake' secret is only acceptable under tests; anywhere
-  // else a missing secret would let anyone forge signed webhooks.
-  if (!secrets.length) {
-    if (env.NODE_ENV !== 'test') throw new Error('BACHS_WEBHOOK_SECRET is required');
-    secrets.push('whsec_fake');
-  }
-  instance =
-    env.PAYMENT_PROVIDER === 'fake'
-      ? new FakeProvider(secrets, env.WEBHOOK_TOLERANCE_SECONDS)
-      : new BachsProvider({
-          baseUrl: env.BACHS_BASE_URL,
-          secretKey: env.BACHS_SECRET_KEY as string,
-          webhookSecrets: secrets,
-          webhookToleranceSeconds: env.WEBHOOK_TOLERANCE_SECONDS,
-        });
+  const secrets = [env.BANK78_WEBHOOK_SECRET, env.BANK78_WEBHOOK_SECRET_PREVIOUS].filter((s): s is string => !!s);
+  instance = new Bank78Provider({
+    baseUrl: env.BANK78_BASE_URL,
+    clientId: env.BANK78_CLIENT_ID,
+    clientSecret: env.BANK78_CLIENT_SECRET,
+    apiKey: env.BANK78_API_KEY,
+    webhookSecrets: secrets,
+    webhookToleranceSeconds: env.WEBHOOK_TOLERANCE_SECONDS,
+  });
   return instance;
 }
 
-/** Test seam: swap the provider (e.g. for a FakeProvider with knobs set). */
+/** Test seam: swap the provider for an in-memory double (src/test/integration/paymentDouble.ts). */
 export function setPaymentProvider(provider: PaymentProvider | null): void {
   instance = provider;
 }

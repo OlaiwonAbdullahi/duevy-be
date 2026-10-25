@@ -2,8 +2,8 @@ import { type Checkout } from '@prisma/client';
 import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
-import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
-import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/withdrawal.service';
+import { expireCheckout, fulfilCheckout, markUnderpaid, routeCheckoutFunds } from '../services/checkout.service';
+import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
 
 /**
@@ -12,8 +12,8 @@ import { expireStaleApprovals } from '../services/withdrawalApproval.service';
  * Every action goes through the same idempotent service functions, so racing a
  * webhook is safe.
  *
- * Only rows created through the CURRENT provider are touched — Anchor-era
- * records are resolved by hand.
+ * Only rows created through the CURRENT provider are touched — Anchor- and
+ * Bachs-era records are resolved by hand.
  */
 
 // Short: payment events can be slow or missing, and a student is usually
@@ -22,6 +22,7 @@ const CHECK_PENDING_AFTER_MS = 2 * 60 * 1000;
 const EXPIRY_GRACE_MS = 5 * 60 * 1000;
 const RETRY_DISPATCH_AFTER_MS = 2 * 60 * 1000;
 const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
+const ROUTE_RETRY_AFTER_MS = 60 * 1000;
 
 export async function reconcileCheckouts(): Promise<void> {
   const provider = getPaymentProvider();
@@ -95,16 +96,25 @@ export async function reconcilePayouts(): Promise<void> {
     await refreshPayout(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'payout refresh failed'));
   }
 
-  const unsettledFees = await db.payout.findMany({
-    where: { provider: provider.name, status: 'success', feeSettledAt: null },
-    take: 25,
-  });
-  for (const p of unsettledFees) {
-    await settleWithdrawalFee(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'fee settlement retry failed'));
-  }
-
   // Multisig withdrawals nobody approved in time: cancel and restore the balance.
   await expireStaleApprovals();
+}
+
+/**
+ * Paid checkouts whose money hasn't reached the rep's wallet yet: the transfer
+ * right after payment failed or the process stopped. Routing is idempotent.
+ */
+export async function reconcileRouting(): Promise<void> {
+  const provider = getPaymentProvider();
+  const unrouted = await db.checkout.findMany({
+    where: { provider: provider.name, status: 'paid', routedAt: null, paidAt: { lte: new Date(Date.now() - ROUTE_RETRY_AFTER_MS) } },
+    orderBy: { paidAt: 'asc' },
+    select: { id: true, reference: true },
+    take: 25,
+  });
+  for (const c of unrouted) {
+    await routeCheckoutFunds(c.id).catch((err) => logger.warn({ ref: c.reference, err: (err as Error).message }, 'routing retry failed'));
+  }
 }
 
 /** Housekeeping: drop idempotency keys past their 24h window. */
@@ -119,6 +129,7 @@ export async function purgeExpiredIdempotencyKeys(): Promise<void> {
  */
 export async function runReconciliationOnce(): Promise<void> {
   await reconcileCheckouts().catch((err) => logger.error({ err: (err as Error).message }, 'checkout reconciliation run failed'));
+  await reconcileRouting().catch((err) => logger.error({ err: (err as Error).message }, 'routing reconciliation run failed'));
   await reconcilePayouts().catch((err) => logger.error({ err: (err as Error).message }, 'payout reconciliation run failed'));
   await purgeExpiredIdempotencyKeys().catch(() => {});
 }

@@ -19,7 +19,6 @@ import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getPaymentSettings, setCheckoutMode } from '../services/settings.service';
 import { redeemForSpace } from '../services/partner.service';
 import { AppError } from '../lib/errors';
 import { adminPartnersRouter } from './partners';
@@ -298,7 +297,7 @@ adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Reque
 /**
  * Duevy's revenue and payment counts, all-time and for the last 30 days.
  *  revenue      = service fees on paid checkouts + the withdrawal fees kept
- *                 (feeSettlementKobo: Duevy's fee minus Bachs's payout fee)
+ *                 (feeSettlementKobo; zero while Duevy takes no withdrawal fee)
  *  transactions = paid student checkouts; volume is what students paid
  */
 async function platformMetrics() {
@@ -527,7 +526,7 @@ adminRouter.post('/users/:userId/deactivate', requireAdminPermission('userManage
   res.status(204).end();
 });
 
-// Identity is Bachs's decision: an admin may revoke a rep's verification
+// Identity is Didit's decision: an admin may revoke a rep's verification
 // (block them) but can never mark someone verified.
 const kycSchema = z.object({ decision: z.literal('rejected'), note: z.string().max(500).optional() });
 
@@ -545,7 +544,7 @@ adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManage
 
 
 // ---------------------------------------------------------------------------
-// Rep student ID review. Bachs verifies identity (NIN); Duevy verifies the rep
+// Rep student ID review. Didit verifies identity (NIN); Duevy verifies the rep
 // is a student. A space can only collect once its lead rep's student ID is
 // approved here. View links are signed and expire after a few minutes.
 // ---------------------------------------------------------------------------
@@ -632,11 +631,10 @@ function serializeAdminRep(
     kyc: {
       status: user.kycStatus,
       studentIdStatus: user.studentIdStatus,
-      payoutsActive: user.bachsPayoutsActive,
+      payoutsActive: !!user.walletAccountNumber && user.kycStatus === 'verified',
+      phoneVerifiedAt: user.phoneVerifiedAt?.toISOString() ?? null,
       submittedAt: user.kycSubmittedAt?.toISOString() ?? null,
-      payoutAccount: user.payoutDestinationAccountMasked
-        ? { bankName: user.payoutDestinationBankName, accountMasked: user.payoutDestinationAccountMasked, accountName: user.payoutDestinationAccountName }
-        : null,
+      wallet: user.walletAccountNumber ? { accountNumber: user.walletAccountNumber } : null,
     },
     application: application
       ? {
@@ -685,7 +683,6 @@ const applicantSelect = {
   gender: true,
   kycStatus: true,
   kycRejectionReason: true,
-  kycRequirementsDue: true,
   kycSubmittedAt: true,
   kycResolvedAt: true,
   studentIdStatus: true,
@@ -704,7 +701,7 @@ function serializeRepApplication(app: RepApplication, user?: Applicant) {
     applicant: user
       ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level, phone: user.phone, gender: user.gender }
       : null,
-    // NIN verification (Bachs) and the student ID card, so the admin can give final approval.
+    // NIN verification (Didit) and the student ID card, so the admin can give final approval.
     kyc: user ? adminKycSummary(user) : null,
     status: app.status,
     requestedSpace: {
@@ -777,7 +774,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
     return;
   }
-  // Final approval comes after KYC: Bachs must have verified the NIN, and the
+  // Final approval comes after KYC: Didit must have verified the NIN, and the
   // student ID card must be on file (approving the application approves it).
   if (user.kycStatus !== 'verified') {
     errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
@@ -1682,30 +1679,6 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
 });
 
 // ===========================================================================
-// Payment settings — how students pay (hosted redirect vs. custom bank account)
-// ===========================================================================
-adminRouter.get('/settings/payments', async (_req: Request, res: Response): Promise<void> => {
-  ok(res, await getPaymentSettings());
-});
-
-const paymentSettingsSchema = z.object({ checkoutMode: z.enum(['hosted', 'custom']) });
-
-adminRouter.put('/settings/payments', requireSuperAdmin(), validate(paymentSettingsSchema), async (req: Request, res: Response): Promise<void> => {
-  const { checkoutMode } = req.body as z.infer<typeof paymentSettingsSchema>;
-  const before = await getPaymentSettings();
-  const adminId = (req as AuthenticatedRequest).user.sub as string;
-  const settings = await setCheckoutMode(checkoutMode, adminId);
-  if (before.checkoutMode !== checkoutMode) {
-    await writeAdminAudit(req, 'settings.checkout_mode', {
-      target: 'checkout_mode',
-      severity: 'warning',
-      metadata: { from: before.checkoutMode, to: checkoutMode },
-    });
-  }
-  ok(res, settings);
-});
-
-// ===========================================================================
 // §14.9 Reports
 // ===========================================================================
 /** One CSV cell. Text that a spreadsheet would run as a formula is prefixed with ' first. */
@@ -1886,5 +1859,3 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   res.status(200).send(body);
 });
 
-// The payment rail is chosen by configuration (PAYMENT_PROVIDER), not at runtime;
-// only the checkout mode is switchable (PUT /admin/settings/payments).

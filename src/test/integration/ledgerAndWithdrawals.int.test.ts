@@ -1,48 +1,68 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import bcrypt from 'bcryptjs';
 import { db } from '../../config/db';
-import { ProviderError, type FakeProvider } from '../../providers/payment';
+import { ProviderError } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
-import { completePayout, failPayoutByReference, requestWithdrawal } from '../../services/withdrawal.service';
+import { completePayout, failPayoutByReference, refreshPayout, requestWithdrawal } from '../../services/withdrawal.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
-import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, creditSpace, installPaymentDouble, makeSpace, newKey, TEST_PIN, sendWebhook, startHttp, stopHttp, tokenFor, transferSuccessEvent } from './fixtures';
 
-let fake: FakeProvider;
+const fake = installPaymentDouble();
 beforeAll(async () => {
-  fake = installFakeProvider();
   await startHttp();
 });
-beforeEach(() => fake.reset());
+beforeEach(async () => {
+  fake.reset();
+  // The last Bank78 fee seen is held back from withdrawals; start each test clean.
+  await db.platformSetting.deleteMany({ where: { key: 'bank78_last_payout_fee_kobo' } });
+});
 afterAll(stopHttp);
 
 describe('ledger balance', () => {
-  it('is derived from entries: collections − withdrawals − fees, restored by a reversal', async () => {
+  it('is derived from entries: collections − withdrawals − Bank78 fees, restored by a reversal', async () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 3_000_000); // ₦30,000
     await creditSpace(space.id, 2_500_000); // ₦25,000
     expect(await getSpaceBalance(space.id)).toBe(5_500_000);
 
-    // ₦20,000 withdrawal: ₦100 fee, ₦19,900 sent, ₦20,000 debited.
+    // ₦20,000 withdrawal: no Duevy fee, all ₦20,000 sent and debited.
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
-    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 10_000, net: 1_990_000 });
+    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 0, net: 2_000_000 });
     expect(await getSpaceBalance(space.id)).toBe(3_500_000);
-    expect(fake.calls.find((c) => c.op === 'initiatePayout')?.args).toMatchObject({ amountKobo: 1_990_000, reference: p.reference });
+    expect(fake.calls.find((c) => c.op === 'initiatePayout')?.args).toMatchObject({ amountKobo: 2_000_000, reference: p.reference });
 
+    // Bank78's ₦50 transfer fee comes off the balance once it succeeds.
     await completePayout(p.reference, 5_000);
     const summary = await getSpaceLedgerSummary(space.id);
-    expect(summary).toMatchObject({ balance: 3_500_000, collected: 5_500_000, withdrawn: 1_990_000, withdrawalFees: 10_000, inFlight: 0 });
-    // Duevy's fee less Bachs's own ₦50 payout fee is moved to the platform.
-    expect(fake.calls.find((c) => c.op === 'settleFee')?.args).toMatchObject({ amountKobo: 5_000 });
+    expect(summary).toMatchObject({ balance: 3_495_000, collected: 5_500_000, withdrawn: 2_000_000, withdrawalFees: 5_000, inFlight: 0 });
+    const done = await db.payout.findUniqueOrThrow({ where: { id: p.id } });
+    expect(done).toMatchObject({ providerFeeKobo: 5_000, feeSettlementKobo: 0 });
+    // A repeat success report doesn't take the fee twice.
+    await completePayout(p.reference, 5_000);
+    expect(await getSpaceBalance(space.id)).toBe(3_495_000);
 
-    // A bank reversal after success restores the full ₦20,000.
+    // A bank reversal after success restores the ₦20,000 sent.
     await failPayoutByReference(p.reference, 'returned by the bank');
     const reversed = await db.payout.findUniqueOrThrow({ where: { id: p.id } });
     expect(reversed.status).toBe('reversed');
-    expect(await getSpaceBalance(space.id)).toBe(5_500_000);
+    expect(await getSpaceBalance(space.id)).toBe(5_495_000);
     // A second failure report changes nothing.
     await failPayoutByReference(p.reference, 'again');
-    expect(await getSpaceBalance(space.id)).toBe(5_500_000);
+    expect(await getSpaceBalance(space.id)).toBe(5_495_000);
+  });
+
+  it('holds back the last Bank78 fee seen, so a whole-balance withdrawal can still pay it', async () => {
+    const { rep, space, beneficiary } = await makeSpace();
+    await creditSpace(space.id, 1_000_000);
+    const first = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN });
+    await completePayout(first.reference, 5_000); // balance 495,000; Bank78 charged ₦50
+
+    await expect(
+      requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 495_000, pin: TEST_PIN }),
+    ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
+    const all = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 490_000, pin: TEST_PIN });
+    expect(all.status).toBe('processing');
   });
 
   it('is append-only: the database refuses UPDATE and DELETE', async () => {
@@ -115,16 +135,19 @@ describe('withdrawals', () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 2_000_000);
     const a = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 1_000_000, pin: TEST_PIN });
-    await sendWebhook({ id: `evt_pp_${a.reference}`, type: 'payout.paid', data: { withdrawal_id: a.providerPayoutId, reference: a.reference, status: 'completed' } });
-    await sendWebhook({ id: `evt_pp_${a.reference}`, type: 'payout.paid', data: { withdrawal_id: a.providerPayoutId, reference: a.reference, status: 'completed' } });
+    const event = transferSuccessEvent(a.reference, 2_500);
+    await sendWebhook(event);
+    await sendWebhook(event);
     await drainWebhookQueue();
     expect((await db.payout.findUniqueOrThrow({ where: { id: a.id } })).status).toBe('success');
+    expect(await getSpaceBalance(space.id)).toBe(997_500); // ₦10,000 sent + Bank78's ₦25, once
 
+    // Bank78 has no failure webhook: reconciliation's query finds it.
     const b = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN });
-    await sendWebhook({ id: `evt_pf_${b.reference}`, type: 'payout.failed', data: { withdrawal_id: b.providerPayoutId, reference: b.reference, status: 'failed' } });
-    await drainWebhookQueue();
+    fake.payoutStatus.set(b.providerPayoutId!, { providerPayoutId: b.providerPayoutId!, state: 'failed', providerFeeKobo: null, failureReason: 'Invalid Account' });
+    await refreshPayout(b.id);
     expect((await db.payout.findUniqueOrThrow({ where: { id: b.id } })).status).toBe('failed');
-    expect(await getSpaceBalance(space.id)).toBe(1_000_000);
+    expect(await getSpaceBalance(space.id)).toBe(997_500);
   });
 
   it('HTTP: the Idempotency-Key replays the first response and never creates a second withdrawal', async () => {
@@ -311,12 +334,12 @@ describe('beneficiaries', () => {
   it('re-registers the destination on the current lead account after a lead change', async () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 1_000_000);
-    await db.user.update({ where: { id: rep.id }, data: { bachsAccountId: `${rep.bachsAccountId}_new` } });
+    await db.user.update({ where: { id: rep.id }, data: { walletAccountNumber: `${rep.walletAccountNumber}N` } });
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 200_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
-    expect(fake.calls.find((c) => c.op === 'registerPayoutDestination')?.args).toMatchObject({ accountId: `${rep.bachsAccountId}_new` });
+    expect(fake.calls.find((c) => c.op === 'registerPayoutDestination')?.args).toMatchObject({ accountId: `${rep.walletAccountNumber}N` });
     const updated = await db.payoutBeneficiary.findUniqueOrThrow({ where: { id: beneficiary!.id } });
-    expect(updated.bachsAccountId).toBe(`${rep.bachsAccountId}_new`);
-    expect(p.destinationId).toBe(updated.bachsDestinationId);
+    expect(updated.walletAccountNumber).toBe(`${rep.walletAccountNumber}N`);
+    expect(p.destinationId).toBe(updated.destinationId);
   });
 });

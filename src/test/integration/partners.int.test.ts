@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { type FakeProvider } from '../../providers/payment';
 import { getSpaceLedgerSummary } from '../../services/ledger.service';
 import { requestWithdrawal } from '../../services/withdrawal.service';
-import { api, creditSpace, installFakeProvider, makeSpace, TEST_PIN, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, creditSpace, installPaymentDouble, makeSpace, TEST_PIN, startHttp, stopHttp, tokenFor } from './fixtures';
 
-let fake: FakeProvider;
+let fake: ReturnType<typeof installPaymentDouble>;
 beforeAll(async () => {
-  fake = installFakeProvider();
+  fake = installPaymentDouble();
   await startHttp();
 });
 beforeEach(() => fake.reset());
@@ -134,54 +133,41 @@ describe('partner codes', () => {
 });
 
 describe('discounted withdrawals', () => {
-  it('quotes and charges the discounted fee, and keeps the redeemed percent after the partner changes', async () => {
+  // Duevy takes no withdrawal fee for now (lib/money.ts), so a partner
+  // discount has nothing to take off; the redemption itself still stands.
+  it('quotes no Duevy fee with or without a partner discount', async () => {
     const p = await makePartner({ withdrawalFeeDiscountPercent: 50 });
     const { rep, space, beneficiary } = await makeSpace();
     const token = await tokenFor(rep);
     await creditSpace(space.id, 5_000_000);
     await api('POST', `/v1/spaces/${space.id}/partner`, { token, body: { code: p.code } });
-    // Later edits don't change the space's terms.
-    await db.partner.update({ where: { id: p.id }, data: { withdrawalFeeDiscountPercent: 10, isActive: false } });
 
     const quote = await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token });
-    expect(quote.body.data).toMatchObject({ amount: 2_000_000, feeBeforeDiscount: 10_000, discount: 5_000, discountPercent: 50, fee: 5_000, net: 1_995_000 });
+    expect(quote.body.data).toMatchObject({ amount: 2_000_000, feeBeforeDiscount: 0, discount: 0, discountPercent: 50, fee: 0, net: 2_000_000 });
 
     const summary = await api('GET', `/v1/spaces/${space.id}/payout/summary`, { token });
-    expect(summary.body.data.fees.below.feeKobo).toBe(5_000);
-    expect(summary.body.data.fees.atOrAbove.feeKobo).toBe(10_000);
+    expect(summary.body.data.fees).toMatchObject({ duevyFeeKobo: 0 });
     expect(summary.body.data.partner).toMatchObject({ discountPercent: 50, active: true });
 
     const payout = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
-    expect(payout).toMatchObject({ feeKobo: 5_000, netKobo: 1_995_000, feeDiscountKobo: 5_000 });
-    expect(payout.partnerRedemptionId).not.toBeNull();
-  });
-
-  it('charges no fee at 100% off without writing a zero ledger entry', async () => {
-    const p = await makePartner({ withdrawalFeeDiscountPercent: 100 });
-    const { rep, space, beneficiary } = await makeSpace();
-    await creditSpace(space.id, 3_000_000);
-    await api('POST', `/v1/spaces/${space.id}/partner`, { token: await tokenFor(rep), body: { code: p.code } });
-
-    const payout = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
-    expect(payout).toMatchObject({ feeKobo: 0, netKobo: 2_000_000, feeDiscountKobo: 10_000 });
+    expect(payout).toMatchObject({ feeKobo: 0, netKobo: 2_000_000, feeDiscountKobo: 0, partnerRedemptionId: null });
     expect(await db.ledgerEntry.count({ where: { payoutId: payout.id, type: 'payout_fee' } })).toBe(0);
-    expect((await getSpaceLedgerSummary(space.id)).balance).toBe(1_000_000);
+    expect((await getSpaceLedgerSummary(space.id)).balance).toBe(3_000_000);
   });
 
-  it('goes back to the full fee once the redemption ends or is revoked', async () => {
+  it('reports a redemption that ended or was revoked as inactive', async () => {
     const { rep, space } = await makeSpace();
     const token = await tokenFor(rep);
     const p = await makePartner();
     const applied = await api('POST', `/v1/spaces/${space.id}/partner`, { token, body: { code: p.code } });
 
     await db.partnerRedemption.update({ where: { id: applied.body.data.id }, data: { endsAt: new Date(Date.now() - 1000) } });
-    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 10_000, discount: 0 });
+    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 0, discount: 0, discountPercent: 0 });
     expect((await api('GET', `/v1/spaces/${space.id}/partner`, { token })).body.data.active).toBe(false);
 
     await db.partnerRedemption.update({ where: { id: applied.body.data.id }, data: { endsAt: null } });
     const revoked = await api('POST', `/v1/admin/partner-redemptions/${applied.body.data.id}/revoke`, { token: await adminToken() });
     expect(revoked.body.data.revokedAt).not.toBeNull();
-    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 10_000, discount: 0 });
     expect((await api('GET', `/v1/spaces/${space.id}/partner`, { token })).body.data).toBeNull();
   });
 });

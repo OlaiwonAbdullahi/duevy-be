@@ -4,22 +4,24 @@ import { AppError, conflict, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { notify } from '../lib/notifications';
 import { getFileStore } from '../lib/storage';
-import { maskAccountNumber } from '../lib/encryption';
-import { resolveBankDetails } from './beneficiary.service';
-import { getPaymentProvider, ProviderError, type IdentityNumber, type IdentityResult } from '../providers/payment';
+import { checkPhoneCode, DiditError, normaliseNigerianPhone, sendPhoneCode, verifyIdNumber, type IdCheckResult, type IdKind } from '../lib/didit';
+import { getPaymentProvider } from '../providers/payment';
 
 /**
- * Rep identity verification (KYC). Two independent checks, both required
- * before a rep's spaces can collect:
+ * Rep identity verification (KYC). Three checks, all required before a rep's
+ * spaces can collect:
  *
- *  1. Bachs verifies the rep's identity: NIN + date of birth (a BVN only if
- *     Bachs later asks for one). The verdict arrives by webhook
- *     (identity.updated), which re-reads it from Bachs.
- *  2. Duevy verifies the rep is a student: the rep uploads their student ID
- *     card, stored privately in ImageKit, and an admin approves it.
+ *  1. Phone: Didit texts a one-time code to the rep's number and checks it.
+ *  2. NIN and BVN: Didit validates each, with the name and date of birth,
+ *     against Nigeria's registries. Approval opens the rep's wallet (a Bank78
+ *     sub-account, which needs the BVN) that collections are routed into and
+ *     withdrawals are paid out of.
+ *  3. Student: the rep uploads their student ID card, stored privately in
+ *     ImageKit, and an admin approves it.
  *
- * The NIN, BVN and date of birth go straight to Bachs and are NEVER persisted
- * or logged. For the student ID we keep only the storage reference.
+ * The NIN, BVN, date of birth and OTP code go straight to Didit (the NIN and
+ * BVN also to Bank78 when the wallet opens) and are NEVER persisted or logged. For the
+ * student ID we keep only the storage reference.
  *
  * Students never do KYC; rep applicants do it as part of their application.
  */
@@ -38,17 +40,14 @@ export interface UploadedDocument {
 
 export interface KycSubmission {
   nin: string;
-  /** Optional: only when Bachs asks for one (it is not required to start). */
-  bvn?: string;
+  /** Bank78 requires it to open the rep's wallet. Checked by Didit, never stored. */
+  bvn: string;
   dob: string; // YYYY-MM-DD
-  /** Bachs has no field for it; kept on the user for admins. */
+  /** Kept on the user for admins. */
   gender: 'male' | 'female';
   firstName?: string;
   lastName?: string;
-  phone?: string;
   studentId: UploadedDocument;
-  /** Optional: a government ID document, when Bachs asks for one. */
-  governmentId?: UploadedDocument;
 }
 
 /** One free-text name → first/last for the provider. */
@@ -59,16 +58,16 @@ export function splitName(fullName: string): { firstName: string; lastName: stri
   return { firstName: parts[0] as string, lastName: parts[parts.length - 1] as string };
 }
 
-type KycFields = Pick<User, 'kycStatus' | 'bachsAccountId' | 'studentIdStatus'>;
+type KycFields = Pick<User, 'kycStatus' | 'walletAccountNumber' | 'studentIdStatus'>;
 
-/** Can this rep's spaces take payments? Bachs passed the rep AND an admin approved the student ID. */
+/** Can this rep's spaces take payments? Didit verified the rep, they have a wallet, and an admin approved the student ID. */
 export function canCollect(user: KycFields): boolean {
-  return user.kycStatus === 'verified' && !!user.bachsAccountId && user.studentIdStatus === 'approved';
+  return user.kycStatus === 'verified' && !!user.walletAccountNumber && user.studentIdStatus === 'approved';
 }
 
-/** Can this rep withdraw? (Can collect, and Bachs has enabled payouts.) */
-export function canWithdraw(user: KycFields & Pick<User, 'bachsPayoutsActive'>): boolean {
-  return canCollect(user) && user.bachsPayoutsActive;
+/** Can this rep withdraw? Withdrawals come out of the same wallet collections go into. */
+export function canWithdraw(user: KycFields): boolean {
+  return canCollect(user);
 }
 
 export interface KycState {
@@ -76,19 +75,11 @@ export interface KycState {
   payoutsActive: boolean;
   canCollect: boolean;
   canWithdraw: boolean;
+  /** Didit's reference for the NIN check. */
   providerReference: string | null;
-  /** Field keys Bachs still asks for, e.g. a BVN or an ID document. */
-  requirementsDue: string[];
-  governmentIdSubmittedAt: string | null;
-  /** The rep's own bank account on their Bachs account; `null` until sent. */
-  payoutDestination: {
-    bankCode: string;
-    bankName: string;
-    /** Masked, e.g. "•••• 6789". */
-    accountNumber: string;
-    accountName: string;
-    submittedAt: string;
-  } | null;
+  phone: { number: string | null; verifiedAt: string | null };
+  /** The rep's Bank78 wallet; `null` until the NIN is approved. */
+  wallet: { accountNumber: string } | null;
   studentId: {
     status: DocumentReviewStatus | null;
     uploadedAt: string | null;
@@ -104,16 +95,10 @@ export interface KycState {
 /** The user fields {@link toState} reads, for loads that only need the KYC state. */
 const KYC_STATE_SELECT = {
   kycStatus: true,
-  bachsAccountId: true,
-  bachsPayoutsActive: true,
-  bachsPersonId: true,
-  kycRequirementsDue: true,
-  governmentIdSubmittedAt: true,
-  payoutDestinationSubmittedAt: true,
-  payoutDestinationBankCode: true,
-  payoutDestinationBankName: true,
-  payoutDestinationAccountMasked: true,
-  payoutDestinationAccountName: true,
+  walletAccountNumber: true,
+  diditNinRequestId: true,
+  phone: true,
+  phoneVerifiedAt: true,
   studentIdStatus: true,
   studentIdUploadedAt: true,
   studentIdReviewedAt: true,
@@ -127,22 +112,12 @@ const KYC_STATE_SELECT = {
 function toState(u: Prisma.UserGetPayload<{ select: typeof KYC_STATE_SELECT }>): KycState {
   return {
     kycStatus: u.kycStatus,
-    payoutsActive: u.bachsPayoutsActive,
+    payoutsActive: canWithdraw(u),
     canCollect: canCollect(u),
     canWithdraw: canWithdraw(u),
-    providerReference: u.bachsPersonId,
-    requirementsDue: u.kycRequirementsDue,
-    governmentIdSubmittedAt: u.governmentIdSubmittedAt?.toISOString() ?? null,
-    payoutDestination:
-      u.payoutDestinationSubmittedAt && u.payoutDestinationBankCode
-        ? {
-            bankCode: u.payoutDestinationBankCode,
-            bankName: u.payoutDestinationBankName ?? '',
-            accountNumber: u.payoutDestinationAccountMasked ?? '',
-            accountName: u.payoutDestinationAccountName ?? '',
-            submittedAt: u.payoutDestinationSubmittedAt.toISOString(),
-          }
-        : null,
+    providerReference: u.diditNinRequestId,
+    phone: { number: u.phone, verifiedAt: u.phoneVerifiedAt?.toISOString() ?? null },
+    wallet: u.walletAccountNumber ? { accountNumber: u.walletAccountNumber } : null,
     studentId: {
       status: u.studentIdStatus,
       uploadedAt: u.studentIdUploadedAt?.toISOString() ?? null,
@@ -162,9 +137,8 @@ const EMPTY_STATE: KycState = {
   canCollect: false,
   canWithdraw: false,
   providerReference: null,
-  requirementsDue: [],
-  governmentIdSubmittedAt: null,
-  payoutDestination: null,
+  phone: { number: null, verifiedAt: null },
+  wallet: null,
   studentId: { status: null, uploadedAt: null, reviewedAt: null, reviewNote: null },
   rejectionReason: null,
   retryLockedUntil: null,
@@ -185,15 +159,11 @@ export async function getKycState(userId: string): Promise<KycState> {
   return toState(user);
 }
 
-/** KYC state of the space's lead rep — the account its collections settle into. */
+/** KYC state of the space's lead rep — whose wallet its collections are routed into. */
 export async function getSpaceKycState(spaceId: string): Promise<KycState & { leadRepId: string | null }> {
   const lead = await db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: { select: KYC_STATE_SELECT } } });
   if (!lead) return { ...EMPTY_STATE, leadRepId: null };
   return { ...toState(lead.user), leadRepId: lead.userId };
-}
-
-function statusFrom(result: IdentityResult): KycStatus {
-  return result.status === 'verified' ? 'verified' : result.status === 'rejected' ? 'rejected' : 'pending';
 }
 
 async function storeStudentId(userId: string, doc: UploadedDocument) {
@@ -213,15 +183,94 @@ async function discardFile(fileId: string | null | undefined): Promise<void> {
     .catch((err) => logger.warn({ fileId, err: (err as Error).message }, 'could not delete superseded KYC file'));
 }
 
-export async function submitKyc(userId: string, input: KycSubmission): Promise<KycState> {
-  const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
+function unavailable(): AppError {
+  return new AppError(503, 'KYC_UNAVAILABLE', 'Verification is temporarily unavailable. Please try again in a few minutes.');
+}
 
+// ---------------------------------------------------------------------------
+// Step 1 — phone
+// ---------------------------------------------------------------------------
+
+function parsePhone(input: string): string {
+  const phone = normaliseNigerianPhone(input);
+  if (!phone) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Enter a Nigerian mobile number', [{ field: 'phone', issue: 'must be a Nigerian mobile number, e.g. 08012345678' }]);
+  }
+  return phone;
+}
+
+async function assertCanVerify(userId: string): Promise<User> {
+  const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
   if (!isRepOrApplicant(user)) {
     throw forbidden('Only reps and rep applicants can verify their identity', 'REP_NOT_APPROVED');
   }
-  if (user.kycStatus === 'verified') throw conflict('ALREADY_VERIFIED', 'Your identity is already verified');
-  if (user.kycStatus === 'pending' && user.bachsPersonId) {
-    throw conflict('KYC_PENDING', 'Your verification is already being reviewed');
+  return user;
+}
+
+/** Text a one-time code to the rep's phone. */
+export async function sendPhoneVerification(userId: string, phoneInput: string): Promise<{ phone: string }> {
+  await assertCanVerify(userId);
+  const phone = parsePhone(phoneInput);
+  let outcome;
+  try {
+    outcome = await sendPhoneCode(userId, phone);
+  } catch (err) {
+    if (err instanceof DiditError && !err.retryable) {
+      throw new AppError(422, 'PHONE_REJECTED', 'We could not send a code to that number. Check it and try again.');
+    }
+    throw unavailable();
+  }
+  if (outcome === 'blocked') {
+    throw new AppError(429, 'PHONE_BLOCKED', 'Too many attempts for this number. Try again later or use another number.');
+  }
+  return { phone };
+}
+
+/** Check the code. On success the number is saved as the rep's verified phone. */
+export async function confirmPhoneVerification(userId: string, phoneInput: string, code: string): Promise<KycState> {
+  await assertCanVerify(userId);
+  const phone = parsePhone(phoneInput);
+  let result;
+  try {
+    result = await checkPhoneCode(userId, phone, code);
+  } catch (err) {
+    if (err instanceof DiditError && !err.retryable) {
+      throw new AppError(422, 'INVALID_CODE', 'That code is not valid', [{ field: 'code', issue: 'invalid' }]);
+    }
+    throw unavailable();
+  }
+  switch (result.outcome) {
+    case 'approved': {
+      const updated = await db.user.update({ where: { id: userId }, data: { phone, phoneVerifiedAt: new Date() } });
+      logger.info({ userId }, 'kyc phone verified');
+      return toState(updated);
+    }
+    case 'wrong_code':
+      throw new AppError(422, 'INVALID_CODE', result.message ?? 'The code is incorrect', [{ field: 'code', issue: 'incorrect' }]);
+    case 'declined':
+      throw new AppError(422, 'PHONE_DECLINED', 'This number cannot be used for verification. Use your own mobile number, not a virtual or shared one.');
+    case 'expired':
+      throw new AppError(422, 'CODE_EXPIRED', 'That code has expired. Request a new one.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 — NIN + BVN (with the student ID card)
+// ---------------------------------------------------------------------------
+
+/** Both numbers must pass; a decline wins over "the registry didn't answer". */
+function combine(checks: IdCheckResult[]): IdCheckResult {
+  return checks.find((c) => c.outcome === 'declined') ?? checks.find((c) => c.outcome === 'in_review') ?? checks[0]!;
+}
+
+export async function submitKyc(userId: string, input: KycSubmission): Promise<KycState> {
+  const user = await assertCanVerify(userId);
+  // A verified rep whose wallet Bank78 couldn't open may submit again: the BVN
+  // that opens it is never kept, so only the rep can supply it a second time.
+  const walletRetry = user.kycStatus === 'verified' && !user.walletAccountNumber;
+  if (user.kycStatus === 'verified' && !walletRetry) throw conflict('ALREADY_VERIFIED', 'Your identity is already verified');
+  if (!user.phoneVerifiedAt || !user.phone) {
+    throw conflict('PHONE_NOT_VERIFIED', 'Verify your phone number first');
   }
   if (user.kycRetryLockedUntil && user.kycRetryLockedUntil > new Date()) {
     throw new AppError(429, 'KYC_RETRY_LOCKED', 'Too many failed attempts. Try again later.', [
@@ -230,87 +279,117 @@ export async function submitKyc(userId: string, input: KycSubmission): Promise<K
   }
 
   // 1. The student ID goes to private storage first, so a failure there
-  //    doesn't leave a half-submitted identity at Bachs.
-  const stored = await storeStudentId(user.id, input.studentId);
+  //    doesn't leave a half-finished verification behind. A wallet retry keeps
+  //    the card already under (or past) review.
+  const stored = walletRetry ? null : await storeStudentId(user.id, input.studentId);
 
-  // 2. Identity at Bachs.
-  const idNumbers: IdentityNumber[] = [{ type: 'nin', value: input.nin }];
-  if (input.bvn) idNumbers.push({ type: 'bvn', value: input.bvn });
+  // 2. The NIN, then the BVN, each checked against the registry. The BVN
+  //    check is skipped (and not billed) when the NIN already failed.
   const names = splitName(user.name);
-  let result: IdentityResult;
+  const firstName = input.firstName ?? names.firstName;
+  const lastName = input.lastName ?? names.lastName;
+  const ask = (kind: IdKind, number: string) => verifyIdNumber({ userId: user.id, kind, number, firstName, lastName, dob: input.dob });
+  let check: IdCheckResult;
+  let ninRequestId: string | null;
   try {
-    result = await getPaymentProvider().verifyIdentity({
-      profile: {
-        userId: user.id,
-        email: user.email,
-        firstName: input.firstName ?? names.firstName,
-        lastName: input.lastName ?? names.lastName,
-        displayName: user.name,
-        phone: input.phone ?? user.phone,
-      },
-      idNumbers,
-      dob: input.dob,
-      existingAccountId: user.bachsAccountId,
-      existingPersonId: user.bachsPersonId,
-    });
+    const nin = await ask('nin', input.nin);
+    ninRequestId = nin.requestId;
+    check = nin.outcome === 'approved' ? combine([nin, await ask('bvn', input.bvn)]) : nin;
   } catch (err) {
-    await discardFile(stored.fileId);
-    // A 4xx means the details were refused; count it. Anything else is the
-    // provider being unavailable — not the rep's fault.
-    if (err instanceof ProviderError && err.status !== null && err.status >= 400 && err.status < 500) {
+    await discardFile(stored?.fileId);
+    // A 4xx means Didit refused the details as given; count it. Anything else
+    // is Didit being unavailable — not the rep's fault.
+    if (err instanceof DiditError && !err.retryable) {
       await recordFailedAttempt(user, err.message);
       throw new AppError(422, 'KYC_REJECTED', 'The verification details were not accepted. Check them and try again.');
     }
-    throw err;
+    throw unavailable();
   }
 
-  // 3. A government ID document, if the rep sent one (Bachs may ask for it).
-  let governmentIdSubmittedAt = user.governmentIdSubmittedAt;
-  if (input.governmentId) {
-    try {
-      await getPaymentProvider().uploadIdentityDocument({
-        accountId: result.accountId,
-        personId: result.personId,
-        buffer: input.governmentId.buffer,
-        fileName: `government-id.${input.governmentId.ext}`,
-        mimeType: input.governmentId.mimeType,
-      });
-      governmentIdSubmittedAt = new Date();
-    } catch (err) {
-      logger.warn({ userId, err: (err as Error).message }, 'government ID upload to provider failed — rep can retry it');
-    }
-  }
+  const kycStatus: KycStatus = check.outcome === 'approved' ? 'verified' : check.outcome === 'declined' ? 'rejected' : 'pending';
+  const attempts = kycStatus === 'rejected' ? user.kycAttempts + 1 : kycStatus === 'verified' ? 0 : user.kycAttempts;
 
-  const kycStatus = statusFrom(result);
   const updated = await db.user.update({
     where: { id: user.id },
     data: {
-      bachsAccountId: result.accountId,
-      bachsPersonId: result.personId,
       kycStatus,
-      bachsPayoutsActive: result.payoutsActive,
-      kycRequirementsDue: result.requirementsDue,
+      diditNinRequestId: ninRequestId,
       kycSubmittedAt: new Date(),
       // Kept for admins (the rep directory and application review).
       gender: input.gender,
-      ...(input.phone ? { phone: input.phone } : {}),
       kycResolvedAt: kycStatus === 'pending' ? null : new Date(),
-      kycRejectionReason: kycStatus === 'rejected' ? result.failureReason ?? 'Verification failed' : null,
-      governmentIdSubmittedAt,
-      studentIdFileId: stored.fileId,
-      studentIdFilePath: stored.filePath,
-      studentIdMimeType: input.studentId.mimeType,
-      studentIdStatus: 'pending',
-      studentIdUploadedAt: new Date(),
-      studentIdReviewedAt: null,
-      studentIdReviewedById: null,
-      studentIdReviewNote: null,
+      kycRejectionReason:
+        kycStatus === 'rejected'
+          ? check.reason
+          : kycStatus === 'pending'
+            ? `The ${check.kind.toUpperCase()} registry did not answer. Submit again in a few minutes.`
+            : null,
+      kycAttempts: attempts,
+      kycRetryLockedUntil: kycStatus === 'rejected' && attempts >= MAX_KYC_ATTEMPTS ? new Date(Date.now() + KYC_RETRY_LOCK_MS) : null,
+      ...(stored
+        ? {
+            studentIdFileId: stored.fileId,
+            studentIdFilePath: stored.filePath,
+            studentIdMimeType: input.studentId.mimeType,
+            studentIdStatus: 'pending' as const,
+            studentIdUploadedAt: new Date(),
+            studentIdReviewedAt: null,
+            studentIdReviewedById: null,
+            studentIdReviewNote: null,
+          }
+        : {}),
     },
   });
-  if (user.studentIdFileId && user.studentIdFileId !== stored.fileId) await discardFile(user.studentIdFileId);
+  if (stored && user.studentIdFileId && user.studentIdFileId !== stored.fileId) await discardFile(user.studentIdFileId);
+  logger.info({ userId, providerRef: ninRequestId, kycStatus, walletRetry }, 'kyc submitted');
 
-  logger.info({ userId, providerRef: result.personId, kycStatus, requirementsDue: result.requirementsDue }, 'kyc submitted');
-  return toState(updated);
+  // 3. Both numbers approved: open the rep's wallet. Bank78 needs the BVN for
+  //    it. If Bank78 is unavailable the rep stays verified without a wallet,
+  //    and submitting again retries it.
+  let final = updated;
+  if (kycStatus === 'verified') {
+    final = (await openWallet(updated, { nin: input.nin, bvn: input.bvn, firstName, lastName }).catch((err) => {
+      logger.warn({ userId, err: (err as Error).message }, 'wallet could not be opened — the rep can submit again');
+      return null;
+    })) ?? updated;
+  }
+
+  if (kycStatus !== 'pending' && !walletRetry) {
+    await notify({
+      userId: user.id,
+      kind: 'system',
+      tone: kycStatus === 'verified' ? 'brand' : 'rose',
+      title: kycStatus === 'verified' ? 'Identity verified' : 'Identity verification failed',
+      detail:
+        kycStatus === 'verified'
+          ? !user.isRep
+            ? 'Your identity is verified. An admin will now review your rep application.'
+            : 'Your identity is verified. Collection opens once your student ID is approved.'
+          : `We could not verify your identity${check.reason ? `: ${check.reason}` : ''}. Please try again.`,
+      href: '/dashboard/kyc',
+    }).catch(() => {});
+  }
+  return toState(final);
+}
+
+/**
+ * Open the verified rep's Bank78 wallet. Idempotent: Bank78 keys the
+ * sub-account on our user id, so a retry finds the same one. The NIN and BVN
+ * are passed straight through (Bank78 requires the BVN) and never kept.
+ */
+async function openWallet(user: User, ids: { nin: string; bvn: string; firstName: string; lastName: string }): Promise<User> {
+  const wallet = await getPaymentProvider().createWallet({
+    userId: user.id,
+    firstName: ids.firstName,
+    lastName: ids.lastName,
+    email: user.email,
+    phone: user.phone!,
+    nin: ids.nin,
+    bvn: ids.bvn,
+  });
+  const updated = await db.user.update({ where: { id: user.id }, data: { walletAccountNumber: wallet.accountNumber } });
+  logger.info({ userId: user.id, wallet: wallet.accountNumber }, 'rep wallet opened');
+  return updated;
 }
 
 /** Replace the student ID card — when an admin rejected it, or none was ever sent. */
@@ -340,57 +419,6 @@ export async function resubmitStudentId(userId: string, doc: UploadedDocument): 
   return toState(updated);
 }
 
-/** Forward a government ID document to Bachs, after Bachs asked for one. */
-export async function submitGovernmentId(userId: string, doc: UploadedDocument): Promise<KycState> {
-  const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
-  if (!user.bachsAccountId || !user.bachsPersonId) {
-    throw conflict('KYC_NOT_STARTED', 'Submit your NIN and student ID first');
-  }
-  await getPaymentProvider().uploadIdentityDocument({
-    accountId: user.bachsAccountId,
-    personId: user.bachsPersonId,
-    buffer: doc.buffer,
-    fileName: `government-id.${doc.ext}`,
-    mimeType: doc.mimeType,
-  });
-  const updated = await db.user.update({ where: { id: user.id }, data: { governmentIdSubmittedAt: new Date() } });
-  logger.info({ userId, providerRef: user.bachsPersonId }, 'government ID forwarded to provider');
-  return toState(updated);
-}
-
-/**
- * Give the provider the rep's own bank account (`payout_destination`).
- * Collected during onboarding, and again whenever Bachs lists it in
- * requirementsDue. Name-checked first; the bank's name is what is sent.
- * Saved (masked) once Bachs accepts it, then the requirements are re-read.
- */
-export async function submitPayoutDestination(userId: string, bankCode: string, accountNumber: string): Promise<KycState> {
-  const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
-  if (!user.bachsAccountId || !user.bachsPersonId) {
-    throw conflict('KYC_NOT_STARTED', 'Submit your NIN and student ID first');
-  }
-  const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
-  await getPaymentProvider().submitAccountPayoutDestination({
-    accountId: user.bachsAccountId,
-    bankCode,
-    accountNumber,
-    accountName,
-  });
-  await db.user.update({
-    where: { id: userId },
-    data: {
-      payoutDestinationBankCode: bankCode,
-      payoutDestinationBankName: bankName,
-      payoutDestinationAccountMasked: maskAccountNumber(accountNumber),
-      payoutDestinationAccountName: accountName,
-      payoutDestinationSubmittedAt: new Date(),
-    },
-  });
-  logger.info({ userId, providerRef: user.bachsAccountId, bank: bankCode, account: maskAccountNumber(accountNumber) }, 'payout destination sent to provider');
-  await refreshIdentity(user.bachsAccountId);
-  return toState(await db.user.findUniqueOrThrow({ where: { id: userId } }));
-}
-
 async function recordFailedAttempt(user: User, reason: string): Promise<void> {
   const attempts = user.kycAttempts + 1;
   await db.user.update({
@@ -404,73 +432,6 @@ async function recordFailedAttempt(user: User, reason: string): Promise<void> {
   });
 }
 
-/**
- * identity.updated — re-read the verdict and the outstanding requirements
- * from the provider and apply them. Idempotent.
- */
-export async function refreshIdentity(accountId: string): Promise<'updated' | 'unchanged' | 'unknown'> {
-  const user = await db.user.findUnique({ where: { bachsAccountId: accountId } });
-  if (!user || !user.bachsPersonId) {
-    logger.warn({ accountId }, 'identity event for an account we do not know');
-    return 'unknown';
-  }
-
-  const result = await getPaymentProvider().getIdentityStatus(accountId, user.bachsPersonId);
-  const kycStatus = statusFrom(result);
-  const sameRequirements =
-    result.requirementsDue.length === user.kycRequirementsDue.length &&
-    result.requirementsDue.every((r) => user.kycRequirementsDue.includes(r));
-  if (kycStatus === user.kycStatus && result.payoutsActive === user.bachsPayoutsActive && sameRequirements) return 'unchanged';
-
-  const becameRejected = kycStatus === 'rejected' && user.kycStatus !== 'rejected';
-  const attempts = becameRejected ? user.kycAttempts + 1 : user.kycAttempts;
-  await db.user.update({
-    where: { id: user.id },
-    data: {
-      kycStatus,
-      bachsPayoutsActive: result.payoutsActive,
-      kycRequirementsDue: result.requirementsDue,
-      kycResolvedAt: kycStatus === 'pending' ? user.kycResolvedAt : new Date(),
-      kycRejectionReason: kycStatus === 'rejected' ? result.failureReason ?? 'Verification failed' : null,
-      kycAttempts: kycStatus === 'verified' ? 0 : attempts,
-      kycRetryLockedUntil:
-        becameRejected && attempts >= MAX_KYC_ATTEMPTS ? new Date(Date.now() + KYC_RETRY_LOCK_MS) : user.kycRetryLockedUntil,
-    },
-  });
-  logger.info(
-    { userId: user.id, providerRef: user.bachsPersonId, kycStatus, payoutsActive: result.payoutsActive, requirementsDue: result.requirementsDue },
-    'kyc updated',
-  );
-
-  if (kycStatus !== user.kycStatus && kycStatus !== 'pending') {
-    await notify({
-      userId: user.id,
-      kind: 'system',
-      tone: kycStatus === 'verified' ? 'brand' : 'rose',
-      title: kycStatus === 'verified' ? 'Identity verified' : 'Identity verification failed',
-      detail:
-        kycStatus === 'verified'
-          ? !user.isRep
-            ? 'Your identity is verified. An admin will now review your rep application.'
-            : user.studentIdStatus === 'approved'
-              ? 'Your spaces can now collect payments.'
-              : 'Your identity is verified. Collection opens once your student ID is approved.'
-          : `We could not verify your identity${result.failureReason ? `: ${result.failureReason}` : ''}. Please try again.`,
-      href: '/dashboard/kyc',
-    }).catch(() => {});
-  } else if (!sameRequirements && result.requirementsDue.length > 0) {
-    await notify({
-      userId: user.id,
-      kind: 'system',
-      tone: 'amber',
-      title: 'More verification details needed',
-      detail: 'Our payment partner has asked for more information to finish verifying you.',
-      href: '/dashboard/kyc',
-    }).catch(() => {});
-  }
-  return 'updated';
-}
-
 // ---------------------------------------------------------------------------
 // Admin: student ID review
 // ---------------------------------------------------------------------------
@@ -479,7 +440,6 @@ type AdminKycFields = Pick<
   User,
   | 'kycStatus'
   | 'kycRejectionReason'
-  | 'kycRequirementsDue'
   | 'kycSubmittedAt'
   | 'kycResolvedAt'
   | 'studentIdStatus'
@@ -490,13 +450,12 @@ type AdminKycFields = Pick<
   | 'studentIdReviewNote'
 >;
 
-/** The KYC picture an admin needs next to a rep application: the Bachs NIN verdict and the student ID card. */
+/** The KYC picture an admin needs next to a rep application: the Didit NIN verdict and the student ID card. */
 export function adminKycSummary(u: AdminKycFields) {
   return {
     identity: {
       status: u.kycStatus,
       rejectionReason: u.kycRejectionReason,
-      requirementsDue: u.kycRequirementsDue,
       submittedAt: u.kycSubmittedAt?.toISOString() ?? null,
       resolvedAt: u.kycResolvedAt?.toISOString() ?? null,
     },

@@ -13,8 +13,16 @@ const defaults: Record<string, string> = {
   JWT_ACCESS_SECRET: 'test-access-secret-that-is-at-least-32-chars',
   JWT_REFRESH_SECRET: 'test-refresh-secret-that-is-at-least-32-chars',
   RESEND_API_KEY: 're_test',
-  PAYMENT_PROVIDER: 'fake',
-  BACHS_WEBHOOK_SECRET: 'whsec_test_secret',
+  // Never a real host: integration tests swap in the in-memory double, and
+  // anything that slips past it fails against the sandbox's auth.
+  BANK78_BASE_URL: 'https://sandbox.bank78.co',
+  BANK78_CLIENT_ID: 'test-client',
+  BANK78_CLIENT_SECRET: 'test-client-secret',
+  BANK78_API_KEY: 'test-api-key',
+  BANK78_WEBHOOK_SECRET: 'whsec_test_secret',
+  BANK78_ALLOW_LIVE_OUTSIDE_PRODUCTION: 'false',
+  DIDIT_BASE_URL: 'https://didit.invalid',
+  DIDIT_API_KEY: 'test-didit-key',
   RUN_WORKERS: 'false',
   FILE_STORAGE: 'memory',
 };

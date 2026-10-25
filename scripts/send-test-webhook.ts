@@ -1,94 +1,87 @@
 /**
- * Send a correctly signed Bachs-format webhook to a running API, for local
- * testing (works against PAYMENT_PROVIDER=fake or bachs — both verify the
- * real Bachs signature scheme with BACHS_WEBHOOK_SECRET).
+ * Send a correctly signed Bank78-format (merchant API v2) webhook to a running
+ * API, for local testing. Signed with BANK78_WEBHOOK_SECRET, exactly as Bank78
+ * signs deliveries.
  *
- *   npm run webhook:test -- paid      DVY-XXXX-XXXX [amountNaira]
- *   npm run webhook:test -- overpaid  DVY-XXXX-XXXX <receivedNaira> <expectedNaira>
- *   npm run webhook:test -- underpaid DVY-XXXX-XXXX <paidNaira> <expectedNaira>
- *   npm run webhook:test -- expired   DVY-XXXX-XXXX
- *   npm run webhook:test -- payout-paid   WD-2026-XXXXXX
- *   npm run webhook:test -- payout-failed WD-2026-XXXXXX
- *   npm run webhook:test -- identity  acct_...
+ *   npm run webhook:test -- paid         DVY-XXXX-XXXX <amountNaira>
+ *   npm run webhook:test -- payout-paid  WD-2026-XXXXXX [feeNaira]
+ *   npm run webhook:test -- wrong-amount DVY-XXXX-XXXX <paidNaira> <expectedNaira>
  *
- * Options (env): WEBHOOK_URL (default http://localhost:$PORT/v1/webhooks/bachs),
- * EVENT_ID (reuse one to test duplicate delivery).
+ * Options (env): WEBHOOK_URL (default http://localhost:$PORT/v1/webhooks/bank78),
+ * SESSION_ID (reuse one to test duplicate delivery).
  *
- * For amounts, `paid` without an amount reads the checkout's total from
- * GET /v1/payments/:reference — pass it explicitly when you have no token.
+ * `paid` needs the checkout total in naira (GET /v1/payments/:reference shows it).
  */
 import 'dotenv/config';
 import { randomUUID } from 'crypto';
-import { computeBachsSignature } from '../src/providers/payment/bachs/signature';
+import { computeBank78Signature } from '../src/providers/payment/bank78/signature';
 
 const [kind, ref, a, b] = process.argv.slice(2);
-const secret = process.env.BACHS_WEBHOOK_SECRET;
-const url = process.env.WEBHOOK_URL ?? `http://localhost:${process.env.PORT ?? 3000}/v1/webhooks/bachs`;
+const secret = process.env.BANK78_WEBHOOK_SECRET;
+const url = process.env.WEBHOOK_URL ?? `http://localhost:${process.env.PORT ?? 3000}/v1/webhooks/bank78`;
+const sessionId = process.env.SESSION_ID ?? `100033${Date.now()}${randomUUID().replace(/\D/g, '').slice(0, 8)}`;
 
 function usage(): never {
-  console.error('usage: send-test-webhook <paid|overpaid|underpaid|expired|payout-paid|payout-failed|identity> <reference|accountId> [amounts]');
+  console.error('usage: send-test-webhook <paid|payout-paid|wrong-amount> <reference> [amounts]');
   process.exit(1);
 }
 if (!kind || !ref) usage();
 if (!secret) {
-  console.error('BACHS_WEBHOOK_SECRET is not set');
+  console.error('BANK78_WEBHOOK_SECRET is not set');
   process.exit(1);
 }
 
-const naira = (v: string | undefined) => (v ? Number(v).toFixed(2) : undefined);
-
-function build(): { type: string; data: Record<string, unknown>; account?: string } {
+function build(): { eventType: string; data: Record<string, unknown> } {
   switch (kind) {
     case 'paid':
       if (!a) {
-        console.error('pass the amount in naira (the checkout total), e.g. 5120');
+        console.error('pass the amount in naira (the checkout total), e.g. 5075');
         process.exit(1);
       }
-      return { type: 'collection.succeeded', data: { reference: ref, status: 'SUCCEEDED', amount: naira(a), currency: 'NGN' } };
-    case 'overpaid':
       return {
-        type: 'collection.succeeded',
+        eventType: 'virtual-nuban-transaction-credit',
         data: {
-          reference: ref,
-          status: 'OVERPAID',
-          amount: naira(b),
-          expected_amount: naira(b),
-          received_amount: naira(a),
-          overpaid_amount: (Number(a) - Number(b)).toFixed(2),
-          currency: 'NGN',
+          accountReference: ref,
+          accountNumber: '7001646987',
+          amount: Number(a),
+          paymentDate: new Date().toISOString().slice(0, 19),
+          sessionId,
+          paymentReference: sessionId,
+          transactionReference: sessionId,
+          senderAccountNumber: '8084101999',
+          senderAccountName: 'TEST PAYER',
+          senderBank: 'Test Bank',
+          notificationType: 'credit',
+          status: 'transaction.success',
         },
       };
-    case 'underpaid':
-      return {
-        type: 'collection.underpaid',
-        data: { reference: ref, status: 'UNDERPAID', amount_paid: naira(a), amount_expected: naira(b), currency: 'NGN' },
-      };
-    case 'expired':
-      return { type: 'collection.failed', data: { reference: ref, status: 'EXPIRED' } };
     case 'payout-paid':
-      return { type: 'payout.paid', data: { reference: ref, withdrawal_id: `pay_${ref}`, status: 'completed', withdrawal_fee: '50.00' } };
-    case 'payout-failed':
-      return { type: 'payout.failed', data: { reference: ref, withdrawal_id: `pay_${ref}`, status: 'failed', failure_reason: 'Test failure' } };
-    case 'identity':
-      return { type: 'capability.updated', account: ref, data: { account: ref, capability: 'payouts', status: 'active', requested: true } };
+      return {
+        eventType: 'transfer.success',
+        data: { reference: ref, sessionId, amount: 0, fee: Number(a ?? 50), status: 'success', responseCode: '00', currencyCode: 'NGN' },
+      };
+    case 'wrong-amount':
+      return {
+        eventType: 'virtual-nuban-transaction.failed',
+        data: { accountReference: ref, sessionId, status: 'invalid_amount', failureReason: 'Transaction amount is invalid.', actualAmount: Number(a), expectedAmount: Number(b) },
+      };
     default:
       usage();
   }
 }
 
 async function main() {
-  const event = build();
-  const body = JSON.stringify({
-    id: process.env.EVENT_ID ?? `evt_test_${randomUUID().replace(/-/g, '')}`,
-    created_at: new Date().toISOString(),
-    organization_id: 'acct_platform',
-    ...event,
-  });
+  const body = JSON.stringify(build());
   const t = Math.floor(Date.now() / 1000);
-  const sig = computeBachsSignature(secret!, t, body);
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${t},v1=${sig}` },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Source': 'BANK78',
+      'X-Bank78-Webhook-Timestamp': String(t),
+      'X-Bank78-Webhook-Signature-Version': 'v1',
+      'X-Bank78-Webhook-Signature': computeBank78Signature(secret!, t, body),
+    },
     body,
   });
   console.log(`${res.status} ${await res.text()}`);

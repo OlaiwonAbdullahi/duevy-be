@@ -1,11 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import bcrypt from 'bcryptjs';
 import { db } from '../../config/db';
-import { type FakeProvider } from '../../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance } from '../../services/ledger.service';
 import { completePayout, requestWithdrawal } from '../../services/withdrawal.service';
 import { expireStaleApprovals } from '../../services/withdrawalApproval.service';
-import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, creditSpace, installPaymentDouble, makeSpace, newKey, TEST_PIN, startHttp, stopHttp, tokenFor } from './fixtures';
 
 // Capture approval codes instead of emailing them.
 const codes = new Map<string, string>();
@@ -20,9 +19,9 @@ vi.mock('../../lib/email', async (importOriginal) => ({
 const PASSWORD = 'Secret123!';
 const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
 
-let fake: FakeProvider;
+let fake: ReturnType<typeof installPaymentDouble>;
 beforeAll(async () => {
-  fake = installFakeProvider();
+  fake = installPaymentDouble();
   await startHttp();
 });
 beforeEach(() => {
@@ -131,7 +130,7 @@ describe('team management', () => {
     await expect(req({ dueId: due!.id, amountKobo: 600_000 })).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
 
     const p = await req({ dueId: due!.id });
-    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, providerAccountId: t.lead.bachsAccountId });
+    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, providerAccountId: t.lead.walletAccountNumber });
     expect(await dueLeft(t.space.id, due!.id)).toBe(200_000);
     expect(await getSpaceBalance(t.space.id)).toBe(2_200_000);
 
@@ -171,7 +170,8 @@ describe('what is left of each due', () => {
     const whole = await requestWithdrawal({ spaceId: t.space.id, userId: t.lead.id, beneficiaryId: t.beneficiary!.id, amountKobo: 600_000, pin: TEST_PIN });
     await completePayout(whole.reference);
     expect(await dueLeft(t.space.id, leadDue!.id)).toBe(0);
-    expect(await dueLeft(t.space.id, bolaDue!.id)).toBe(400_000);
+    // ₦6,000 sent, then Bank78's ₦50 fee — both after the lead's due runs out.
+    expect(await dueLeft(t.space.id, bolaDue!.id)).toBe(395_000);
     await expect(
       requestWithdrawal({ spaceId: t.space.id, userId: t.bola.id, dueId: bolaDue!.id, beneficiaryId: t.beneficiary!.id, amountKobo: 450_000, pin: TEST_PIN }),
     ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });

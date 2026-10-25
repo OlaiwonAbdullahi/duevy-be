@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { koboToDecimal } from '../../lib/money';
 import { createCheckout } from '../../services/checkout.service';
 import { getSpaceBalance } from '../../services/ledger.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
-import { api, installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, creditEvent, installPaymentDouble, makeSpace, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
 
 beforeAll(async () => {
-  installFakeProvider();
+  installPaymentDouble();
   await startHttp();
 });
 afterAll(stopHttp);
@@ -16,11 +15,7 @@ let seq = 0;
 const guestEmail = () => `guest_${Date.now()}_${seq++}@test.duevy`;
 
 async function pay(reference: string, amountKobo: number) {
-  await sendWebhook({
-    id: `evt_guest_${reference}`,
-    type: 'collection.succeeded',
-    data: { reference, status: 'SUCCEEDED', amount: koboToDecimal(amountKobo), currency: 'NGN' },
-  });
+  await sendWebhook(creditEvent(reference, amountKobo));
   await drainWebhookQueue();
 }
 
@@ -40,12 +35,12 @@ describe('guest pay', () => {
 
     const summary = await api('GET', `/v1/public/dues/${due.id}`);
     expect(summary.status).toBe(200);
-    expect(summary.body.data).toMatchObject({ amount: 500_000, fee: 12_000, total: 512_000, canCollect: true });
+    expect(summary.body.data).toMatchObject({ amount: 500_000, fee: 7_500, total: 507_500, canCollect: true });
 
     const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', email } });
     expect(opened.status).toBe(201);
     const { reference, token, amount } = opened.body.data;
-    expect(amount).toBe(512_000);
+    expect(amount).toBe(507_500);
     expect(token).toBeTruthy();
 
     const guest = await db.user.findUniqueOrThrow({ where: { email } });

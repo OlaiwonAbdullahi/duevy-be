@@ -60,7 +60,7 @@ describe('KYC reminder emails', () => {
       kycSubmittedAt: new Date(),
       kycStatus: 'pending',
       studentIdStatus: 'pending',
-      payoutDestinationSubmittedAt: new Date(),
+      phoneVerifiedAt: new Date(),
     }); // everything submitted, awaiting review
     await applicant(48, { emailVerified: false });
     await applicant(48, { isSuspended: true });
@@ -74,7 +74,7 @@ describe('KYC reminder emails', () => {
       kycSubmittedAt: new Date(),
       kycStatus: 'verified',
       studentIdStatus: 'rejected',
-      payoutDestinationSubmittedAt: new Date(),
+      phoneVerifiedAt: new Date(),
     });
     await sendKycRemindersOnce();
     expect(sent.map((s) => s.stage)).toEqual([1]);

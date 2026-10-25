@@ -6,20 +6,21 @@ import { db } from '../../config/db';
 import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
 import { encrypt, maskAccountNumber } from '../../lib/encryption';
-import { FakeProvider, setPaymentProvider } from '../../providers/payment';
-import { computeBachsSignature } from '../../providers/payment/bachs/signature';
+import { setPaymentProvider } from '../../providers/payment';
+import { computeBank78Signature } from '../../providers/payment/bank78/signature';
+import { PaymentDouble } from './paymentDouble';
 import { appendLedgerEntry } from '../../services/ledger.service';
 
 /** Withdrawal security code every fixture space is given (see makeSpace). */
 export const TEST_PIN = '2580';
 const TEST_PIN_HASH = bcrypt.hashSync(TEST_PIN, 4);
 
-export const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? 'whsec_test_secret';
+export const WEBHOOK_SECRET = process.env.BANK78_WEBHOOK_SECRET ?? 'whsec_test_secret';
 
-export function installFakeProvider(): FakeProvider {
-  const fake = new FakeProvider([WEBHOOK_SECRET], 300);
-  setPaymentProvider(fake);
-  return fake;
+export function installPaymentDouble(): PaymentDouble {
+  const double = new PaymentDouble([WEBHOOK_SECRET], 300);
+  setPaymentProvider(double);
+  return double;
 }
 
 let seq = 0;
@@ -37,9 +38,9 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       isRep: true,
       repApplicationStatus: 'approved',
       kycStatus: verified ? 'verified' : 'unverified',
-      bachsAccountId: verified ? `acct_fake_${u}` : null,
-      bachsPersonId: verified ? `per_fake_${u}` : null,
-      bachsPayoutsActive: verified,
+      phone: verified ? '+2348012345678' : null,
+      phoneVerifiedAt: verified ? new Date() : null,
+      walletAccountNumber: verified ? `W${u}`.slice(0, 20) : null,
       studentIdStatus: verified ? 'approved' : null,
     },
   });
@@ -61,8 +62,8 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
         accountNumber: encrypt('0123456789'),
         accountNumberMasked: maskAccountNumber('0123456789'),
         accountName: 'ADA OBI',
-        bachsDestinationId: `pd_fake_${u}`,
-        bachsAccountId: rep.bachsAccountId,
+        destinationId: `dest_${u}`,
+        walletAccountNumber: rep.walletAccountNumber,
       },
     });
   }
@@ -142,17 +143,47 @@ export async function api(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** POST a signed Bachs-format event to the webhook route. */
-export async function sendWebhook(event: { id: string; type: string; data: Record<string, unknown>; account?: string }) {
-  const raw = JSON.stringify({ created_at: new Date().toISOString(), organization_id: 'acct_platform', ...event });
+/** POST a signed Bank78-format (API v2) event to the webhook route. */
+export async function sendWebhook(event: { eventType: string; data: Record<string, unknown> }) {
+  const raw = JSON.stringify(event);
   const t = Math.floor(Date.now() / 1000);
-  const sig = computeBachsSignature(WEBHOOK_SECRET, t, raw);
-  const res = await fetch(`${base}/v1/webhooks/bachs`, {
+  const res = await fetch(`${base}/v1/webhooks/bank78`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${t},v1=${sig}` },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Source': 'BANK78',
+      'X-Bank78-Webhook-Timestamp': String(t),
+      'X-Bank78-Webhook-Signature-Version': 'v1',
+      'X-Bank78-Webhook-Signature': computeBank78Signature(WEBHOOK_SECRET, t, raw),
+    },
     body: raw,
   });
   return res.status;
+}
+
+/** A Bank78 credit on a checkout's virtual account, as the webhook sends it. */
+export function creditEvent(reference: string, amountKobo: number, sessionId = `S${uniq()}`) {
+  return {
+    eventType: 'virtual-nuban-transaction-credit',
+    data: {
+      accountReference: reference,
+      accountNumber: '7001646987',
+      amount: amountKobo / 100,
+      paymentDate: new Date().toISOString().slice(0, 19),
+      sessionId,
+      transactionReference: sessionId,
+      notificationType: 'credit',
+      status: 'transaction.success',
+    },
+  };
+}
+
+/** Bank78's transfer.success for a withdrawal. */
+export function transferSuccessEvent(reference: string, feeKobo = 5_000, sessionId = `S${uniq()}`) {
+  return {
+    eventType: 'transfer.success',
+    data: { reference, sessionId, amount: 0, fee: feeKobo / 100, status: 'success', responseCode: '00', currencyCode: 'NGN' },
+  };
 }
 
 export const newKey = () => randomUUID();

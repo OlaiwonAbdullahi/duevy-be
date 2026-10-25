@@ -3,8 +3,8 @@ import { randomInt } from 'crypto';
 /**
  * Money helpers. Every amount in this codebase is an integer number of kobo
  * (₦1 = 100 kobo). No floats are ever used for arithmetic; the only place a
- * decimal appears is at the provider boundary, where Bachs takes and returns
- * decimal strings ("7000.00") — see koboToDecimal / decimalToKobo.
+ * decimal appears is at the provider boundary, where Bank78 takes and returns
+ * naira amounts (7000.5) — see koboToDecimal / decimalToKobo.
  */
 
 /** Convert kobo to naira (display / email templates only — never for arithmetic). */
@@ -45,9 +45,9 @@ export function koboToDecimal(kobo: number): string {
 }
 
 /**
- * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number (some
- * Bachs responses render an amount as a bare number of naira). More than two
- * decimal places is rounded half-up to the kobo, matching how Bachs stores it.
+ * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number (Bank78
+ * renders amounts as bare numbers of naira). More than two decimal places is
+ * rounded half-up to the kobo.
  */
 export function decimalToKobo(value: string | number): number {
   const str = typeof value === 'number' ? numberToPlainString(value) : value.trim();
@@ -71,14 +71,19 @@ function numberToPlainString(n: number): string {
 // Fees (server-side only — never accepted from a client)
 // ---------------------------------------------------------------------------
 
-/** Checkout service charge: 2% of the basket, plus a flat ₦20, paid by the student on top. */
-export const CHECKOUT_FEE_PERCENT = 2;
-export const CHECKOUT_FEE_FLAT_KOBO = 2_000; // ₦20
+/**
+ * Checkout service charge, paid by the student on top of the dues:
+ * Duevy's 1.5% of the basket plus whatever Bank78 charges to collect it.
+ * Basis points, so the percentage stays integer arithmetic.
+ */
+export const CHECKOUT_FEE_BPS = 150; // 1.5%
 
-/** Withdrawal fee: ₦100 under ₦50,000, ₦200 at ₦50,000 and above, deducted from the withdrawal. */
-export const WITHDRAWAL_FEE_LOW_KOBO = 10_000; // ₦100
-export const WITHDRAWAL_FEE_HIGH_KOBO = 20_000; // ₦200
-export const WITHDRAWAL_FEE_THRESHOLD_KOBO = 5_000_000; // ₦50,000
+/**
+ * Withdrawal fee: none from Duevy for now. The rep pays only Bank78's own
+ * payout fee, which Bank78 reports on the transfer and is debited from the
+ * ledger once the withdrawal succeeds (withdrawal.service).
+ */
+export const WITHDRAWAL_FEE_KOBO = 0;
 
 /** No withdrawal below ₦1,000. */
 export const MIN_PAYOUT_KOBO = 100_000;
@@ -89,13 +94,24 @@ function mulDivRoundHalfUp(a: number, num: number, den: number): number {
 }
 
 /**
+ * What Bank78 charges to collect `faceKobo` on a dynamic virtual account.
+ * Bank78 publishes no rate or quote endpoint yet, and the student must see the
+ * exact total before transferring, so this is 0 until they do. It is the only
+ * place that changes when the rate is known.
+ */
+export function bank78CollectionFee(faceKobo: number): number {
+  assertKobo(faceKobo, 'faceKobo');
+  return 0;
+}
+
+/**
  * The service charge for one checkout covering `faceKobo` worth of dues.
- * Charged ONCE per checkout: the ₦20 flat does not multiply per due.
+ * Charged ONCE per checkout, however many dues it covers.
  */
 export function checkoutFee(faceKobo: number): number {
   assertKobo(faceKobo, 'faceKobo');
   if (faceKobo === 0) return 0;
-  return mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_PERCENT, 100) + CHECKOUT_FEE_FLAT_KOBO;
+  return mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_BPS, 10_000) + bank78CollectionFee(faceKobo);
 }
 
 export interface Charge {
@@ -143,7 +159,7 @@ export function allocate(total: number, weights: number[]): number[] {
 
 export function withdrawalFee(grossKobo: number): number {
   assertKobo(grossKobo, 'grossKobo');
-  return grossKobo < WITHDRAWAL_FEE_THRESHOLD_KOBO ? WITHDRAWAL_FEE_LOW_KOBO : WITHDRAWAL_FEE_HIGH_KOBO;
+  return WITHDRAWAL_FEE_KOBO;
 }
 
 export interface WithdrawalBreakdown {

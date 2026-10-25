@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 /**
  * Integration suite: real Postgres (embedded, see globalSetup), real
- * migrations, the FakeProvider for the payment rail. Files run one at a time
+ * migrations, an in-memory double for the payment rail and Didit. Files run one at a time
  * against the shared database; each test builds its own fixtures.
  */
 export default defineConfig({
