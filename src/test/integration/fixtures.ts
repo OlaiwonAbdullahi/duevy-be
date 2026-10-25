@@ -7,17 +7,18 @@ import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
 import { encrypt, maskAccountNumber } from '../../lib/encryption';
 import { FakeProvider, setPaymentProvider } from '../../providers/payment';
-import { computeBachsSignature } from '../../providers/payment/bachs/signature';
+import { computeKrediSignature } from '../../providers/payment/kredi/signature';
+import { koboToDecimal } from '../../lib/money';
 import { appendLedgerEntry } from '../../services/ledger.service';
 
 /** Withdrawal security code every fixture space is given (see makeSpace). */
 export const TEST_PIN = '2580';
 const TEST_PIN_HASH = bcrypt.hashSync(TEST_PIN, 4);
 
-export const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? 'whsec_test_secret';
+export const WEBHOOK_SECRET = process.env.KREDI_WEBHOOK_SECRET ?? 'whsec_test_secret';
 
 export function installFakeProvider(): FakeProvider {
-  const fake = new FakeProvider([WEBHOOK_SECRET], 300);
+  const fake = new FakeProvider([WEBHOOK_SECRET]);
   setPaymentProvider(fake);
   return fake;
 }
@@ -37,9 +38,11 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       isRep: true,
       repApplicationStatus: 'approved',
       kycStatus: verified ? 'verified' : 'unverified',
-      bachsAccountId: verified ? `acct_fake_${u}` : null,
-      bachsPersonId: verified ? `per_fake_${u}` : null,
-      bachsPayoutsActive: verified,
+      providerAccountId: verified ? `cus_fake_${u}` : null,
+      providerAccountNumber: verified ? '9900000000' : null,
+      payoutsActive: verified,
+      phoneVerifiedAt: verified ? new Date() : null,
+      bvnVerifiedAt: verified ? new Date() : null,
       studentIdStatus: verified ? 'approved' : null,
     },
   });
@@ -61,8 +64,6 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
         accountNumber: encrypt('0123456789'),
         accountNumberMasked: maskAccountNumber('0123456789'),
         accountName: 'ADA OBI',
-        bachsDestinationId: `pd_fake_${u}`,
-        bachsAccountId: rep.bachsAccountId,
       },
     });
   }
@@ -142,17 +143,50 @@ export async function api(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** POST a signed Bachs-format event to the webhook route. */
-export async function sendWebhook(event: { id: string; type: string; data: Record<string, unknown>; account?: string }) {
-  const raw = JSON.stringify({ created_at: new Date().toISOString(), organization_id: 'acct_platform', ...event });
-  const t = Math.floor(Date.now() / 1000);
-  const sig = computeBachsSignature(WEBHOOK_SECRET, t, raw);
-  const res = await fetch(`${base}/v1/webhooks/bachs`, {
+/** POST a body to the Kredi webhook route, signed over amount-secret-reference. */
+export async function sendKrediWebhook(body: Record<string, unknown>, signed: { amount: string; reference: string }) {
+  const res = await fetch(`${base}/v1/webhooks/kredi`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${t},v1=${sig}` },
-    body: raw,
+    headers: { 'Content-Type': 'application/json', 'signature-key': computeKrediSignature(signed.amount, WEBHOOK_SECRET, signed.reference) },
+    body: JSON.stringify(body),
   });
   return res.status;
+}
+
+/** A Kredi collection webhook: `amountKobo` arrived on the checkout's payment link. */
+export async function sendCollectionWebhook(reference: string, amountKobo: number, opts: { remitReference?: string; status?: string } = {}) {
+  const remitReference = opts.remitReference ?? `remit_${reference}_${amountKobo}`;
+  const amount = koboToDecimal(amountKobo);
+  return sendKrediWebhook(
+    {
+      merchantRef: reference,
+      amount,
+      amountReceived: amount,
+      status: opts.status ?? 'successful',
+      remitReference,
+      sessionId: `sess_${remitReference}`,
+      accountType: 'collection',
+      createdAt: new Date().toISOString(),
+      receivedAt: new Date().toISOString(),
+    },
+    { amount, reference: remitReference },
+  );
+}
+
+/** A Kredi payout (outward) webhook: 200 succeeded, 401 failed. */
+export async function sendPayoutWebhook(reference: string, code: 200 | 401 | 100, amountKobo: number, krediReference = `KRDM_${reference}`) {
+  const amount = Number(koboToDecimal(amountKobo));
+  return sendKrediWebhook(
+    {
+      krediReference,
+      merchantReference: reference,
+      transactionAmount: amount,
+      transactionStatus: { code, status_message: code === 200 ? 'Successful' : code === 401 ? 'Failed' : 'Processing' },
+      transactionStatusMessage: code === 401 ? 'Beneficiary bank declined' : 'Approved',
+      createdAt: new Date().toISOString(),
+    },
+    { amount: String(amount), reference },
+  );
 }
 
 export const newKey = () => randomUUID();

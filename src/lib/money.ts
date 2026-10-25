@@ -3,8 +3,8 @@ import { randomInt } from 'crypto';
 /**
  * Money helpers. Every amount in this codebase is an integer number of kobo
  * (₦1 = 100 kobo). No floats are ever used for arithmetic; the only place a
- * decimal appears is at the provider boundary, where Bachs takes and returns
- * decimal strings ("7000.00") — see koboToDecimal / decimalToKobo.
+ * decimal appears is at the provider boundary, where Kredi takes and returns
+ * naira decimals ("7000.00" or 7000) — see koboToDecimal / decimalToKobo.
  */
 
 /** Convert kobo to naira (display / email templates only — never for arithmetic). */
@@ -46,8 +46,8 @@ export function koboToDecimal(kobo: number): string {
 
 /**
  * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number (some
- * Bachs responses render an amount as a bare number of naira). More than two
- * decimal places is rounded half-up to the kobo, matching how Bachs stores it.
+ * Kredi responses render an amount as a bare number of naira). More than two
+ * decimal places is rounded half-up to the kobo.
  */
 export function decimalToKobo(value: string | number): number {
   const str = typeof value === 'number' ? numberToPlainString(value) : value.trim();
@@ -71,14 +71,47 @@ function numberToPlainString(n: number): string {
 // Fees (server-side only — never accepted from a client)
 // ---------------------------------------------------------------------------
 
-/** Checkout service charge: 2% of the basket, plus a flat ₦20, paid by the student on top. */
-export const CHECKOUT_FEE_PERCENT = 2;
+/**
+ * Checkout service charge, paid by the student on top: 1.5% of the basket plus
+ * a flat ₦20 (which covers Kredi's ₦20 inward fee), capped at ₦250 in total.
+ * The cap bites from a basket of about ₦15,334.
+ */
+export const CHECKOUT_FEE_BASIS_POINTS = 150; // 1.5%
 export const CHECKOUT_FEE_FLAT_KOBO = 2_000; // ₦20
+export const CHECKOUT_FEE_CAP_KOBO = 25_000; // ₦250
 
-/** Withdrawal fee: ₦100 under ₦50,000, ₦200 at ₦50,000 and above, deducted from the withdrawal. */
-export const WITHDRAWAL_FEE_LOW_KOBO = 10_000; // ₦100
-export const WITHDRAWAL_FEE_HIGH_KOBO = 20_000; // ₦200
-export const WITHDRAWAL_FEE_THRESHOLD_KOBO = 5_000_000; // ₦50,000
+/**
+ * Withdrawal fee, deducted from the withdrawal, tiered to track Kredi's own
+ * transfer cost. Tiers are inclusive of `maxKobo`; the last has no ceiling.
+ *   under ₦10,000          ₦50
+ *   ₦10,000 to ₦50,000     ₦120
+ *   above ₦50,000          ₦200
+ */
+export interface WithdrawalFeeTier {
+  /** Inclusive upper bound of the gross; null for the top tier. */
+  maxKobo: number | null;
+  feeKobo: number;
+}
+export const WITHDRAWAL_FEE_TIERS: readonly WithdrawalFeeTier[] = [
+  { maxKobo: 999_999, feeKobo: 5_000 },
+  { maxKobo: 5_000_000, feeKobo: 12_000 },
+  { maxKobo: null, feeKobo: 20_000 },
+];
+
+/** What Kredi charges us. Used for revenue reporting only — never charged to anyone. */
+export const KREDI_INWARD_COST_KOBO = 2_000; // ₦20 per payment received
+
+/**
+ * Kredi's cost of one outward transfer of `amountKobo` (stamp duty assumed at
+ * ₦50 from ₦10,000 — confirm with Kredi). Intra-Kredi transfers are free.
+ */
+export function krediPayoutCostKobo(amountKobo: number): number {
+  assertKobo(amountKobo, 'amountKobo');
+  if (amountKobo < 500_000) return 1_000; // ₦10
+  if (amountKobo < 1_000_000) return 2_500; // ₦25
+  if (amountKobo <= 5_000_000) return 7_500; // ₦25 + stamp duty
+  return 10_000; // ₦50 + stamp duty
+}
 
 /** No withdrawal below ₦1,000. */
 export const MIN_PAYOUT_KOBO = 100_000;
@@ -90,12 +123,14 @@ function mulDivRoundHalfUp(a: number, num: number, den: number): number {
 
 /**
  * The service charge for one checkout covering `faceKobo` worth of dues.
- * Charged ONCE per checkout: the ₦20 flat does not multiply per due.
+ * Charged ONCE per checkout: the ₦20 flat does not multiply per due, and the
+ * ₦250 cap applies to the whole checkout.
  */
 export function checkoutFee(faceKobo: number): number {
   assertKobo(faceKobo, 'faceKobo');
   if (faceKobo === 0) return 0;
-  return mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_PERCENT, 100) + CHECKOUT_FEE_FLAT_KOBO;
+  const fee = mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_BASIS_POINTS, 10_000) + CHECKOUT_FEE_FLAT_KOBO;
+  return Math.min(fee, CHECKOUT_FEE_CAP_KOBO);
 }
 
 export interface Charge {
@@ -143,7 +178,8 @@ export function allocate(total: number, weights: number[]): number[] {
 
 export function withdrawalFee(grossKobo: number): number {
   assertKobo(grossKobo, 'grossKobo');
-  return grossKobo < WITHDRAWAL_FEE_THRESHOLD_KOBO ? WITHDRAWAL_FEE_LOW_KOBO : WITHDRAWAL_FEE_HIGH_KOBO;
+  const tier = WITHDRAWAL_FEE_TIERS.find((t) => t.maxKobo === null || grossKobo <= t.maxKobo);
+  return (tier as WithdrawalFeeTier).feeKobo;
 }
 
 export interface WithdrawalBreakdown {

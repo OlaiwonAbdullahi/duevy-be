@@ -313,7 +313,7 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
       ['Reference', escapeHtml(input.reference)],
     ])}
     <a href="${receiptLink}" class="btn">View receipt</a>
-    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the service fee is 2% + ₦20 per payment. Questions? Reply here or reach us at support@duevy.app</p>
+    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the service fee is 1.5% + ₦20 per payment, capped at ₦250. Questions? Reply here or reach us at support@duevy.app</p>
   `,
     undefined,
     { preheader: `${amount} paid for ${summary} — your receipt is inside.` },
@@ -366,7 +366,7 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     2: {
       subject: 'Your department is waiting — finish your Duevy verification',
       heading: 'Your department can\'t collect dues yet',
-      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your NIN, your student ID card and your bank account.`,
+      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your phone, your BVN, your student ID card and your bank account.`,
     },
     3: {
       subject: 'Last reminder: complete your Duevy rep verification',
@@ -383,7 +383,7 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     <p class="muted">Already done? You can ignore this email.</p>
   `,
     BRAND,
-    { preheader: 'Verify your NIN, student ID and payout account in about three minutes.' },
+    { preheader: 'Verify your phone, BVN, student ID and payout account in about three minutes.' },
   );
 
   await sendEmail({ to, subject: copy.subject, html });

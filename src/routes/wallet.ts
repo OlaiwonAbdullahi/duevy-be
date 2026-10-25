@@ -12,5 +12,5 @@ walletRouter.use(authenticate);
 // GET /wallet/payment-gateway — which rail is live, for dashboard copy.
 walletRouter.get('/payment-gateway', async (_req: Request, res: Response): Promise<void> => {
   const name = getPaymentProvider().name;
-  ok(res, { active: name === 'bachs' ? 'Bachs' : name, method: 'bank_transfer' });
+  ok(res, { active: name === 'kredi' ? 'Kredibank' : name, method: 'bank_transfer' });
 });

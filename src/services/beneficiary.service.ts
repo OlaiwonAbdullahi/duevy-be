@@ -13,8 +13,9 @@ import { lockSpace } from './ledger.service';
 /**
  * Beneficiaries: the bank accounts a space can withdraw to. Any account the
  * lead rep adds — their own, a lecturer's, a vendor's. Name enquiry is
- * mandatory, so the stored name is always the bank's. Every rep is emailed
- * when one is added, since a new beneficiary is where money can now go.
+ * mandatory, so the stored name is always the bank's (and it runs again before
+ * every payout). Every rep is emailed when one is added, since a new
+ * beneficiary is where money can now go.
  */
 
 export const MAX_BENEFICIARIES = 25;
@@ -42,7 +43,7 @@ export function listBeneficiaries(spaceId: string): Promise<PayoutBeneficiary[]>
 
 export async function addBeneficiary(input: {
   spaceId: string;
-  actor: { id: string; name: string; bachsAccountId: string };
+  actor: { id: string; name: string };
   bankCode: string;
   accountNumber: string;
   label?: string;
@@ -57,12 +58,6 @@ export async function addBeneficiary(input: {
   if (precheck) return { beneficiary: await refreshLabel(precheck, label), created: false };
 
   const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
-  const destination = await getPaymentProvider().registerPayoutDestination({
-    accountId: actor.bachsAccountId,
-    bankCode,
-    accountNumber,
-    accountName,
-  });
 
   const masked = maskAccountNumber(accountNumber);
   const result = await db.$transaction(async (tx) => {
@@ -78,8 +73,6 @@ export async function addBeneficiary(input: {
         accountNumber: encrypt(accountNumber),
         accountNumberMasked: masked,
         accountName,
-        bachsDestinationId: destination.destinationId,
-        bachsAccountId: actor.bachsAccountId,
         createdById: actor.id,
       },
     });
@@ -88,7 +81,7 @@ export async function addBeneficiary(input: {
   // A concurrent request added the same account first.
   if (!result.created) return { beneficiary: await refreshLabel(result.beneficiary, label), created: false };
   const beneficiary = result.beneficiary;
-  logger.info({ spaceId, beneficiaryId: beneficiary.id, bank: bankCode, account: masked, usable: destination.usable }, 'beneficiary added');
+  logger.info({ spaceId, beneficiaryId: beneficiary.id, bank: bankCode, account: masked }, 'beneficiary added');
 
   const who = `${accountName} (${bankName} ${masked})`;
   await writeAudit(spaceId, { id: actor.id, name: actor.name, role: 'lead' }, 'beneficiary_added', `Added beneficiary ${who}`).catch(() => {});
@@ -129,31 +122,15 @@ export async function removeBeneficiary(spaceId: string, beneficiaryId: string, 
   ).catch(() => {});
 }
 
-/**
- * The provider destination for paying this beneficiary out of `accountId` (the
- * current lead rep's Bachs account). A destination belongs to one Bachs
- * account, so after a lead change it is registered again on the new one.
- */
-export async function destinationFor(b: PayoutBeneficiary, accountId: string): Promise<string> {
-  if (b.bachsDestinationId && b.bachsAccountId === accountId) return b.bachsDestinationId;
-  const destination = await getPaymentProvider().registerPayoutDestination({
-    accountId,
-    bankCode: b.bankCode,
-    accountNumber: decrypt(b.accountNumber),
-    accountName: b.accountName,
-  });
-  await db.payoutBeneficiary.update({
-    where: { id: b.id },
-    data: { bachsDestinationId: destination.destinationId, bachsAccountId: accountId },
-  });
-  return destination.destinationId;
+/** Where a payout to this beneficiary goes. The number is kept encrypted on the payout too. */
+export function destinationFor(b: PayoutBeneficiary): { bankCode: string; accountNumber: string; accountName: string } {
+  return { bankCode: b.bankCode, accountNumber: decrypt(b.accountNumber), accountName: b.accountName };
 }
 
-/** A one-off withdrawal target: name-checked and registered with the provider, but not saved. */
-export async function oneOffDestination(accountId: string, bankCode: string, accountNumber: string) {
+/** A one-off withdrawal target: name-checked, but not saved as a beneficiary. */
+export async function oneOffDestination(bankCode: string, accountNumber: string) {
   const { bankName, accountName } = await resolveBankDetails(bankCode, accountNumber);
-  const destination = await getPaymentProvider().registerPayoutDestination({ accountId, bankCode, accountNumber, accountName });
-  return { bankName, accountName, accountNumberMasked: maskAccountNumber(accountNumber), destinationId: destination.destinationId };
+  return { bankName, accountName, accountNumberMasked: maskAccountNumber(accountNumber), bankCode, accountNumber };
 }
 
 async function notifyRepsOfNewBeneficiary(spaceId: string, actorName: string, who: string): Promise<void> {

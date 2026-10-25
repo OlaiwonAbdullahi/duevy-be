@@ -5,7 +5,8 @@ import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
 import { completePayout, failPayoutByReference, requestWithdrawal } from '../../services/withdrawal.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
-import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { decrypt } from '../../lib/encryption';
+import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, sendPayoutWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
 
 let fake: FakeProvider;
 beforeAll(async () => {
@@ -22,18 +23,23 @@ describe('ledger balance', () => {
     await creditSpace(space.id, 2_500_000); // ₦25,000
     expect(await getSpaceBalance(space.id)).toBe(5_500_000);
 
-    // ₦20,000 withdrawal: ₦100 fee, ₦19,900 sent, ₦20,000 debited.
+    // ₦20,000 withdrawal: ₦120 fee, ₦19,880 sent, ₦20,000 debited.
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
-    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 10_000, net: 1_990_000 });
+    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 12_000, net: 1_988_000 });
     expect(await getSpaceBalance(space.id)).toBe(3_500_000);
-    expect(fake.calls.find((c) => c.op === 'initiatePayout')?.args).toMatchObject({ amountKobo: 1_990_000, reference: p.reference });
+    expect(fake.calls.find((c) => c.op === 'initiatePayout')?.args).toMatchObject({
+      amountKobo: 1_988_000,
+      reference: p.reference,
+      destination: { bankCode: '058', accountName: 'ADA OBI' },
+    });
 
-    await completePayout(p.reference, 5_000);
+    await completePayout(p.reference);
     const summary = await getSpaceLedgerSummary(space.id);
-    expect(summary).toMatchObject({ balance: 3_500_000, collected: 5_500_000, withdrawn: 1_990_000, withdrawalFees: 10_000, inFlight: 0 });
-    // Duevy's fee less Bachs's own ₦50 payout fee is moved to the platform.
-    expect(fake.calls.find((c) => c.op === 'settleFee')?.args).toMatchObject({ amountKobo: 5_000 });
+    expect(summary).toMatchObject({ balance: 3_500_000, collected: 5_500_000, withdrawn: 1_988_000, withdrawalFees: 12_000, inFlight: 0 });
+    // The fee stays in the merchant account; what it earned is the fee less Kredi's transfer cost.
+    const done = await db.payout.findUniqueOrThrow({ where: { id: p.id } });
+    expect({ cost: done.providerFeeKobo, margin: done.feeMarginKobo }).toEqual({ cost: 2_500, margin: 9_500 });
 
     // A bank reversal after success restores the full ₦20,000.
     await failPayoutByReference(p.reference, 'returned by the bank');
@@ -95,7 +101,7 @@ describe('withdrawals', () => {
     fake.failNextPayout = new ProviderError('Insufficient balance', 400, 'INSUFFICIENT_BALANCE', false);
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN });
     expect(p.status).toBe('failed');
-    expect(p.failureReason).toMatch(/settling/);
+    expect(p.failureReason).toMatch(/briefly unavailable/);
     expect(await getSpaceBalance(space.id)).toBe(1_000_000);
     // The lock is released: a new withdrawal can start.
     const next = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN });
@@ -115,13 +121,15 @@ describe('withdrawals', () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 2_000_000);
     const a = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 1_000_000, pin: TEST_PIN });
-    await sendWebhook({ id: `evt_pp_${a.reference}`, type: 'payout.paid', data: { withdrawal_id: a.providerPayoutId, reference: a.reference, status: 'completed' } });
-    await sendWebhook({ id: `evt_pp_${a.reference}`, type: 'payout.paid', data: { withdrawal_id: a.providerPayoutId, reference: a.reference, status: 'completed' } });
+    expect(await sendPayoutWebhook(a.reference, 100, a.netKobo)).toBe(200); // processing: not final
+    expect(await sendPayoutWebhook(a.reference, 200, a.netKobo)).toBe(200);
+    expect(await sendPayoutWebhook(a.reference, 200, a.netKobo)).toBe(200);
     await drainWebhookQueue();
     expect((await db.payout.findUniqueOrThrow({ where: { id: a.id } })).status).toBe('success');
+    expect(await db.webhookEvent.count({ where: { providerEventId: `payout:${a.reference}:200` } })).toBe(1);
 
     const b = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN });
-    await sendWebhook({ id: `evt_pf_${b.reference}`, type: 'payout.failed', data: { withdrawal_id: b.providerPayoutId, reference: b.reference, status: 'failed' } });
+    await sendPayoutWebhook(b.reference, 401, b.netKobo);
     await drainWebhookQueue();
     expect((await db.payout.findUniqueOrThrow({ where: { id: b.id } })).status).toBe('failed');
     expect(await getSpaceBalance(space.id)).toBe(1_000_000);
@@ -189,16 +197,16 @@ describe('beneficiaries', () => {
     });
     expect(res.status).toBe(201);
     expect(res.body.data).toMatchObject({ status: 'processing', accountName: 'ADEYEMI JOHN', beneficiaryId: added.body.data.id });
-    const registered = fake.calls.find((c) => c.op === 'registerPayoutDestination');
-    const sent = fake.calls.find((c) => c.op === 'initiatePayout')?.args as { destinationId: string };
-    expect(registered).toBeDefined();
+    const sent = fake.calls.find((c) => c.op === 'initiatePayout')?.args as { destination: { bankCode: string; accountName: string } };
+    expect(sent.destination).toMatchObject({ bankCode: '058', accountName: 'ADEYEMI JOHN' });
     const payout = await db.payout.findUniqueOrThrow({ where: { reference: res.body.data.reference } });
-    expect(sent.destinationId).toBe(payout.destinationId);
+    expect(payout.destinationBankCode).toBe('058');
+    expect(decrypt(payout.destinationAccount!)).toBe('0987654321');
 
     // Removing it doesn't touch the withdrawal already made, but blocks new ones.
     const removed = await api('DELETE', `/v1/spaces/${space.id}/payout/beneficiaries/${added.body.data.id}`, { token });
     expect(removed.status).toBe(200);
-    expect((await db.payout.findUniqueOrThrow({ where: { id: payout.id } })).destinationId).toBe(sent.destinationId);
+    expect(decrypt((await db.payout.findUniqueOrThrow({ where: { id: payout.id } })).destinationAccount!)).toBe('0987654321');
     await completePayout(payout.reference);
     await expect(
       requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: added.body.data.id, amountKobo: 200_000, pin: TEST_PIN }),
@@ -220,8 +228,8 @@ describe('beneficiaries', () => {
     expect(res.status).toBe(201);
     expect(res.body.data).toMatchObject({ status: 'processing', accountName: 'BELLO PRINTS LTD', beneficiaryId: null });
     const payout = await db.payout.findUniqueOrThrow({ where: { reference: res.body.data.reference } });
-    const sent = fake.calls.find((c) => c.op === 'initiatePayout')?.args as { destinationId: string };
-    expect(sent.destinationId).toBe(payout.destinationId);
+    expect(payout.destinationBankCode).toBe('058');
+    expect(decrypt(payout.destinationAccount!)).toBe('0555555555');
     expect(await db.payoutBeneficiary.count({ where: { spaceId: space.id, accountName: 'BELLO PRINTS LTD' } })).toBe(0);
 
     // Exactly one of beneficiaryId or bankCode + accountNumber.
@@ -308,15 +316,13 @@ describe('beneficiaries', () => {
     ).rejects.toMatchObject({ code: 'BENEFICIARY_NOT_FOUND' });
   });
 
-  it('re-registers the destination on the current lead account after a lead change', async () => {
+  it('refuses to pay an account whose holder changed since it was saved, and restores the balance', async () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 1_000_000);
-    await db.user.update({ where: { id: rep.id }, data: { bachsAccountId: `${rep.bachsAccountId}_new` } });
+    fake.failNextPayout = new ProviderError('The account holder has changed since this account was saved', 422, 'ACCOUNT_CHANGED', false);
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 200_000, pin: TEST_PIN });
-    expect(p.status).toBe('processing');
-    expect(fake.calls.find((c) => c.op === 'registerPayoutDestination')?.args).toMatchObject({ accountId: `${rep.bachsAccountId}_new` });
-    const updated = await db.payoutBeneficiary.findUniqueOrThrow({ where: { id: beneficiary!.id } });
-    expect(updated.bachsAccountId).toBe(`${rep.bachsAccountId}_new`);
-    expect(p.destinationId).toBe(updated.bachsDestinationId);
+    expect(p.status).toBe('failed');
+    expect(p.failureReason).toMatch(/different holder/);
+    expect(await getSpaceBalance(space.id)).toBe(1_000_000);
   });
 });

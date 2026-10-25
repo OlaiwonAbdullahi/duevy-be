@@ -12,15 +12,15 @@ import { generateId } from '../lib/id';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
 import { canCollect } from './kyc.service';
-import { getCheckoutMode } from './settings.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
- * with ONE bank transfer into a one-time account opened for this checkout.
+ * in ONE payment on a Kredi payment link opened for this checkout. The money
+ * pools in Duevy's merchant account; the ledger credits the space.
  *
- *   face  = Σ due amounts          → credited to the space in full
- *   fee   = 2% of face + ₦20       → Duevy's, paid by the student on top
- *   total = face + fee             → what the student transfers
+ *   face  = Σ due amounts                     → credited to the space in full
+ *   fee   = 1.5% of face + ₦20, max ₦250      → Duevy's, paid by the student on top
+ *   total = face + fee                        → what the student pays
  *
  * Every amount is computed here, from the dues in the database. Nothing about
  * money is read from the request.
@@ -128,7 +128,7 @@ export async function createCheckout(
   }
 
   const [user, dues] = await Promise.all([
-    db.user.findUnique({ where: { id: userId }, select: { email: true, name: true } }),
+    db.user.findUnique({ where: { id: userId }, select: { email: true, name: true, phone: true } }),
     db.due.findMany({
       where: { id: { in: dueIds } },
       include: { space: { select: { id: true, name: true, isArchived: true } } },
@@ -156,7 +156,7 @@ export async function createCheckout(
     }),
     db.spaceRep.findFirst({
       where: { spaceId: space.id, role: 'lead' },
-      include: { user: { select: { kycStatus: true, bachsAccountId: true, studentIdStatus: true } } },
+      include: { user: { select: { kycStatus: true, providerAccountId: true, studentIdStatus: true } } },
     }),
   ]);
 
@@ -171,8 +171,8 @@ export async function createCheckout(
 
   if (paid) throw conflict('DUE_ALREADY_PAID', `"${paid.due.title}" has already been paid`);
 
-  // Collections settle into the lead rep's provider account, so the space can
-  // only collect once that rep has passed KYC.
+  // A space collects only once its lead rep — accountable for the money — has
+  // passed KYC and an admin has approved them.
   if (!lead || !canCollect(lead.user)) {
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
@@ -215,7 +215,6 @@ export async function createCheckout(
         totalKobo: face + fee,
         dueSetKey,
         provider: getPaymentProvider().name,
-        destinationAccountId: lead.user.bachsAccountId,
         // Provisional; replaced by the provider's own expiry once the account opens.
         expiresAt: new Date(Date.now() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
         items: {
@@ -249,11 +248,6 @@ export async function createCheckout(
   return { checkout: serializeCheckout(checkout), reused: outcome.reused };
 }
 
-/**
- * Ask the provider for the one-time account. Safe to call again for the same
- * checkout: the provider calls carry idempotency keys derived from our
- * reference, so a retry replays rather than opening a second account.
- */
 /** Where a hosted checkout sends the payer back to when they're done. */
 function returnUrlFor(checkout: CheckoutWithItems, opts: CreateCheckoutOptions): string {
   const ref = encodeURIComponent(checkout.reference);
@@ -262,27 +256,28 @@ function returnUrlFor(checkout: CheckoutWithItems, opts: CreateCheckoutOptions):
   return `${env.FRONTEND_URL}/pay/${dueId}?ref=${ref}&t=${guestCheckoutToken(checkout.reference)}`;
 }
 
+/**
+ * Ask the provider for the payment link. Safe to call again for the same
+ * checkout: the link is keyed by our reference, which Kredi echoes back on
+ * the collection webhook, so whichever link the student pays credits it.
+ */
 async function openCollectionAccount(
   checkout: CheckoutWithItems,
-  user: { email: string; name: string },
+  user: { email: string; name: string; phone: string | null },
   reused: boolean,
   returnUrl: string,
 ): Promise<CheckoutWithItems> {
   if (reused && Date.now() - checkout.createdAt.getTime() < OPENING_GRACE_MS) {
     throw conflict('CHECKOUT_OPENING', 'This payment is still being set up. Try again in a few seconds.');
   }
-  if (!checkout.destinationAccountId) throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet");
-
   try {
     const account = await getPaymentProvider().createCollectionAccount({
       reference: checkout.reference,
       faceKobo: checkout.faceKobo,
       platformFeeKobo: checkout.feeKobo,
-      destinationAccountId: checkout.destinationAccountId,
-      customer: { email: user.email, name: user.name },
+      customer: { email: user.email, name: user.name, phone: user.phone },
       expiresInMinutes: env.CHECKOUT_EXPIRY_MINUTES,
       metadata: { checkoutId: checkout.id, spaceId: checkout.spaceId, dueCount: String(checkout.items.length) },
-      mode: await getCheckoutMode(),
       returnUrl,
     });
     if (account.totalKobo !== checkout.totalKobo) {
@@ -303,8 +298,8 @@ async function openCollectionAccount(
     });
   } catch (err) {
     // A definite refusal closes the checkout so the student can start again.
-    // A timeout/5xx leaves it pending: the account may exist, and the next
-    // attempt (or reconciliation) replays the same idempotent calls.
+    // A timeout/5xx leaves it pending: the link may exist, and the next
+    // attempt (or reconciliation) opens or finds it under the same reference.
     if (err instanceof ProviderError && !err.retryable) {
       await expireCheckout(checkout.id, `provider refused: ${err.code ?? err.message}`).catch(() => {});
     }
@@ -472,6 +467,8 @@ export async function fulfilCheckout(
           paidAt: new Date(),
           receivedKobo,
           overpaidKobo: excess,
+          // The transfer that paid it, so a later, different one is seen as a second payment.
+          providerChargeId: providerChargeId ?? checkout.providerChargeId,
           needsReview: flags.length > 0 || checkout.needsReview,
           reviewReason: flags.length ? flags.join('; ') : checkout.reviewReason,
         },

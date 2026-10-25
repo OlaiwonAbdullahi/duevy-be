@@ -5,7 +5,6 @@ import { logger, scrub } from '../lib/logger';
 import { type ProviderEvent } from '../providers/payment';
 import { expireCheckout, findCheckoutId, fulfilCheckout, markUnderpaid } from './checkout.service';
 import { completePayout, failPayoutByReference } from './withdrawal.service';
-import { refreshIdentity } from './kyc.service';
 
 /**
  * Inbound webhook pipeline.
@@ -96,9 +95,6 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
       await failPayoutByReference(event.reference, event.reason ?? 'The bank could not complete the transfer');
       return;
     }
-    case 'identity.updated':
-      await refreshIdentity(event.accountId);
-      return;
     case 'ignored':
       return;
   }

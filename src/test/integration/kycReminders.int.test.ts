@@ -57,6 +57,7 @@ describe('KYC reminder emails', () => {
   it('skips the too-new, the finished, the unverified and the suspended', async () => {
     await applicant(2); // too new
     await applicant(48, {
+      phoneVerifiedAt: new Date(),
       kycSubmittedAt: new Date(),
       kycStatus: 'pending',
       studentIdStatus: 'pending',

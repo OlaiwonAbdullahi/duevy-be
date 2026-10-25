@@ -8,18 +8,21 @@ import { env } from '../config/env';
 export const webhooksRouter = Router();
 
 /**
- * POST /webhooks/bachs — public; authenticated by signature only.
+ * POST /webhooks/kredi — public; authenticated by signature only. Kredi posts
+ * collection webhooks here (the URL is set on each payment link) and payout
+ * webhooks (the URL is set on the Kredi dashboard).
  *
  * Does the minimum and returns 200 fast:
- *   1. Verify the signature over the exact raw bytes (401 if it fails).
- *   2. Enqueue, deduplicated by Bachs's event id (a duplicate is a no-op).
+ *   1. Verify the signature-key over the raw body (401 if it fails).
+ *   2. Enqueue, deduplicated by an id built from Kredi's own references (a
+ *      duplicate is a no-op).
  *   3. 200. The work happens in src/jobs/webhookWorker.ts.
  *
- * A 5xx is returned only if we could not durably store the event, so Bachs
+ * A 5xx is returned only if we could not durably store the event, so Kredi
  * retries it. Anything authenticated but unreadable is stored as `dead` for a
  * human and acknowledged — retrying it would never succeed.
  */
-webhooksRouter.post('/bachs', async (req: Request, res: Response): Promise<void> => {
+webhooksRouter.post('/kredi', async (req: Request, res: Response): Promise<void> => {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
   const provider = getPaymentProvider();
 

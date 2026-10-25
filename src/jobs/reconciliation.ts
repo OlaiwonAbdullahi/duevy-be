@@ -3,7 +3,7 @@ import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
-import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/withdrawal.service';
+import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
 
 /**
@@ -77,8 +77,9 @@ export async function reconcilePayouts(): Promise<void> {
   const provider = getPaymentProvider();
   const now = Date.now();
 
-  // Created but never accepted by the provider (crash, timeout): resend. The
-  // reference is the idempotency key, so this cannot pay twice.
+  // Created but never accepted by the provider (crash, timeout): resend. Kredi
+  // refuses a reused reference and reports the first attempt instead, so this
+  // cannot pay twice.
   const undispatched = await db.payout.findMany({
     where: { provider: provider.name, status: 'pending', requestedAt: { lte: new Date(now - RETRY_DISPATCH_AFTER_MS) } },
     take: 25,
@@ -93,14 +94,6 @@ export async function reconcilePayouts(): Promise<void> {
   });
   for (const p of processing) {
     await refreshPayout(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'payout refresh failed'));
-  }
-
-  const unsettledFees = await db.payout.findMany({
-    where: { provider: provider.name, status: 'success', feeSettledAt: null },
-    take: 25,
-  });
-  for (const p of unsettledFees) {
-    await settleWithdrawalFee(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'fee settlement retry failed'));
   }
 
   // Multisig withdrawals nobody approved in time: cancel and restore the balance.

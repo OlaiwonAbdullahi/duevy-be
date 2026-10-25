@@ -13,18 +13,17 @@ import { maskAccountNumber } from '../lib/encryption';
 import {
   discountedFee,
   MIN_PAYOUT_KOBO,
-  WITHDRAWAL_FEE_HIGH_KOBO,
-  WITHDRAWAL_FEE_LOW_KOBO,
-  WITHDRAWAL_FEE_THRESHOLD_KOBO,
+  WITHDRAWAL_FEE_TIERS,
 } from '../lib/money';
 import { getKycState, getSpaceKycState } from '../services/kyc.service';
 import { getActiveDiscount, serializeSpacePartner } from '../services/partner.service';
 import {
-  governmentIdHandlers,
   payoutDestinationHandlers,
   payoutDestinationLookupHandlers,
   resubmitStudentIdHandlers,
+  sendPhoneCodeHandlers,
   submitKycHandlers,
+  verifyPhoneCodeHandlers,
 } from './kycHandlers';
 import { getDueAvailability, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
@@ -88,10 +87,14 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     signatoriesComplete: signatories.length >= REQUIRED_SIGNATORIES,
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
-    // Already net of the space's partner discount, if any.
+    // The withdrawal fee by amount, already net of the space's partner
+    // discount. Each tier covers fromKobo..toKobo inclusive; toKobo null = no ceiling.
     fees: {
-      below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_LOW_KOBO, discountPercent) },
-      atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_HIGH_KOBO, discountPercent) },
+      tiers: WITHDRAWAL_FEE_TIERS.map((t, i) => ({
+        fromKobo: i === 0 ? 0 : (WITHDRAWAL_FEE_TIERS[i - 1]!.maxKobo as number) + 1,
+        toKobo: t.maxKobo,
+        feeKobo: discountedFee(t.feeKobo, discountPercent),
+      })),
     },
     partner: partner ? serializeSpacePartner(partner) : null,
   });
@@ -223,7 +226,7 @@ payoutsRouter.get('/payout/beneficiaries', async (req: Request, res: Response): 
   ok(res, (await listBeneficiaries(spaceId(req))).map(serializeBeneficiary));
 });
 
-// POST /payout/beneficiaries — lead rep only; registers the account with the provider.
+// POST /payout/beneficiaries — lead rep only; the account is name-checked with the bank.
 payoutsRouter.post(
   '/payout/beneficiaries',
   requireSpaceRep(true),
@@ -233,15 +236,15 @@ payoutsRouter.post(
     const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
     const me = await db.user.findUniqueOrThrow({
       where: { id: uid(req) },
-      select: { id: true, name: true, bachsAccountId: true, kycStatus: true },
+      select: { id: true, name: true, kycStatus: true },
     });
-    if (!me.bachsAccountId || me.kycStatus !== 'verified') {
+    if (me.kycStatus !== 'verified') {
       errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
     }
     const { beneficiary, created } = await addBeneficiary({
       spaceId: spaceId(req),
-      actor: { id: me.id, name: me.name, bachsAccountId: me.bachsAccountId },
+      actor: { id: me.id, name: me.name },
       bankCode,
       accountNumber,
       label,
@@ -266,7 +269,8 @@ payoutsRouter.delete(
 // ---------------------------------------------------------------------------
 payoutsRouter.post('/payout/kyc', ...submitKycHandlers);
 payoutsRouter.post('/payout/kyc/student-id', ...resubmitStudentIdHandlers);
-payoutsRouter.post('/payout/kyc/government-id', ...governmentIdHandlers);
+payoutsRouter.post('/payout/kyc/phone/send', ...sendPhoneCodeHandlers);
+payoutsRouter.post('/payout/kyc/phone/verify', ...verifyPhoneCodeHandlers);
 payoutsRouter.post('/payout/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
 payoutsRouter.post('/payout/kyc/payout-destination', ...payoutDestinationHandlers);
 

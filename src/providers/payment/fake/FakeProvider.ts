@@ -1,4 +1,3 @@
-import { randomInt } from 'crypto';
 import {
   InvalidSignatureError,
   ProviderError,
@@ -6,28 +5,23 @@ import {
   type CollectionAccount,
   type CollectionStatus,
   type CreateCollectionInput,
-  type IdentityDocumentInput,
   type IdentityResult,
-  type IdentityStatus,
   type InitiatePayoutInput,
   type PaymentProvider,
-  type PayoutDestination,
   type PayoutResult,
   type ProviderEvent,
-  type RegisterDestinationInput,
   type ResolvedAccount,
-  type SettleFeeInput,
   type VerifyIdentityInput,
 } from '../types';
-import { normaliseBachsEvent } from '../bachs/events';
-import { verifyBachsSignature } from '../bachs/signature';
+import { normaliseKrediEvent } from '../kredi/events';
+import { verifyKrediSignature } from '../kredi/signature';
 
 /**
  * In-memory provider for local development, the seed and the test suite.
  * PAYMENT_PROVIDER=fake. Refused in production by env validation.
  *
  * Its API calls succeed instantly against in-memory state. Its WEBHOOKS use
- * the real Bachs wire format and signature scheme, so scripts/send-test-webhook.ts
+ * the real Kredi wire format and signature scheme, so scripts/send-test-webhook.ts
  * and the tests exercise exactly the parsing path production uses.
  *
  * Test knobs are plain public fields; `calls` records every operation.
@@ -35,32 +29,27 @@ import { verifyBachsSignature } from '../bachs/signature';
 export class FakeProvider implements PaymentProvider {
   readonly name = 'fake';
 
-  /** What verifyIdentity reports. Real KYC resolves later, by webhook. */
-  identityOutcome: IdentityStatus = 'pending';
-  /** What getIdentityStatus reports, per account — set this, then send identity.updated. */
-  identityByAccount = new Map<string, { status: IdentityStatus; payoutsActive: boolean }>();
-  /** What getIdentityStatus reports as still outstanding. */
-  requirementsDue: string[] = [];
+  /** The next verifyIdentity throws this, once (e.g. a 4xx refusal). */
+  failNextIdentity: ProviderError | null = null;
   /** Account numbers name enquiry cannot resolve. */
   unresolvable = new Set<string>();
   resolvedName = 'ADA OBI';
-  /** What Bachs charges on top of each payout. */
-  payoutFeeKobo = 5_000;
+  /** What Kredi charges for each payout (reporting only). */
+  payoutFeeKobo = 2_500;
   /** The next initiatePayout throws this, once. */
   failNextPayout: ProviderError | null = null;
   /** Artificial latency for concurrency tests. */
   payoutDelayMs = 0;
   /** Collection status overrides for reconciliation tests. */
   collectionStatus = new Map<string, CollectionStatus>();
+  /** Payout outcomes by our reference, as getPayout reports them. */
   payoutStatus = new Map<string, PayoutResult>();
+  platformBalanceKobo = 0;
 
   calls: { op: string; args: unknown }[] = [];
   private seq = 0;
 
-  constructor(
-    private readonly webhookSecrets: string[] = ['whsec_fake'],
-    private readonly toleranceSeconds = 300,
-  ) {}
+  constructor(private readonly webhookSecrets: string[] = ['whsec_fake']) {}
 
   private record(op: string, args: unknown): void {
     // Never retain secrets, even in a test double.
@@ -71,28 +60,26 @@ export class FakeProvider implements PaymentProvider {
   }
 
   reset(): void {
-    this.identityOutcome = 'pending';
-    this.requirementsDue = [];
-    this.identityByAccount.clear();
+    this.failNextIdentity = null;
     this.unresolvable.clear();
     this.resolvedName = 'ADA OBI';
     this.failNextPayout = null;
     this.payoutDelayMs = 0;
     this.collectionStatus.clear();
     this.payoutStatus.clear();
+    this.platformBalanceKobo = 0;
     this.calls = [];
   }
 
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
     this.record('createCollectionAccount', input);
-    const hosted = input.mode === 'hosted';
     return {
-      providerCheckoutId: `chk_fake_${input.reference}`,
-      providerChargeId: `ch_fake_${input.reference}`,
-      accountNumber: hosted ? null : `99${randomInt(10_000_000, 99_999_999)}`,
-      bankName: hosted ? null : 'Fake Bank',
-      accountName: hosted ? null : 'Duevy Checkout',
-      checkoutUrl: hosted ? `https://checkout.fake.test/${input.reference}` : null,
+      providerCheckoutId: input.reference,
+      providerChargeId: null,
+      accountNumber: null,
+      bankName: null,
+      accountName: null,
+      checkoutUrl: `https://checkout.fake.test/${input.reference}`,
       totalKobo: input.faceKobo + input.platformFeeKobo,
       expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
     };
@@ -105,75 +92,50 @@ export class FakeProvider implements PaymentProvider {
 
   async verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult> {
     this.record('verifyIdentity', input);
-    if (!input.idNumbers.some((n) => n.type === 'nin' && /^\d{11}$/.test(n.value))) {
-      throw new ProviderError('A valid NIN is required', 422, 'VALIDATION_ERROR', false);
+    if (this.failNextIdentity) {
+      const err = this.failNextIdentity;
+      this.failNextIdentity = null;
+      throw err;
     }
-    const accountId = input.existingAccountId ?? `acct_fake_${input.profile.userId}`;
-    const personId = input.existingPersonId ?? `per_fake_${input.profile.userId}`;
-    const verified = this.identityOutcome === 'verified';
-    this.identityByAccount.set(accountId, { status: this.identityOutcome, payoutsActive: verified });
+    if (!input.idNumbers.some((n) => n.type === 'bvn' && /^\d{11}$/.test(n.value))) {
+      throw new ProviderError('A valid BVN is required', 422, 'VALIDATION_ERROR', false);
+    }
     return {
-      accountId,
-      personId,
-      status: this.identityOutcome,
-      payoutsActive: verified,
+      accountId: `cus_fake_${input.profile.userId}`,
+      accountNumber: `99${String(++this.seq).padStart(8, '0')}`,
+      status: 'verified',
+      payoutsActive: true,
       failureReason: null,
-      requirementsDue: this.requirementsDue,
     };
   }
 
-  async getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult> {
-    this.record('getIdentityStatus', { accountId, personId });
-    const s = this.identityByAccount.get(accountId) ?? { status: 'pending' as const, payoutsActive: false };
-    return {
-      accountId,
-      personId,
-      status: s.status,
-      payoutsActive: s.payoutsActive,
-      failureReason: s.status === 'rejected' ? 'Identity details did not match' : null,
-      requirementsDue: this.requirementsDue,
-    };
-  }
-
-  async uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }> {
-    this.record('uploadIdentityDocument', {
-      accountId: input.accountId,
-      personId: input.personId,
-      mimeType: input.mimeType,
-      bytes: input.buffer.length,
-    });
-    return { documentId: `doc_fake_${++this.seq}` };
+  async getIdentityStatus(accountId: string): Promise<IdentityResult> {
+    this.record('getIdentityStatus', { accountId });
+    return { accountId, accountNumber: null, status: 'verified', payoutsActive: true, failureReason: null };
   }
 
   async listBanks(): Promise<Bank[]> {
     return [
+      { code: '000014', name: 'Access Bank' },
+      { code: '000013', name: 'Guaranty Trust Bank' },
+      { code: '090267', name: 'Kuda MFB' },
+      { code: '090405', name: 'Moniepoint MFB' },
+      { code: '100004', name: 'OPay' },
+      { code: '000004', name: 'United Bank for Africa' },
+      { code: '000015', name: 'Zenith Bank' },
+      // Kept for fixtures written against the old 3-digit codes.
       { code: '058', name: 'Guaranty Trust Bank' },
-      { code: '044', name: 'Access Bank' },
-      { code: '057', name: 'Zenith Bank' },
-      { code: '033', name: 'United Bank for Africa' },
-      { code: '50515', name: 'Moniepoint MFB' },
-      { code: '999992', name: 'OPay' },
     ];
   }
 
   async resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount | null> {
     this.record('resolveAccount', { bankCode });
     if (this.unresolvable.has(accountNumber)) return null;
-    return { accountName: this.resolvedName };
-  }
-
-  async registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination> {
-    this.record('registerPayoutDestination', { accountId: input.accountId, bankCode: input.bankCode });
-    return { destinationId: `pd_fake_${++this.seq}`, usable: true, accountName: input.accountName };
-  }
-
-  async submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void> {
-    this.record('submitAccountPayoutDestination', { accountId: input.accountId, bankCode: input.bankCode });
-    this.requirementsDue = this.requirementsDue.filter((r) => r !== 'payout_destination');
+    return { accountName: this.resolvedName, bvn: '22222222222', kycLevel: '3' };
   }
 
   async initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult> {
-    this.record('initiatePayout', input);
+    this.record('initiatePayout', { ...input, destination: { ...input.destination, accountNumber: '[redacted]' } });
     if (this.payoutDelayMs) await new Promise((r) => setTimeout(r, this.payoutDelayMs));
     if (this.failNextPayout) {
       const err = this.failNextPayout;
@@ -181,36 +143,29 @@ export class FakeProvider implements PaymentProvider {
       throw err;
     }
     const result: PayoutResult = {
-      providerPayoutId: `pay_fake_${input.reference}`,
+      providerPayoutId: `KRDM_fake_${input.reference}`,
       state: 'processing',
       providerFeeKobo: this.payoutFeeKobo,
       failureReason: null,
     };
-    this.payoutStatus.set(result.providerPayoutId, result);
+    this.payoutStatus.set(input.reference, result);
     return result;
   }
 
-  async getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult> {
-    this.record('getPayout', { accountId, providerPayoutId });
-    const p = this.payoutStatus.get(providerPayoutId);
-    if (!p) throw new ProviderError('Payout not found', 404, 'NOT_FOUND', false);
+  async getPayout(reference: string): Promise<PayoutResult> {
+    this.record('getPayout', { reference });
+    const p = this.payoutStatus.get(reference);
+    if (!p) return { providerPayoutId: reference, state: 'pending', providerFeeKobo: null, failureReason: null };
     return p;
   }
 
-  async settleFee(input: SettleFeeInput): Promise<{ transferId: string }> {
-    this.record('settleFee', input);
-    return { transferId: `tr_fake_${input.reference}` };
+  async getPlatformBalance(): Promise<{ availableKobo: number }> {
+    return { availableKobo: this.platformBalanceKobo };
   }
 
   parseWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): ProviderEvent {
-    const check = verifyBachsSignature(rawBody, headers, this.webhookSecrets, this.toleranceSeconds);
+    const check = verifyKrediSignature(rawBody, headers, this.webhookSecrets);
     if (!check.ok) throw new InvalidSignatureError(`Webhook signature ${check.reason}`);
-    let body: unknown;
-    try {
-      body = JSON.parse(rawBody.toString('utf8'));
-    } catch {
-      throw new InvalidSignatureError('Webhook body is not JSON');
-    }
-    return normaliseBachsEvent(body);
+    return normaliseKrediEvent(JSON.parse(rawBody.toString('utf8')));
   }
 }

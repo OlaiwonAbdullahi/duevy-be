@@ -1,6 +1,6 @@
 /**
  * HISTORICAL: written for the pre-ledger -> ledger move. Since the Bachs
- * cutover the ledger is written by the services themselves (see
+ * cutover (and now Kredi) the ledger is written by the services themselves (see
  * src/services/ledger.service.ts); this should not be needed again.
  *
  * One-time backfill: create LedgerEntry rows for financial activity that

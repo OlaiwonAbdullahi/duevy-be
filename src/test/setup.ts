@@ -14,7 +14,9 @@ const defaults: Record<string, string> = {
   JWT_REFRESH_SECRET: 'test-refresh-secret-that-is-at-least-32-chars',
   RESEND_API_KEY: 're_test',
   PAYMENT_PROVIDER: 'fake',
-  BACHS_WEBHOOK_SECRET: 'whsec_test_secret',
+  KREDI_WEBHOOK_SECRET: 'whsec_test_secret',
+  IDENTITY_PROVIDER: 'fake',
+  BVN_HASH_PEPPER: 'test-bvn-pepper-that-is-at-least-32-characters',
   RUN_WORKERS: 'false',
   FILE_STORAGE: 'memory',
 };

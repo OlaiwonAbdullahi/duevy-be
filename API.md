@@ -136,7 +136,7 @@ This shows who has paid and who has not. `GET /dues/:dueId/collections/export` r
 
 ### 🔑 `POST /dues/pay`
 
-One bank transfer pays every due in the basket.
+One payment on a Kredi payment link pays every due in the basket.
 
 ```json
 { "dueIds": ["due_…", "due_…"] }
@@ -148,23 +148,18 @@ One bank transfer pays every due in the basket.
 {
   "reference": "DVY-7KQ2-MN4X",
   "status": "pending",
-  "amount": 665000,
-  "breakdown": { "face": 650000, "fee": 15000, "total": 665000 },
-  "items": [{ "dueId": "…", "title": "…", "amount": 500000, "fee": 11538 }],
-  "bankTransfer": { "accountNumber": "9902847361", "bankName": "…", "accountName": "…", "amountKobo": 665000, "expiresAt": "…" },
-  "checkoutUrl": null,
+  "amount": 661750,
+  "breakdown": { "face": 650000, "fee": 11750, "total": 661750 },
+  "items": [{ "dueId": "…", "title": "…", "amount": 500000, "fee": 9038 }],
+  "bankTransfer": null,
+  "checkoutUrl": "https://…/hosted/pay/…",
   "expiresAt": "…", "paidAt": null, "receivedKobo": null, "overpaidKobo": 0, "reused": false
 }
 ```
 
-How the student pays depends on the admin's checkout mode (`GET|PUT /admin/settings/payments`):
+Redirect the student to `checkoutUrl`, Kredi's hosted payment page. Kredi sends them back to `/dashboard/pay/:reference` (guests: the public pay page) whether or not they paid; the status below says which. `bankTransfer` is kept in the shape for older clients and is always `null`.
 
-- `hosted`: `bankTransfer` is `null` and `checkoutUrl` is set. Redirect the student there. Bachs sends them back to `/dashboard/pay/:reference?checkout_id=…`.
-- `custom`: `bankTransfer` is set and `checkoutUrl` is `null`. Show the one-time account (example above).
-
-An open checkout keeps the mode it was created with.
-
-The fee is 2% of the face value (rounded half-up to the kobo) plus ₦20. The student pays the fee on top, and the space receives the full face value.
+The fee is 1.5% of the face value (rounded half-up to the kobo) plus ₦20, capped at ₦250 in total. The student pays the fee on top, and the space receives the full face value.
 
 Rules:
 
@@ -185,7 +180,7 @@ Rules:
 |---|---|
 | `pending` | Waiting for the transfer. |
 | `paid` | Paid. |
-| `expired` | The bank account closed with nothing paid. |
+| `expired` | The payment window closed with nothing paid. |
 | `underpaid` | Less than the total arrived. No due is marked paid; support follows up. |
 
 Only the webhook (and the reconciliation job behind it) changes the status. Polling this endpoint never does.
@@ -205,61 +200,84 @@ Only the webhook (and the reconciliation job behind it) changes the status. Poll
 
 All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the space.
 
-KYC has two parts, and a space collects only when **both** pass:
+KYC runs in order, each step needing the one before. A space collects only when **all** pass:
 
-- **Identity, verified by Bachs:** NIN + date of birth. A BVN is not required; Bachs may ask for one (or an ID document) later, and `requirementsDue` says so.
-- **Student status, verified by a Duevy admin:** the rep's student ID card.
+1. **Phone** — a one-time code via Didit.
+2. **BVN** — Didit matches the BVN to the rep's name and date of birth. Submitted together with the student ID card.
+3. **Kredi** — the rep is registered as a Kredi customer, automatically, as soon as step 2 passes.
+4. **Student status** — a Duevy admin approves the student ID card (and the rep application).
+
+Every endpoint below is also mounted under `/me/kyc…` for rep applicants who have no space yet.
+
+### `POST /payout/kyc/phone/send`
+
+Body `{ "phone": "08012345678" }` (also `+2348012345678` or `2348012345678`; Nigerian mobile numbers only). Didit texts a 6-digit code. `200`: `{ "sentTo": "+234 801 ••• 5678", "expiresInSeconds": 300, "resendAfterSeconds": 60 }`.
+
+| Error | When |
+|---|---|
+| `400 VALIDATION_ERROR` | Not a Nigerian mobile number. |
+| `409 PHONE_IN_USE` | Another account has verified this number. |
+| `409 PHONE_ALREADY_VERIFIED`, `409 PHONE_LOCKED` | Already verified; or identity is verified and the number can only be changed by support. |
+| `422 PHONE_NOT_ACCEPTED` | The number can't receive a code. |
+| `429 OTP_RESEND_TOO_SOON`, `429 OTP_LIMIT` | Under a minute since the last code; or 5 codes in the last hour. |
+
+### `POST /payout/kyc/phone/verify`
+
+Body `{ "code": "123456" }`. `200` with the KYC state; the number is now the rep's verified phone. Errors: `409 NO_PENDING_PHONE`, `422 INVALID_OTP` (wrong code; the message says how many tries remain), `410 OTP_EXPIRED`, `422 PHONE_DECLINED` (a VoIP or temporary number — use your own SIM).
 
 ### `POST /payout/kyc` (`multipart/form-data`)
 
 | Part | Required | Notes |
 |---|---|---|
-| `nin` | yes | 11 digits. Sent to Bachs; never stored or logged. |
-| `dob` | yes | `YYYY-MM-DD`. Sent to Bachs; never stored or logged. |
-| `gender` | yes | `male` or `female`. Validated; Bachs has no field for it. |
+| `bvn` | yes | 11 digits. Checked by Didit and sent to Kredi; never stored or logged. |
+| `dob` | yes | `YYYY-MM-DD`. Checked against the BVN record; never stored or logged. |
+| `gender` | yes | `male` or `female`. |
+| `address` | yes | Residential address, sent to Kredi. Not stored by Duevy. |
+| `consent` | yes | Must be `true`: the rep agrees to the BVN check (NDPR). |
 | `studentIdCard` | yes | File: JPEG, PNG, WebP or PDF, max 5 MB, checked by its bytes. Stored privately in ImageKit for admin review. |
-| `governmentId` | no | File, same rules. Forwarded to Bachs, only useful when it asks for an ID document. |
-| `bvn` | no | 11 digits. Only if Bachs asks for it. |
-| `firstName`, `lastName`, `phone` | no | `phone` in E.164, any country (e.g. `+2348012345678`, `+447911123456`). Names default to the account name. |
+| `firstName`, `lastName` | no | The names on the BVN, if they differ from the account name. |
 
 `202`:
 
 ```json
-{ "kycStatus": "pending", "payoutsActive": false, "canCollect": false, "canWithdraw": false, "providerReference": "per_…",
-  "requirementsDue": [], "governmentIdSubmittedAt": null,
+{ "kycStatus": "verified", "payoutsActive": true, "canCollect": false, "canWithdraw": false,
+  "steps": {
+    "phone": { "verified": true, "number": "+234 801 ••• 5678", "pendingNumber": null, "verifiedAt": "…" },
+    "bvn": { "verified": true, "verifiedAt": "…" },
+    "account": { "created": true }
+  },
+  "payoutDestination": null,
   "studentId": { "status": "pending", "uploadedAt": "…", "reviewedAt": null, "reviewNote": null },
-  "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": null }
+  "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": "…" }
 ```
 
-The Bachs verdict arrives by webhook. Validation errors never echo the NIN, BVN or date of birth.
+`canCollect` turns true once an admin approves the student ID. Validation errors never echo the BVN or date of birth.
 
 | Error | When |
 |---|---|
-| `400 VALIDATION_ERROR` | Bad field, missing `studentIdCard`, or a file that isn't really a JPEG/PNG/WebP/PDF. |
+| `400 VALIDATION_ERROR` | Bad field, missing `consent` or `studentIdCard`, or a file that isn't really a JPEG/PNG/WebP/PDF. |
 | `413 FILE_TOO_LARGE` | A file over 5 MB. |
-
-| Error | When |
-|---|---|
-| `403 REP_NOT_APPROVED` | The caller is not an approved rep. |
-| `409 ALREADY_VERIFIED`, `409 KYC_PENDING` | Already verified, or a verification is already under review. |
-| `422 KYC_REJECTED` | Bachs refused the details. |
+| `403 REP_NOT_APPROVED` | The caller is not a rep or rep applicant. |
+| `409 PHONE_NOT_VERIFIED` | Step 1 isn't done. |
+| `409 ALREADY_VERIFIED` | Already verified. |
+| `409 BVN_IN_USE` | The BVN is linked to another rep account. |
+| `422 BVN_INVALID` | The registry doesn't recognise the BVN. Not counted as an attempt. |
+| `422 KYC_REJECTED` | The name or date of birth doesn't match the BVN record, or Kredi refused the details. Counts as an attempt. |
 | `429 KYC_RETRY_LOCKED` | Three failed attempts; retries are locked for 24 hours. |
+| `503 VERIFICATION_UNAVAILABLE` | The BVN registry didn't answer. Try again; not counted. |
+| `503 ACCOUNT_SETUP_PENDING` | The BVN matched but Kredi was unavailable. Submit again; the BVN check isn't repeated or re-billed. |
 
 ### `POST /payout/kyc/student-id` (`multipart/form-data`)
 
 Replaces the student ID card after an admin rejected it (or if none was sent). Part: `studentIdCard`. Returns `202` with the KYC state. `409 STUDENT_ID_PENDING` / `STUDENT_ID_APPROVED` if there is nothing to replace.
 
-### `POST /payout/kyc/government-id` (`multipart/form-data`)
-
-Forwards a government ID document to Bachs, for when `requirementsDue` asks for one. Part: `governmentId`. Returns `202`. `409 KYC_NOT_STARTED` before the first submission.
-
 ### `POST /payout/kyc/payout-destination` (also `/me/kyc/payout-destination`)
 
-The rep's own bank account. Collected during onboarding right after the NIN + student ID submission, and again whenever Bachs lists `payout_destination` in `requirementsDue`. Bachs won't finish onboarding (and payouts stay off) until it has one. Once accepted it's saved (masked) and returned as `payoutDestination` on the KYC state: `{ bankCode, bankName, accountNumber (masked), accountName, submittedAt }`, or `null` until sent. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. The account is name-checked and the bank's name is sent to Bachs. `200` with the refreshed KYC state. Errors: `409 KYC_NOT_STARTED`, `422 ACCOUNT_UNVERIFIABLE`, `422 PAYOUT_DESTINATION_REJECTED` (Bachs refused it).
+The rep's own bank account, kept for their reference and the onboarding checklist. Body: `{ "bankCode": "000013", "accountNumber": "0123456789" }`. The account is name-checked; the bank's name and the masked number are saved and returned as `payoutDestination` on the KYC state: `{ bankCode, bankName, accountNumber (masked), accountName, submittedAt }`. `200` with the KYC state. Error: `422 ACCOUNT_UNVERIFIABLE`.
 
-`POST /me/kyc/payout-destination/lookup` (also `/payout/kyc/payout-destination/lookup`) with the same body runs the name check without sending anything: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
+`POST /me/kyc/payout-destination/lookup` (also `/payout/kyc/payout-destination/lookup`) with the same body runs the name check without saving: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
 
-This is separate from beneficiaries: it only tells Bachs where the rep's account would pay out by default. Withdrawals still go to the beneficiary or account chosen each time.
+This is separate from beneficiaries. Withdrawals go to the beneficiary or account chosen each time.
 
 ### `GET /payout/kyc-status`
 
@@ -272,7 +290,11 @@ This is separate from beneficiaries: it only tells Bachs where the rep's account
 ```json
 { "available": 900000, "balance": 900000, "collected": 900000, "withdrawn": 0, "withdrawalFees": 0, "inFlight": 0,
   "kyc": { … }, "beneficiaryCount": 1, "minPayout": 100000,
-  "fees": { "below": { "thresholdKobo": 5000000, "feeKobo": 10000 }, "atOrAbove": { "thresholdKobo": 5000000, "feeKobo": 20000 } } }
+  "fees": { "tiers": [
+    { "fromKobo": 0, "toKobo": 999999, "feeKobo": 5000 },
+    { "fromKobo": 1000000, "toKobo": 5000000, "feeKobo": 12000 },
+    { "fromKobo": 5000001, "toKobo": null, "feeKobo": 20000 }
+  ] } }
 ```
 
 The balance always comes from the ledger.
@@ -293,7 +315,7 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 |---|---|
 | `POST /payout/beneficiaries/lookup` | Name enquiry without saving. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. Returns `200` `{ bankCode, bankName, accountNumber (masked), accountName }`. |
 | `GET /payout/beneficiaries` | Any rep. `[Beneficiary]`, newest first. |
-| `POST /payout/beneficiaries` | Lead rep only. Body: `{ bankCode, accountNumber, label? }` (`label` up to 60 characters, e.g. `"Dr. Adeyemi (HOD)"`). Runs name enquiry and registers the account with Bachs. `201` with the new `Beneficiary`, or `200` with the existing one if that account was already added. Every rep of the space is emailed. |
+| `POST /payout/beneficiaries` | Lead rep only. Body: `{ bankCode, accountNumber, label? }` (`label` up to 60 characters, e.g. `"Dr. Adeyemi (HOD)"`). Runs name enquiry with the bank. `201` with the new `Beneficiary`, or `200` with the existing one if that account was already added. Every rep of the space is emailed. |
 | `DELETE /payout/beneficiaries/:beneficiaryId` | Lead rep only. `200` `{ removed: true }`. Withdrawals already made to it are unaffected. |
 
 `Beneficiary = { id, label, bankCode, bankName, accountNumber (masked), accountName, createdAt }`
@@ -304,14 +326,14 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 
 `200`: `{ amount, fee, net, feeBeforeDiscount, discount, discountPercent, minPayout, belowMinimum }`. `fee` is net of any partner discount (see Partners).
 
-The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from the withdrawal.
+The fee is ₦50 under ₦10,000, ₦120 from ₦10,000 to ₦50,000, and ₦200 above ₦50,000. It is deducted from the withdrawal.
 
 ### 🔑 `POST /payout/request` (lead rep, or a co-rep for an assigned due)
 
 - Body: `{ "amount": 500000, "beneficiaryId": "…", "pin": "4821", "dueId"?: "…", "note"?: "…" }`. `amount` is the gross in kobo.
-- `dueId` draws on one due's collections. The lead may omit it to draw on the whole space. A co-rep must send it, and the due must be assigned to them (`POST /dues/:dueId/reassign`). The amount can't exceed what is left of that due (see `GET /payout/dues`). The money always leaves the lead rep's account, where collections settle.
+- `dueId` draws on one due's collections. The lead may omit it to draw on the whole space. A co-rep must send it, and the due must be assigned to them (`POST /dues/:dueId/reassign`). The amount can't exceed what is left of that due (see `GET /payout/dues`). The money leaves Duevy's Kredi merchant account, where collections pool, as a Payout V2 transfer.
 - `pin` is needed only in `pin` mode (see [Withdrawal security](#withdrawal-security)). It is the space's 4-digit security code, which the lead rep sets themselves (`PUT /payout/pin`). Five wrong codes lock it for 30 minutes. `GET /payout/summary` reports `withdrawalAuthMode`, `withdrawalPinSet`, `withdrawalPinLockedUntil` and `withdrawalPinHoldUntil`.
-- Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked and registered with Bachs the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
+- Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
 - `201`: `Payout`. In `multisig` mode it is `awaiting_approval` and carries `approval` (below), including `otpSentToRequester: true` when the requester is a signatory and has been emailed their code.
 
 `Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, dueId, note, requestedById, requestedAt, approvalExpiresAt, processingAt, settledAt, failedAt, reversedAt, cancelledAt, failureReason }`
@@ -327,6 +349,8 @@ Withdrawal status moves `[awaiting_approval →] pending → processing → succ
 | `409 SIGNATORIES_INCOMPLETE` | `multisig` mode, but the space has fewer than 3 signatories. |
 | `404 BENEFICIARY_NOT_FOUND` | No beneficiary with that id in this space. |
 | `422 ACCOUNT_UNVERIFIABLE` | The one-off account couldn't be verified with the bank. |
+
+Name enquiry runs again just before the transfer. If the bank now reports a different holder, the withdrawal fails (status `failed`, balance restored) with a reason asking the rep to check the beneficiary.
 | `409 WITHDRAWAL_IN_PROGRESS` | Another withdrawal for this space is still in flight. |
 | `422 INSUFFICIENT_BALANCE` | The amount is more than the balance. |
 | `422 BELOW_MIN_PAYOUT` | Under the ₦1,000 minimum. |
@@ -389,7 +413,7 @@ Every set, change and reset is written to the space audit log. The code is clear
 
 ### `GET /banks`
 
-`200`: `[{ code, name }]`, the bank list from Bachs.
+`200`: `[{ code, name }]`, the bank list from Kredi. `code` is the bank's NIP code (e.g. `000013`).
 
 ---
 
@@ -440,7 +464,7 @@ Body: `{ "code": "NACOS" }`. `201`: `SpacePartner`. A space has at most one part
 - `GET /payout/quote` adds `feeBeforeDiscount`, `discount` and `discountPercent` (`0` with no partner). `fee` and `net` are already discounted.
 - `GET /payout/summary` adds `partner: SpacePartner | null` (only while active), and its `fees` tiers are already discounted.
 - `Payout` adds `feeDiscount` (kobo).
-- A 100% discount means no fee at all. When the discounted fee is below Bachs's own payout fee, the platform covers the difference at settlement.
+- A 100% discount means no fee at all. Kredi's own transfer cost is Duevy's either way; it never touches the space's balance.
 
 ---
 
@@ -469,7 +493,7 @@ Aggregate-only traction figures for duevy.app/metrics. No auth. Cached for 10 mi
 
 Clears the space's withdrawal code, for example when a rep's account may be compromised. Admins never set or see codes. Withdrawals stop until the lead rep sets a new code, and every rep is notified. `200`: `{ withdrawalPinSet: false }`. `GET /admin/spaces` rows carry `withdrawalPinSet`, `withdrawalPinSetAt`, `withdrawalPinLocked` and `withdrawalPinHoldUntil`.
 
-Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is Bachs's decision, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` and the dues `allowGuests` field are removed. Co-reps are now added with `POST /spaces/:spaceId/reps`.
+Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is decided by the phone and BVN checks (Didit) and the Kredi registration, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` and the dues `allowGuests` field are removed. Co-reps are now added with `POST /spaces/:spaceId/reps`.
 
 `role = admin` is required. Each route also checks the permission named in its row; a super admin has every permission.
 
@@ -486,12 +510,11 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `GET /admin/checkouts?status=&needsReview=true&overpaid=true&spaceId=` | userManagement | The review queue: underpaid, overpaid, late and duplicate payments. |
 | `POST /admin/checkouts/:reference/resolve` | overrides | Clears a review flag. Body: `{ note }`. |
 | `GET /admin/payouts?status=&spaceId=` | payouts | Every withdrawal. |
-| `GET /admin/health` | userManagement | `{ deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledWithdrawalFees, pendingStudentIds, healthy, recentWebhookFailures }` |
+| `GET /admin/health` | userManagement | `{ deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, liquidity: { ledgerKobo, merchantKobo, shortfallKobo, error }, pendingStudentIds, healthy, recentWebhookFailures }`. `liquidity` compares what every space is owed with the Kredi merchant balance (cached 60s); a shortfall marks it unhealthy. |
+| `GET /admin/reps/:repId/application` | userManagement | The application with `kyc.identity` (`phone`, `bvn` with `diditRequestId` to open the check in the Didit console, `kredi.registered`) and the student ID card. |
 | `POST /admin/reps/:repId/freeze-payouts` · `/unfreeze-payouts` | payouts | Freezes or unfreezes the rep's withdrawals. |
 | `GET /admin/feedback?status=&category=&q=` | userManagement | Feedback inbox, newest first; `status` is `new` or `resolved`, `category` is `bug`, `idea` or `other`. Rows as in `POST /feedback`. `meta.unresolved` is the count of `new` feedback (for a badge). |
 | `POST /admin/feedback/:id/resolve` · `/reopen` | userManagement | Marks it resolved (body: `{ note? }`, kept as `adminNote`) or back to `new`. Both are audit-logged. |
-| `GET /admin/settings/payments` | any admin | `{ checkoutMode: "hosted" \| "custom", updatedAt, updatedById }`. Defaults to `hosted`. |
-| `PUT /admin/settings/payments` | super admin | Body `{ checkoutMode: "hosted" \| "custom" }`. Applies to checkouts opened from then on. Audit-logged as `settings.checkout_mode`. |
 | `GET /admin/partners?q=&status=all\|active\|inactive` | payouts | `[{ id, name, short, code, logoUrl, withdrawalFeeDiscountPercent, durationDays, maxRedemptions, expiresAt, isActive, redemptionCount, createdAt, updatedAt }]`. `redemptionCount` leaves out revoked ones. |
 | `POST /admin/partners` | payouts | Body: `{ name, short, code, withdrawalFeeDiscountPercent (1–100), logoUrl?, durationDays?, maxRedemptions?, expiresAt?, isActive? }`. `code` is 3–20 letters, numbers or dashes, stored uppercase. `409 PARTNER_CODE_TAKEN`. Audit-logged as `partner.create`. |
 | `PATCH /admin/partners/:partnerId` | payouts | Any of the fields above. Doesn't change spaces that already redeemed the code. Audit-logged as `partner.update`. |
@@ -503,35 +526,35 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 
 ## Webhook
 
-### `POST /webhooks/bachs`
+### `POST /webhooks/kredi`
 
-Public. It authenticates only by signature: `X-Bachs-Signature-V2: t=…,v1=…`, with `X-Bachs-Signature` plus `X-Bachs-Timestamp` as the legacy fallback.
+Public. It authenticates only by signature: `signature-key` = SHA-512 of `"<amount>-<secret>-<reference>"` (the collection's `remitReference`, or the payout's `merchantReference`). Kredi posts collection webhooks here (each payment link carries this URL) and payout webhooks (set on the Kredi dashboard).
 
 | Response | When |
 |---|---|
-| `200` | The event was stored (deduplicated by event id), or it was authenticated but unreadable and was dead-lettered. |
-| `401` | The signature is bad or stale. |
-| `503` | The event could not be stored, so Bachs retries it. |
+| `200` | The event was stored (deduplicated by Kredi's references), or it was authenticated but unreadable and was dead-lettered. |
+| `401` | The signature is missing or wrong. |
+| `503` | The event could not be stored, so Kredi retries it. |
 
 Events Duevy acts on:
 
-| Event | Effect |
+| Body | Effect |
 |---|---|
-| `collection.succeeded` (`SUCCEEDED`, `ACCEPTED`, `OVERPAID`) | The checkout is paid. |
-| `collection.underpaid` | The checkout is marked underpaid. |
-| `collection.failed` / `checkout.expired` | The checkout expires. |
-| `payout.paid` / `payout.failed` | The withdrawal succeeds, or fails or is reversed. |
-| `account.updated` / `capability.updated` | Duevy re-reads the rep's KYC state. |
+| Collection, `status: "successful"` | The checkout is paid; less than the total marks it underpaid, more flags the excess. A second, different transfer into a paid checkout is flagged for a refund. |
+| Collection, `status: "expired"` | The checkout expires. |
+| Payout, `transactionStatus.code` `200` / `401` | The withdrawal succeeds, or fails (or is reversed after success). `100` and `400` are not final and are ignored. |
 
-Anything else is acknowledged and ignored.
+Anything else — including transfers into virtual accounts — is acknowledged and ignored.
 
 ---
 
 ## Removed or changed in this release
 
-- `POST /webhooks/anchor` is gone; use `/webhooks/bachs`.
+- **Bachs → Kredi.** `POST /webhooks/bachs` is gone; use `/webhooks/kredi`. Checkouts are hosted payment links only, and `GET|PUT /admin/settings/payments` (checkout mode) is removed. `GET /payout/summary` returns `fees.tiers` instead of `fees.below` / `fees.atOrAbove`. The student fee is 1.5% + ₦20 (max ₦250); the withdrawal fee is ₦50 / ₦120 / ₦200.
+- **KYC.** NIN and `governmentId` are no longer collected, and `POST /payout/kyc/government-id` is removed. Verify the phone first (`POST /payout/kyc/phone/send` and `/verify`); `POST /payout/kyc` then takes `bvn`, `dob`, `gender`, `address`, `consent` and the student ID card. The KYC state has `steps` instead of `providerReference`, `requirementsDue` and `governmentIdSubmittedAt`.
+- `POST /webhooks/anchor` is gone.
 - `POST /payout/kyc/upgrade` is removed, along with KYC tiers and the ₦300,000 balance ceiling.
-- `POST /payout/kyc` is now `multipart/form-data` and takes a **NIN** (not a BVN) plus a `studentIdCard` file. A space can only collect once an admin approves the card.
+- `POST /payout/kyc` is `multipart/form-data` with a `studentIdCard` file. A space can only collect once an admin approves the card.
 - `POST /payout/:id/approve`, `POST /payout/:id/cancel`, `GET|POST /dues/:dueId/payout/*` are removed (approval quorum and co-rep payouts are out of scope).
 - `POST /dues/pay` no longer accepts `discountCode` or `method: "card"`. Guest payers are refused.
 - `POST /polls/:slug/votes` on a paid poll returns `501 PAID_VOTING_UNAVAILABLE`. Free polls still work.

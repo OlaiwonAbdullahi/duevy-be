@@ -131,7 +131,7 @@ describe('team management', () => {
     await expect(req({ dueId: due!.id, amountKobo: 600_000 })).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
 
     const p = await req({ dueId: due!.id });
-    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, providerAccountId: t.lead.bachsAccountId });
+    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, destinationBankCode: t.beneficiary!.bankCode });
     expect(await dueLeft(t.space.id, due!.id)).toBe(200_000);
     expect(await getSpaceBalance(t.space.id)).toBe(2_200_000);
 

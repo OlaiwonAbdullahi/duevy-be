@@ -1,98 +1,104 @@
 /**
- * Send a correctly signed Bachs-format webhook to a running API, for local
- * testing (works against PAYMENT_PROVIDER=fake or bachs — both verify the
- * real Bachs signature scheme with BACHS_WEBHOOK_SECRET).
+ * Send a correctly signed Kredi-format webhook to a running API, for local
+ * testing (works against PAYMENT_PROVIDER=fake or kredi — both verify the
+ * real Kredi signature scheme with KREDI_WEBHOOK_SECRET).
  *
- *   npm run webhook:test -- paid      DVY-XXXX-XXXX [amountNaira]
- *   npm run webhook:test -- overpaid  DVY-XXXX-XXXX <receivedNaira> <expectedNaira>
- *   npm run webhook:test -- underpaid DVY-XXXX-XXXX <paidNaira> <expectedNaira>
- *   npm run webhook:test -- expired   DVY-XXXX-XXXX
- *   npm run webhook:test -- payout-paid   WD-2026-XXXXXX
- *   npm run webhook:test -- payout-failed WD-2026-XXXXXX
- *   npm run webhook:test -- identity  acct_...
+ *   npm run webhook:test -- paid          DVY-XXXX-XXXX <amountNaira>
+ *   npm run webhook:test -- payout-paid   WD-2026-XXXXXX <netNaira>
+ *   npm run webhook:test -- payout-failed WD-2026-XXXXXX <netNaira>
  *
- * Options (env): WEBHOOK_URL (default http://localhost:$PORT/v1/webhooks/bachs),
- * EVENT_ID (reuse one to test duplicate delivery).
+ * A short `paid` amount is recorded as an underpayment, a larger one as an
+ * overpayment — the checkout service compares it to the checkout total.
  *
- * For amounts, `paid` without an amount reads the checkout's total from
- * GET /v1/payments/:reference — pass it explicitly when you have no token.
+ * Options (env): WEBHOOK_URL (default http://localhost:$PORT/v1/webhooks/kredi),
+ * REMIT_REFERENCE (reuse one to test duplicate delivery).
  */
 import 'dotenv/config';
-import { randomUUID } from 'crypto';
-import { computeBachsSignature } from '../src/providers/payment/bachs/signature';
+import { randomInt } from 'crypto';
+import { computeKrediSignature } from '../src/providers/payment/kredi/signature';
 
-const [kind, ref, a, b] = process.argv.slice(2);
-const secret = process.env.BACHS_WEBHOOK_SECRET;
-const url = process.env.WEBHOOK_URL ?? `http://localhost:${process.env.PORT ?? 3000}/v1/webhooks/bachs`;
+const [kind, ref, amount] = process.argv.slice(2);
+const secret = process.env.KREDI_WEBHOOK_SECRET;
+const url = process.env.WEBHOOK_URL ?? `http://localhost:${process.env.PORT ?? 3000}/v1/webhooks/kredi`;
 
 function usage(): never {
-  console.error('usage: send-test-webhook <paid|overpaid|underpaid|expired|payout-paid|payout-failed|identity> <reference|accountId> [amounts]');
+  console.error('usage: send-test-webhook <paid|payout-paid|payout-failed> <reference> <amountNaira>');
   process.exit(1);
 }
-if (!kind || !ref) usage();
+if (!kind || !ref || !amount) usage();
 if (!secret) {
-  console.error('BACHS_WEBHOOK_SECRET is not set');
+  console.error('KREDI_WEBHOOK_SECRET is not set');
   process.exit(1);
 }
 
-const naira = (v: string | undefined) => (v ? Number(v).toFixed(2) : undefined);
+const digits = (n: number) => Array.from({ length: n }, () => randomInt(10)).join('');
+const now = new Date().toISOString();
 
-function build(): { type: string; data: Record<string, unknown>; account?: string } {
+function build(): { body: Record<string, unknown>; signedAmount: string; signedRef: string } {
   switch (kind) {
-    case 'paid':
-      if (!a) {
-        console.error('pass the amount in naira (the checkout total), e.g. 5120');
-        process.exit(1);
-      }
-      return { type: 'collection.succeeded', data: { reference: ref, status: 'SUCCEEDED', amount: naira(a), currency: 'NGN' } };
-    case 'overpaid':
+    case 'paid': {
+      const remitReference = process.env.REMIT_REFERENCE ?? digits(30);
+      const value = Number(amount).toFixed(2);
       return {
-        type: 'collection.succeeded',
-        data: {
-          reference: ref,
-          status: 'OVERPAID',
-          amount: naira(b),
-          expected_amount: naira(b),
-          received_amount: naira(a),
-          overpaid_amount: (Number(a) - Number(b)).toFixed(2),
-          currency: 'NGN',
+        signedAmount: value,
+        signedRef: remitReference,
+        body: {
+          merchantRef: ref,
+          amount: value,
+          amountReceived: value,
+          status: 'successful',
+          narration: 'CR|FRM TRF test payment',
+          sessionId: digits(30),
+          senderAccountName: 'TEST PAYER',
+          senderAccountNumber: '0123456789',
+          senderBank: 'ACCESS BANK',
+          senderBankCode: '000014',
+          remitReference,
+          accountType: 'collection',
+          customer: { customerName: 'Test Payer', customerEmail: '', customerPhone: '' },
+          createdAt: now,
+          receivedAt: now,
         },
       };
-    case 'underpaid':
-      return {
-        type: 'collection.underpaid',
-        data: { reference: ref, status: 'UNDERPAID', amount_paid: naira(a), amount_expected: naira(b), currency: 'NGN' },
-      };
-    case 'expired':
-      return { type: 'collection.failed', data: { reference: ref, status: 'EXPIRED' } };
+    }
     case 'payout-paid':
-      return { type: 'payout.paid', data: { reference: ref, withdrawal_id: `pay_${ref}`, status: 'completed', withdrawal_fee: '50.00' } };
-    case 'payout-failed':
-      return { type: 'payout.failed', data: { reference: ref, withdrawal_id: `pay_${ref}`, status: 'failed', failure_reason: 'Test failure' } };
-    case 'identity':
-      return { type: 'capability.updated', account: ref, data: { account: ref, capability: 'payouts', status: 'active', requested: true } };
+    case 'payout-failed': {
+      const code = kind === 'payout-paid' ? 200 : 401;
+      const value = Number(amount);
+      return {
+        signedAmount: String(value),
+        signedRef: ref,
+        body: {
+          id: `test-${digits(8)}`,
+          krediReference: `KRDM_${digits(12)}`,
+          merchantReference: ref,
+          beneficiaryName: 'TEST BENEFICIARY',
+          beneficiaryAccountNumber: '0123456789',
+          beneficiaryBankCode: '000013',
+          transactionAmount: value,
+          narration: `Duevy payout ${ref}`,
+          transactionStatus: { code, status_message: code === 200 ? 'Successful' : 'Failed' },
+          transactionStatusMessage: code === 200 ? 'Approved' : 'Test failure',
+          responseCode: code === 200 ? '00' : '91',
+          createdAt: now,
+        },
+      };
+    }
     default:
       usage();
   }
 }
 
 async function main() {
-  const event = build();
-  const body = JSON.stringify({
-    id: process.env.EVENT_ID ?? `evt_test_${randomUUID().replace(/-/g, '')}`,
-    created_at: new Date().toISOString(),
-    organization_id: 'acct_platform',
-    ...event,
-  });
-  const t = Math.floor(Date.now() / 1000);
-  const sig = computeBachsSignature(secret!, t, body);
+  const { body, signedAmount, signedRef } = build();
+  const raw = JSON.stringify(body);
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${t},v1=${sig}` },
-    body,
+    headers: { 'Content-Type': 'application/json', 'signature-key': computeKrediSignature(signedAmount, secret!, signedRef) },
+    body: raw,
   });
   console.log(`${res.status} ${await res.text()}`);
-  console.log(body);
+  console.log(raw);
 }
 
 main().catch((err) => {

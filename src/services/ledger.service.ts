@@ -86,6 +86,17 @@ export async function getSpaceBalance(spaceId: string, tx: Tx | typeof db = db):
 }
 
 /**
+ * What every space is owed, together. Collections pool in Duevy's Kredi
+ * merchant account, so that account should never hold less than this.
+ */
+export async function getTotalLedgerBalance(): Promise<number> {
+  const rows = await db.$queryRaw<{ balance: bigint | null }[]>`
+    SELECT COALESCE(SUM(CASE WHEN "direction" = 'credit' THEN "amountKobo" ELSE -"amountKobo" END), 0)::bigint AS balance
+    FROM "ledger_entries"`;
+  return Number(rows[0]?.balance ?? 0);
+}
+
+/**
  * What each due of a space can still pay out, in kobo.
  *
  * A due's own entries (its collections, withdrawals made against it and their

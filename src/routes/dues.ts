@@ -41,7 +41,7 @@ function serializeStudentDue(due: Due, payment: DuePayment | undefined, now: Dat
     title: due.title,
     note: due.note,
     amount: due.amount, // face amount the rep set
-    processingFee: charge.fee, // 2% + ₦20, added on top
+    processingFee: charge.fee, // 1.5% + ₦20 (max ₦250), added on top
     payableAmount: charge.total, // what the student pays for this due alone
     dueDate: due.dueDate.toISOString().slice(0, 10),
     type: due.category,

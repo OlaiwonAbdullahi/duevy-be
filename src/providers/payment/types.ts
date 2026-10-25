@@ -2,8 +2,11 @@
  * The payment-rail boundary. Everything Duevy needs from a provider goes
  * through this interface, in kobo and in our own vocabulary, so the rail can be
  * swapped without touching services or routes. Provider wire formats
- * (decimal strings, uppercase statuses, event envelopes) never leak past an
+ * (decimal amounts, status codes, webhook bodies) never leak past an
  * implementation.
+ *
+ * Money is pooled: collections settle into the platform's account, the
+ * per-space ledger says whose it is, and payouts leave the platform account.
  *
  * Keep it thin: one method per thing the business does, no provider concepts.
  */
@@ -22,61 +25,48 @@ export interface IdentityProfile {
 
 /** A government identifier. Pass-through only: never stored, never logged. */
 export interface IdentityNumber {
-  type: 'nin' | 'bvn';
+  type: 'bvn';
   value: string;
 }
 
+/**
+ * Open the rep's record at the provider. Called only after Duevy's own
+ * checks (phone OTP and BVN match, via the identity verifier) have passed.
+ */
 export interface VerifyIdentityInput {
   profile: IdentityProfile;
-  /** At least a NIN. A BVN is added only when the provider asks for one. */
+  /** The BVN Duevy already matched to this rep. Pass-through only. */
   idNumbers: IdentityNumber[];
-  /** YYYY-MM-DD. Pass-through only. */
-  dob: string;
-  /** Re-use the rep's existing provider account/person on a retry. */
-  existingAccountId?: string | null;
-  existingPersonId?: string | null;
+  /** Pass-through only. */
+  gender: 'male' | 'female';
+  /** Pass-through only. */
+  address: string;
 }
 
 export interface IdentityResult {
-  /** The rep's account at the provider — where collections settle. */
+  /** The rep's record at the provider (Kredi: the customer id). */
   accountId: string;
-  /** The provider's reference for this verification (the person record). */
-  personId: string;
+  /** The account number the provider gave the rep's record. */
+  accountNumber: string | null;
   status: IdentityStatus;
-  /** Whether the account may pay out right now. */
+  /** Whether the rep may withdraw right now. */
   payoutsActive: boolean;
   failureReason?: string | null;
-  /** What the provider still asks for, as its field keys (e.g. "persons.per_x.bvn"). */
-  requirementsDue: string[];
-}
-
-export interface IdentityDocumentInput {
-  accountId: string;
-  personId: string;
-  buffer: Buffer;
-  fileName: string;
-  mimeType: string;
 }
 
 export interface CreateCollectionInput {
   /** Our checkout reference; also sent to the provider so events echo it back. */
   reference: string;
-  /** The face amount — what the space (rep's account) receives. */
+  /** The face amount — what the space is credited. */
   faceKobo: number;
   /** Duevy's fee, charged on top. The student pays faceKobo + platformFeeKobo. */
   platformFeeKobo: number;
-  /** The rep's provider account the face amount is routed to. */
-  destinationAccountId: string;
-  customer: { email: string; name: string };
+  customer: { email: string; name: string; phone?: string | null };
   expiresInMinutes: number;
   metadata: Record<string, string>;
-  /** 'hosted' redirects the student to the provider's page; 'custom' opens a bank account we display. */
-  mode: CheckoutMode;
   /** Where a hosted checkout sends the student back to, paid or not. */
   returnUrl: string;
 }
-
-export type CheckoutMode = 'hosted' | 'custom';
 
 /**
  * How the student pays: either a one-time bank account we show them, or a
@@ -103,6 +93,9 @@ export interface CollectionStatus {
 
 export interface ResolvedAccount {
   accountName: string;
+  /** The account holder's BVN, when the bank's name enquiry returns one. Never stored. */
+  bvn?: string | null;
+  kycLevel?: string | null;
 }
 
 export interface Bank {
@@ -110,28 +103,19 @@ export interface Bank {
   name: string;
 }
 
-export interface RegisterDestinationInput {
-  accountId: string;
+/** A bank account money can be sent to. */
+export interface BankDestination {
   bankCode: string;
   accountNumber: string;
+  /** The name the bank returned at name enquiry. */
   accountName: string;
 }
 
-export interface PayoutDestination {
-  destinationId: string;
-  /** Whether it can receive money yet (it may sit in review). */
-  usable: boolean;
-  /** The name the bank holds for the account. */
-  accountName: string | null;
-}
-
 export interface InitiatePayoutInput {
-  /** The rep's provider account the payout is drawn from. */
-  accountId: string;
-  destinationId: string;
+  destination: BankDestination;
   /** What lands in the bank account. */
   amountKobo: number;
-  /** Ours. Also the provider idempotency key, so a retry can never pay twice. */
+  /** Ours. Also the provider's transaction reference, so a retry can never pay twice. */
   reference: string;
 }
 
@@ -140,17 +124,9 @@ export type PayoutState = 'pending' | 'processing' | 'succeeded' | 'failed';
 export interface PayoutResult {
   providerPayoutId: string;
   state: PayoutState;
-  /** What the provider charged on top, debited from the same account. */
+  /** What the provider charged for the transfer (reporting only). */
   providerFeeKobo: number | null;
   failureReason: string | null;
-}
-
-export interface SettleFeeInput {
-  /** The rep's provider account. */
-  accountId: string;
-  /** Positive: move from the rep's account to the platform. Negative: platform tops the account up. */
-  amountKobo: number;
-  reference: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +182,6 @@ export type ProviderEvent =
       providerPayoutId: string | null;
       reason: string | null;
     })
-  | (EventBase & {
-      kind: 'identity.updated';
-      accountId: string;
-    })
   | (EventBase & { kind: 'ignored' });
 
 export type ProviderEventKind = ProviderEvent['kind'];
@@ -242,32 +214,24 @@ export class ProviderError extends Error {
 export interface PaymentProvider {
   readonly name: string;
 
-  // --- the five core operations --------------------------------------------
-  /** Open a one-time bank account for one checkout. */
+  // --- the core operations -------------------------------------------------
+  /** Open a payment for one checkout (a hosted page, or a one-time account). */
   createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount>;
-  /** Submit a rep's identity (BVN + DOB). The outcome arrives later by webhook. */
+  /** Open the rep's record at the provider, once Duevy has verified them. */
   verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult>;
   /** Name enquiry. Null when the bank cannot resolve the account. */
   resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount | null>;
-  /** Send money from a rep's account to their registered bank account. */
+  /** Send money from the platform account to a bank account. */
   initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult>;
   /** Verify the signature over the raw body and normalise the event. Throws InvalidSignatureError. */
   parseWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): ProviderEvent;
 
-  // --- supporting reads/writes the core flows depend on ---------------------
+  // --- supporting reads the core flows depend on ----------------------------
   listBanks(): Promise<Bank[]>;
-  getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult>;
-  /** Attach a government ID document to the rep's person, when the provider asks for one. */
-  uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }>;
-  registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination>;
-  /**
-   * Put the rep's own bank account on their provider account, satisfying the
-   * `payout_destination` onboarding requirement. Distinct from
-   * registerPayoutDestination, which adds a place a withdrawal can be sent.
-   */
-  submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void>;
+  getIdentityStatus(accountId: string): Promise<IdentityResult>;
   getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus>;
-  getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult>;
-  /** Move Duevy's withdrawal fee (net of the provider's own payout fee) between the rep's account and the platform. */
-  settleFee(input: SettleFeeInput): Promise<{ transferId: string }>;
+  /** The payout's outcome, by our reference. */
+  getPayout(reference: string): Promise<PayoutResult>;
+  /** What the platform account actually holds — compared against the ledger. */
+  getPlatformBalance(): Promise<{ availableKobo: number }>;
 }

@@ -9,9 +9,10 @@ import { ok, fail, errors } from '../lib/response';
 import { MAX_DOCUMENT_BYTES, sniffDocumentType } from '../lib/storage';
 import {
   resubmitStudentId,
-  submitGovernmentId,
+  sendPhoneCode,
   submitKyc,
   submitPayoutDestination,
+  verifyPhoneCode,
   type UploadedDocument,
 } from '../services/kyc.service';
 import { resolveBankDetails } from '../services/beneficiary.service';
@@ -22,15 +23,19 @@ import { maskAccountNumber } from '../lib/encryption';
  * or after their space exists) and `/spaces/:spaceId/payout/kyc*`. KYC state
  * lives on the user, so both mounts act on the caller.
  *
- * multipart/form-data, submitted together:
- *   fields:  nin, dob (YYYY-MM-DD), gender, bvn? (only if Bachs asks),
- *            firstName?, lastName?, phone?
- *   files:   studentIdCard (required) — reviewed by a Duevy admin
- *            governmentId (optional)  — forwarded to Bachs if it asks for one
+ * The flow, in order (each step requires the one before):
+ *   POST …/kyc/phone/send    { phone }      — Didit texts a one-time code
+ *   POST …/kyc/phone/verify  { code }       — the number becomes the rep's verified phone
+ *   POST …/kyc               multipart/form-data:
+ *     fields:  bvn, dob (YYYY-MM-DD), gender, address, consent=true,
+ *              firstName?, lastName? (the names on the BVN, if not the profile's)
+ *     files:   studentIdCard (required) — reviewed by a Duevy admin
+ *   Didit matches the BVN to the name and date of birth; only then is the rep
+ *   registered with Kredi.
  *
- * The NIN, BVN and date of birth go to Bachs and are never stored or logged;
- * validation errors never echo them. Images/PDFs only, 5 MB each, checked by
- * their actual bytes rather than the client's Content-Type.
+ * The BVN, date of birth and code are never stored or logged; validation
+ * errors never echo them. Images/PDFs only, 5 MB, checked by their actual
+ * bytes rather than the client's Content-Type.
  */
 
 function uid(req: Request): string {
@@ -39,7 +44,7 @@ function uid(req: Request): string {
 
 const kycUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_DOCUMENT_BYTES, files: 2, fields: 10 },
+  limits: { fileSize: MAX_DOCUMENT_BYTES, files: 1, fields: 10 },
 });
 
 function kycFiles(fields: { name: string; maxCount: number }[]): RequestHandler {
@@ -71,11 +76,7 @@ function readDocument(req: Request, field: string): UploadedDocument | null | 'i
 
 const kycSchema = z
   .object({
-    nin: z.string().regex(/^\d{11}$/, 'must be an 11-digit NIN'),
-    bvn: z
-      .string()
-      .regex(/^\d{11}$/, 'must be an 11-digit BVN')
-      .optional(),
+    bvn: z.string().regex(/^\d{11}$/, 'must be an 11-digit BVN'),
     dob: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD')
@@ -85,12 +86,10 @@ const kycSchema = z
         return !Number.isNaN(d.getTime()) && age >= 15 && age <= 100;
       }, 'must be a real date of birth'),
     gender: z.enum(['male', 'female']),
+    address: z.string().trim().min(5, 'enter your residential address').max(200),
+    consent: z.literal(true, { errorMap: () => ({ message: 'you must agree to the BVN check' }) }),
     firstName: z.string().trim().min(1).max(60).optional(),
     lastName: z.string().trim().min(1).max(60).optional(),
-    phone: z
-      .string()
-      .regex(/^\+[1-9]\d{6,14}$/, 'must be an international number in E.164 form, e.g. +2348012345678')
-      .optional(),
   })
   .strict();
 
@@ -103,17 +102,38 @@ function normaliseKycBody(body: Record<string, unknown>): Record<string, unknown
   }
   if (out.dateOfBirth && !out.dob) out.dob = out.dateOfBirth;
   if (typeof out.gender === 'string') out.gender = out.gender.toLowerCase();
+  if (out.consent === 'true') out.consent = true;
   delete out.dateOfBirth;
   return out;
 }
 
-/** POST …/kyc — NIN + date of birth to Bachs, student ID card for admin review. */
+const sendCodeSchema = z.object({ phone: z.string().trim().min(10).max(16) }).strict();
+const verifyCodeSchema = z.object({ code: z.string().regex(/^\d{4,8}$/, 'must be the digits from the text message') }).strict();
+
+/** POST …/kyc/phone/send — text a one-time code to the rep's mobile number. */
+export const sendPhoneCodeHandlers: RequestHandler[] = [
+  sensitiveLimiter,
+  validate(sendCodeSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { phone } = req.body as z.infer<typeof sendCodeSchema>;
+    ok(res, await sendPhoneCode(uid(req), phone, { ip: req.ip, userAgent: req.get('user-agent') ?? undefined }));
+  },
+];
+
+/** POST …/kyc/phone/verify — the code from the text message. */
+export const verifyPhoneCodeHandlers: RequestHandler[] = [
+  sensitiveLimiter,
+  validate(verifyCodeSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const { code } = req.body as z.infer<typeof verifyCodeSchema>;
+    ok(res, await verifyPhoneCode(uid(req), code));
+  },
+];
+
+/** POST …/kyc — BVN (checked by Didit, then registered at Kredi) and the student ID card for admin review. */
 export const submitKycHandlers: RequestHandler[] = [
   sensitiveLimiter,
-  kycFiles([
-    { name: 'studentIdCard', maxCount: 1 },
-    { name: 'governmentId', maxCount: 1 },
-  ]),
+  kycFiles([{ name: 'studentIdCard', maxCount: 1 }]),
   (req, _res, next) => {
     req.body = normaliseKycBody((req.body ?? {}) as Record<string, unknown>);
     next();
@@ -121,23 +141,16 @@ export const submitKycHandlers: RequestHandler[] = [
   validate(kycSchema),
   async (req: Request, res: Response): Promise<void> => {
     const studentId = readDocument(req, 'studentIdCard');
-    const governmentId = readDocument(req, 'governmentId');
     if (!studentId) {
       errors.validation(res, [{ field: 'studentIdCard', issue: 'a photo or scan of your student ID card is required' }]);
       return;
     }
-    if (studentId === 'invalid' || governmentId === 'invalid') {
-      errors.validation(res, [
-        { field: studentId === 'invalid' ? 'studentIdCard' : 'governmentId', issue: 'must be a JPEG, PNG, WebP or PDF file' },
-      ]);
+    if (studentId === 'invalid') {
+      errors.validation(res, [{ field: 'studentIdCard', issue: 'must be a JPEG, PNG, WebP or PDF file' }]);
       return;
     }
-    const state = await submitKyc(uid(req), {
-      ...(req.body as z.infer<typeof kycSchema>),
-      studentId,
-      governmentId: governmentId ?? undefined,
-    });
-    // 202: submitted; the Bachs verdict arrives by webhook and an admin reviews the student ID.
+    const state = await submitKyc(uid(req), { ...(req.body as z.infer<typeof kycSchema>), studentId });
+    // 202: identity is verified; an admin still reviews the student ID and the application.
     ok(res, state, 202);
   },
 ];
@@ -153,20 +166,6 @@ export const resubmitStudentIdHandlers: RequestHandler[] = [
       return;
     }
     ok(res, await resubmitStudentId(uid(req), doc), 202);
-  },
-];
-
-/** POST …/kyc/government-id — send Bachs an ID document when it asks for one (see `requirementsDue`). */
-export const governmentIdHandlers: RequestHandler[] = [
-  sensitiveLimiter,
-  kycFiles([{ name: 'governmentId', maxCount: 1 }]),
-  async (req: Request, res: Response): Promise<void> => {
-    const doc = readDocument(req, 'governmentId');
-    if (!doc || doc === 'invalid') {
-      errors.validation(res, [{ field: 'governmentId', issue: 'a JPEG, PNG, WebP or PDF of a government ID is required' }]);
-      return;
-    }
-    ok(res, await submitGovernmentId(uid(req), doc), 202);
   },
 ];
 
@@ -193,10 +192,7 @@ export const payoutDestinationLookupHandlers: RequestHandler[] = [
   },
 ];
 
-/**
- * POST …/kyc/payout-destination — the rep's own bank account, when Bachs asks
- * for one (`payout_destination` in `requirementsDue`) to finish onboarding.
- */
+/** POST …/kyc/payout-destination — save the rep's own bank account (name-checked). */
 export const payoutDestinationHandlers: RequestHandler[] = [
   sensitiveLimiter,
   validate(payoutDestinationSchema),

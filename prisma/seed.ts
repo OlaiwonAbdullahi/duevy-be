@@ -5,8 +5,8 @@
  * With PAYMENT_PROVIDER=fake the rep is also KYC-verified (against fake
  * provider ids) with a payout account, and the student has one paid checkout,
  * created through the real checkout service, so the ledger, receipt and rep
- * dashboard all have data. With PAYMENT_PROVIDER=bachs the rep is left
- * unverified: KYC must be done for real against the Bachs sandbox.
+ * dashboard all have data. With PAYMENT_PROVIDER=kredi the rep is left
+ * unverified: KYC must be done for real (Didit + the Kredi sandbox).
  *
  * Idempotent: safe to re-run. Refuses to run with NODE_ENV=production.
  *
@@ -70,9 +70,12 @@ async function main() {
       ...(fake
         ? {
             kycStatus: 'verified' as const,
-            bachsAccountId: 'acct_fake_seed_rep',
-            bachsPersonId: 'per_fake_seed_rep',
-            bachsPayoutsActive: true,
+            providerAccountId: 'cus_fake_seed_rep',
+            providerAccountNumber: '9900000001',
+            payoutsActive: true,
+            verifiedPhone: '+2348012345678',
+            phoneVerifiedAt: now,
+            bvnVerifiedAt: now,
             studentIdStatus: 'approved' as const,
             studentIdUploadedAt: now,
             studentIdReviewedAt: now,
@@ -122,8 +125,6 @@ async function main() {
           accountNumber: encrypt(accountNumber),
           accountNumberMasked: maskAccountNumber(accountNumber),
           accountName: 'OKAFOR TUNDE',
-          bachsDestinationId: 'pd_fake_seed_rep',
-          bachsAccountId: 'acct_fake_seed_rep',
           createdById: rep.id,
         },
       });
@@ -193,7 +194,7 @@ async function main() {
   const balance = await getSpaceBalance(space.id);
   console.log('Seeded.\n');
   console.log(`  super admin  admin@duevy.test / ${PASSWORD}`);
-  console.log(`  rep          rep@duevy.test / ${PASSWORD}   (KYC: ${fake ? 'verified (fake provider)' : 'not verified — run KYC against the Bachs sandbox'})`);
+  console.log(`  rep          rep@duevy.test / ${PASSWORD}   (KYC: ${fake ? 'verified (fake provider)' : 'not verified — run KYC against Didit and the Kredi sandbox'})`);
   console.log(`  student      student@duevy.test / ${PASSWORD}`);
   console.log(`  space        ${space.name} — join code ${space.joinCode}`);
   console.log(`  paid example ${paidNote}`);

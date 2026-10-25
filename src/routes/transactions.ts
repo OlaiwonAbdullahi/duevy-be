@@ -111,7 +111,7 @@ transactionsRouter.get('/:transactionId/receipt', async (req: Request, res: Resp
     return;
   }
 
-  // Legacy (pre-Bachs) transactions.
+  // Legacy (pre-checkout) transactions.
   const dp = txn.duePayment;
   const pdf = await renderReceiptPdf({
     reference: txn.reference,
@@ -180,7 +180,7 @@ async function paymentStatus(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  // Legacy (pre-Bachs) pending payments: report what we recorded.
+  // Legacy (pre-checkout) pending payments: report what we recorded.
   const pending = await db.pendingPayment.findUnique({ where: { reference } });
   if (!pending || pending.userId !== id) {
     errors.notFound(res, 'Payment not found');

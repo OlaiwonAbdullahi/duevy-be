@@ -45,8 +45,11 @@ function clearRefreshCookie(res: Response) {
 function toSessionUser<T extends Partial<User>>(user: T) {
   const {
     passwordHash: _ph,
-    bachsAccountId: _ba,
-    bachsPersonId: _bp,
+    providerAccountId: _ba,
+    providerAccountNumber: _pn,
+    bvnHash: _bh,
+    diditBvnRequestId: _dr,
+    pendingPhone: _pp,
     anchorCustomerId: _ac,
     studentIdFileId: _sf,
     studentIdFilePath: _sp,

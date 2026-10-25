@@ -144,15 +144,18 @@ describe('discounted withdrawals', () => {
     await db.partner.update({ where: { id: p.id }, data: { withdrawalFeeDiscountPercent: 10, isActive: false } });
 
     const quote = await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token });
-    expect(quote.body.data).toMatchObject({ amount: 2_000_000, feeBeforeDiscount: 10_000, discount: 5_000, discountPercent: 50, fee: 5_000, net: 1_995_000 });
+    expect(quote.body.data).toMatchObject({ amount: 2_000_000, feeBeforeDiscount: 12_000, discount: 6_000, discountPercent: 50, fee: 6_000, net: 1_994_000 });
 
     const summary = await api('GET', `/v1/spaces/${space.id}/payout/summary`, { token });
-    expect(summary.body.data.fees.below.feeKobo).toBe(5_000);
-    expect(summary.body.data.fees.atOrAbove.feeKobo).toBe(10_000);
+    expect(summary.body.data.fees.tiers).toEqual([
+      { fromKobo: 0, toKobo: 999_999, feeKobo: 2_500 },
+      { fromKobo: 1_000_000, toKobo: 5_000_000, feeKobo: 6_000 },
+      { fromKobo: 5_000_001, toKobo: null, feeKobo: 10_000 },
+    ]);
     expect(summary.body.data.partner).toMatchObject({ discountPercent: 50, active: true });
 
     const payout = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
-    expect(payout).toMatchObject({ feeKobo: 5_000, netKobo: 1_995_000, feeDiscountKobo: 5_000 });
+    expect(payout).toMatchObject({ feeKobo: 6_000, netKobo: 1_994_000, feeDiscountKobo: 6_000 });
     expect(payout.partnerRedemptionId).not.toBeNull();
   });
 
@@ -163,7 +166,7 @@ describe('discounted withdrawals', () => {
     await api('POST', `/v1/spaces/${space.id}/partner`, { token: await tokenFor(rep), body: { code: p.code } });
 
     const payout = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
-    expect(payout).toMatchObject({ feeKobo: 0, netKobo: 2_000_000, feeDiscountKobo: 10_000 });
+    expect(payout).toMatchObject({ feeKobo: 0, netKobo: 2_000_000, feeDiscountKobo: 12_000 });
     expect(await db.ledgerEntry.count({ where: { payoutId: payout.id, type: 'payout_fee' } })).toBe(0);
     expect((await getSpaceLedgerSummary(space.id)).balance).toBe(1_000_000);
   });
@@ -175,13 +178,13 @@ describe('discounted withdrawals', () => {
     const applied = await api('POST', `/v1/spaces/${space.id}/partner`, { token, body: { code: p.code } });
 
     await db.partnerRedemption.update({ where: { id: applied.body.data.id }, data: { endsAt: new Date(Date.now() - 1000) } });
-    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 10_000, discount: 0 });
+    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 12_000, discount: 0 });
     expect((await api('GET', `/v1/spaces/${space.id}/partner`, { token })).body.data.active).toBe(false);
 
     await db.partnerRedemption.update({ where: { id: applied.body.data.id }, data: { endsAt: null } });
     const revoked = await api('POST', `/v1/admin/partner-redemptions/${applied.body.data.id}/revoke`, { token: await adminToken() });
     expect(revoked.body.data.revokedAt).not.toBeNull();
-    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 10_000, discount: 0 });
+    expect((await api('GET', `/v1/spaces/${space.id}/payout/quote?amount=2000000`, { token })).body.data).toMatchObject({ fee: 12_000, discount: 0 });
     expect((await api('GET', `/v1/spaces/${space.id}/partner`, { token })).body.data).toBeNull();
   });
 });

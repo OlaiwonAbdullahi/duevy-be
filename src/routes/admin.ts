@@ -9,8 +9,9 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFeedback, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
-import { computeCharge, generateReference } from '../lib/money';
-import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
+import { computeCharge, generateReference, KREDI_INWARD_COST_KOBO } from '../lib/money';
+import { appendLedgerEntry, getTotalLedgerBalance, lockSpace } from '../services/ledger.service';
+import { getPaymentProvider } from '../providers/payment';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
@@ -19,7 +20,6 @@ import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getPaymentSettings, setCheckoutMode } from '../services/settings.service';
 import { redeemForSpace } from '../services/partner.service';
 import { AppError } from '../lib/errors';
 import { adminPartnersRouter } from './partners';
@@ -170,13 +170,13 @@ adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req
   const payoutStale = new Date(now - 60 * 60 * 1000);
   const checkoutStale = new Date(now - 30 * 60 * 1000);
 
-  const [deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, unsettledFees, pendingStudentIds, samples] = await Promise.all([
+  const [deadWebhooks, retryingWebhooks, stuckPayouts, checkoutsNeedingReview, unresolvedCheckouts, liquidity, pendingStudentIds, samples] = await Promise.all([
     db.webhookEvent.count({ where: { status: 'dead', provider: { not: 'anchor' } } }),
     db.webhookEvent.count({ where: { status: 'failed' } }),
     db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: payoutStale } } }),
     db.checkout.count({ where: { needsReview: true } }),
     db.checkout.count({ where: { status: 'pending', expiresAt: { lte: checkoutStale } } }),
-    db.payout.count({ where: { status: 'success', feeSettledAt: null, settledAt: { lte: payoutStale } } }),
+    liquidityCheck(),
     db.user.count({ where: { studentIdStatus: 'pending' } }),
     db.webhookEvent.findMany({
       where: { status: { in: ['dead', 'failed'] }, provider: { not: 'anchor' } },
@@ -192,9 +192,10 @@ adminRouter.get('/health', requireAdminPermission('userManagement'), async (_req
     stuckPayouts,
     checkoutsNeedingReview,
     unresolvedCheckouts,
-    unsettledWithdrawalFees: unsettledFees,
+    liquidity,
     pendingStudentIds,
-    healthy: deadWebhooks === 0 && stuckPayouts === 0 && checkoutsNeedingReview === 0 && unresolvedCheckouts === 0,
+    healthy:
+      deadWebhooks === 0 && stuckPayouts === 0 && checkoutsNeedingReview === 0 && unresolvedCheckouts === 0 && !(liquidity.shortfallKobo > 0),
     recentWebhookFailures: samples.map((e) => ({
       eventId: e.providerEventId,
       type: e.type,
@@ -296,9 +297,32 @@ adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Reque
 });
 
 /**
+ * Pooled money check: what the ledgers say every space is owed against what
+ * the Kredi merchant account actually holds (which also carries Duevy's own
+ * fees, so it should be the larger). A shortfall means withdrawals will fail.
+ */
+let liquidityCache: { at: number; value: Awaited<ReturnType<typeof readLiquidity>> } | null = null;
+async function readLiquidity() {
+  const ledgerKobo = await getTotalLedgerBalance();
+  try {
+    const { availableKobo } = await getPaymentProvider().getPlatformBalance();
+    return { ledgerKobo, merchantKobo: availableKobo, shortfallKobo: Math.max(0, ledgerKobo - availableKobo), error: null as string | null };
+  } catch (err) {
+    return { ledgerKobo, merchantKobo: null, shortfallKobo: 0, error: (err as Error).message };
+  }
+}
+async function liquidityCheck() {
+  if (liquidityCache && Date.now() - liquidityCache.at < 60_000) return liquidityCache.value;
+  const value = await readLiquidity();
+  liquidityCache = { at: Date.now(), value };
+  return value;
+}
+
+/**
  * Duevy's revenue and payment counts, all-time and for the last 30 days.
- *  revenue      = service fees on paid checkouts + the withdrawal fees kept
- *                 (feeSettlementKobo: Duevy's fee minus Bachs's payout fee)
+ *  revenue      = service fees on paid checkouts, less Kredi's ₦20 per payment,
+ *                 + what withdrawal fees earned (feeMarginKobo: Duevy's fee
+ *                 minus Kredi's transfer cost)
  *  transactions = paid student checkouts; volume is what students paid
  */
 async function platformMetrics() {
@@ -311,8 +335,8 @@ async function platformMetrics() {
     });
   const keptWithdrawalFees = (from?: Date) =>
     db.payout.aggregate({
-      where: { status: 'success', feeSettledAt: from ? { gte: from } : { not: null } },
-      _sum: { feeSettlementKobo: true },
+      where: { status: 'success', ...(from ? { settledAt: { gte: from } } : {}) },
+      _sum: { feeMarginKobo: true },
     });
   const [all, recent, wdAll, wdRecent, payouts] = await Promise.all([
     paidCheckouts(),
@@ -321,14 +345,15 @@ async function platformMetrics() {
     keptWithdrawalFees(since),
     db.payout.count({ where: { status: 'success' } }),
   ]);
-  const checkoutFees = all._sum.feeKobo ?? 0;
-  const withdrawalFees = wdAll._sum.feeSettlementKobo ?? 0;
+  const netOfInward = (agg: typeof all) => (agg._sum.feeKobo ?? 0) - agg._count._all * KREDI_INWARD_COST_KOBO;
+  const checkoutFees = netOfInward(all);
+  const withdrawalFees = wdAll._sum.feeMarginKobo ?? 0;
   return {
     revenue: {
       total: checkoutFees + withdrawalFees,
       checkoutFees,
       withdrawalFees,
-      last30Days: (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0),
+      last30Days: netOfInward(recent) + (wdRecent._sum.feeMarginKobo ?? 0),
     },
     transactions: {
       count: all._count._all,
@@ -527,8 +552,9 @@ adminRouter.post('/users/:userId/deactivate', requireAdminPermission('userManage
   res.status(204).end();
 });
 
-// Identity is Bachs's decision: an admin may revoke a rep's verification
-// (block them) but can never mark someone verified.
+// Identity is decided by the phone and BVN checks (Didit) and the Kredi
+// registration: an admin may revoke a rep's verification (block them) but can
+// never mark someone verified.
 const kycSchema = z.object({ decision: z.literal('rejected'), note: z.string().max(500).optional() });
 
 adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManagement'), validate(kycSchema), async (req: Request, res: Response): Promise<void> => {
@@ -545,7 +571,7 @@ adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManage
 
 
 // ---------------------------------------------------------------------------
-// Rep student ID review. Bachs verifies identity (NIN); Duevy verifies the rep
+// Rep student ID review. Didit verifies identity (phone, BVN); Duevy verifies the rep
 // is a student. A space can only collect once its lead rep's student ID is
 // approved here. View links are signed and expire after a few minutes.
 // ---------------------------------------------------------------------------
@@ -580,7 +606,7 @@ adminRouter.post(
 /**
  * One rep directory row: status and money, plus everything the rep gave us —
  * sign-up details, the space they applied with, and KYC/payout state.
- * Sensitive identity numbers (NIN, BVN, DOB) are never stored, so never shown.
+ * Sensitive identity numbers (BVN, DOB) are never stored, so never shown.
  */
 async function buildAdminReps(users: User[]) {
   const userIds = users.map((u) => u.id);
@@ -632,7 +658,10 @@ function serializeAdminRep(
     kyc: {
       status: user.kycStatus,
       studentIdStatus: user.studentIdStatus,
-      payoutsActive: user.bachsPayoutsActive,
+      payoutsActive: user.payoutsActive,
+      phoneVerifiedAt: user.phoneVerifiedAt?.toISOString() ?? null,
+      bvnVerifiedAt: user.bvnVerifiedAt?.toISOString() ?? null,
+      diditBvnRequestId: user.diditBvnRequestId,
       submittedAt: user.kycSubmittedAt?.toISOString() ?? null,
       payoutAccount: user.payoutDestinationAccountMasked
         ? { bankName: user.payoutDestinationBankName, accountMasked: user.payoutDestinationAccountMasked, accountName: user.payoutDestinationAccountName }
@@ -685,8 +714,12 @@ const applicantSelect = {
   gender: true,
   kycStatus: true,
   kycRejectionReason: true,
-  kycRequirementsDue: true,
   kycSubmittedAt: true,
+  verifiedPhone: true,
+  phoneVerifiedAt: true,
+  bvnVerifiedAt: true,
+  diditBvnRequestId: true,
+  providerAccountId: true,
   kycResolvedAt: true,
   studentIdStatus: true,
   studentIdFilePath: true,
@@ -704,7 +737,7 @@ function serializeRepApplication(app: RepApplication, user?: Applicant) {
     applicant: user
       ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level, phone: user.phone, gender: user.gender }
       : null,
-    // NIN verification (Bachs) and the student ID card, so the admin can give final approval.
+    // Phone and BVN verification (Didit), the Kredi registration and the student ID card, so the admin can give final approval.
     kyc: user ? adminKycSummary(user) : null,
     status: app.status,
     requestedSpace: {
@@ -777,10 +810,11 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
     return;
   }
-  // Final approval comes after KYC: Bachs must have verified the NIN, and the
-  // student ID card must be on file (approving the application approves it).
+  // Final approval comes after KYC: the phone and BVN must be verified (and the
+  // rep registered at Kredi), and the student ID card must be on file
+  // (approving the application approves it).
   if (user.kycStatus !== 'verified') {
-    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
+    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's phone and BVN verification hasn't passed yet");
     return;
   }
   if (user.studentIdStatus !== 'pending' && user.studentIdStatus !== 'approved') {
@@ -1679,30 +1713,6 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
   );
   await writeAdminAudit(req, 'roles.update', { target: role, severity: 'critical', metadata: perms });
   ok(res, { role, permissions: perms });
-});
-
-// ===========================================================================
-// Payment settings — how students pay (hosted redirect vs. custom bank account)
-// ===========================================================================
-adminRouter.get('/settings/payments', async (_req: Request, res: Response): Promise<void> => {
-  ok(res, await getPaymentSettings());
-});
-
-const paymentSettingsSchema = z.object({ checkoutMode: z.enum(['hosted', 'custom']) });
-
-adminRouter.put('/settings/payments', requireSuperAdmin(), validate(paymentSettingsSchema), async (req: Request, res: Response): Promise<void> => {
-  const { checkoutMode } = req.body as z.infer<typeof paymentSettingsSchema>;
-  const before = await getPaymentSettings();
-  const adminId = (req as AuthenticatedRequest).user.sub as string;
-  const settings = await setCheckoutMode(checkoutMode, adminId);
-  if (before.checkoutMode !== checkoutMode) {
-    await writeAdminAudit(req, 'settings.checkout_mode', {
-      target: 'checkout_mode',
-      severity: 'warning',
-      metadata: { from: before.checkoutMode, to: checkoutMode },
-    });
-  }
-  ok(res, settings);
 });
 
 // ===========================================================================

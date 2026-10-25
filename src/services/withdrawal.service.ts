@@ -3,7 +3,8 @@ import bcrypt from 'bcryptjs';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
-import { computeWithdrawal, generatePayoutReference, MIN_PAYOUT_KOBO } from '../lib/money';
+import { computeWithdrawal, generatePayoutReference, krediPayoutCostKobo, MIN_PAYOUT_KOBO } from '../lib/money';
+import { decrypt, encrypt } from '../lib/encryption';
 import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
@@ -18,11 +19,13 @@ import { getActiveDiscount } from './partner.service';
  * Withdrawals: a space's lead rep moves the space's balance to one of its
  * beneficiaries — any bank account the space has added. A co-rep can withdraw
  * a due's collections when the lead has assigned that due to them. Either way
- * the money leaves the LEAD rep's provider account, where collections settle.
+ * the money leaves Duevy's Kredi merchant account, where every collection
+ * pools; the space's ledger is what entitles it to that much.
  *
  *   gross = what the rep asks for, debited from the space's ledger
- *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross,
- *           less the space's partner discount if it has one (partner.service)
+ *   fee   = ₦50 (< ₦10,000), ₦120 (₦10,000–₦50,000) or ₦200 (> ₦50,000),
+ *           deducted from the gross, less the space's partner discount if it
+ *           has one (partner.service). It stays in the merchant account.
  *   net   = gross − fee, sent to the bank
  *
  * Safety, in order:
@@ -41,7 +44,7 @@ import { getActiveDiscount } from './partner.service';
  *     same space is impossible even if the lock were bypassed.
  *  4. The ledger is debited when the withdrawal is CREATED. A failure or
  *     reversal credits the full gross back (payout_reversal).
- *  5. The provider call uses our reference as its idempotency key.
+ *  5. The provider call carries our reference, which Kredi never accepts twice.
  *
  * Status: [awaiting_approval →] pending → processing → success | failed | reversed;
  *         awaiting_approval → cancelled.
@@ -262,17 +265,16 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   if (user.kycStatus !== 'verified') {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
-  // Collections settle into the lead rep's account, so that is what pays out.
+  // The lead rep is accountable for the space's money: they must be verified.
   if (!lead || !canWithdraw(lead.user)) {
     throw forbidden(
       rep.role === 'lead' ? 'Complete identity verification before withdrawing' : "The lead rep's account can't make withdrawals yet",
       rep.role === 'lead' ? 'KYC_NOT_VERIFIED' : 'LEAD_KYC_NOT_VERIFIED',
     );
   }
-  const accountId = lead.user.bachsAccountId!;
-  // canWithdraw guarantees a Bachs account. The destination is fixed on the
-  // payout now so a later change to the beneficiary can't redirect it.
-  const target = await resolveTarget(req, accountId);
+  // The destination is fixed on the payout now so a later change to the
+  // beneficiary can't redirect it.
+  const target = await resolveTarget(req);
   const needsApproval = space.withdrawalAuthMode === 'multisig';
 
   const reference = await uniquePayoutReference();
@@ -317,11 +319,11 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             accountMasked: `${target.bankName} ${target.accountNumberMasked}`,
             accountName: target.accountName,
             beneficiaryId: target.beneficiaryId,
-            destinationId: target.destinationId,
+            destinationBankCode: target.bankCode,
+            destinationAccount: encrypt(target.accountNumber),
             note: req.note,
             requestedById: userId,
             provider: getPaymentProvider().name,
-            providerAccountId: accountId,
           },
         });
         await debit(tx, created);
@@ -347,7 +349,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
 }
 
-async function resolveTarget(req: WithdrawalRequest, accountId: string) {
+async function resolveTarget(req: WithdrawalRequest) {
   if (req.beneficiaryId) {
     const b = await db.payoutBeneficiary.findFirst({ where: { id: req.beneficiaryId, spaceId: req.spaceId } });
     if (!b) throw new AppError(404, 'BENEFICIARY_NOT_FOUND', 'That beneficiary no longer exists');
@@ -355,12 +357,11 @@ async function resolveTarget(req: WithdrawalRequest, accountId: string) {
       beneficiaryId: b.id,
       bankName: b.bankName,
       accountNumberMasked: b.accountNumberMasked,
-      accountName: b.accountName,
-      destinationId: await destinationFor(b, accountId),
+      ...destinationFor(b),
     };
   }
   if (req.account) {
-    return { beneficiaryId: null, ...(await oneOffDestination(accountId, req.account.bankCode, req.account.accountNumber)) };
+    return { beneficiaryId: null, ...(await oneOffDestination(req.account.bankCode, req.account.accountNumber)) };
   }
   throw new AppError(400, 'VALIDATION_ERROR', 'Choose a beneficiary or enter an account for this withdrawal');
 }
@@ -400,21 +401,25 @@ export async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
 
 /**
  * Send a pending withdrawal to the provider. Safe to call repeatedly (the
- * reconciliation job does, for anything stuck in `pending`): the provider call
- * is idempotent on our reference, and the state change is guarded.
+ * reconciliation job does, for anything stuck in `pending`): Kredi refuses a
+ * reused reference and the provider then reports the first attempt's outcome,
+ * and the state change is guarded.
  */
 export async function dispatchPayout(payoutId: string): Promise<void> {
   const payout = await db.payout.findUnique({ where: { id: payoutId } });
   if (!payout || payout.status !== 'pending') return;
-  if (!payout.providerAccountId || !payout.destinationId) {
+  if (!payout.destinationBankCode || !payout.destinationAccount || !payout.accountName) {
     await failPayout(payout.id, 'No payout destination on this withdrawal');
     return;
   }
 
   try {
     const result = await getPaymentProvider().initiatePayout({
-      accountId: payout.providerAccountId,
-      destinationId: payout.destinationId,
+      destination: {
+        bankCode: payout.destinationBankCode,
+        accountNumber: decrypt(payout.destinationAccount),
+        accountName: payout.accountName,
+      },
       amountKobo: payout.netKobo,
       reference: payout.reference,
     });
@@ -439,20 +444,25 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
     if (err instanceof ProviderError && !err.retryable) {
       const reason =
         err.code === 'INSUFFICIENT_BALANCE'
-          ? 'Recent payments are still settling. Try again later.'
-          : err.code === 'DESTINATION_PENDING_REVIEW'
-            ? 'This beneficiary account is still being reviewed.'
-            : err.message;
+          ? 'Withdrawals are briefly unavailable. Try again later.'
+          : err.code === 'ACCOUNT_CHANGED'
+            ? 'The bank now shows a different holder for this account. Check the beneficiary and add it again.'
+            : err.code === 'ACCOUNT_UNVERIFIABLE'
+              ? 'The bank could not verify this account. Check the beneficiary.'
+              : err.message;
+      // The pooled merchant account ran short: the ledger says the money is
+      // owed, so this is ours to fix, not the rep's.
+      if (err.code === 'INSUFFICIENT_BALANCE') logger.error({ ref: payout.reference }, 'merchant account cannot cover a withdrawal — top up Kredi');
       await failPayout(payout.id, reason, err.code ?? undefined);
       return;
     }
     // Timeout / 5xx: the payout may exist. Leave it pending; reconciliation
-    // retries with the same idempotency key, which replays instead of paying twice.
+    // retries with the same reference, which Kredi won't pay twice.
     logger.warn({ ref: payout.reference, err: (err as Error).message }, 'withdrawal dispatch deferred');
   }
 }
 
-/** payout.paid — idempotent. */
+/** payout succeeded — idempotent. Records what the fee earned net of Kredi's own transfer cost. */
 export async function completePayout(reference: string, providerFeeKobo?: number | null): Promise<boolean> {
   const done = await db.$transaction(async (tx) => {
     const found = await tx.payout.findUnique({ where: { reference }, select: { id: true } });
@@ -463,20 +473,21 @@ export async function completePayout(reference: string, providerFeeKobo?: number
       logger.error({ ref: reference, status: p.status }, 'success reported for a withdrawal already closed');
       return null;
     }
+    const cost = providerFeeKobo ?? p.providerFeeKobo ?? krediPayoutCostKobo(p.netKobo);
     return tx.payout.update({
       where: { id: p.id },
       data: {
         status: 'success',
         settledAt: new Date(),
         activeSpaceId: null,
-        ...(providerFeeKobo !== undefined && providerFeeKobo !== null ? { providerFeeKobo } : {}),
+        providerFeeKobo: cost,
+        feeMarginKobo: p.feeKobo - cost,
       },
     });
   });
   if (!done) return false;
 
   logger.info({ ref: reference }, 'withdrawal succeeded');
-  await settleWithdrawalFee(done.id).catch((err) => logger.warn({ ref: reference, err: (err as Error).message }, 'fee settlement deferred'));
   await notifyReps(done, 'success');
   return true;
 }
@@ -511,13 +522,6 @@ export async function failPayout(payoutId: string, reason: string, code?: string
   if (!done) return false;
 
   logger.warn({ ref: done.reference, status: done.status, reason, code }, 'withdrawal failed — balance restored');
-  // A reversed withdrawal whose fee had already been swept: give the fee back
-  // to the rep's provider account, since the ledger restored it to the space.
-  if (done.status === 'reversed' && done.feeSettledAt && done.feeSettlementKobo && done.providerAccountId) {
-    await getPaymentProvider()
-      .settleFee({ accountId: done.providerAccountId, amountKobo: -done.feeSettlementKobo, reference: `${done.reference}-REV` })
-      .catch((err) => logger.error({ ref: done.reference, err: (err as Error).message }, 'fee refund on reversal failed — reconcile by hand'));
-  }
   await notifyReps(done, 'failed');
   return true;
 }
@@ -563,27 +567,11 @@ export async function cancelPayout(payoutId: string, reason: string): Promise<Pa
   return done;
 }
 
-/**
- * After a successful withdrawal the rep's provider account has been debited
- * net + the provider's own payout fee; the ledger debited net + Duevy's fee.
- * Moving (Duevy fee − provider fee) to the platform makes the two agree.
- */
-export async function settleWithdrawalFee(payoutId: string): Promise<void> {
-  const p = await db.payout.findUnique({ where: { id: payoutId } });
-  if (!p || p.status !== 'success' || p.feeSettledAt || !p.providerAccountId) return;
-  const amount = p.feeKobo - (p.providerFeeKobo ?? 0);
-  if (amount !== 0) {
-    await getPaymentProvider().settleFee({ accountId: p.providerAccountId, amountKobo: amount, reference: p.reference });
-  }
-  await db.payout.update({ where: { id: p.id }, data: { feeSettledAt: new Date(), feeSettlementKobo: amount } });
-  logger.info({ ref: p.reference, amount }, 'withdrawal fee settled');
-}
-
 /** Reconciliation: resolve a processing withdrawal from the provider's own record. */
 export async function refreshPayout(payoutId: string): Promise<void> {
   const p = await db.payout.findUnique({ where: { id: payoutId } });
-  if (!p || p.status !== 'processing' || !p.providerPayoutId || !p.providerAccountId) return;
-  const result = await getPaymentProvider().getPayout(p.providerAccountId, p.providerPayoutId);
+  if (!p || p.status !== 'processing') return;
+  const result = await getPaymentProvider().getPayout(p.reference);
   if (result.state === 'succeeded') await completePayout(p.reference, result.providerFeeKobo);
   else if (result.state === 'failed') await failPayout(p.id, result.failureReason ?? 'The bank could not complete the transfer');
 }

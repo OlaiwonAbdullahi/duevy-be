@@ -194,7 +194,7 @@ enum NotificationTone {
   rose
 }
 
-// Duevy's own review of a document Bachs doesn't check (the rep's student ID).
+// Duevy's own review of a document no provider checks (the rep's student ID).
 enum DocumentReviewStatus {
   pending
   approved
@@ -361,41 +361,47 @@ model User {
   level                          String?
   notificationPrefs              Json? // §3.4 — email/push toggles; null = defaults
   referralCode                   String?               @unique
-  // Rep identity on Bachs Connect. Each rep is a recipient Connect account
-  // (bachsAccountId) whose representative person (bachsPersonId — the
-  // provider reference for KYC) carries the rep's NIN (and a BVN only if Bachs
-  // later asks for one). Collections settle into this account as destination
-  // charges and withdrawals are paid out of it.
+  // Rep identity, in three gates (src/services/kyc.service.ts):
+  //  1. Phone: a one-time code via Didit proves the rep holds `verifiedPhone`.
+  //  2. BVN: Didit matches the BVN to the rep's name and date of birth.
+  //  3. Kredi: the rep is registered as a Kredi customer (providerAccountId).
+  // Then an admin approves the student ID and the rep application.
   //
-  // THE NIN, BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to
-  // Bachs in the KYC request and nowhere else; only the outcome is stored.
-  bachsAccountId                 String?               @unique
-  bachsPersonId                  String?
-  // Bachs reports these separately: the person's verification, and whether the
-  // account may pay out. A rep can collect only when both are true.
+  // THE BVN AND DATE OF BIRTH ARE NEVER PERSISTED. Only `bvnHash` — a keyed
+  // one-way fingerprint that stops one BVN backing two reps — is kept.
+  verifiedPhone                  String?               @unique // E.164; set only once the OTP passes
+  phoneVerifiedAt                DateTime?
+  pendingPhone                   String? // the number a code was last sent to
+  phoneOtpSentAt                 DateTime?
+  phoneOtpSendCount              Int                   @default(0) // sends in the current hour window
+  phoneOtpWindowStartedAt        DateTime?
+  bvnHash                        String?               @unique
+  bvnVerifiedAt                  DateTime?
+  diditBvnRequestId              String? // open the check in the Didit console
+  kycConsentAt                   DateTime? // NDPR consent to the BVN check
+  // The rep's Kredi customer record and its account number. No money is
+  // routed through it: collections pool in Duevy's merchant account.
+  providerAccountId              String?               @unique
+  providerAccountNumber          String?
   kycStatus                      KycStatus             @default(unverified)
-  bachsPayoutsActive             Boolean               @default(false)
+  payoutsActive                  Boolean               @default(false)
   kycSubmittedAt                 DateTime?
   kycResolvedAt                  DateTime?
   kycRejectionReason             String?
   kycAttempts                    Int                   @default(0)
   kycRetryLockedUntil            DateTime? // §9.2 — 24h lock after 3 consecutive failures
-  // Field keys Bachs still asks for on the rep's account (e.g. a BVN or an ID
-  // document), refreshed on every identity event, so the rep can be told.
-  kycRequirementsDue             String[]              @default([])
-  governmentIdSubmittedAt        DateTime? // an ID document forwarded to Bachs on request
   // "Finish your verification" emails to rep applicants who stall on KYC:
   // 1 = 24h, 2 = 3 days, 3 = 7 days after sign-up (src/jobs/kycReminders.ts).
   kycReminderStage               Int                   @default(0)
   kycReminderSentAt              DateTime?
-  // The rep's own bank account, sent to Bachs as their account's
-  // payout_destination during onboarding. Only the masked number is kept.
+  // The rep's own bank account, name-checked and kept for their reference.
+  // Only the masked number is kept.
   payoutDestinationBankCode      String?
   payoutDestinationBankName      String?
   payoutDestinationAccountMasked String?
   payoutDestinationAccountName   String?
   payoutDestinationSubmittedAt   DateTime?
-  // The rep's student ID card — Duevy's own check, not Bachs's. Uploaded at
+  // The rep's student ID card — Duevy's own check. Uploaded at
   // KYC time to private storage (ImageKit) and reviewed by an admin; a space
   // can only collect once it is approved. Only the storage reference is kept.
   studentIdFileId                String?
@@ -562,9 +568,9 @@ model Space {
   withdrawalPinFailedAttempts Int                @default(0)
   withdrawalPinLockedUntil    DateTime?
   withdrawalPinHoldUntil      DateTime?
-  // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
-  // its own: collections settle into the LEAD REP's Connect account and the
-  // space's share is tracked by its ledger. These stay so any balance still
+  // --- Legacy (Anchor era). Read-only. A space has no account of its own:
+  // collections pool in Duevy's Kredi merchant account and the space's share
+  // is tracked by its ledger. These stay so any balance still
   // held in an Anchor deposit account can be traced and paid out by an admin.
   anchorAccountId             String?            @unique
   anchorAccountNumber         String?
@@ -729,7 +735,7 @@ model DuePayment {
   reference             String
   checkoutId            String? // the checkout that settled it; null for legacy and manual-credit rows
   amountPaid            Int // kobo — this line's share of what the student paid (face + its share of the fee)
-  processingFee         Int // kobo — legacy split of the fee; 0 for Bachs-era rows (Duevy absorbs Bachs's fee)
+  processingFee         Int // kobo — legacy split of the fee; 0 since Bachs (Duevy absorbs the rail's own fee)
   duevyFee              Int // kobo — this line's share of the checkout service charge
   netToSpace            Int // kobo — the face value, credited to the space in full
   // --- Legacy (Anchor era) checkout/remittance fields. Nothing writes these now.
@@ -761,40 +767,39 @@ model DuePayment {
 // one-time bank account opened for this checkout. Fees are computed server
 // side when it is created and never change afterwards.
 model Checkout {
-  id                   String         @id @default(cuid())
-  reference            String         @unique // our reference; also the provider's
-  userId               String
-  spaceId              String
-  status               CheckoutStatus @default(pending)
-  faceKobo             Int // sum of the dues' face amounts — what the space receives
-  feeKobo              Int // 2% + ₦20, on top
-  totalKobo            Int // faceKobo + feeKobo — what the student must transfer
-  receivedKobo         Int? // what the provider reported as received
-  overpaidKobo         Int            @default(0)
+  id                 String         @id @default(cuid())
+  reference          String         @unique // our reference; also the provider's
+  userId             String
+  spaceId            String
+  status             CheckoutStatus @default(pending)
+  faceKobo           Int // sum of the dues' face amounts — what the space receives
+  feeKobo            Int // 1.5% + ₦20 (capped at ₦250), on top
+  totalKobo          Int // faceKobo + feeKobo — what the student must transfer
+  receivedKobo       Int? // what the provider reported as received
+  overpaidKobo       Int            @default(0)
   // The sorted due ids, so a repeat request for the same basket returns the
   // still-open checkout instead of opening a second account.
-  dueSetKey            String
-  provider             String         @default("bachs")
-  providerCheckoutId   String?        @unique
-  providerChargeId     String?
-  // The rep's Connect account the face amount is routed to (destination charge).
-  destinationAccountId String?
-  // The one-time bank account the student transfers into.
-  vaAccountNumber      String?
-  vaBankName           String?
-  vaAccountName        String?
+  dueSetKey          String
+  provider           String         @default("kredi")
+  providerCheckoutId String?        @unique
+  // The provider's id for the transfer that paid it (Kredi: remitReference).
+  providerChargeId   String?
+  // A one-time bank account the student transfers into (unused by Kredi).
+  vaAccountNumber    String?
+  vaBankName         String?
+  vaAccountName      String?
   // Or, on a hosted checkout, the provider's page the student is redirected to.
-  checkoutUrl          String?
-  expiresAt            DateTime
-  paidAt               DateTime?
-  expiredAt            DateTime?
-  underpaidAt          DateTime?
+  checkoutUrl        String?
+  expiresAt          DateTime
+  paidAt             DateTime?
+  expiredAt          DateTime?
+  underpaidAt        DateTime?
   // Set on anything a human has to look at: underpaid, overpaid, late money,
   // or a paid checkout whose dues had already been settled elsewhere.
-  needsReview          Boolean        @default(false)
-  reviewReason         String?
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
+  needsReview        Boolean        @default(false)
+  reviewReason       String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
   user        User           @relation(fields: [userId], references: [id])
   space       Space          @relation(fields: [spaceId], references: [id])
@@ -890,14 +895,14 @@ model PendingPayment {
 
 // Inbound provider events, and the DB-backed job queue that processes them.
 //
-// Bachs delivers at least once, so the webhook route only verifies the
+// Kredi delivers at least once, so the webhook route only verifies the
 // signature and inserts here (deduplicated by the provider's event id), then
 // returns 200. src/jobs/webhookWorker.ts claims rows with
 // FOR UPDATE SKIP LOCKED and retries failures with backoff until `dead`.
 // Handlers are idempotent, so a retry or a duplicate is always safe.
 model WebhookEvent {
   id              String        @id @default(cuid())
-  provider        String        @default("bachs")
+  provider        String        @default("kredi")
   providerEventId String
   type            String
   payload         Json
@@ -921,9 +926,8 @@ model WebhookEvent {
 
 // A bank account the space can withdraw to: the rep's own, a lecturer's, a
 // vendor's. Name enquiry runs when it is added, so `accountName` is always the
-// bank's. Registered as a payout destination on the lead rep's Bachs account;
-// if the lead changes, it is re-registered on the new lead's account at the
-// next withdrawal.
+// bank's — and run again before every payout, which is refused if the holder
+// has changed.
 model PayoutBeneficiary {
   id                  String   @id @default(cuid())
   spaceId             String
@@ -933,8 +937,6 @@ model PayoutBeneficiary {
   accountNumber       String // stored encrypted
   accountNumberMasked String // "•••• 4021"
   accountName         String
-  bachsDestinationId  String?
-  bachsAccountId      String?
   createdById         String?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
@@ -958,7 +960,9 @@ model Payout {
   // edit or removal of the beneficiary can't redirect it.
   beneficiaryId       String?
   accountName         String?
-  destinationId       String? // the provider payout destination it is sent to
+  // The bank account it is sent to, copied at request time.
+  destinationBankCode String?
+  destinationAccount  String? // stored encrypted
   note                String?
   requestedById       String?
   failureReason       String?
@@ -974,15 +978,11 @@ model Payout {
   // ends. Unique, so a space can never have two withdrawals in flight — the
   // database-level backstop behind the advisory lock in withdrawal.service.
   activeSpaceId       String?      @unique
-  provider            String       @default("bachs")
+  provider            String       @default("kredi")
   providerPayoutId    String?      @unique
-  providerAccountId   String? // the rep's Connect account it was paid out of
-  providerFeeKobo     Int? // what Bachs charged on top, from the payout response
-  // Once the payout succeeds, Duevy's fee (less Bachs's own payout fee) is
-  // moved from the rep's account to the platform. Signed: positive = swept to
-  // the platform, negative = the platform topped the account up.
-  feeSettlementKobo   Int?
-  feeSettledAt        DateTime?
+  providerFeeKobo     Int? // what Kredi charges for the transfer (its tariff, for reporting)
+  // On success: Duevy's fee less Kredi's transfer cost — what the withdrawal earned.
+  feeMarginKobo       Int?
   // awaiting_approval only: when it is cancelled if not yet approved.
   approvalExpiresAt   DateTime?
   requestedAt         DateTime     @default(now())
@@ -1410,7 +1410,7 @@ model AssistantMessage {
 }
 
 // Platform-wide switches an admin can change at runtime, one row per key.
-//   checkout_mode: "hosted" | "custom" — how students pay (see settings.service.ts).
+//   (no keys in use; checkout_mode was retired with Bachs)
 model PlatformSetting {
   key         String   @id
   value       Json
