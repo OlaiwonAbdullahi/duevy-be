@@ -30,6 +30,17 @@ async function startServer() {
 
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
+
+    // A stray rejected promise would otherwise kill the whole API (Node's
+    // default); log it and keep serving. A thrown exception leaves the process
+    // in an unknown state, so log and exit — Docker restarts the container.
+    process.on('unhandledRejection', (reason) => {
+      logger.error({ err: reason }, 'unhandled promise rejection');
+    });
+    process.on('uncaughtException', (err) => {
+      logger.fatal({ err }, 'uncaught exception');
+      process.exit(1);
+    });
   } catch (err) {
     logger.fatal({ err }, 'failed to start server');
     process.exit(1);

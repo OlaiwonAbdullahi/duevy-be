@@ -3,9 +3,12 @@ import { type Request } from "express";
 import { fail } from "../lib/response";
 import { type AuthenticatedRequest } from "./auth";
 
+// Per IP, and a whole class can share one IP (campus Wi-Fi, a hotspot, mobile
+// carrier NAT), so this only stops floods. Per-user limits below guard the
+// expensive routes.
 export const standardLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 1500,
   handler: (req, res) => {
     fail(
       res,
@@ -16,9 +19,12 @@ export const standardLimiter = rateLimit({
   },
 });
 
+// Only failed attempts count, so classmates signing up together from one
+// network don't lock each other out, while password guessing still does.
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20, // stricter limit for auth routes
+  max: 30,
+  skipSuccessfulRequests: true,
   handler: (req, res) => {
     fail(
       res,
