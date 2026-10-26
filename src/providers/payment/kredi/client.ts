@@ -26,6 +26,8 @@ export interface KrediRequest {
   op: string;
   /** Payment reference for log correlation. */
   ref?: string;
+  /** Extra headers, e.g. a transfer's `signature-key`. */
+  headers?: Record<string, string>;
 }
 
 /** Kredi's usual envelope. `status` is a number, "Success"/"Failed", or a boolean depending on the endpoint. */
@@ -71,6 +73,7 @@ export class KrediClient {
       Accept: 'application/json',
     };
     if (req.body !== undefined) headers['Content-Type'] = 'application/json';
+    Object.assign(headers, req.headers);
 
     const started = Date.now();
     let res: Response;

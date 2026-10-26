@@ -33,8 +33,8 @@ Kredi's costs live in `krediPayoutCostKobo` and `KREDI_INWARD_COST_KOBO` (report
 ## Withdrawal
 
 1. The ledger is debited (net + fee) under the space lock, and the payout copies the destination (bank code, encrypted account number, the bank's name).
-2. `GET /api/kredipay/nameenquiry` runs again. A different holder → `ACCOUNT_CHANGED`, the withdrawal fails and the balance is restored. Name enquiry also returns the holder's BVN and KYC level, which V2 needs; neither is stored.
-3. `POST /api/kredipay/fundtransfer` with `transaction_reference` = our payout reference. `responseCode "00"` → succeeded.
+2. Name enquiry runs again (`POST /api/wallet/customers/account-enquiry`, `{ account_no, bank_code }`; the Payout V2 `/api/kredipay/nameenquiry` is closed to us on test). A different holder → `ACCOUNT_CHANGED`, the withdrawal fails and the balance is restored. Name enquiry also returns the holder's BVN and KYC level, which V2 needs; neither is stored.
+3. `POST /api/kredipay/fundtransfer` with `transaction_reference` = our payout reference and a `signature-key` header = SHA-512 of `"<transactionAmount>-<merchant secret>-<transactionReference>"` (Async Transfer page; the secret is `KREDI_WEBHOOK_SECRET`). `responseCode "00"` → succeeded.
 4. A reused reference is refused by Kredi ("Duplicate transaction reference"), so a retry after a timeout can't pay twice; the provider reads the first attempt's outcome instead.
 5. Outcome: the payout webhook (`transactionStatus.code` 200 / 401), or TSQ `GET /api/kredipay/transactions/{ref}` with `GET /api/v2/transactions/search?yourReference=` as the fallback. Without a final answer the payout stays `processing`; it is never failed on a guess.
 
@@ -71,6 +71,7 @@ Each is a one-place change once answered.
 6. The bank name to show customers for `generate_account` accounts, and the live collection host.
 7. How to check a collection's status by our reference (`GET /api/payment` errors on the collection host and its `keyword` doesn't list `transaction_ref`).
 8. `GET /api/kredipay/banks` on `walletv2-api.test.kredimfb.com` returns `403 "Access forbidden to malicious requests"`: is our server IP allowlisted for Payout V2? `GET /api/wallet/account/balance` errors (`gl_id` on null): is the test merchant fully set up?
+10. Which secret signs a transfer's `signature-key`: the docs say "the Merchant's Secret Key". We use `KREDI_WEBHOOK_SECRET` (the same scheme signs webhooks); confirm it's that one and not the API secret.
 9. Whether customer creation validates the BVN against the name. Didit checks it first, so this only affects error handling.
 
 **Didit**

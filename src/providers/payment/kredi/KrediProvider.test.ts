@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { KrediProvider, localPhone, sameAccountHolder } from './KrediProvider';
 import { ProviderError } from '../types';
+import { computeKrediSignature } from './signature';
 
 type Route = (url: URL, init: RequestInit) => { status?: number; body: unknown };
 
@@ -128,7 +129,7 @@ describe('KrediProvider — collections', () => {
 describe('KrediProvider — V2 payouts', () => {
   it('re-runs name enquiry and sends a V2 fundtransfer with the holder BVN', async () => {
     const calls = stubKredi({
-      'GET /api/kredipay/nameenquiry': enquiry(),
+      'POST /api/wallet/customers/account-enquiry': enquiry(),
       'POST /api/kredipay/fundtransfer': () => ({
         body: { message: 'Transaction Approved', status: 'Success', data: { responseCode: '00', cbaTransactionId: 'TBMFB_1' } },
       }),
@@ -136,6 +137,8 @@ describe('KrediProvider — V2 payouts', () => {
     const r = await provider().initiatePayout({ destination, amountKobo: 1_988_000, reference: 'WD-2026-AAAAAA' });
     expect(r).toMatchObject({ state: 'succeeded', providerPayoutId: 'TBMFB_1', providerFeeKobo: 7_500 });
     const transfer = calls.find((c) => c.key === 'POST /api/kredipay/fundtransfer')!;
+    // sha512("19880-<secret>-WD-2026-AAAAAA"), the merchant secret being the configured one.
+    expect(transfer.headers['signature-key']).toBe(computeKrediSignature('19880', 's', 'WD-2026-AAAAAA'));
     expect(transfer.body).toMatchObject({
       transaction_reference: 'WD-2026-AAAAAA',
       transaction_amount: 19880,
@@ -147,7 +150,7 @@ describe('KrediProvider — V2 payouts', () => {
   });
 
   it('refuses to pay an account whose holder has changed', async () => {
-    const calls = stubKredi({ 'GET /api/kredipay/nameenquiry': enquiry('SOMEONE ELSE') });
+    const calls = stubKredi({ 'POST /api/wallet/customers/account-enquiry': enquiry('SOMEONE ELSE') });
     await expect(provider().initiatePayout({ destination, amountKobo: 100_000, reference: 'WD-2026-BBBBBB' })).rejects.toMatchObject({
       code: 'ACCOUNT_CHANGED',
       retryable: false,
@@ -157,7 +160,7 @@ describe('KrediProvider — V2 payouts', () => {
 
   it('resolves a duplicate reference through TSQ instead of paying again', async () => {
     const calls = stubKredi({
-      'GET /api/kredipay/nameenquiry': enquiry(),
+      'POST /api/wallet/customers/account-enquiry': enquiry(),
       'POST /api/kredipay/fundtransfer': () => ({
         status: 400,
         body: { message: 'Duplicate transaction reference (WD-2026-CCCCCC)', status: 'Failed' },
@@ -170,7 +173,7 @@ describe('KrediProvider — V2 payouts', () => {
   });
 
   it('a timeout is retryable — never read as "did not happen"', async () => {
-    stubKredi({ 'GET /api/kredipay/nameenquiry': enquiry() });
+    stubKredi({ 'POST /api/wallet/customers/account-enquiry': enquiry() });
     const real = globalThis.fetch;
     vi.stubGlobal('fetch', async (input: URL | string, init?: RequestInit) => {
       if (String(input).includes('fundtransfer')) throw new Error('The operation was aborted due to timeout');
@@ -220,15 +223,30 @@ describe('KrediProvider — reps and banks', () => {
     expect(calls[0]!.body).toMatchObject({ phone: '08101234520', country: 'Nigeria', gender: 'female', bvn: '12345678901' });
   });
 
-  it('uses the NIP code as the bank code', async () => {
+  it('uses the NIP code as the bank code, one entry per code', async () => {
+    // Shapes from the Kredi test environment's /api/wallet/customers/banks.
     stubKredi({
-      'GET /api/kredipay/banks': () => ({ body: { status: 200, data: [{ institutionCode: '044', nipCode: '000014', institutionName: 'Access Bank' }] } }),
+      'GET /api/wallet/customers/banks': () => ({
+        body: {
+          status: 200,
+          message: 'All banks',
+          data: [
+            { id: 1, institutionCode: '044', nipCode: '000014', institutionName: 'Access Bank', category: 'Commercial Bank' },
+            { id: 1, institutionCode: '063', nipCode: '000014', institutionName: 'Access Bank (DIAMOND)', category: 'Commercial Bank' },
+            { id: 117, institutionCode: '50200', nipCode: '090380', institutionName: 'Kredi Bank / Conpro MFB', category: 'Microfinance Bank' },
+          ],
+        },
+      }),
     });
-    expect(await provider().listBanks()).toEqual([{ code: '000014', name: 'Access Bank' }]);
+    expect(await provider().listBanks()).toEqual([
+      { code: '000014', name: 'Access Bank' },
+      { code: '090380', name: 'Kredi Bank / Conpro MFB' },
+    ]);
   });
 
   it('treats a refused name enquiry as an unknown account', async () => {
-    stubKredi({ 'GET /api/kredipay/nameenquiry': () => ({ status: 400, body: { status: 'Failed', message: 'Invalid account' } }) });
+    // What the test environment returns for an account it can't find.
+    stubKredi({ 'POST /api/wallet/customers/account-enquiry': () => ({ status: 404, body: { error: true, status: 404, message: 'Beneficiary Account not Found', data: [] } }) });
     expect(await provider().resolveAccount('000014', '0000000000')).toBeNull();
   });
 

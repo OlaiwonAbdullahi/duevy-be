@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { KrediClient } from './client';
 import { normaliseKrediEvent } from './events';
-import { verifyKrediSignature } from './signature';
+import { computeKrediSignature, verifyKrediSignature } from './signature';
 
 /**
  * Kredi Pay as Duevy's payment rail (see docs/KREDI.md).
@@ -258,21 +258,30 @@ export class KrediProvider implements PaymentProvider {
   // Banks
   // -------------------------------------------------------------------------
 
+  /**
+   * The wallet API's bank list (`/api/wallet/customers/banks`). The Payout V2
+   * copy (`/api/kredipay/banks`) returns the same data but is closed to us on
+   * test. Several banks share a NIP code (e.g. Access and Access (Diamond));
+   * the first name listed for a code is kept, so codes stay unique.
+   */
   async listBanks(): Promise<Bank[]> {
-    const res = await this.client.request<KrediBank[]>({ method: 'GET', path: '/api/kredipay/banks', op: 'banks.list' });
-    return (Array.isArray(res.data) ? res.data : [])
-      .filter((b) => b.nipCode && b.institutionName)
-      .map((b) => ({ code: b.nipCode as string, name: b.institutionName as string }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const res = await this.client.request<KrediBank[]>({ method: 'GET', path: '/api/wallet/customers/banks', op: 'banks.list' });
+    const byCode = new Map<string, string>();
+    for (const b of Array.isArray(res.data) ? res.data : []) {
+      if (b.nipCode && b.institutionName && !byCode.has(b.nipCode)) byCode.set(b.nipCode, b.institutionName);
+    }
+    return [...byCode].map(([code, name]) => ({ code, name })).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async resolveAccount(bankCode: string, accountNumber: string): Promise<ResolvedAccount | null> {
     let res;
     try {
+      // The wallet API's beneficiary enquiry; the Payout V2 one
+      // (/api/kredipay/nameenquiry) is closed to us on test.
       res = await this.client.request<KrediNameEnquiry>({
-        method: 'GET',
-        path: '/api/kredipay/nameenquiry',
-        query: { bank_code: bankCode, account_no: accountNumber },
+        method: 'POST',
+        path: '/api/wallet/customers/account-enquiry',
+        body: { account_no: accountNumber, bank_code: bankCode },
         op: 'banks.resolve',
       });
     } catch (err) {
@@ -302,15 +311,19 @@ export class KrediProvider implements PaymentProvider {
       throw new ProviderError('The account holder has changed since this account was saved', 422, 'ACCOUNT_CHANGED', false);
     }
 
+    const amount = naira(amountKobo);
     try {
       const res = await this.client.request<KrediTransfer>({
         method: 'POST',
         path: '/api/kredipay/fundtransfer',
         op: 'payout.create',
         ref: reference,
+        // Payout V2 (async) signs each transfer: sha512 of
+        // "transactionAmount-merchantSecret-transactionReference".
+        headers: { 'signature-key': computeKrediSignature(String(amount), this.config.webhookSecrets[0] as string, reference) },
         body: {
           transaction_reference: reference,
-          transaction_amount: naira(amountKobo),
+          transaction_amount: amount,
           beneficiary_account_no: destination.accountNumber,
           beneficiary_account_name: holder.accountName,
           beneficiary_entity_code: destination.bankCode,
