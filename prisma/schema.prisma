@@ -698,6 +698,7 @@ model Due {
   category       DueType // exposed as `type` in the API
   status         RepDueStatus @default(draft)
   allowGuests    Boolean      @default(false)
+  guestFields    Json? // extra questions on the guest pay link (lib/guestForm.ts); null = the original form
   publishedAt    DateTime?
   closedAt       DateTime?
   lastRemindedAt DateTime? // §7.7 reminder cooldown
@@ -785,6 +786,8 @@ model Checkout {
   vaAccountName        String?
   // Or, on a hosted checkout, the provider's page the student is redirected to.
   checkoutUrl          String?
+  // A guest's answers to the due's guestFields, labels copied in (lib/guestForm.ts).
+  guestAnswers         Json?
   expiresAt            DateTime
   paidAt               DateTime?
   expiredAt            DateTime?

@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { type Prisma, type RepRole } from '@prisma/client';
+import { Prisma, type RepRole } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -11,6 +11,7 @@ import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
+import { guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
 import { getSpaceKycState } from '../services/kyc.service';
 import { writeAudit } from '../lib/audit';
 import { notify, notifyMany } from '../lib/notifications';
@@ -154,6 +155,8 @@ const createDueSchema = z.object({
   assignedRepId: z.string().min(1).optional(),
   // Opens the due's public pay link to people outside the space (no account).
   allowGuests: z.boolean().default(false),
+  // Extra questions on the guest pay link. Omitted/null = the original form.
+  guestFields: guestFieldsSchema.optional(),
 });
 
 repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Request, res: Response): Promise<void> => {
@@ -197,6 +200,7 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         publishedAt: publishing ? new Date() : null,
         assignedRepId: assignee,
         allowGuests: data.allowGuests,
+        guestFields: data.guestFields ?? Prisma.DbNull,
       },
     });
     if (publishing) {
@@ -231,6 +235,7 @@ const patchDueSchema = z.object({
   dueDate: dueDateField.optional(),
   category: categoryField.optional(),
   allowGuests: z.boolean().optional(),
+  guestFields: guestFieldsSchema.optional(),
 });
 
 repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (req: Request, res: Response): Promise<void> => {
@@ -269,6 +274,7 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
       ...(data.dueDate !== undefined ? { dueDate: new Date(`${data.dueDate}T00:00:00Z`) } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
       ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
+      ...(data.guestFields !== undefined ? { guestFields: data.guestFields ?? Prisma.DbNull } : {}),
     },
   });
 
@@ -408,7 +414,10 @@ type RosterStatus = 'all' | 'paid' | 'unpaid';
 async function guestPayers(dueId: string) {
   const rows = await db.duePayment.findMany({
     where: { dueId, user: { isGuest: true } },
-    include: { user: { select: { id: true, name: true, email: true, matricNo: true } } },
+    include: {
+      user: { select: { id: true, name: true, email: true, matricNo: true } },
+      checkout: { select: { guestAnswers: true } },
+    },
     orderBy: { paidAt: 'desc' },
     take: 500,
   });
@@ -419,6 +428,7 @@ async function guestPayers(dueId: string) {
     matricNo: p.user.matricNo,
     paidAt: p.paidAt.toISOString(),
     reference: p.reference,
+    answers: readGuestAnswers(p.checkout?.guestAnswers),
   }));
 }
 
@@ -562,14 +572,22 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
     statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(due.id),
   ]);
 
-  const header = ['Name', 'Matric No', 'Level', 'Email', 'Status', 'Paid At', 'Reference'];
+  // A column per guest question: the due's current fields, then any that were
+  // answered before being removed. Members leave them blank.
+  const questions = new Map((readGuestFields(due.guestFields) ?? []).map((f) => [f.id, f.label]));
+  for (const g of guests) for (const a of g.answers) if (!questions.has(a.fieldId)) questions.set(a.fieldId, a.label);
+  const questionIds = [...questions.keys()];
+  const blanks = questionIds.map(() => null);
+
+  const header = ['Name', 'Matric No', 'Level', 'Email', 'Status', 'Paid At', 'Reference', ...questions.values()];
   const rows = [
     ...students.map((s) =>
-      [s.name, s.matricNo, s.level, s.email, s.status, s.paidAt, s.reference].map(csvCell).join(','),
+      [s.name, s.matricNo, s.level, s.email, s.status, s.paidAt, s.reference, ...blanks].map(csvCell).join(','),
     ),
-    ...guests.map((g) =>
-      [g.name, g.matricNo, null, g.email, 'paid (guest)', g.paidAt, g.reference].map(csvCell).join(','),
-    ),
+    ...guests.map((g) => {
+      const answers = questionIds.map((id) => g.answers.find((a) => a.fieldId === id)?.value ?? null);
+      return [g.name, g.matricNo, null, g.email, 'paid (guest)', g.paidAt, g.reference, ...answers].map(csvCell).join(',');
+    }),
   ];
   const csv = [header.join(','), ...rows].join('\n');
 

@@ -135,4 +135,50 @@ describe('guest pay', () => {
     await api('PATCH', `/v1/spaces/${space.id}/dues/${dues[0]!.id}`, { token: repToken, body: { allowGuests: false } });
     expect((await api('GET', `/v1/public/dues/${dues[0]!.id}`)).status).toBe(404);
   });
+
+  it("collects the rep's own questions and shows the answers on the roster", async () => {
+    const { rep, space, dues } = await makeSpace();
+    const repToken = await tokenFor(rep);
+    const path = `/v1/spaces/${space.id}/dues/${dues[0]!.id}`;
+
+    const badForm = await api('PATCH', path, {
+      token: repToken,
+      body: { guestFields: [{ id: 'size', label: 'T-shirt size', type: 'select', options: ['M'] }] },
+    });
+    expect(badForm.status).toBe(400);
+
+    const fields = [
+      { id: 'size', label: 'T-shirt size', type: 'select', required: true, options: ['S', 'M', 'L'] },
+      { id: 'phone', label: 'Phone', type: 'phone', required: false },
+    ];
+    const set = await api('PATCH', path, { token: repToken, body: { allowGuests: true, guestFields: fields } });
+    expect(set.status).toBe(200);
+    expect(set.body.data.guestFields).toEqual(fields);
+
+    const summary = await api('GET', `/v1/public/dues/${dues[0]!.id}`);
+    expect(summary.body.data.fields).toHaveLength(2);
+
+    const checkoutPath = `/v1/public/dues/${dues[0]!.id}/checkout`;
+    const email = guestEmail();
+    const missing = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email } });
+    expect(missing.status).toBe(400);
+    expect(missing.body.error.details).toEqual([expect.objectContaining({ field: 'answers.size' })]);
+
+    const wrong = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email, answers: { size: 'XXL' } } });
+    expect(wrong.status).toBe(400);
+
+    const opened = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email, answers: { size: 'M', phone: ' ' } } });
+    expect(opened.status).toBe(201);
+    await pay(opened.body.data.reference, opened.body.data.amount);
+
+    // Renaming the question later doesn't rewrite what the guest answered.
+    await api('PATCH', path, { token: repToken, body: { guestFields: [{ ...fields[0], label: 'Size' }] } });
+    const roster = await api('GET', `${path}/collections`, { token: repToken });
+    expect(roster.body.data.guests[0].answers).toEqual([{ fieldId: 'size', label: 'T-shirt size', value: 'M' }]);
+
+    const csv = await fetch(`${await startHttp()}${path}/collections/export`, { headers: { Authorization: `Bearer ${repToken}` } });
+    const [header, ...rows] = (await csv.text()).split('\n');
+    expect(header).toBe('Name,Matric No,Level,Email,Status,Paid At,Reference,Size');
+    expect(rows.find((r) => r.includes(email))).toMatch(/,M$/);
+  });
 });

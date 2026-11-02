@@ -16,6 +16,7 @@ import {
   type AssistantMessage,
   type Feedback,
 } from '@prisma/client';
+import { readGuestFields } from './guestForm';
 
 type UserWithSpaces = User & {
   spaceMemberships: { space: { name: string } }[];
@@ -243,6 +244,7 @@ export function serializeRepDue(
     status: due.status,
     assignedRepId: due.assignedRepId,
     allowGuests: due.allowGuests,
+    guestFields: readGuestFields(due.guestFields),
     paidCount: opts.paidCount,
     guestPaidCount: opts.guestPaidCount ?? 0,
     memberCount: opts.memberCount,

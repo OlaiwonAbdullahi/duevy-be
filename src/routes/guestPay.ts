@@ -10,10 +10,12 @@ import { computeCharge } from '../lib/money';
 import { createCheckout, getGuestCheckout, guestCheckoutToken } from '../services/checkout.service';
 import { renderReceiptByNumber } from '../services/receipt.service';
 import { getSpaceKycState } from '../services/kyc.service';
+import { checkGuestAnswers, readGuestFields } from '../lib/guestForm';
 
 /**
  * Guest pay — dues a rep has opened to guests (`dues.allowGuests`) can be paid
- * from a public link with just a name and email, no account.
+ * from a public link with just a name and email, no account, plus whatever
+ * extra questions the rep added (`dues.guestFields`, see lib/guestForm.ts).
  *
  * The payer gets a password-less `isGuest` user row, so the checkout, ledger,
  * receipt and webhook paths are exactly the member ones. There's no session:
@@ -56,6 +58,8 @@ guestPayRouter.get('/dues/:dueId', lookupLimiter, async (req: Request, res: Resp
     fee: charge.fee,
     total: charge.total,
     canCollect: kyc.canCollect,
+    // The rep's extra questions; null = the original form (optional matric no).
+    fields: readGuestFields(due.guestFields),
     space: { id: due.space.id, name: due.space.name, short: due.space.short, kind: due.space.kind, hue: due.space.hue },
   });
 });
@@ -72,6 +76,8 @@ const guestCheckoutSchema = z.object({
     .max(254)
     .transform((e) => e.toLowerCase()),
   matricNo: z.string().trim().max(32).optional(),
+  // Answers to the due's guestFields, keyed by field id.
+  answers: z.record(z.string().max(1000)).optional(),
 });
 
 /** The guest's user row: reused across their payments, created on first pay. */
@@ -111,12 +117,20 @@ guestPayRouter.post(
   validate(guestCheckoutSchema),
   async (req: Request, res: Response): Promise<void> => {
     const dueId = req.params.dueId as string;
-    if (!(await loadGuestDue(dueId))) {
+    const due = await loadGuestDue(dueId);
+    if (!due) {
       errors.notFound(res, 'This payment link is not open');
       return;
     }
 
     const input = req.body as z.infer<typeof guestCheckoutSchema>;
+    const fields = readGuestFields(due.guestFields);
+    const checked = fields ? checkGuestAnswers(fields, input.answers) : { answers: null };
+    if ('issues' in checked) {
+      errors.validation(res, checked.issues);
+      return;
+    }
+
     const payer = await guestPayer(input);
     // A real account pays signed in, so the payment lands in their history.
     if (!payer.isGuest) {
@@ -129,6 +143,10 @@ guestPayRouter.post(
     }
 
     const { checkout, reused } = await createCheckout(payer.id, [dueId], { guest: true });
+    // On a reused checkout the latest answers win — it's the same payer and due.
+    if (checked.answers) {
+      await db.checkout.update({ where: { reference: checkout.reference }, data: { guestAnswers: checked.answers } });
+    }
     ok(res, { ...checkout, reused, token: guestCheckoutToken(checkout.reference) }, reused ? 200 : 201);
   },
 );
