@@ -14,6 +14,7 @@ import { repDuesRouter } from './repDues';
 import { payoutsRouter } from './payouts';
 import { pollsRepRouter } from './polls';
 import { spacePartnerRouter } from './partners';
+import { receiptDesignRouter } from './receiptDesign';
 
 export const spacesRouter = Router();
 
@@ -335,5 +336,6 @@ spacesRouter.use('/:spaceId', circleRouter);
 spacesRouter.use('/:spaceId', repDuesRouter);
 spacesRouter.use('/:spaceId', payoutsRouter);
 spacesRouter.use('/:spaceId', spacePartnerRouter);
+spacesRouter.use('/:spaceId', receiptDesignRouter);
 // pollsRepRouter 404s everything when polls are off, so it stays last.
 spacesRouter.use('/:spaceId', pollsRepRouter);

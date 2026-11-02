@@ -588,6 +588,7 @@ model Space {
   ledgerEntries     LedgerEntry[]
   checkouts         Checkout[]
   receipts          Receipt[]
+  receiptDesign     ReceiptDesign?
   partnerRedemption PartnerRedemption?
 
   @@index([institution])
@@ -845,6 +846,51 @@ model Receipt {
 
   @@index([userId, issuedAt])
   @@map("receipts")
+}
+
+// How a space's receipts look: the rep's colour, wording, logo and signatures
+// (see services/receiptDesign.service.ts). No row = the standard Duevy design.
+// Images are small PNG/JPEG bytes, resized by the dashboard before upload.
+model ReceiptDesign {
+  spaceId     String   @id
+  accent      String? // #rrggbb; null = Duevy green
+  headerStyle String   @default("artwork") // artwork | solid
+  title       String?
+  showStamp   Boolean  @default(true)
+  stampText   String?
+  stampStyle  String   @default("round") // round | rect | ribbon — ignored while a stamp image is set
+  stampColor  String? // #rrggbb; null = the receipt colour
+  stampImage  Bytes? // the space's own stamp, printed in place of a drawn one
+  stampMime   String?
+  thankYou    String?
+  note        String?
+  showAnswers Boolean  @default(true) // print a guest's answers to the due's questions
+  logo        Bytes?
+  logoMime    String?
+  updatedAt   DateTime @updatedAt
+
+  space      Space              @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  signatures ReceiptSignature[]
+
+  @@map("receipt_designs")
+}
+
+// One signatory on a space's receipts (up to three, side by side), e.g. the
+// class rep and the treasurer. Name, role and image are each optional.
+model ReceiptSignature {
+  id        String   @id @default(cuid())
+  spaceId   String
+  position  Int
+  name      String?
+  role      String?
+  image     Bytes?
+  imageMime String?
+  createdAt DateTime @default(now())
+
+  design ReceiptDesign @relation(fields: [spaceId], references: [spaceId], onDelete: Cascade)
+
+  @@index([spaceId, position])
+  @@map("receipt_signatures")
 }
 
 // ---------------------------------------------------------------------------

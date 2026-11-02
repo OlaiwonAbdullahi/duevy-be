@@ -1,11 +1,14 @@
 import { db } from '../config/db';
 import { notFound } from '../lib/errors';
 import { renderReceiptPdf } from '../lib/receipt';
+import { readGuestAnswers } from '../lib/guestForm';
+import { getReceiptDesign } from './receiptDesign.service';
 
 /**
  * Receipts. One is issued (a Receipt row with a number) when a checkout is
  * paid; its content is always rendered from the checkout's own rows, so a
- * receipt can never disagree with what was recorded.
+ * receipt can never disagree with what was recorded. Its look comes from the
+ * space's receipt design as it is at render time.
  */
 
 async function loadOwnedReceipt(where: { checkoutId: string } | { number: string }, userId: string) {
@@ -78,6 +81,8 @@ async function renderPdf(r: LoadedReceipt) {
     netToSpace: c.faceKobo,
     paidAt: c.paidAt ?? r.issuedAt,
     method: 'Bank transfer',
+    design: await getReceiptDesign(r.spaceId),
+    answers: readGuestAnswers(c.guestAnswers),
   });
   return { filename: `receipt-${r.number}.pdf`, pdf };
 }
