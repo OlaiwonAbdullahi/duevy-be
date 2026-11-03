@@ -13,6 +13,8 @@ import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
 import { canCollect } from './kyc.service';
 import { getCheckoutMode } from './settings.service';
+import { guestAccountState, sendGuestAccountInvite } from './guestAccount.service';
+import { readGuestAnswers } from '../lib/guestForm';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
@@ -313,15 +315,33 @@ async function openCollectionAccount(
   }
 }
 
-/** A guest checkout's status, for whoever holds its token. */
+/**
+ * A guest checkout's status, for whoever holds its token: enough for the
+ * success page (who paid, what they answered, the receipt) and whether their
+ * Duevy account is on its way.
+ */
 export async function getGuestCheckout(reference: string, token: string) {
   if (!isValidGuestCheckoutToken(reference, token)) throw notFound('Payment not found');
   const checkout = await db.checkout.findUnique({
     where: { reference },
-    include: { ...withItems, receipt: { select: { number: true } } },
+    include: {
+      ...withItems,
+      receipt: { select: { number: true } },
+      user: { select: { name: true, email: true, matricNo: true, isGuest: true } },
+      space: { select: { name: true } },
+    },
   });
   if (!checkout) throw notFound('Payment not found');
-  return { ...serializeCheckout(checkout), receiptNumber: checkout.receipt?.number ?? null, userId: checkout.userId };
+  return {
+    ...serializeCheckout(checkout),
+    receiptNumber: checkout.receipt?.number ?? null,
+    spaceName: checkout.space.name,
+    payer: { name: checkout.user.name, email: checkout.user.email, matricNo: checkout.user.matricNo },
+    answers: readGuestAnswers(checkout.guestAnswers),
+    account: guestAccountState(checkout),
+    id: checkout.id,
+    userId: checkout.userId,
+  };
 }
 
 export async function getCheckoutForUser(reference: string, userId: string) {
@@ -625,6 +645,13 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     detail: `Your payment for ${what} was received.`,
     href: `/dashboard/pay/${checkout.reference}`,
   });
+  // The guest asked for an account at checkout: now that it's paid, send the
+  // activation link. A failure here is retried by reconciliation.
+  if (payer?.isGuest && checkout.accountRequestedAt) {
+    await sendGuestAccountInvite(checkout.id).catch((err) =>
+      logger.warn({ err: (err as Error).message, ref: checkout.reference }, 'guest account invite failed; will retry'),
+    );
+  }
   if (payer) {
     await sendDuePaymentReceiptEmail(payer.email, payer.name, {
       spaceName: space?.name ?? '',

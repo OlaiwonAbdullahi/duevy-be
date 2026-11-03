@@ -11,8 +11,10 @@ import { type ProviderEvent } from '../types';
  *  - collection.underpaid  → underpaid (amount_paid vs amount_expected).
  *  - collection.failed     status EXPIRED → expired; FAILED → failed.
  *  - checkout.expired      → expired (the session lapsed unpaid).
- *  - checkout.completed    ignored: collection.* is the payment source of truth
- *    and carries the received amount; acting on both would only add noise.
+ *  - checkout.completed    → payment.completed: a cue to read the collection
+ *    back from Bachs (it carries no received amount, so it is never fulfilled
+ *    on directly). Whichever of it and collection.succeeded lands first wins;
+ *    the other is a no-op, because fulfilment is idempotent.
  *  - payout.paid / payout.failed → withdrawal outcome.
  *  - account.updated / capability.updated → re-read the rep's identity state.
  *    Neither carries the verdict itself, so the handler fetches it.
@@ -99,6 +101,8 @@ export function normaliseBachsEvent(body: unknown): ProviderEvent {
     case 'collection.failed':
       if (status === 'EXPIRED') return { ...base, kind: 'payment.expired', reference, providerCheckoutId };
       return { ...base, kind: 'payment.failed', reference, providerCheckoutId, reason: str(data.reason) };
+    case 'checkout.completed':
+      return { ...base, kind: 'payment.completed', reference, providerCheckoutId };
     case 'checkout.expired':
       return { ...base, kind: 'payment.expired', reference, providerCheckoutId };
     case 'payout.paid':

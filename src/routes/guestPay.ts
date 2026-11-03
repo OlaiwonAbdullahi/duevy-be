@@ -7,20 +7,30 @@ import { checkoutLimiter, lookupLimiter } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
-import { createCheckout, getGuestCheckout, guestCheckoutToken } from '../services/checkout.service';
+import { createCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken } from '../services/checkout.service';
+import { syncPendingCheckout } from './transactions';
 import { renderReceiptByNumber } from '../services/receipt.service';
 import { getSpaceKycState } from '../services/kyc.service';
 import { checkGuestAnswers, readGuestFields } from '../lib/guestForm';
+import { optionalAuthenticate, type AuthenticatedRequest } from '../middleware/auth';
+import { requestGuestAccount } from '../services/guestAccount.service';
 
 /**
  * Guest pay — dues a rep has opened to guests (`dues.allowGuests`) can be paid
- * from a public link with just a name and email, no account, plus whatever
- * extra questions the rep added (`dues.guestFields`, see lib/guestForm.ts).
+ * from a public link with a name, email and matric number, no account, plus
+ * whatever extra questions the rep added (`dues.guestFields`, see lib/guestForm.ts).
  *
  * The payer gets a password-less `isGuest` user row, so the checkout, ledger,
  * receipt and webhook paths are exactly the member ones. There's no session:
  * the status page and receipt are unlocked by a token (an HMAC of the
  * checkout reference) returned only to whoever started the checkout.
+ *
+ * A guest can tick "create a Duevy account for me" (`createAccount`). That only
+ * records consent; the activation link goes out once the payment is confirmed
+ * (services/guestAccount.service.ts). Someone whose email already has a full
+ * account signs in first and pays on the same page as themselves, so the
+ * payment lands in their history without anyone else being able to attach a
+ * payment to their account.
  *
  * Mounted at /public, unauthenticated.
  */
@@ -58,7 +68,7 @@ guestPayRouter.get('/dues/:dueId', lookupLimiter, async (req: Request, res: Resp
     fee: charge.fee,
     total: charge.total,
     canCollect: kyc.canCollect,
-    // The rep's extra questions; null = the original form (optional matric no).
+    // The rep's extra questions, on top of name, email and matric number.
     fields: readGuestFields(due.guestFields),
     space: { id: due.space.id, name: due.space.name, short: due.space.short, kind: due.space.kind, hue: due.space.hue },
   });
@@ -75,37 +85,42 @@ const guestCheckoutSchema = z.object({
     .email()
     .max(254)
     .transform((e) => e.toLowerCase()),
-  matricNo: z.string().trim().max(32).optional(),
+  // Always asked. Optional here only for a signed-in payer whose profile already has one.
+  matricNo: z.string().trim().min(1).max(32).optional(),
   // Answers to the due's guestFields, keyed by field id.
   answers: z.record(z.string().max(1000)).optional(),
+  // "Create a free Duevy account for me" — consent only; nothing is created until it's paid.
+  createAccount: z.boolean().optional(),
 });
+
+const payerSelect = { id: true, isGuest: true, isSuspended: true, isDeactivated: true, matricNo: true } as const;
 
 /** The guest's user row: reused across their payments, created on first pay. */
 async function guestPayer(input: z.infer<typeof guestCheckoutSchema>) {
-  const existing = await db.user.findUnique({
-    where: { email: input.email },
-    select: { id: true, isGuest: true, isSuspended: true, isDeactivated: true },
-  });
-  if (existing) return existing;
+  const existing = await db.user.findUnique({ where: { email: input.email }, select: payerSelect });
+  if (existing) {
+    // A guest row carries their latest matric number; a real account's profile is left alone.
+    if (existing.isGuest && input.matricNo && existing.matricNo !== input.matricNo) {
+      return db.user.update({ where: { id: existing.id }, data: { matricNo: input.matricNo }, select: payerSelect });
+    }
+    return existing;
+  }
   try {
     return await db.user.create({
       data: {
         id: generateId('user'),
         name: input.name,
         email: input.email,
-        matricNo: input.matricNo || null,
+        matricNo: input.matricNo ?? null,
         isGuest: true,
         role: 'student',
       },
-      select: { id: true, isGuest: true, isSuspended: true, isDeactivated: true },
+      select: payerSelect,
     });
   } catch (err) {
     // Two tabs paying with the same new email at once: the other one won.
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      return db.user.findUniqueOrThrow({
-        where: { email: input.email },
-        select: { id: true, isGuest: true, isSuspended: true, isDeactivated: true },
-      });
+      return db.user.findUniqueOrThrow({ where: { email: input.email }, select: payerSelect });
     }
     throw err;
   }
@@ -113,6 +128,8 @@ async function guestPayer(input: z.infer<typeof guestCheckoutSchema>) {
 
 guestPayRouter.post(
   '/dues/:dueId/checkout',
+  // Before the limiter, so a signed-in payer is limited per account, not per (shared campus) IP.
+  optionalAuthenticate,
   checkoutLimiter,
   validate(guestCheckoutSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -131,9 +148,26 @@ guestPayRouter.post(
       return;
     }
 
-    const payer = await guestPayer(input);
+    // Signed in: pay as yourself. The session proves who you are, so the
+    // typed name and email are ignored, and the profile's matric number is used.
+    const sessionUserId = (req as Partial<AuthenticatedRequest>).user?.sub;
+    const account = sessionUserId ? await db.user.findUnique({ where: { id: sessionUserId }, select: payerSelect }) : null;
+    if (sessionUserId && !account) {
+      errors.unauthorized(res);
+      return;
+    }
+    // Matric number is always asked — except of an account that already has one.
+    if (!input.matricNo && !account?.matricNo) {
+      errors.validation(res, [{ field: 'matricNo', issue: 'Matric number is required' }]);
+      return;
+    }
+    const payer = account
+      ? account.matricNo || !input.matricNo
+        ? account
+        : await db.user.update({ where: { id: account.id }, data: { matricNo: input.matricNo }, select: payerSelect })
+      : await guestPayer(input);
     // A real account pays signed in, so the payment lands in their history.
-    if (!payer.isGuest) {
+    if (!sessionUserId && !payer.isGuest) {
       fail(res, 409, 'EMAIL_HAS_ACCOUNT', 'This email has a Duevy account. Sign in to pay.');
       return;
     }
@@ -143,10 +177,15 @@ guestPayRouter.post(
     }
 
     const { checkout, reused } = await createCheckout(payer.id, [dueId], { guest: true });
-    // On a reused checkout the latest answers win — it's the same payer and due.
-    if (checked.answers) {
-      await db.checkout.update({ where: { reference: checkout.reference }, data: { guestAnswers: checked.answers } });
-    }
+    // On a reused checkout the latest answers and choice win — same payer, same due.
+    await db.checkout.update({
+      where: { reference: checkout.reference },
+      data: {
+        ...(checked.answers ? { guestAnswers: checked.answers } : {}),
+        // Consent is the guest's; someone with an account already has one.
+        accountRequestedAt: payer.isGuest && input.createAccount ? new Date() : null,
+      },
+    });
     ok(res, { ...checkout, reused, token: guestCheckoutToken(checkout.reference) }, reused ? 200 : 201);
   },
 );
@@ -160,8 +199,29 @@ function tokenOf(req: Request): string {
 }
 
 guestPayRouter.get('/checkouts/:reference', async (req: Request, res: Response): Promise<void> => {
-  const { userId: _userId, ...checkout } = await getGuestCheckout(req.params.reference as string, tokenOf(req));
+  const reference = req.params.reference as string;
+  // Ask the provider (throttled) so the page reflects a payment, or an expired
+  // overlay session, without waiting for the webhook. Token first: an unknown
+  // caller never triggers a provider call.
+  if (isValidGuestCheckoutToken(reference, tokenOf(req))) await syncPendingCheckout(reference);
+  const { userId: _userId, id: _id, ...checkout } = await getGuestCheckout(req.params.reference as string, tokenOf(req));
   ok(res, checkout);
+});
+
+// ---------------------------------------------------------------------------
+// POST /public/checkouts/{reference}/account?t= — "create my Duevy account"
+// from the success page, or send the activation link again. Sends only once
+// the checkout is paid; before that it records the request.
+// ---------------------------------------------------------------------------
+guestPayRouter.post('/checkouts/:reference/account', checkoutLimiter, async (req: Request, res: Response): Promise<void> => {
+  const checkout = await getGuestCheckout(req.params.reference as string, tokenOf(req));
+  if (checkout.account.exists) {
+    fail(res, 409, 'ACCOUNT_EXISTS', 'This email already has a Duevy account. Sign in to see this payment.');
+    return;
+  }
+  const outcome = await requestGuestAccount(checkout.id);
+  const { account } = await getGuestCheckout(req.params.reference as string, tokenOf(req));
+  ok(res, { outcome, account });
 });
 
 guestPayRouter.get('/checkouts/:reference/receipt', async (req: Request, res: Response): Promise<void> => {

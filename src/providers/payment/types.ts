@@ -184,6 +184,16 @@ export type ProviderEvent =
       expectedKobo: number;
     })
   | (EventBase & {
+      /**
+       * The provider says the checkout completed, without saying what arrived.
+       * Not proof of payment on its own: the handler reads the collection back
+       * from the provider and applies that.
+       */
+      kind: 'payment.completed';
+      reference: string | null;
+      providerCheckoutId: string | null;
+    })
+  | (EventBase & {
       kind: 'payment.expired';
       reference: string | null;
       providerCheckoutId: string | null;

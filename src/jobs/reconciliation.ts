@@ -5,6 +5,7 @@ import { getPaymentProvider } from '../providers/payment';
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
 import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/withdrawal.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
+import { retryGuestAccountInvites } from '../services/guestAccount.service';
 
 /**
  * Self-healing backstop for lost or delayed webhooks. The webhook is the fast
@@ -120,6 +121,7 @@ export async function purgeExpiredIdempotencyKeys(): Promise<void> {
 export async function runReconciliationOnce(): Promise<void> {
   await reconcileCheckouts().catch((err) => logger.error({ err: (err as Error).message }, 'checkout reconciliation run failed'));
   await reconcilePayouts().catch((err) => logger.error({ err: (err as Error).message }, 'payout reconciliation run failed'));
+  await retryGuestAccountInvites().catch((err) => logger.error({ err: (err as Error).message }, 'guest account invite sweep failed'));
   await purgeExpiredIdempotencyKeys().catch(() => {});
 }
 

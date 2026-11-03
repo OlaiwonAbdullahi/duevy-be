@@ -11,7 +11,7 @@ import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
-import { guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
+import { DEFAULT_GUEST_FIELDS, guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
 import { getSpaceKycState } from '../services/kyc.service';
 import { writeAudit } from '../lib/audit';
 import { notify, notifyMany } from '../lib/notifications';
@@ -40,11 +40,20 @@ async function loadDue(sid: string, dueId: string) {
   return due;
 }
 
+/**
+ * Who counts as a guest payer: anyone who isn't a member of the space — by
+ * membership, not account type, so a guest who later activates an account (or
+ * a signed-in non-member paying through the link) stays out of the members'
+ * paid / unpaid, and someone who joins the space afterwards moves into it.
+ */
+const paidByMember = (spaceId: string) => ({ user: { spaceMemberships: { some: { spaceId } } } });
+const paidByOutsider = (spaceId: string) => ({ user: { spaceMemberships: { none: { spaceId } } } });
+
 async function repDuePayload(sid: string, due: Awaited<ReturnType<typeof loadDue>>) {
   if (!due) throw new Error('due required');
   const [paidCount, guestPaidCount, memberCount] = await Promise.all([
-    db.duePayment.count({ where: { dueId: due.id, user: { isGuest: false } } }),
-    db.duePayment.count({ where: { dueId: due.id, user: { isGuest: true } } }),
+    db.duePayment.count({ where: { dueId: due.id, ...paidByMember(sid) } }),
+    db.duePayment.count({ where: { dueId: due.id, ...paidByOutsider(sid) } }),
     db.spaceMembership.count({ where: { spaceId: sid } }),
   ]);
   return serializeRepDue(due, { paidCount, guestPaidCount, memberCount });
@@ -113,12 +122,12 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
   const [paidCounts, guestCounts] = await Promise.all([
     db.duePayment.groupBy({
       by: ['dueId'],
-      where: { dueId: { in: dueIds }, user: { isGuest: false } },
+      where: { dueId: { in: dueIds }, ...paidByMember(sid) },
       _count: { _all: true },
     }),
     db.duePayment.groupBy({
       by: ['dueId'],
-      where: { dueId: { in: dueIds }, user: { isGuest: true } },
+      where: { dueId: { in: dueIds }, ...paidByOutsider(sid) },
       _count: { _all: true },
     }),
   ]);
@@ -155,7 +164,7 @@ const createDueSchema = z.object({
   assignedRepId: z.string().min(1).optional(),
   // Opens the due's public pay link to people outside the space (no account).
   allowGuests: z.boolean().default(false),
-  // Extra questions on the guest pay link. Omitted/null = the original form.
+  // Extra questions on the guest pay link. Omitted = DEFAULT_GUEST_FIELDS; null = the original form.
   guestFields: guestFieldsSchema.optional(),
 });
 
@@ -200,7 +209,7 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         publishedAt: publishing ? new Date() : null,
         assignedRepId: assignee,
         allowGuests: data.allowGuests,
-        guestFields: data.guestFields ?? Prisma.DbNull,
+        guestFields: data.guestFields === undefined ? DEFAULT_GUEST_FIELDS : (data.guestFields ?? Prisma.DbNull),
       },
     });
     if (publishing) {
@@ -411,9 +420,9 @@ repDuesRouter.post(
 type RosterStatus = 'all' | 'paid' | 'unpaid';
 
 /** People outside the space who paid this due through its guest link. */
-async function guestPayers(dueId: string) {
+async function guestPayers(sid: string, dueId: string) {
   const rows = await db.duePayment.findMany({
-    where: { dueId, user: { isGuest: true } },
+    where: { dueId, ...paidByOutsider(sid) },
     include: {
       user: { select: { id: true, name: true, email: true, matricNo: true } },
       checkout: { select: { guestAnswers: true } },
@@ -517,11 +526,11 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
       where: { dueId: due.id },
       _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
     }),
-    guestPayers(due.id),
+    guestPayers(sid, due.id),
   ]);
 
   // Paid/unpaid compare against members, so guests are left out of them.
-  const paidCount = await db.duePayment.count({ where: { dueId: due.id, user: { isGuest: false } } });
+  const paidCount = await db.duePayment.count({ where: { dueId: due.id, ...paidByMember(sid) } });
   const collected = agg._sum.amountPaid ?? 0;
   const fees = (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0);
   const net = agg._sum.netToSpace ?? 0;
@@ -569,7 +578,7 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
   const statusFilter = parsed.success ? parsed.data.status : 'all';
   const [{ students }, guests] = await Promise.all([
     buildRoster(sid, due.id, statusFilter),
-    statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(due.id),
+    statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(sid, due.id),
   ]);
 
   // A column per guest question: the due's current fields, then any that were

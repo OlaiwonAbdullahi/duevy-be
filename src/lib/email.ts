@@ -205,6 +205,38 @@ export async function sendPasswordResetEmail(
   });
 }
 
+/**
+ * A guest who ticked "create a free Duevy account" at checkout, sent once their
+ * payment is confirmed. The link is a single-use set-password token; no
+ * password is ever generated or emailed.
+ */
+export async function sendAccountActivationEmail(
+  to: string,
+  name: string,
+  token: string,
+  opts: { spaceName: string; expiresInHours: number },
+): Promise<void> {
+  const link = `${env.FRONTEND_URL}/reset-password?token=${token}&activate=1`;
+  const html = renderEmail(
+    `
+    <h1>Activate your Duevy account</h1>
+    <p>Hi ${escapeHtml(name)}, your payment to ${escapeHtml(opts.spaceName)} is confirmed. As you asked, we've set up a free Duevy account for this email, so you can track payments, find your receipts and pay future dues in one place.</p>
+    <p>Set a password to finish:</p>
+    <a href="${link}" class="btn">Set my password</a>
+    <p class="muted">This link works once and expires in ${opts.expiresInHours} hours. Didn't ask for an account? Ignore this email and nothing changes.</p>
+  `,
+    BRAND,
+    { preheader: 'Set a password to see your receipts and payments on Duevy.' },
+  );
+
+  await sendEmail({
+    to,
+    subject: 'Activate your Duevy account',
+    html,
+    text: `Hi ${name},\n\nYour payment to ${opts.spaceName} is confirmed. Set a password to activate your Duevy account: ${link}\n\nThis link works once and expires in ${opts.expiresInHours} hours.`,
+  });
+}
+
 export type DuePaymentReceipt = {
   spaceName: string;
   reference: string;

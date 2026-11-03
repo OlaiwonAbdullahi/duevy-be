@@ -49,9 +49,13 @@ describe('normaliseBachsEvent', () => {
     });
   });
 
-  it('maps checkout.expired, and ignores checkout.completed', () => {
+  it('maps checkout.expired, and checkout.completed to a read-back cue (never a payment)', () => {
     expect(normaliseBachsEvent(envelope('checkout.expired', { checkout_id: 'chk_1', reference: 'R' })).kind).toBe('payment.expired');
-    expect(normaliseBachsEvent(envelope('checkout.completed', { checkout_id: 'chk_1', payment_status: 'paid' })).kind).toBe('ignored');
+    expect(normaliseBachsEvent(envelope('checkout.completed', { checkout_id: 'chk_1', reference: 'R', payment_status: 'paid' }))).toMatchObject({
+      kind: 'payment.completed',
+      reference: 'R',
+      providerCheckoutId: 'chk_1',
+    });
   });
 
   it('maps payout events by our reference', () => {

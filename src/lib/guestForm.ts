@@ -2,9 +2,10 @@ import { z } from 'zod';
 
 /**
  * Guest form builder — the extra questions a rep asks guests on a due's
- * public pay link (`dues.guestFields`), on top of the name and email every
- * guest checkout needs. `null` keeps the original form (an optional matric
- * number); `[]` asks nothing extra.
+ * public pay link (`dues.guestFields`), on top of the name, email and matric
+ * number every guest checkout asks (CORE: the matric number is kept on the
+ * payer, not as an answer). `null` and `[]` both ask nothing extra. New dues
+ * start from DEFAULT_GUEST_FIELDS; dues created before that keep whatever they had.
  *
  * Answers are stored on the checkout (`checkouts.guestAnswers`) with each
  * field's label copied in, so renaming or removing a field later doesn't
@@ -29,16 +30,27 @@ export const guestFieldSchema = z
   })
   .transform((f) => (f.type === 'select' ? f : { ...f, options: undefined }));
 
+/** Asked on every guest checkout already, so never a rep's question too. */
+const CORE_FIELD_IDS = new Set(['matric']);
+
 export const guestFieldsSchema = z
   .array(guestFieldSchema)
   .max(MAX_GUEST_FIELDS)
   .refine((fields) => new Set(fields.map((f) => f.id)).size === fields.length, 'field ids must be unique')
+  // An older form's own matric question is dropped: it's a core field now.
+  .transform((fields) => fields.filter((f) => !CORE_FIELD_IDS.has(f.id)))
   .nullable();
 
 export type GuestField = z.output<typeof guestFieldSchema>;
 export type GuestAnswer = { fieldId: string; label: string; value: string };
 
-/** A due's stored fields, or `null` for the original form. */
+/**
+ * The form a new due starts with when the rep doesn't send one. Name, email
+ * and matric number are always asked on top. The id matches the frontend's preset.
+ */
+export const DEFAULT_GUEST_FIELDS: GuestField[] = [{ id: 'phone', label: 'Phone number', type: 'phone', required: false }];
+
+/** A due's stored fields (without any core field an older form asked), or `null` for none. */
 export function readGuestFields(raw: unknown): GuestField[] | null {
   const parsed = guestFieldsSchema.safeParse(raw ?? null);
   return parsed.success ? parsed.data : null;

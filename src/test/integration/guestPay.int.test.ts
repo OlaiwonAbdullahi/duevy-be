@@ -29,7 +29,7 @@ describe('guest pay', () => {
     const { dues } = await makeSpace();
     const due = dues[0]!;
     expect((await api('GET', `/v1/public/dues/${due.id}`)).status).toBe(404);
-    const res = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', email: guestEmail() } });
+    const res = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail() } });
     expect(res.status).toBe(404);
   });
 
@@ -42,7 +42,7 @@ describe('guest pay', () => {
     expect(summary.status).toBe(200);
     expect(summary.body.data).toMatchObject({ amount: 500_000, fee: 12_000, total: 512_000, canCollect: true });
 
-    const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', email } });
+    const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email } });
     expect(opened.status).toBe(201);
     const { reference, token, amount } = opened.body.data;
     expect(amount).toBe(512_000);
@@ -54,7 +54,7 @@ describe('guest pay', () => {
     expect(await db.spaceMembership.count({ where: { userId: guest.id } })).toBe(0);
 
     // Asking again reuses the open checkout rather than opening a second account.
-    const again = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', email } });
+    const again = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email } });
     expect(again.status).toBe(200);
     expect(again.body.data.reference).toBe(reference);
 
@@ -79,7 +79,7 @@ describe('guest pay', () => {
     const roster = await api('GET', `/v1/spaces/${space.id}/dues/${due.id}/collections`, { token: repToken });
     expect(roster.status).toBe(200);
     expect(roster.body.data.totals).toMatchObject({ paid: 0, unpaid: 3, guestPaid: 1 });
-    expect(roster.body.data.guests).toEqual([expect.objectContaining({ name: 'Tolu Ade', email, reference })]);
+    expect(roster.body.data.guests).toEqual([expect.objectContaining({ name: 'Tolu Ade', matricNo: 'CSC/21/001', email, reference })]);
 
     const listed = await api('GET', `/v1/spaces/${space.id}/dues`, { token: repToken });
     expect(listed.body.data.find((d: { id: string }) => d.id === due.id)).toMatchObject({
@@ -89,7 +89,7 @@ describe('guest pay', () => {
     });
 
     // Paying the same due twice with the same email is refused.
-    const twice = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', email } });
+    const twice = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email } });
     expect(twice.status).toBe(409);
     expect(twice.body.error.code).toBe('DUE_ALREADY_PAID');
   });
@@ -98,7 +98,7 @@ describe('guest pay', () => {
     const { students, dues } = await makeSpace();
     await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });
     const res = await api('POST', `/v1/public/dues/${dues[0]!.id}/checkout`, {
-      body: { name: 'Someone', email: students[0]!.email },
+      body: { name: 'Someone', matricNo: 'CSC/21/001', email: students[0]!.email },
     });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('EMAIL_HAS_ACCOUNT');
@@ -106,13 +106,13 @@ describe('guest pay', () => {
 
   it("won't let a guest pay a members-only due, even through the service", async () => {
     const { dues } = await makeSpace();
-    const guest = await db.user.create({ data: { name: 'G', email: guestEmail(), isGuest: true } });
+    const guest = await db.user.create({ data: { name: 'G', matricNo: 'CSC/21/001', email: guestEmail(), isGuest: true } });
     await expect(createCheckout(guest.id, [dues[0]!.id], { guest: true })).rejects.toMatchObject({ code: 'GUESTS_NOT_ALLOWED' });
   });
 
   it('keeps guest accounts out of login and signup until the email is proven', async () => {
     const email = guestEmail();
-    await db.user.create({ data: { name: 'Tolu Ade', email, isGuest: true } });
+    await db.user.create({ data: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email, isGuest: true } });
 
     const login = await api('POST', '/v1/auth/login', { body: { email, password: 'whatever-password' } });
     expect(login.status).toBe(401);
@@ -160,14 +160,14 @@ describe('guest pay', () => {
 
     const checkoutPath = `/v1/public/dues/${dues[0]!.id}/checkout`;
     const email = guestEmail();
-    const missing = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email } });
+    const missing = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email } });
     expect(missing.status).toBe(400);
     expect(missing.body.error.details).toEqual([expect.objectContaining({ field: 'answers.size' })]);
 
-    const wrong = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email, answers: { size: 'XXL' } } });
+    const wrong = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email, answers: { size: 'XXL' } } });
     expect(wrong.status).toBe(400);
 
-    const opened = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', email, answers: { size: 'M', phone: ' ' } } });
+    const opened = await api('POST', checkoutPath, { body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email, answers: { size: 'M', phone: ' ' } } });
     expect(opened.status).toBe(201);
     await pay(opened.body.data.reference, opened.body.data.amount);
 

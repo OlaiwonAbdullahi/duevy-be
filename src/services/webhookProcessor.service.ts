@@ -6,6 +6,7 @@ import { type ProviderEvent } from '../providers/payment';
 import { expireCheckout, findCheckoutId, fulfilCheckout, markUnderpaid } from './checkout.service';
 import { completePayout, failPayoutByReference } from './withdrawal.service';
 import { refreshIdentity } from './kyc.service';
+import { reconcileCheckout } from '../jobs/reconciliation';
 
 /**
  * Inbound webhook pipeline.
@@ -66,6 +67,14 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
       const id = await findCheckoutId(event.reference, event.providerCheckoutId);
       const outcome = await fulfilCheckout(id, event.receivedKobo, event.overpaidKobo, `webhook ${event.eventId}`, event.providerChargeId);
       logger.info({ ...log, ref: event.reference, outcome }, 'payment event applied');
+      return;
+    }
+    case 'payment.completed': {
+      // Ask the provider what actually arrived; only its answer moves the checkout.
+      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
+      const c = await db.checkout.findUniqueOrThrow({ where: { id } });
+      await reconcileCheckout(c, { expireIfPastDue: false, source: `webhook ${event.eventId}` });
+      logger.info({ ...log, ref: c.reference }, 'checkout completion checked with the provider');
       return;
     }
     case 'payment.underpaid': {

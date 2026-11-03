@@ -789,6 +789,10 @@ model Checkout {
   checkoutUrl          String?
   // A guest's answers to the due's guestFields, labels copied in (lib/guestForm.ts).
   guestAnswers         Json?
+  // A guest ticked "create a free Duevy account for me". The account is only
+  // claimed after payment: an activation link goes out once it's paid.
+  accountRequestedAt   DateTime?
+  accountInviteSentAt  DateTime?
   expiresAt            DateTime
   paidAt               DateTime?
   expiredAt            DateTime?
@@ -811,6 +815,7 @@ model Checkout {
   @@index([status, expiresAt])
   @@index([status, createdAt])
   @@index([needsReview])
+  @@index([status, accountRequestedAt])
   @@map("checkouts")
 }
 

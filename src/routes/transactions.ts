@@ -146,7 +146,7 @@ paymentsRouter.use(authenticate);
 const PROVIDER_CHECK_INTERVAL_MS = 10_000;
 const lastProviderCheck = new Map<string, number>();
 
-async function syncPendingCheckout(reference: string): Promise<void> {
+export async function syncPendingCheckout(reference: string): Promise<void> {
   const c = await db.checkout.findUnique({ where: { reference } });
   if (!c || c.status !== 'pending' || !c.providerCheckoutId) return;
   const now = Date.now();
