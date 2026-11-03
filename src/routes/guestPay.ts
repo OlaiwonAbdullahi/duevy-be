@@ -176,11 +176,9 @@ guestPayRouter.post(
       return;
     }
 
-    const { checkout, reused } = await createCheckout(payer.id, [dueId], { guest: true });
-    // On a reused checkout the latest answers and choice win — same payer, same due.
-    await db.checkout.update({
-      where: { reference: checkout.reference },
-      data: {
+    const { checkout, reused } = await createCheckout(payer.id, [dueId], {
+      guest: true,
+      guestData: {
         ...(checked.answers ? { guestAnswers: checked.answers } : {}),
         // Consent is the guest's; someone with an account already has one.
         accountRequestedAt: payer.isGuest && input.createAccount ? new Date() : null,

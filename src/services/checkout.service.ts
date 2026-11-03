@@ -117,6 +117,11 @@ export interface CreateCheckoutOptions {
    * has opened to guests, and the hosted page returns to the public pay page.
    */
   guest?: boolean;
+  /**
+   * Saved on the checkout as it's opened (or onto the reused one — the latest
+   * answers and choice win), so the guest route needs no extra write.
+   */
+  guestData?: Pick<Prisma.CheckoutUncheckedCreateInput, 'guestAnswers' | 'accountRequestedAt'>;
 }
 
 export async function createCheckout(
@@ -191,7 +196,10 @@ export async function createCheckout(
       include: withItems,
     });
     const same = open.find((c) => c.dueSetKey === dueSetKey);
-    if (same) return { checkout: same, reused: true };
+    if (same) {
+      if (opts.guestData) await tx.checkout.update({ where: { id: same.id }, data: opts.guestData, select: { id: true } });
+      return { checkout: same, reused: true };
+    }
     if (open.length > 0) {
       throw conflict(
         'CHECKOUT_OVERLAP',
@@ -206,7 +214,9 @@ export async function createCheckout(
     const reference = await uniqueCheckoutReference(tx);
     const title = ordered.length === 1 ? ordered[0]!.title : `${ordered.length} dues`;
 
-    const checkout = await tx.checkout.create({
+    // Written without `include`: reading the rows back would cost three more
+    // round trips, and everything serializeCheckout needs is already in hand.
+    const created = await tx.checkout.create({
       data: {
         id: generateId('checkout'),
         reference,
@@ -220,12 +230,16 @@ export async function createCheckout(
         destinationAccountId: lead.user.bachsAccountId,
         // Provisional; replaced by the provider's own expiry once the account opens.
         expiresAt: new Date(Date.now() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
-        items: {
-          create: ordered.map((d, i) => ({ dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]! })),
-        },
+        ...opts.guestData,
       },
-      include: withItems,
     });
+    const items = await tx.checkoutItem.createManyAndReturn({
+      data: ordered.map((d, i) => ({ checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]! })),
+    });
+    const checkout: CheckoutWithItems = {
+      ...created,
+      items: items.map((item) => ({ ...item, due: { title: ordered.find((d) => d.id === item.dueId)!.title } })),
+    };
     // The student's transaction history row, completed on payment.
     await tx.transaction.create({
       data: {
@@ -290,7 +304,8 @@ async function openCollectionAccount(
     if (account.totalKobo !== checkout.totalKobo) {
       throw new ProviderError('Provider total does not match the checkout total', null, 'PRICE_MISMATCH', false);
     }
-    return await db.checkout.update({
+    // One UPDATE … RETURNING; the items haven't changed, so they're not re-read.
+    const updated = await db.checkout.update({
       where: { id: checkout.id },
       data: {
         providerCheckoutId: account.providerCheckoutId,
@@ -301,8 +316,8 @@ async function openCollectionAccount(
         checkoutUrl: account.checkoutUrl,
         expiresAt: account.expiresAt,
       },
-      include: withItems,
     });
+    return { ...updated, items: checkout.items };
   } catch (err) {
     // A definite refusal closes the checkout so the student can start again.
     // A timeout/5xx leaves it pending: the account may exist, and the next
