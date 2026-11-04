@@ -9,6 +9,7 @@ interface SendEmailOptions {
   subject: string;
   html: string;
   text?: string;
+  attachments?: { filename: string; content: Buffer }[];
 }
 
 /** Strip CR/LF so a user-controlled value can never inject extra headers via the subject. */
@@ -23,6 +24,7 @@ export async function sendEmail(options: SendEmailOptions): Promise<void> {
     subject: headerSafe(options.subject),
     html: options.html,
     text: options.text,
+    attachments: options.attachments,
   });
 
   if (error) {
@@ -249,6 +251,11 @@ export type DuePaymentReceipt = {
   /** What the student actually sent. */
   amountPaidKobo: number;
   paidAt: Date;
+  /**
+   * Where "View receipt" goes. Defaults to the app's payment page, which is
+   * behind sign-in — so guests get their token-unlocked pay-link page instead.
+   */
+  receiptUrl?: string;
 };
 
 const nairaExact = (kobo: number) =>
@@ -314,7 +321,7 @@ function emailReceiptCard(input: DuePaymentReceipt, amountPaid: string): string 
 export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentReceipt) {
   const amount = nairaExact(input.amountPaidKobo);
   // The app's payment page shows the full receipt and its PDF download (behind sign-in).
-  const receiptLink = `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(input.reference)}`;
+  const receiptLink = input.receiptUrl ?? `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(input.reference)}`;
   const paidAt = input.paidAt.toLocaleString('en-NG', {
     day: 'numeric',
     month: 'short',
@@ -362,8 +369,18 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
   return { subject: `Payment confirmed — ${summary}`, html, text };
 }
 
-export async function sendDuePaymentReceiptEmail(to: string, name: string, input: DuePaymentReceipt): Promise<void> {
-  await sendEmail({ to, ...buildDuePaymentReceiptEmail(name, input) });
+/** `pdf`, when given, is attached — the same receipt PDF the app downloads. */
+export async function sendDuePaymentReceiptEmail(
+  to: string,
+  name: string,
+  input: DuePaymentReceipt,
+  pdf?: { filename: string; pdf: Buffer },
+): Promise<void> {
+  await sendEmail({
+    to,
+    ...buildDuePaymentReceiptEmail(name, input),
+    ...(pdf ? { attachments: [{ filename: pdf.filename, content: pdf.pdf }] } : {}),
+  });
 }
 
 export async function sendRepApplicationReceivedEmail(

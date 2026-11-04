@@ -15,6 +15,7 @@ import { canCollect } from './kyc.service';
 import { getCheckoutMode } from './settings.service';
 import { guestAccountState, sendGuestAccountInvite } from './guestAccount.service';
 import { readGuestAnswers } from '../lib/guestForm';
+import { renderReceiptByNumber } from './receipt.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
@@ -668,6 +669,16 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     );
   }
   if (payer) {
+    // Guests have no dashboard to download it from, so the PDF rides along
+    // with the email. If it can't be rendered the email still goes, with the
+    // link to their receipt page (which offers the download).
+    const pdf =
+      payer.isGuest && receipt
+        ? await renderReceiptByNumber(receipt.number, checkout.userId).catch((err) => {
+            logger.warn({ err: (err as Error).message, ref: checkout.reference }, 'receipt PDF for guest email failed');
+            return undefined;
+          })
+        : undefined;
     await sendDuePaymentReceiptEmail(payer.email, payer.name, {
       spaceName: space?.name ?? '',
       reference: checkout.reference,
@@ -677,8 +688,15 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       feeKobo: checkout.feeKobo,
       amountPaidKobo: checkout.receivedKobo ?? checkout.totalKobo,
       paidAt: checkout.paidAt ?? new Date(),
-    });
+      receiptUrl: payer.isGuest && items[0] ? guestReceiptUrl(items[0].dueId, checkout.reference) : undefined,
+    }, pdf);
   }
+}
+
+/** A guest's pay-link page for this checkout: status, receipt and its download, unlocked by the token. */
+function guestReceiptUrl(dueId: string, reference: string): string {
+  const q = new URLSearchParams({ ref: reference, t: guestCheckoutToken(reference) });
+  return `${env.FRONTEND_URL}/pay/${encodeURIComponent(dueId)}?${q}`;
 }
 
 async function flagToAdmins(title: string, detail: string): Promise<void> {

@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { db } from '../../config/db';
 import { koboToDecimal } from '../../lib/money';
-import { sendAccountActivationEmail } from '../../lib/email';
+import { sendAccountActivationEmail, sendDuePaymentReceiptEmail } from '../../lib/email';
+import { guestCheckoutToken } from '../../services/checkout.service';
 import { retryGuestAccountInvites } from '../../services/guestAccount.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { type FakeProvider } from '../../providers/payment';
@@ -18,8 +19,10 @@ vi.mock('../../lib/email', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/email')>()),
   sendEmail: vi.fn(async () => {}),
   sendAccountActivationEmail: vi.fn(async () => {}),
+  sendDuePaymentReceiptEmail: vi.fn(async () => {}),
 }));
 const activationEmail = vi.mocked(sendAccountActivationEmail);
+const receiptEmail = vi.mocked(sendDuePaymentReceiptEmail);
 
 let fake: FakeProvider;
 beforeAll(async () => {
@@ -27,7 +30,10 @@ beforeAll(async () => {
   await startHttp();
 });
 afterAll(stopHttp);
-beforeEach(() => activationEmail.mockReset().mockResolvedValue(undefined));
+beforeEach(() => {
+  activationEmail.mockReset().mockResolvedValue(undefined);
+  receiptEmail.mockReset().mockResolvedValue(undefined);
+});
 
 let seq = 0;
 const guestEmail = () => `acct_${Date.now()}_${seq++}@test.duevy`;
@@ -340,5 +346,56 @@ describe('checkout.completed from the overlay', () => {
     const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } });
     expect(await db.duePayment.count({ where: { checkoutId: checkout.id } })).toBe(1);
     expect(await db.ledgerEntry.count({ where: { reference: c.reference } })).toBe(1);
+  });
+});
+
+describe('the payment confirmation email', () => {
+  /** afterPaid runs after the webhook commits; wait for its receipt email. */
+  const receiptSentTo = async (email: string) => {
+    await vi.waitFor(() => expect(receiptEmail.mock.calls.some(([to]) => to === email)).toBe(true));
+    return receiptEmail.mock.calls.find(([to]) => to === email)!;
+  };
+
+  it("attaches a guest's receipt PDF and links to their pay-link receipt page", async () => {
+    const { due } = await guestDue();
+    const email = guestEmail();
+    const c = await open(due.id, { name: 'Ada Guest', matricNo: '2021/0001', email });
+    await pay(c.reference, c.amount);
+
+    const [, name, input, pdf] = await receiptSentTo(email);
+    expect(name).toBe('Ada Guest');
+    const receipt = await db.receipt.findFirstOrThrow({ where: { checkout: { reference: c.reference } } });
+    expect(pdf?.filename).toBe(`receipt-${receipt.number}.pdf`);
+    expect(pdf?.pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-');
+    // Same link the pay page itself uses, so it opens without signing in.
+    expect(input.receiptUrl).toContain(`/pay/${due.id}?ref=${c.reference}&t=${encodeURIComponent(guestCheckoutToken(c.reference))}`);
+    expect(guestCheckoutToken(c.reference)).toBe(c.token);
+  });
+
+  it('sends account holders the plain email: their receipt is in the app', async () => {
+    const { due } = await guestDue();
+    const { rep: member } = await makeSpace();
+    const c = await open(due.id, { name: member.name, email: member.email, matricNo: '2021/0003' }, await tokenFor(member));
+    await pay(c.reference, c.amount);
+
+    const [, , input, pdf] = await receiptSentTo(member.email);
+    expect(pdf).toBeUndefined();
+    expect(input.receiptUrl).toBeUndefined();
+  });
+
+  it('still sends the email when the PDF fails, without the attachment', async () => {
+    const { due } = await guestDue();
+    const email = guestEmail();
+    const c = await open(due.id, { name: 'Bola Guest', matricNo: '2021/0002', email });
+    const receipts = await import('../../services/receipt.service');
+    const spy = vi.spyOn(receipts, 'renderReceiptByNumber').mockRejectedValueOnce(new Error('pdf engine down'));
+    try {
+      await pay(c.reference, c.amount);
+      const [, , input, pdf] = await receiptSentTo(email);
+      expect(pdf).toBeUndefined();
+      expect(input.receiptUrl).toContain(`/pay/${due.id}?ref=${c.reference}`);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
