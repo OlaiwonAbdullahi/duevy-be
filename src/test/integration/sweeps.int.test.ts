@@ -183,13 +183,24 @@ describe('withdrawal limits: ₦500k at once, ₦5M a day per space', () => {
   it("stops a sweep at the space account's ₦10M a day; the rest waits for another day", async () => {
     const s = await makeSpace();
     await collect(s); // ₦5,000 unswept
-    // ₦9,998,000 already swept into it today.
-    await db.sweep.create({
-      data: { spaceId: s.space.id, amountKobo: DAILY_LIMIT_KOBO - 200_000, trigger: 'withdrawal', reference: `SWPTEST${s.space.id}`, status: 'succeeded' },
+    // ₦9,998,000 already moved out of the account today (as recorded, e.g. before the ₦500k cap).
+    await db.payout.create({
+      data: {
+        spaceId: s.space.id,
+        amount: DAILY_LIMIT_KOBO - 200_000,
+        netKobo: DAILY_LIMIT_KOBO - 202_000,
+        feeKobo: 2_000,
+        reference: `WD-TEST-${s.space.id}`,
+        status: 'success',
+        accountMasked: 'GTB •••• 6789',
+        provider: fake.name,
+      },
     });
-    // That sweep was for money collected another way; count it as collected so it isn't "oversweeping".
-    await creditSpace(s.space.id, DAILY_LIMIT_KOBO - 200_000);
-    expect(await getDailyAllowanceKobo(s.space.id)).toBe(200_000);
+    await runDailySweeps(afterSweepHour());
+    const daily = await db.sweep.findFirstOrThrow({ where: { spaceId: s.space.id, trigger: 'daily' } });
+    expect(daily.amountKobo).toBe(200_000);
+    expect(await getDailyAllowanceKobo(s.space.id)).toBe(0);
+    expect(await getUnsweptKobo(s.space.id)).toBe(300_000);
   });
 });
 

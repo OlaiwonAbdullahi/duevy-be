@@ -37,10 +37,16 @@ Duevy pays for sweeps out of the 1.5%. `Sweep.feeKobo` is for Duevy's own report
 
 ## Limits
 
-Each space's permanent account may move at most **₦10,000,000 a day**. Duevy counts sweeps in **and** withdrawals out against it (the safe reading; confirm with 9jaPay), on Lagos days.
+Duevy's own, all on Lagos days and checked before anything is debited:
 
-- A sweep moves at most what's left today. The rest goes the next day.
-- A withdrawal that would pass it (including any sweep it needs) is refused with `422 DAILY_LIMIT_EXCEEDED` before anything is debited.
+| Limit | Amount | Error |
+|---|---|---|
+| One withdrawal | ₦1,000 – ₦500,000 | `422 BELOW_MIN_PAYOUT` / `ABOVE_MAX_PAYOUT` |
+| Withdrawn per space per day | ₦5,000,000 | `422 DAILY_LIMIT_EXCEEDED` |
+| Moved through a space account per day (sweeps in + withdrawals out) | ₦10,000,000 | `422 DAILY_LIMIT_EXCEEDED` (withdrawals); a sweep stops there and the rest goes the next day |
+| One sweep transfer | ₦1,000,000 | — a bigger sweep goes as several transfers |
+
+A failed, reversed or cancelled withdrawal gives its share of the day back.
 
 ## Webhooks
 
@@ -103,7 +109,8 @@ The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be vali
 ## Limits (from the dashboard)
 
 - **₦1,000,000 per transfer** and **₦10,000,000 of transfers a day for the whole business**, for now.
-- Not handled yet: a sweep or withdrawal over ₦1M is refused by 9jaPay (the sweep fails and stays unswept; the withdrawal fails and is restored). Duevy's own ₦10M check is per space account, not business-wide. See the recommendation in the PR: split at ₦1M, a platform-wide daily budget, sweep only for withdrawals while the cap stands.
+- Per transfer: handled. Withdrawals are capped at ₦500,000 and sweeps are split into ₦1M transfers.
+- Per day, business-wide: **not enforced by Duevy**. Two spaces can each withdraw ₦5M, and sweeps count too if 9jaPay counts them. A transfer past 9jaPay's cap is refused by 9jaPay: a withdrawal fails and is restored, a sweep fails and stays unswept for the next run. Revisit once 9jaPay answers question 3 below.
 
 ## Open questions for 9jaPay
 

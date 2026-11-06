@@ -262,9 +262,9 @@ Replaces the student ID card after an admin rejected it (or if none was sent). P
 
 ```json
 { "available": 900000, "balance": 900000, "collected": 900000, "withdrawn": 0, "withdrawalFees": 0, "inFlight": 0,
-  "kyc": { … }, "beneficiaryCount": 1, "minPayout": 100000,
+  "kyc": { … }, "beneficiaryCount": 1, "minPayout": 100000, "maxPayout": 50000000,
   "account": { "accountNumber": "9000002133", "accountName": "DUEVY/Computer Science Department", "bankName": "9jaPay" },
-  "funds": { "inSpaceAccountKobo": 400000, "awaitingSweepKobo": 500000, "dailyLimitKobo": 1000000000, "dailyRemainingKobo": 1000000000 },
+  "funds": { "inSpaceAccountKobo": 400000, "awaitingSweepKobo": 500000, "dailyLimitKobo": 500000000, "dailyRemainingKobo": 500000000 },
   "fees": { "bands": [
     { "fromKobo": 0, "toKobo": 500000, "feeKobo": 1000 },
     { "fromKobo": 500000, "toKobo": 10000000, "feeKobo": 1500 },
@@ -275,7 +275,7 @@ The balance always comes from the ledger.
 
 - `account` is the space's own 9jaPay account, or `null` while it's being opened (withdrawals wait for it).
 - `funds` splits the balance by where it sits: already in the space's account, or still in Duevy's account awaiting the daily sweep. Withdrawals sweep what they need first, so the whole balance can be withdrawn.
-- A space account moves at most ₦10,000,000 a day (sweeps in plus withdrawals out, Lagos days). `dailyRemainingKobo` is what's left today.
+- Withdrawals: ₦1,000 to ₦500,000 each (`minPayout`, `maxPayout`), and at most ₦5,000,000 per space per Lagos day (`dailyLimitKobo`). `dailyRemainingKobo` is what the space can still withdraw today.
 - `fees.bands` is 9jaPay's transfer charge by withdrawal amount (`toKobo` exclusive, `null` = no upper bound), net of any partner discount.
 
 ### Other dashboard reads
@@ -303,7 +303,7 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 
 ### `GET /payout/quote?amount=500000`
 
-`200`: `{ amount, fee, net, feeBeforeDiscount, discount, discountPercent, minPayout, belowMinimum }`. `fee` is net of any partner discount (see Partners).
+`200`: `{ amount, fee, net, feeBeforeDiscount, discount, discountPercent, minPayout, maxPayout, belowMinimum, aboveMaximum, dailyRemaining }`. `fee` is net of any partner discount (see Partners).
 
 The fee is 9jaPay's transfer charge, passed on: ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000. It is deducted from the withdrawal.
 
@@ -323,7 +323,8 @@ Withdrawal status moves `[awaiting_approval →] pending → processing → succ
 |---|---|
 | `403 KYC_NOT_VERIFIED` | The requesting rep's identity isn't verified. |
 | `409 SPACE_ACCOUNT_NOT_READY` | The space's 9jaPay account is still being opened. |
-| `422 DAILY_LIMIT_EXCEEDED` | The space account's ₦10M daily limit (sweeps in + withdrawals out) would be passed; `details[0].issue` gives what's left today. |
+| `422 ABOVE_MAX_PAYOUT` | Over ₦500,000; split it into several withdrawals. |
+| `422 DAILY_LIMIT_EXCEEDED` | The space would pass ₦5,000,000 withdrawn today (or its account's ₦10M of sweeps + withdrawals); `details[0].issue` gives what's left today. |
 | `403 DUE_REQUIRED` | A co-rep didn't send `dueId`. |
 | `403 DUE_NOT_ASSIGNED` | That due isn't assigned to the co-rep. |
 | `409 SIGNATORIES_INCOMPLETE` | `multisig` mode, but the space has fewer than 3 signatories. |
@@ -533,7 +534,7 @@ Anything else is acknowledged and ignored. `POST /webhooks/bachs` still answers 
 
 - Payments run on 9jaPay. Checkouts always return a one-time `bankTransfer` account; `checkoutUrl` is always `null` and `GET|PUT /admin/settings/payments` (hosted vs custom checkout) are removed.
 - Checkout fee: **1.5%** of the face value, rounded up (was 2% + ₦20). Withdrawal fee: 9jaPay's transfer charge, ₦10 / ₦15 / ₦20 (was ₦100 / ₦200). `GET /payout/summary` `fees` is now `{ bands: [...] }` (was `{ below, atOrAbove }`).
-- Each space has its own 9jaPay account: `account` and `funds` on `GET /payout/summary`. New withdrawal errors: `409 SPACE_ACCOUNT_NOT_READY`, `422 DAILY_LIMIT_EXCEEDED`. `403 LEAD_KYC_NOT_VERIFIED` is gone: the money is the space's, and the requesting rep's own verified identity is what counts.
+- Each space has its own 9jaPay account: `account` and `funds` on `GET /payout/summary`. New withdrawal limits: ₦500,000 per withdrawal (`422 ABOVE_MAX_PAYOUT`) and ₦5,000,000 per space per day (`422 DAILY_LIMIT_EXCEEDED`); also `409 SPACE_ACCOUNT_NOT_READY`. `403 LEAD_KYC_NOT_VERIFIED` is gone: the money is the space's, and the requesting rep's own verified identity is what counts.
 - `POST /payout/kyc` takes only `nin`, `dob` and `studentIdCard`, and answers with the result: `verified`, `pending` (partial match, admin review), `422 KYC_REJECTED` or `503 KYC_PROVIDER_UNAVAILABLE`. Other fields are ignored.
 - KYC state: new `nin: { outcome, reviewStatus, reviewNote }`. Removed: `providerReference`, `governmentIdSubmittedAt`, `payoutDestination`. `payoutsActive` and `requirementsDue` stay as deprecated fixed values.
 - Removed: `POST /payout/kyc/government-id`, `POST /payout/kyc/payout-destination[/lookup]` and their `/me/kyc/*` twins (404).
