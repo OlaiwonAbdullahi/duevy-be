@@ -3,14 +3,23 @@ import bcrypt from 'bcryptjs';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
-import { computeWithdrawal, generatePayoutReference, MIN_PAYOUT_KOBO } from '../lib/money';
+import { computeWithdrawal, generatePayoutReference, MAX_PAYOUT_KOBO, MIN_PAYOUT_KOBO } from '../lib/money';
 import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } from './ledger.service';
-import { canWithdraw } from './kyc.service';
-import { destinationFor, oneOffDestination } from './beneficiary.service';
+import { oneOffDestination } from './beneficiary.service';
+import {
+  createSweep,
+  dailyLimitError,
+  dispatchSweep,
+  ensureSpaceAccount,
+  getDailyAllowanceKobo,
+  getUnsweptKobo,
+  getWithdrawalAllowanceKobo,
+} from './sweep.service';
+import { decrypt, encrypt } from '../lib/encryption';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
 import { getActiveDiscount } from './partner.service';
 
@@ -18,12 +27,18 @@ import { getActiveDiscount } from './partner.service';
  * Withdrawals: a space's lead rep moves the space's balance to one of its
  * beneficiaries — any bank account the space has added. A co-rep can withdraw
  * a due's collections when the lead has assigned that due to them. Either way
- * the money leaves the LEAD rep's provider account, where collections settle.
+ * the money is the SPACE's and leaves the space's own 9jaPay account; when
+ * part of it is still in Duevy's business account, a sweep moves it first and
+ * the withdrawal waits `pending` for it (sweep.service).
  *
  *   gross = what the rep asks for, debited from the space's ledger
- *   fee   = ₦100 (< ₦50,000) or ₦200 (≥ ₦50,000), deducted from the gross,
- *           less the space's partner discount if it has one (partner.service)
+ *   fee   = 9jaPay's transfer charge (₦10 / ₦15 / ₦20 by amount), deducted
+ *           from the gross, less the space's partner discount if any
  *   net   = gross − fee, sent to the bank
+ *
+ * Limits, all checked up front before anything is debited: ₦1,000 to
+ * ₦500,000 per withdrawal; ₦5M withdrawn per space per day; and the space
+ * account's ₦10M a day of sweeps in + withdrawals out.
  *
  * Safety, in order:
  *  0. The space's authorisation, by its withdrawalAuthMode:
@@ -225,7 +240,10 @@ export async function quoteWithdrawal(spaceId: string, amountKobo: number) {
     discount: b.discount,
     discountPercent,
     minPayout: MIN_PAYOUT_KOBO,
+    maxPayout: MAX_PAYOUT_KOBO,
     belowMinimum: amountKobo < MIN_PAYOUT_KOBO,
+    aboveMaximum: amountKobo > MAX_PAYOUT_KOBO,
+    dailyRemaining: await getWithdrawalAllowanceKobo(spaceId),
   };
 }
 
@@ -241,6 +259,13 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   const { spaceId, userId, amountKobo } = req;
   if (!Number.isSafeInteger(amountKobo) || amountKobo < MIN_PAYOUT_KOBO) {
     throw new AppError(422, 'BELOW_MIN_PAYOUT', `The minimum withdrawal is ₦${(MIN_PAYOUT_KOBO / 100).toLocaleString('en-NG')}`);
+  }
+  if (amountKobo > MAX_PAYOUT_KOBO) {
+    throw new AppError(
+      422,
+      'ABOVE_MAX_PAYOUT',
+      `The most you can withdraw at once is ₦${(MAX_PAYOUT_KOBO / 100).toLocaleString('en-NG')}. Split it into several withdrawals.`,
+    );
   }
   const partner = await getActiveDiscount(spaceId);
   const breakdown = computeWithdrawal(amountKobo, partner?.discountPercent ?? 0);
@@ -259,23 +284,22 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   const due = await authoriseScope(req, rep.role);
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
   await verifyAuthorisation(space, req.pin);
+  // The money is the space's; the rep acting on it must have a verified
+  // identity. The student ID review gates collecting (canCollect), not this.
   if (user.kycStatus !== 'verified') {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
-  // Collections settle into the lead rep's account, so that is what pays out.
-  if (!lead || !canWithdraw(lead.user)) {
-    throw forbidden(
-      rep.role === 'lead' ? 'Complete identity verification before withdrawing' : "The lead rep's account can't make withdrawals yet",
-      rep.role === 'lead' ? 'KYC_NOT_VERIFIED' : 'LEAD_KYC_NOT_VERIFIED',
-    );
+  if (!lead) throw forbidden('This space has no lead rep', 'NO_LEAD_REP');
+  const funded = await ensureSpaceAccount(spaceId).catch(() => space);
+  if (!funded.walletAccountNumber) {
+    throw new AppError(409, 'SPACE_ACCOUNT_NOT_READY', "This space's account is still being set up. Try again shortly.");
   }
-  const accountId = lead.user.bachsAccountId!;
-  // canWithdraw guarantees a Bachs account. The destination is fixed on the
-  // payout now so a later change to the beneficiary can't redirect it.
-  const target = await resolveTarget(req, accountId);
+  // Fixed on the payout now so a later change to the beneficiary can't redirect it.
+  const target = await resolveTarget(req);
   const needsApproval = space.withdrawalAuthMode === 'multisig';
 
   const reference = await uniquePayoutReference();
+  let sweepId: string | null = null;
 
   let payout: Payout;
   try {
@@ -301,6 +325,17 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
           }
         }
 
+        // The space's ₦5M a day of withdrawals. What isn't in the space's
+        // account yet has to be swept first, and the sweep and the withdrawal
+        // both count against the account's own daily limit too.
+        const withdrawable = await getWithdrawalAllowanceKobo(spaceId, tx);
+        if (amountKobo > withdrawable) throw dailyLimitError(withdrawable);
+        const unswept = await getUnsweptKobo(spaceId, tx);
+        const sweepNeeded = Math.max(0, amountKobo - Math.max(0, balance - unswept));
+        const accountAllowance = await getDailyAllowanceKobo(spaceId, tx);
+        if (amountKobo + sweepNeeded > accountAllowance) throw dailyLimitError(Math.min(withdrawable, Math.max(0, accountAllowance - sweepNeeded)));
+        if (sweepNeeded > 0) sweepId = (await createSweep(tx, spaceId, sweepNeeded, 'withdrawal')).id;
+
         const created = await tx.payout.create({
           data: {
             spaceId,
@@ -317,11 +352,13 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             accountMasked: `${target.bankName} ${target.accountNumberMasked}`,
             accountName: target.accountName,
             beneficiaryId: target.beneficiaryId,
-            destinationId: target.destinationId,
+            bankCode: target.bankCode,
+            accountNumberEnc: encrypt(target.accountNumber),
+            sweepId,
             note: req.note,
             requestedById: userId,
             provider: getPaymentProvider().name,
-            providerAccountId: accountId,
+            providerPayoutId: getPaymentProvider().wireReference(reference),
           },
         });
         await debit(tx, created);
@@ -342,25 +379,30 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
     throw err;
   }
 
-  logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee, status: payout.status }, 'withdrawal created');
+  logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee, status: payout.status, sweepId }, 'withdrawal created');
+  // The sweep goes now even while signatories approve: moving the space's own
+  // money into its own account is harmless if the withdrawal is cancelled.
+  if (sweepId) await dispatchSweep(sweepId);
   if (payout.status === 'pending') await dispatchPayout(payout.id);
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
 }
 
-async function resolveTarget(req: WithdrawalRequest, accountId: string) {
+async function resolveTarget(req: WithdrawalRequest) {
   if (req.beneficiaryId) {
     const b = await db.payoutBeneficiary.findFirst({ where: { id: req.beneficiaryId, spaceId: req.spaceId } });
     if (!b) throw new AppError(404, 'BENEFICIARY_NOT_FOUND', 'That beneficiary no longer exists');
     return {
       beneficiaryId: b.id,
+      bankCode: b.bankCode,
       bankName: b.bankName,
+      accountNumber: decrypt(b.accountNumber),
       accountNumberMasked: b.accountNumberMasked,
       accountName: b.accountName,
-      destinationId: await destinationFor(b, accountId),
     };
   }
   if (req.account) {
-    return { beneficiaryId: null, ...(await oneOffDestination(accountId, req.account.bankCode, req.account.accountNumber)) };
+    const { bankCode, accountNumber } = req.account;
+    return { beneficiaryId: null, bankCode, accountNumber, ...(await oneOffDestination(bankCode, accountNumber)) };
   }
   throw new AppError(400, 'VALIDATION_ERROR', 'Choose a beneficiary or enter an account for this withdrawal');
 }
@@ -399,24 +441,35 @@ export async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
 }
 
 /**
- * Send a pending withdrawal to the provider. Safe to call repeatedly (the
- * reconciliation job does, for anything stuck in `pending`): the provider call
- * is idempotent on our reference, and the state change is guarded.
+ * Send a pending withdrawal from the space's account. Safe to call repeatedly
+ * (the reconciliation job does, for anything stuck in `pending`): 9jaPay
+ * refuses a second transfer under the same reference, and the state change
+ * is guarded. A withdrawal waiting for a sweep stays pending until it lands.
  */
 export async function dispatchPayout(payoutId: string): Promise<void> {
-  const payout = await db.payout.findUnique({ where: { id: payoutId } });
+  const payout = await db.payout.findUnique({ where: { id: payoutId }, include: { sweep: true, space: true } });
   if (!payout || payout.status !== 'pending') return;
-  if (!payout.providerAccountId || !payout.destinationId) {
-    await failPayout(payout.id, 'No payout destination on this withdrawal');
+  if (payout.sweep && payout.sweep.status !== 'succeeded') {
+    if (payout.sweep.status === 'failed') {
+      await failPayout(payout.id, "The space's collections couldn't be moved into its account. Try again shortly.", 'SWEEP_FAILED');
+    }
+    return;
+  }
+  const { space } = payout;
+  if (!payout.bankCode || !payout.accountNumberEnc || !space.walletAccountNumber || !space.walletAccountName) {
+    await failPayout(payout.id, 'No destination on this withdrawal');
     return;
   }
 
   try {
-    const result = await getPaymentProvider().initiatePayout({
-      accountId: payout.providerAccountId,
-      destinationId: payout.destinationId,
+    const result = await getPaymentProvider().initiateTransfer({
+      from: { accountNumber: space.walletAccountNumber, accountName: space.walletAccountName },
+      bankCode: payout.bankCode,
+      accountNumber: decrypt(payout.accountNumberEnc),
+      accountName: payout.accountName ?? '',
       amountKobo: payout.netKobo,
       reference: payout.reference,
+      narration: `${space.name} withdrawal ${payout.reference}`,
     });
     await db.$transaction(async (tx) => {
       const p = await lockPayout(tx, payout.id);
@@ -424,36 +477,26 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
       assertPayoutTransition('pending', 'processing');
       await tx.payout.update({
         where: { id: p.id },
-        data: {
-          status: 'processing',
-          processingAt: new Date(),
-          providerPayoutId: result.providerPayoutId,
-          providerFeeKobo: result.providerFeeKobo,
-        },
+        data: { status: 'processing', processingAt: new Date(), providerPayoutId: result.providerReference },
       });
     });
-    logger.info({ ref: payout.reference, providerPayoutId: result.providerPayoutId, state: result.state }, 'withdrawal dispatched');
-    if (result.state === 'succeeded') await completePayout(payout.reference, result.providerFeeKobo);
+    logger.info({ ref: payout.reference, state: result.state }, 'withdrawal dispatched');
+    if (result.state === 'succeeded') await completePayout(payout.reference);
     if (result.state === 'failed') await failPayout(payout.id, result.failureReason ?? 'The bank could not complete the transfer');
   } catch (err) {
     if (err instanceof ProviderError && !err.retryable) {
-      const reason =
-        err.code === 'INSUFFICIENT_BALANCE'
-          ? 'Recent payments are still settling. Try again later.'
-          : err.code === 'DESTINATION_PENDING_REVIEW'
-            ? 'This beneficiary account is still being reviewed.'
-            : err.message;
+      const reason = err.code === 'ACCOUNT_UNVERIFIABLE' ? 'The bank could not verify this account.' : err.message;
       await failPayout(payout.id, reason, err.code ?? undefined);
       return;
     }
-    // Timeout / 5xx: the payout may exist. Leave it pending; reconciliation
-    // retries with the same idempotency key, which replays instead of paying twice.
+    // Timeout / 5xx: the transfer may exist. Leave it pending; reconciliation
+    // resends under the same reference, which 9jaPay refuses as a duplicate.
     logger.warn({ ref: payout.reference, err: (err as Error).message }, 'withdrawal dispatch deferred');
   }
 }
 
-/** payout.paid — idempotent. */
-export async function completePayout(reference: string, providerFeeKobo?: number | null): Promise<boolean> {
+/** The transfer succeeded — idempotent. */
+export async function completePayout(reference: string): Promise<boolean> {
   const done = await db.$transaction(async (tx) => {
     const found = await tx.payout.findUnique({ where: { reference }, select: { id: true } });
     if (!found) return null;
@@ -465,23 +508,17 @@ export async function completePayout(reference: string, providerFeeKobo?: number
     }
     return tx.payout.update({
       where: { id: p.id },
-      data: {
-        status: 'success',
-        settledAt: new Date(),
-        activeSpaceId: null,
-        ...(providerFeeKobo !== undefined && providerFeeKobo !== null ? { providerFeeKobo } : {}),
-      },
+      data: { status: 'success', settledAt: new Date(), activeSpaceId: null },
     });
   });
   if (!done) return false;
 
   logger.info({ ref: reference }, 'withdrawal succeeded');
-  await settleWithdrawalFee(done.id).catch((err) => logger.warn({ ref: reference, err: (err as Error).message }, 'fee settlement deferred'));
   await notifyReps(done, 'success');
   return true;
 }
 
-/** payout.failed, or a refusal at dispatch — idempotent. A failure after success is a reversal. */
+/** The transfer failed, or was refused at dispatch — idempotent. A failure after success is a reversal. */
 export async function failPayoutByReference(reference: string, reason: string): Promise<boolean> {
   const p = await db.payout.findUnique({ where: { reference }, select: { id: true } });
   if (!p) return false;
@@ -511,13 +548,6 @@ export async function failPayout(payoutId: string, reason: string, code?: string
   if (!done) return false;
 
   logger.warn({ ref: done.reference, status: done.status, reason, code }, 'withdrawal failed — balance restored');
-  // A reversed withdrawal whose fee had already been swept: give the fee back
-  // to the rep's provider account, since the ledger restored it to the space.
-  if (done.status === 'reversed' && done.feeSettledAt && done.feeSettlementKobo && done.providerAccountId) {
-    await getPaymentProvider()
-      .settleFee({ accountId: done.providerAccountId, amountKobo: -done.feeSettlementKobo, reference: `${done.reference}-REV` })
-      .catch((err) => logger.error({ ref: done.reference, err: (err as Error).message }, 'fee refund on reversal failed — reconcile by hand'));
-  }
   await notifyReps(done, 'failed');
   return true;
 }
@@ -563,28 +593,12 @@ export async function cancelPayout(payoutId: string, reason: string): Promise<Pa
   return done;
 }
 
-/**
- * After a successful withdrawal the rep's provider account has been debited
- * net + the provider's own payout fee; the ledger debited net + Duevy's fee.
- * Moving (Duevy fee − provider fee) to the platform makes the two agree.
- */
-export async function settleWithdrawalFee(payoutId: string): Promise<void> {
-  const p = await db.payout.findUnique({ where: { id: payoutId } });
-  if (!p || p.status !== 'success' || p.feeSettledAt || !p.providerAccountId) return;
-  const amount = p.feeKobo - (p.providerFeeKobo ?? 0);
-  if (amount !== 0) {
-    await getPaymentProvider().settleFee({ accountId: p.providerAccountId, amountKobo: amount, reference: p.reference });
-  }
-  await db.payout.update({ where: { id: p.id }, data: { feeSettledAt: new Date(), feeSettlementKobo: amount } });
-  logger.info({ ref: p.reference, amount }, 'withdrawal fee settled');
-}
-
-/** Reconciliation: resolve a processing withdrawal from the provider's own record. */
+/** Reconciliation (and transfer events): resolve a withdrawal from 9jaPay's own record. */
 export async function refreshPayout(payoutId: string): Promise<void> {
   const p = await db.payout.findUnique({ where: { id: payoutId } });
-  if (!p || p.status !== 'processing' || !p.providerPayoutId || !p.providerAccountId) return;
-  const result = await getPaymentProvider().getPayout(p.providerAccountId, p.providerPayoutId);
-  if (result.state === 'succeeded') await completePayout(p.reference, result.providerFeeKobo);
+  if (!p || p.status !== 'processing') return;
+  const result = await getPaymentProvider().getTransfer(p.reference);
+  if (result.state === 'succeeded') await completePayout(p.reference);
   else if (result.state === 'failed') await failPayout(p.id, result.failureReason ?? 'The bank could not complete the transfer');
 }
 

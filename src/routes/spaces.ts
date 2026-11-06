@@ -14,6 +14,7 @@ import { repDuesRouter } from './repDues';
 import { payoutsRouter } from './payouts';
 import { pollsRepRouter } from './polls';
 import { spacePartnerRouter } from './partners';
+import { openSpaceAccountInBackground } from '../services/sweep.service';
 import { receiptDesignRouter } from './receiptDesign';
 
 export const spacesRouter = Router();
@@ -127,6 +128,8 @@ spacesRouter.post('/', validate(createSpaceSchema), async (req: Request, res: Re
     return created;
   });
 
+  // The space's own 9jaPay account; retried by the sweep job if this fails.
+  openSpaceAccountInBackground(space.id);
   ok(res, { ...serializeSpace(space, { memberCount: 1 }), joinCode: space.joinCode }, 201);
 });
 

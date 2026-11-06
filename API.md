@@ -132,7 +132,7 @@ This shows who has paid and who has not. `GET /dues/:dueId/collections/export` r
 
 `200`: `[{ id, spaceId, title, note, amount, processingFee, payableAmount, dueDate, type, status, paidAt, reference }]`
 
-`processingFee` and `payableAmount` are what the due would cost **on its own**. A checkout charges the ₦20 once for the whole basket, so several dues together cost less than the sum of these figures.
+`processingFee` and `payableAmount` are what the due would cost **on its own**: the 1.5% processing fee, rounded up to the kobo. A basket's fee is 1.5% of its total, so it can differ from the sum of these by a kobo or two.
 
 ### 🔑 `POST /dues/pay`
 
@@ -148,30 +148,27 @@ One bank transfer pays every due in the basket.
 {
   "reference": "DVY-7KQ2-MN4X",
   "status": "pending",
-  "amount": 665000,
-  "breakdown": { "face": 650000, "fee": 15000, "total": 665000 },
-  "items": [{ "dueId": "…", "title": "…", "amount": 500000, "fee": 11538 }],
-  "bankTransfer": { "accountNumber": "9902847361", "bankName": "…", "accountName": "…", "amountKobo": 665000, "expiresAt": "…" },
+  "amount": 659750,
+  "breakdown": { "face": 650000, "fee": 9750, "total": 659750 },
+  "items": [{ "dueId": "…", "title": "…", "amount": 500000, "fee": 7500 }],
+  "bankTransfer": { "accountNumber": "9000001277", "bankName": "9jaPay", "accountName": "…", "amountKobo": 659750, "expiresAt": "…" },
   "checkoutUrl": null,
   "expiresAt": "…", "paidAt": null, "receivedKobo": null, "overpaidKobo": 0, "reused": false
 }
 ```
 
-How the student pays depends on the admin's checkout mode (`GET|PUT /admin/settings/payments`):
+Show the student the one-time account in `bankTransfer`. It accepts exactly `amountKobo` (any other amount is refused at the bank) and closes at `expiresAt`. `checkoutUrl` is always `null` now; hosted checkout pages went with Bachs.
 
-- `hosted`: `bankTransfer` is `null` and `checkoutUrl` is set. Redirect the student there. Bachs sends them back to `/dashboard/pay/:reference?checkout_id=…`.
-- `custom`: `bankTransfer` is set and `checkoutUrl` is `null`. Show the one-time account (example above).
-
-An open checkout keeps the mode it was created with.
-
-The fee is 2% of the face value (rounded half-up to the kobo) plus ₦20. The student pays the fee on top, and the space receives the full face value.
+The fee is a 1.5% processing fee on the face value, rounded up to the kobo, shown separately and paid on top. It covers 9jaPay's charges. The space receives the full face value.
 
 Rules:
+
+- Every due must be `active`Rules:
 
 - Every due must be `active` and belong to the same space (otherwise `422 MIXED_SPACES`).
 - The caller must have joined the space (otherwise `403 NOT_A_MEMBER`).
 - No due may already be paid (otherwise `409 DUE_ALREADY_PAID`).
-- The space's lead rep must have passed KYC (otherwise `409 SPACE_NOT_VERIFIED`).
+- The space's lead rep must have passed KYC: identity verified and student ID approved (otherwise `409 SPACE_NOT_VERIFIED`).
 - A basket that overlaps an open checkout is refused with `409 CHECKOUT_OVERLAP`.
 - Body fields other than `dueIds` (and the legacy `method: "online"`) are rejected with `400`. That includes any amount.
 
@@ -205,61 +202,55 @@ Only the webhook (and the reconciliation job behind it) changes the status. Poll
 
 All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the space.
 
+The money is the **space's**, never the rep's. Each space has its own 9jaPay account (`account` on `GET /payout/summary`); reps manage it. KYC records who is accountable for the space, so a new rep verifies before they can act.
+
 KYC has two parts, and a space collects only when **both** pass:
 
-- **Identity, verified by Bachs:** NIN + date of birth. A BVN is not required; Bachs may ask for one (or an ID document) later, and `requirementsDue` says so.
+- **Identity:** NIN + date of birth, checked against NIMC (through Didit) as you submit. No BVN, no gender, no ID document.
 - **Student status, verified by a Duevy admin:** the rep's student ID card.
 
-### `POST /payout/kyc` (`multipart/form-data`)
+### `POST /payout/kyc` (`multipart/form-data`) (also `/me/kyc`)
 
 | Part | Required | Notes |
 |---|---|---|
-| `nin` | yes | 11 digits. Sent to Bachs; never stored or logged. |
-| `dob` | yes | `YYYY-MM-DD`. Sent to Bachs; never stored or logged. |
-| `gender` | yes | `male` or `female`. Validated; Bachs has no field for it. |
+| `nin` | yes | 11 digits. Checked, never stored or logged. |
+| `dob` | yes | `YYYY-MM-DD`. Checked, never stored or logged. |
 | `studentIdCard` | yes | File: JPEG, PNG, WebP or PDF, max 5 MB, checked by its bytes. Stored privately in ImageKit for admin review. |
-| `governmentId` | no | File, same rules. Forwarded to Bachs, only useful when it asks for an ID document. |
-| `bvn` | no | 11 digits. Only if Bachs asks for it. |
-| `firstName`, `lastName`, `phone` | no | `phone` in E.164, any country (e.g. `+2348012345678`, `+447911123456`). Names default to the account name. |
 
-`202`:
+Fields older clients still send (`gender`, `bvn`, `firstName`, `lastName`, `phone`, a `governmentId` file) are ignored. The NIN is checked under the name on the rep's account.
+
+`202`, with the result already known:
 
 ```json
-{ "kycStatus": "pending", "payoutsActive": false, "canCollect": false, "canWithdraw": false, "providerReference": "per_…",
-  "requirementsDue": [], "governmentIdSubmittedAt": null,
+{ "kycStatus": "verified", "canCollect": false, "canWithdraw": false,
+  "nin": { "outcome": "match", "reviewStatus": null, "reviewNote": null },
   "studentId": { "status": "pending", "uploadedAt": "…", "reviewedAt": null, "reviewNote": null },
-  "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": null }
+  "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": "…",
+  "payoutsActive": false, "requirementsDue": [] }
 ```
 
-The Bachs verdict arrives by webhook. Validation errors never echo the NIN, BVN or date of birth.
+| NIN check | Result |
+|---|---|
+| Match | `kycStatus: "verified"`. Collection opens once the student ID is approved. |
+| Partial match (name or date of birth only partly matched) | `kycStatus: "pending"`, `nin.reviewStatus: "pending"`. An admin decides; the rep is notified. |
+| No match | `422 KYC_REJECTED`; counts as a failed attempt. |
+| NIMC unreachable | `503 KYC_PROVIDER_UNAVAILABLE`; not counted. Try again later. |
+
+`payoutsActive` and `requirementsDue` are deprecated: always `canWithdraw` and `[]`. Validation errors never echo the NIN or date of birth.
 
 | Error | When |
 |---|---|
 | `400 VALIDATION_ERROR` | Bad field, missing `studentIdCard`, or a file that isn't really a JPEG/PNG/WebP/PDF. |
 | `413 FILE_TOO_LARGE` | A file over 5 MB. |
-
-| Error | When |
-|---|---|
-| `403 REP_NOT_APPROVED` | The caller is not an approved rep. |
-| `409 ALREADY_VERIFIED`, `409 KYC_PENDING` | Already verified, or a verification is already under review. |
-| `422 KYC_REJECTED` | Bachs refused the details. |
+| `403 REP_NOT_APPROVED` | The caller is not a rep or rep applicant. |
+| `409 ALREADY_VERIFIED`, `409 KYC_PENDING` | Already verified, or a partial match is awaiting review. |
+| `422 KYC_REJECTED` | The NIN and date of birth didn't match the register. |
 | `429 KYC_RETRY_LOCKED` | Three failed attempts; retries are locked for 24 hours. |
+| `503 KYC_PROVIDER_UNAVAILABLE` | The identity check couldn't be reached. |
 
 ### `POST /payout/kyc/student-id` (`multipart/form-data`)
 
 Replaces the student ID card after an admin rejected it (or if none was sent). Part: `studentIdCard`. Returns `202` with the KYC state. `409 STUDENT_ID_PENDING` / `STUDENT_ID_APPROVED` if there is nothing to replace.
-
-### `POST /payout/kyc/government-id` (`multipart/form-data`)
-
-Forwards a government ID document to Bachs, for when `requirementsDue` asks for one. Part: `governmentId`. Returns `202`. `409 KYC_NOT_STARTED` before the first submission.
-
-### `POST /payout/kyc/payout-destination` (also `/me/kyc/payout-destination`)
-
-The rep's own bank account. Collected during onboarding right after the NIN + student ID submission, and again whenever Bachs lists `payout_destination` in `requirementsDue`. Bachs won't finish onboarding (and payouts stay off) until it has one. Once accepted it's saved (masked) and returned as `payoutDestination` on the KYC state: `{ bankCode, bankName, accountNumber (masked), accountName, submittedAt }`, or `null` until sent. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. The account is name-checked and the bank's name is sent to Bachs. `200` with the refreshed KYC state. Errors: `409 KYC_NOT_STARTED`, `422 ACCOUNT_UNVERIFIABLE`, `422 PAYOUT_DESTINATION_REJECTED` (Bachs refused it).
-
-`POST /me/kyc/payout-destination/lookup` (also `/payout/kyc/payout-destination/lookup`) with the same body runs the name check without sending anything: `200` `{ bankCode, bankName, accountNumber (masked), accountName }`.
-
-This is separate from beneficiaries: it only tells Bachs where the rep's account would pay out by default. Withdrawals still go to the beneficiary or account chosen each time.
 
 ### `GET /payout/kyc-status`
 
@@ -272,10 +263,20 @@ This is separate from beneficiaries: it only tells Bachs where the rep's account
 ```json
 { "available": 900000, "balance": 900000, "collected": 900000, "withdrawn": 0, "withdrawalFees": 0, "inFlight": 0,
   "kyc": { … }, "beneficiaryCount": 1, "minPayout": 100000,
-  "fees": { "below": { "thresholdKobo": 5000000, "feeKobo": 10000 }, "atOrAbove": { "thresholdKobo": 5000000, "feeKobo": 20000 } } }
+  "account": { "accountNumber": "9000002133", "accountName": "DUEVY/Computer Science Department", "bankName": "9jaPay" },
+  "funds": { "inSpaceAccountKobo": 400000, "awaitingSweepKobo": 500000, "dailyLimitKobo": 1000000000, "dailyRemainingKobo": 1000000000 },
+  "fees": { "bands": [
+    { "fromKobo": 0, "toKobo": 500000, "feeKobo": 1000 },
+    { "fromKobo": 500000, "toKobo": 10000000, "feeKobo": 1500 },
+    { "fromKobo": 10000000, "toKobo": null, "feeKobo": 2000 } ] } }
 ```
 
 The balance always comes from the ledger.
+
+- `account` is the space's own 9jaPay account, or `null` while it's being opened (withdrawals wait for it).
+- `funds` splits the balance by where it sits: already in the space's account, or still in Duevy's account awaiting the daily sweep. Withdrawals sweep what they need first, so the whole balance can be withdrawn.
+- A space account moves at most ₦10,000,000 a day (sweeps in plus withdrawals out, Lagos days). `dailyRemainingKobo` is what's left today.
+- `fees.bands` is 9jaPay's transfer charge by withdrawal amount (`toKobo` exclusive, `null` = no upper bound), net of any partner discount.
 
 ### Other dashboard reads
 
@@ -287,13 +288,13 @@ The balance always comes from the ledger.
 
 ### Beneficiaries
 
-A withdrawal goes to a beneficiary: any bank account the space has added, such as the rep's own, a lecturer's or a vendor's. The account holder doesn't have to be the rep, and there is no hold after adding one. The account name always comes from the bank's name enquiry.
+A withdrawal goes to a beneficiary: any bank account the space has added, such as the department's own, a lecturer's, a vendor's or a rep's. The account holder doesn't have to be the rep, and there is no hold after adding one. The account name always comes from the bank's name enquiry.
 
 | Endpoint | Behaviour |
 |---|---|
 | `POST /payout/beneficiaries/lookup` | Name enquiry without saving. Body: `{ "bankCode": "058", "accountNumber": "0123456789" }`. Returns `200` `{ bankCode, bankName, accountNumber (masked), accountName }`. |
 | `GET /payout/beneficiaries` | Any rep. `[Beneficiary]`, newest first. |
-| `POST /payout/beneficiaries` | Lead rep only. Body: `{ bankCode, accountNumber, label? }` (`label` up to 60 characters, e.g. `"Dr. Adeyemi (HOD)"`). Runs name enquiry and registers the account with Bachs. `201` with the new `Beneficiary`, or `200` with the existing one if that account was already added. Every rep of the space is emailed. |
+| `POST /payout/beneficiaries` | Lead rep only. Body: `{ bankCode, accountNumber, label? }` (`label` up to 60 characters, e.g. `"Dr. Adeyemi (HOD)"`). Runs name enquiry and saves it on the space; a rep handover leaves it in place. `201` with the new `Beneficiary`, or `200` with the existing one if that account was already added. Every rep of the space is emailed. |
 | `DELETE /payout/beneficiaries/:beneficiaryId` | Lead rep only. `200` `{ removed: true }`. Withdrawals already made to it are unaffected. |
 
 `Beneficiary = { id, label, bankCode, bankName, accountNumber (masked), accountName, createdAt }`
@@ -304,15 +305,15 @@ A withdrawal goes to a beneficiary: any bank account the space has added, such a
 
 `200`: `{ amount, fee, net, feeBeforeDiscount, discount, discountPercent, minPayout, belowMinimum }`. `fee` is net of any partner discount (see Partners).
 
-The fee is ₦100 under ₦50,000 and ₦200 from ₦50,000. It is deducted from the withdrawal.
+The fee is 9jaPay's transfer charge, passed on: ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000. It is deducted from the withdrawal.
 
 ### 🔑 `POST /payout/request` (lead rep, or a co-rep for an assigned due)
 
 - Body: `{ "amount": 500000, "beneficiaryId": "…", "pin": "4821", "dueId"?: "…", "note"?: "…" }`. `amount` is the gross in kobo.
-- `dueId` draws on one due's collections. The lead may omit it to draw on the whole space. A co-rep must send it, and the due must be assigned to them (`POST /dues/:dueId/reassign`). The amount can't exceed what is left of that due (see `GET /payout/dues`). The money always leaves the lead rep's account, where collections settle.
+- `dueId` draws on one due's collections. The lead may omit it to draw on the whole space. A co-rep must send it, and the due must be assigned to them (`POST /dues/:dueId/reassign`). The amount can't exceed what is left of that due (see `GET /payout/dues`). The money always leaves the space's own account.
 - `pin` is needed only in `pin` mode (see [Withdrawal security](#withdrawal-security)). It is the space's 4-digit security code, which the lead rep sets themselves (`PUT /payout/pin`). Five wrong codes lock it for 30 minutes. `GET /payout/summary` reports `withdrawalAuthMode`, `withdrawalPinSet`, `withdrawalPinLockedUntil` and `withdrawalPinHoldUntil`.
-- Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked and registered with Bachs the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
-- `201`: `Payout`. In `multisig` mode it is `awaiting_approval` and carries `approval` (below), including `otpSentToRequester: true` when the requester is a signatory and has been emailed their code.
+- Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
+- `201`: `Payout`. If part of the amount is still awaiting the daily sweep, it is swept first and the withdrawal stays `pending` until that lands (usually moments). In `multisig` mode it is `awaiting_approval` and carries `approval` (below), including `otpSentToRequester: true` when the requester is a signatory and has been emailed their code.
 
 `Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, dueId, note, requestedById, requestedAt, approvalExpiresAt, processingAt, settledAt, failedAt, reversedAt, cancelledAt, failureReason }`
 
@@ -320,8 +321,9 @@ Withdrawal status moves `[awaiting_approval →] pending → processing → succ
 
 | Error | When |
 |---|---|
-| `403 KYC_NOT_VERIFIED` | The rep has not passed KYC. |
-| `403 LEAD_KYC_NOT_VERIFIED` | A co-rep's request, but the lead rep's account can't make withdrawals yet. |
+| `403 KYC_NOT_VERIFIED` | The requesting rep's identity isn't verified. |
+| `409 SPACE_ACCOUNT_NOT_READY` | The space's 9jaPay account is still being opened. |
+| `422 DAILY_LIMIT_EXCEEDED` | The space account's ₦10M daily limit (sweeps in + withdrawals out) would be passed; `details[0].issue` gives what's left today. |
 | `403 DUE_REQUIRED` | A co-rep didn't send `dueId`. |
 | `403 DUE_NOT_ASSIGNED` | That due isn't assigned to the co-rep. |
 | `409 SIGNATORIES_INCOMPLETE` | `multisig` mode, but the space has fewer than 3 signatories. |
@@ -389,7 +391,7 @@ Every set, change and reset is written to the space audit log. The code is clear
 
 ### `GET /banks`
 
-`200`: `[{ code, name }]`, the bank list from Bachs.
+`200`: `[{ code, name }]`, the bank list from 9jaPay.
 
 ---
 
@@ -440,7 +442,7 @@ Body: `{ "code": "NACOS" }`. `201`: `SpacePartner`. A space has at most one part
 - `GET /payout/quote` adds `feeBeforeDiscount`, `discount` and `discountPercent` (`0` with no partner). `fee` and `net` are already discounted.
 - `GET /payout/summary` adds `partner: SpacePartner | null` (only while active), and its `fees` tiers are already discounted.
 - `Payout` adds `feeDiscount` (kobo).
-- A 100% discount means no fee at all. When the discounted fee is below Bachs's own payout fee, the platform covers the difference at settlement.
+- A 100% discount means no fee at all. Duevy covers the part of 9jaPay's transfer charge the discount takes off.
 
 ---
 
@@ -469,7 +471,7 @@ Aggregate-only traction figures for duevy.app/metrics. No auth. Cached for 10 mi
 
 Clears the space's withdrawal code, for example when a rep's account may be compromised. Admins never set or see codes. Withdrawals stop until the lead rep sets a new code, and every rep is notified. `200`: `{ withdrawalPinSet: false }`. `GET /admin/spaces` rows carry `withdrawalPinSet`, `withdrawalPinSetAt`, `withdrawalPinLocked` and `withdrawalPinHoldUntil`.
 
-Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`. Identity verification is Bachs's decision, so an admin can revoke it but never grant it. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` and the dues `allowGuests` field are removed. Co-reps are now added with `POST /spaces/:spaceId/reps`.
+Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`: an admin can revoke a rep's verification but never grant it, except by approving a partial NIN match below. `PATCH /me` refuses an email change (`422 EMAIL_CHANGE_NOT_ALLOWED`). `POST /spaces/:spaceId/reps/invite` and the dues `allowGuests` field are removed. Co-reps are now added with `POST /spaces/:spaceId/reps`.
 
 `role = admin` is required. Each route also checks the permission named in its row; a super admin has every permission.
 
@@ -481,6 +483,8 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `GET /admin/reps` | userManagement | Reps with their collections. |
 | `GET /admin/kyc/student-ids?status=pending` | userManagement | Student ID cards to review: `[{ userId, name, email, matricNo, institution, kycStatus, studentId: { status, mimeType, uploadedAt, reviewedAt, reviewNote, viewUrl, viewUrlExpiresInSeconds } }]`. `viewUrl` is a signed ImageKit link that expires after 10 minutes. |
 | `POST /admin/users/:userId/student-id/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. The rep is notified. |
+| `GET /admin/kyc/nin-reviews?status=pending` | userManagement | NIN checks that only partly matched: `[{ userId, name, email, matricNo, institution, kycStatus, submittedAt, nameMatchScore, reviewStatus, reviewedAt, reviewNote, providerReference, studentIdStatus }]`. The NIN itself is never stored, so never shown; look the check up in the Didit console by `providerReference`. |
+| `POST /admin/users/:userId/nin/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. Approve verifies the rep; reject counts as a failed attempt. Audit-logged as `user.nin_review`. |
 | `GET /admin/spaces?q=&school=&type=` | userManagement | `[{ id, name, short, kind, school, memberCount, duesTarget, collectedAmount, assignedRepIds, isArchived, payoutsFrozen }]` |
 | `GET /admin/transactions?type=&status=&spaceId=&userId=&from=&to=` | userManagement | Every transaction. |
 | `GET /admin/checkouts?status=&needsReview=true&overpaid=true&spaceId=` | userManagement | The review queue: underpaid, overpaid, late and duplicate payments. |
@@ -490,8 +494,6 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `POST /admin/reps/:repId/freeze-payouts` · `/unfreeze-payouts` | payouts | Freezes or unfreezes the rep's withdrawals. |
 | `GET /admin/feedback?status=&category=&q=` | userManagement | Feedback inbox, newest first; `status` is `new` or `resolved`, `category` is `bug`, `idea` or `other`. Rows as in `POST /feedback`. `meta.unresolved` is the count of `new` feedback (for a badge). |
 | `POST /admin/feedback/:id/resolve` · `/reopen` | userManagement | Marks it resolved (body: `{ note? }`, kept as `adminNote`) or back to `new`. Both are audit-logged. |
-| `GET /admin/settings/payments` | any admin | `{ checkoutMode: "hosted" \| "custom", updatedAt, updatedById }`. Defaults to `hosted`. |
-| `PUT /admin/settings/payments` | super admin | Body `{ checkoutMode: "hosted" \| "custom" }`. Applies to checkouts opened from then on. Audit-logged as `settings.checkout_mode`. |
 | `GET /admin/partners?q=&status=all\|active\|inactive` | payouts | `[{ id, name, short, code, logoUrl, withdrawalFeeDiscountPercent, durationDays, maxRedemptions, expiresAt, isActive, redemptionCount, createdAt, updatedAt }]`. `redemptionCount` leaves out revoked ones. |
 | `POST /admin/partners` | payouts | Body: `{ name, short, code, withdrawalFeeDiscountPercent (1–100), logoUrl?, durationDays?, maxRedemptions?, expiresAt?, isActive? }`. `code` is 3–20 letters, numbers or dashes, stored uppercase. `409 PARTNER_CODE_TAKEN`. Audit-logged as `partner.create`. |
 | `PATCH /admin/partners/:partnerId` | payouts | Any of the fields above. Doesn't change spaces that already redeemed the code. Audit-logged as `partner.update`. |
@@ -503,31 +505,43 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 
 ## Webhook
 
-### `POST /webhooks/bachs`
+### `POST /webhooks/9japay`
 
-Public. It authenticates only by signature: `X-Bachs-Signature-V2: t=…,v1=…`, with `X-Bachs-Signature` plus `X-Bachs-Timestamp` as the legacy fallback.
+Public. Register it in the 9jaPay dashboard (Settings → Developer), for test and live. It authenticates only by signature: `Signature: base64(HMAC-SHA256(secret key, raw body))`.
 
 | Response | When |
 |---|---|
 | `200` | The event was stored (deduplicated by event id), or it was authenticated but unreadable and was dead-lettered. |
-| `401` | The signature is bad or stale. |
-| `503` | The event could not be stored, so Bachs retries it. |
+| `401` | The signature is missing or wrong. |
+| `503` | The event could not be stored, so 9jaPay resends it (up to 10 times). |
 
-Events Duevy acts on:
+9jaPay events carry no timestamp, so none is acted on as-is: each prompts Duevy to ask 9jaPay what happened.
 
 | Event | Effect |
 |---|---|
-| `collection.succeeded` (`SUCCEEDED`, `ACCEPTED`, `OVERPAID`) | The checkout is paid. |
-| `collection.underpaid` | The checkout is marked underpaid. |
-| `collection.failed` / `checkout.expired` | The checkout expires. |
-| `payout.paid` / `payout.failed` | The withdrawal succeeds, or fails or is reversed. |
-| `account.updated` / `capability.updated` | Duevy re-reads the rep's KYC state. |
+| `new_transaction`, Credit, on a checkout's one-time account | Duevy reads the account's transactions; the checkout becomes paid (or underpaid). Money after expiry is honoured and flagged. |
+| `new_transaction`, Credit, on a space's account | A sweep landed: Duevy confirms its sweeps in flight. |
+| `transfer_response` | Duevy queries the transfer's status; the sweep or withdrawal succeeds or fails. |
 
-Anything else is acknowledged and ignored.
+Anything else is acknowledged and ignored. `POST /webhooks/bachs` still answers `200` and drops the event, until Bachs is switched off.
 
 ---
 
 ## Removed or changed in this release
+
+**Bachs → 9jaPay, KYC → NIN + date of birth (this release):**
+
+- Payments run on 9jaPay. Checkouts always return a one-time `bankTransfer` account; `checkoutUrl` is always `null` and `GET|PUT /admin/settings/payments` (hosted vs custom checkout) are removed.
+- Checkout fee: **1.5%** of the face value, rounded up (was 2% + ₦20). Withdrawal fee: 9jaPay's transfer charge, ₦10 / ₦15 / ₦20 (was ₦100 / ₦200). `GET /payout/summary` `fees` is now `{ bands: [...] }` (was `{ below, atOrAbove }`).
+- Each space has its own 9jaPay account: `account` and `funds` on `GET /payout/summary`. New withdrawal errors: `409 SPACE_ACCOUNT_NOT_READY`, `422 DAILY_LIMIT_EXCEEDED`. `403 LEAD_KYC_NOT_VERIFIED` is gone: the money is the space's, and the requesting rep's own verified identity is what counts.
+- `POST /payout/kyc` takes only `nin`, `dob` and `studentIdCard`, and answers with the result: `verified`, `pending` (partial match, admin review), `422 KYC_REJECTED` or `503 KYC_PROVIDER_UNAVAILABLE`. Other fields are ignored.
+- KYC state: new `nin: { outcome, reviewStatus, reviewNote }`. Removed: `providerReference`, `governmentIdSubmittedAt`, `payoutDestination`. `payoutsActive` and `requirementsDue` stay as deprecated fixed values.
+- Removed: `POST /payout/kyc/government-id`, `POST /payout/kyc/payout-destination[/lookup]` and their `/me/kyc/*` twins (404).
+- New admin queue: `GET /admin/kyc/nin-reviews`, `POST /admin/users/:userId/nin/review`.
+- Webhooks: `POST /webhooks/9japay`. `/webhooks/bachs` acknowledges and drops.
+- Reps verified under Bachs stay verified. Reps mid-verification start again.
+
+**Earlier:**
 
 - `POST /webhooks/anchor` is gone; use `/webhooks/bachs`.
 - `POST /payout/kyc/upgrade` is removed, along with KYC tiers and the ₦300,000 balance ceiling.

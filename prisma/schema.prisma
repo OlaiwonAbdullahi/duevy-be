@@ -147,6 +147,18 @@ enum WebhookStatus {
   dead
 }
 
+enum SweepStatus {
+  pending
+  processing
+  succeeded
+  failed
+}
+
+enum SweepTrigger {
+  daily
+  withdrawal
+}
+
 enum PayoutApprovalDecision {
   approved
   rejected
@@ -194,7 +206,7 @@ enum NotificationTone {
   rose
 }
 
-// Duevy's own review of a document Bachs doesn't check (the rep's student ID).
+// Duevy's own review: the rep's student ID card, and a NIN check that only partly matched.
 enum DocumentReviewStatus {
   pending
   approved
@@ -361,41 +373,36 @@ model User {
   level                          String?
   notificationPrefs              Json? // §3.4 — email/push toggles; null = defaults
   referralCode                   String?               @unique
-  // Rep identity on Bachs Connect. Each rep is a recipient Connect account
-  // (bachsAccountId) whose representative person (bachsPersonId — the
-  // provider reference for KYC) carries the rep's NIN (and a BVN only if Bachs
-  // later asks for one). Collections settle into this account as destination
-  // charges and withdrawals are paid out of it.
-  //
-  // THE NIN, BVN AND DATE OF BIRTH ARE NEVER PERSISTED. They pass through to
-  // Bachs in the KYC request and nowhere else; only the outcome is stored.
+  // --- Legacy (Bachs era). Read-only. Each rep was a Bachs Connect account;
+  // under 9jaPay no rep holds a provider account. Nothing writes these.
   bachsAccountId                 String?               @unique
   bachsPersonId                  String?
-  // Bachs reports these separately: the person's verification, and whether the
-  // account may pay out. A rep can collect only when both are true.
+  // Rep KYC. THE NIN AND DATE OF BIRTH ARE NEVER PERSISTED: they pass through
+  // to the identity check and nowhere else; only the outcome is stored.
+  // A rep's spaces can collect once kycStatus is verified AND the student ID
+  // is approved (kyc.service canCollect).
   kycStatus                      KycStatus             @default(unverified)
-  bachsPayoutsActive             Boolean               @default(false)
+  bachsPayoutsActive             Boolean               @default(false) // legacy (Bachs)
   kycSubmittedAt                 DateTime?
   kycResolvedAt                  DateTime?
   kycRejectionReason             String?
   kycAttempts                    Int                   @default(0)
   kycRetryLockedUntil            DateTime? // §9.2 — 24h lock after 3 consecutive failures
-  // Field keys Bachs still asks for on the rep's account (e.g. a BVN or an ID
-  // document), refreshed on every identity event, so the rep can be told.
+  // Legacy (Bachs): what Bachs still asked for, and an ID document sent on request.
   kycRequirementsDue             String[]              @default([])
-  governmentIdSubmittedAt        DateTime? // an ID document forwarded to Bachs on request
+  governmentIdSubmittedAt        DateTime?
   // "Finish your verification" emails to rep applicants who stall on KYC:
   // 1 = 24h, 2 = 3 days, 3 = 7 days after sign-up (src/jobs/kycReminders.ts).
   kycReminderStage               Int                   @default(0)
   kycReminderSentAt              DateTime?
-  // The rep's own bank account, sent to Bachs as their account's
-  // payout_destination during onboarding. Only the masked number is kept.
+  // Legacy (Bachs): the rep's own bank account, sent to Bachs as their
+  // account's payout_destination. Only the masked number was kept.
   payoutDestinationBankCode      String?
   payoutDestinationBankName      String?
   payoutDestinationAccountMasked String?
   payoutDestinationAccountName   String?
   payoutDestinationSubmittedAt   DateTime?
-  // The rep's student ID card — Duevy's own check, not Bachs's. Uploaded at
+  // The rep's student ID card — Duevy's own check. Uploaded at
   // KYC time to private storage (ImageKit) and reviewed by an admin; a space
   // can only collect once it is approved. Only the storage reference is kept.
   studentIdFileId                String?
@@ -406,6 +413,17 @@ model User {
   studentIdReviewedAt            DateTime?
   studentIdReviewedById          String?
   studentIdReviewNote            String?
+  // Rep identity: NIN + date of birth checked against NIMC by Didit
+  // (src/providers/identity). Only the outcome is kept, never the NIN or DOB.
+  // A partial match (name or DOB only partly matched) leaves kycStatus
+  // pending and ninReviewStatus pending until an admin decides.
+  diditRequestId                 String?
+  ninCheckOutcome                String? // match | partial | no_match
+  ninNameMatchScore              Float?
+  ninReviewStatus                DocumentReviewStatus?
+  ninReviewedAt                  DateTime?
+  ninReviewedById                String?
+  ninReviewNote                  String?
   // --- Legacy (Anchor era). Read-only; kept so historical rows and any
   // balance still held at Anchor stay traceable. Nothing writes these.
   anchorCustomerId               String?               @unique
@@ -562,9 +580,17 @@ model Space {
   withdrawalPinFailedAttempts Int                @default(0)
   withdrawalPinLockedUntil    DateTime?
   withdrawalPinHoldUntil      DateTime?
-  // --- Legacy (Anchor era). Read-only. Under Bachs a space has no account of
-  // its own: collections settle into the LEAD REP's Connect account and the
-  // space's share is tracked by its ledger. These stay so any balance still
+  // The space's own permanent 9jaPay account. The space owns it; its reps
+  // only manage it. Collections land in Duevy's business account first and
+  // are swept here (Sweep), and withdrawals are paid out of it. Opened when
+  // the space is created (retried by the sweep job if that failed).
+  walletAccountId             String?            @unique
+  walletAccountNumber         String?            @unique
+  walletAccountName           String?
+  walletBankName              String?
+  walletBankCode              String?
+  walletCreatedAt             DateTime?
+  // --- Legacy (Anchor era). Read-only. These stay so any balance still
   // held in an Anchor deposit account can be traced and paid out by an admin.
   anchorAccountId             String?            @unique
   anchorAccountNumber         String?
@@ -590,6 +616,7 @@ model Space {
   receipts          Receipt[]
   receiptDesign     ReceiptDesign?
   partnerRedemption PartnerRedemption?
+  sweeps            Sweep[]
 
   @@index([institution])
   @@map("spaces")
@@ -769,23 +796,22 @@ model Checkout {
   spaceId              String
   status               CheckoutStatus @default(pending)
   faceKobo             Int // sum of the dues' face amounts — what the space receives
-  feeKobo              Int // 2% + ₦20, on top
+  feeKobo              Int // the 1.5% processing fee, on top
   totalKobo            Int // faceKobo + feeKobo — what the student must transfer
   receivedKobo         Int? // what the provider reported as received
   overpaidKobo         Int            @default(0)
   // The sorted due ids, so a repeat request for the same basket returns the
   // still-open checkout instead of opening a second account.
   dueSetKey            String
-  provider             String         @default("bachs")
+  provider             String         @default("ninejapay")
   providerCheckoutId   String?        @unique
-  providerChargeId     String?
-  // The rep's Connect account the face amount is routed to (destination charge).
-  destinationAccountId String?
+  providerChargeId     String? // legacy (Bachs)
+  destinationAccountId String? // legacy (Bachs): the rep's Connect account
   // The one-time bank account the student transfers into.
   vaAccountNumber      String?
   vaBankName           String?
   vaAccountName        String?
-  // Or, on a hosted checkout, the provider's page the student is redirected to.
+  // Legacy (Bachs): a hosted checkout's page.
   checkoutUrl          String?
   // A guest's answers to the due's guestFields, labels copied in (lib/guestForm.ts).
   guestAnswers         Json?
@@ -951,7 +977,7 @@ model PendingPayment {
 // Handlers are idempotent, so a retry or a duplicate is always safe.
 model WebhookEvent {
   id              String        @id @default(cuid())
-  provider        String        @default("bachs")
+  provider        String        @default("ninejapay")
   providerEventId String
   type            String
   payload         Json
@@ -973,11 +999,9 @@ model WebhookEvent {
 // Payouts & Bank Accounts
 // ---------------------------------------------------------------------------
 
-// A bank account the space can withdraw to: the rep's own, a lecturer's, a
-// vendor's. Name enquiry runs when it is added, so `accountName` is always the
-// bank's. Registered as a payout destination on the lead rep's Bachs account;
-// if the lead changes, it is re-registered on the new lead's account at the
-// next withdrawal.
+// A bank account the space can withdraw to: the department's, a lecturer's, a
+// vendor's, a rep's. It belongs to the space, so a rep handover doesn't touch
+// it. Name enquiry runs when it is added, so `accountName` is always the bank's.
 model PayoutBeneficiary {
   id                  String   @id @default(cuid())
   spaceId             String
@@ -987,8 +1011,8 @@ model PayoutBeneficiary {
   accountNumber       String // stored encrypted
   accountNumberMasked String // "•••• 4021"
   accountName         String
-  bachsDestinationId  String?
-  bachsAccountId      String?
+  bachsDestinationId  String? // legacy (Bachs)
+  bachsAccountId      String? // legacy (Bachs)
   createdById         String?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
@@ -1012,12 +1036,18 @@ model Payout {
   // edit or removal of the beneficiary can't redirect it.
   beneficiaryId       String?
   accountName         String?
-  destinationId       String? // the provider payout destination it is sent to
+  destinationId       String? // legacy (Bachs): the payout destination it was sent to
+  // Where it is sent, fixed when requested (the account number encrypted).
+  bankCode            String?
+  accountNumberEnc    String?
+  // A withdrawal needing money not yet swept into the space's account waits
+  // `pending` for this sweep, then is sent.
+  sweepId             String?
   note                String?
   requestedById       String?
   failureReason       String?
   // amount = feeKobo + netKobo. netKobo is sent to the bank; feeKobo is
-  // Duevy's withdrawal fee. Both are debited from the ledger when the
+  // 9jaPay's transfer charge, passed on. Both are debited from the ledger when the
   // withdrawal is created and credited back in full if it fails.
   feeKobo             Int          @default(0)
   netKobo             Int          @default(0)
@@ -1028,13 +1058,13 @@ model Payout {
   // ends. Unique, so a space can never have two withdrawals in flight — the
   // database-level backstop behind the advisory lock in withdrawal.service.
   activeSpaceId       String?      @unique
-  provider            String       @default("bachs")
+  provider            String       @default("ninejapay")
+  // The provider's copy of `reference` (9jaPay strips punctuation). Set
+  // before the transfer is sent, so its events can always be matched.
   providerPayoutId    String?      @unique
-  providerAccountId   String? // the rep's Connect account it was paid out of
-  providerFeeKobo     Int? // what Bachs charged on top, from the payout response
-  // Once the payout succeeds, Duevy's fee (less Bachs's own payout fee) is
-  // moved from the rep's account to the platform. Signed: positive = swept to
-  // the platform, negative = the platform topped the account up.
+  // --- Legacy (Bachs era). Nothing writes these now.
+  providerAccountId   String?
+  providerFeeKobo     Int?
   feeSettlementKobo   Int?
   feeSettledAt        DateTime?
   // awaiting_approval only: when it is cancelled if not yet approved.
@@ -1056,6 +1086,7 @@ model Payout {
   due               Due?               @relation(fields: [dueId], references: [id], onDelete: SetNull)
   partnerRedemption PartnerRedemption? @relation(fields: [partnerRedemptionId], references: [id], onDelete: SetNull)
   beneficiary       PayoutBeneficiary? @relation(fields: [beneficiaryId], references: [id], onDelete: SetNull)
+  sweep             Sweep?             @relation(fields: [sweepId], references: [id], onDelete: SetNull)
   requestedBy       User?              @relation("PayoutRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
   approvals         PayoutApproval[]
   otps              PayoutOtp[]
@@ -1064,7 +1095,38 @@ model Payout {
   @@index([spaceId, requestedAt])
   @@index([status, requestedAt])
   @@index([dueId])
+  @@index([sweepId])
   @@map("payouts")
+}
+
+// Moving a space's collections from Duevy's business account into the
+// space's own account. Doesn't change the space's balance (the money is the
+// space's either way) and costs the space nothing: 9jaPay bills the transfer
+// to Duevy, covered by the checkout processing fee. A space's unswept money
+// is its 9jaPay collections minus its sweeps that haven't failed
+// (sweep.service). Each space account may move at most ₦10M a day.
+model Sweep {
+  id                String       @id @default(cuid())
+  spaceId           String
+  amountKobo        Int
+  // 9jaPay's charge, for Duevy's own reporting; not on the space's ledger.
+  feeKobo           Int          @default(0)
+  reference         String       @unique // ours, e.g. SWP2026XXXXXXXX
+  providerReference String?      @unique
+  status            SweepStatus  @default(pending)
+  trigger           SweepTrigger
+  failureReason     String?
+  createdAt         DateTime     @default(now())
+  processingAt      DateTime?
+  settledAt         DateTime?
+  failedAt          DateTime?
+
+  space   Space    @relation(fields: [spaceId], references: [id])
+  payouts Payout[]
+
+  @@index([spaceId, createdAt])
+  @@index([status, createdAt])
+  @@map("sweeps")
 }
 
 model PayoutApproval {

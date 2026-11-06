@@ -47,6 +47,8 @@ function toSessionUser<T extends Partial<User>>(user: T) {
     passwordHash: _ph,
     bachsAccountId: _ba,
     bachsPersonId: _bp,
+    diditRequestId: _dr,
+    ninReviewedById: _nr,
     anchorCustomerId: _ac,
     studentIdFileId: _sf,
     studentIdFilePath: _sp,

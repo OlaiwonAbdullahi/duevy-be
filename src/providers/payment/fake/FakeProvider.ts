@@ -1,4 +1,4 @@
-import { randomInt } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import {
   InvalidSignatureError,
   ProviderError,
@@ -6,143 +6,95 @@ import {
   type CollectionAccount,
   type CollectionStatus,
   type CreateCollectionInput,
-  type IdentityDocumentInput,
-  type IdentityResult,
-  type IdentityStatus,
-  type InitiatePayoutInput,
+  type CreateSpaceAccountInput,
+  type InitiateTransferInput,
   type PaymentProvider,
-  type PayoutDestination,
-  type PayoutResult,
   type ProviderEvent,
-  type RegisterDestinationInput,
   type ResolvedAccount,
-  type SettleFeeInput,
-  type VerifyIdentityInput,
+  type SpaceAccount,
+  type TransferResult,
+  type TransferState,
 } from '../types';
-import { normaliseBachsEvent } from '../bachs/events';
-import { verifyBachsSignature } from '../bachs/signature';
+import { normaliseNineJaPayEvent, SPACE_ACCOUNT_PREFIX } from '../ninejapay/events';
+import { verifyNineJaPaySignature } from '../ninejapay/signature';
 
 /**
  * In-memory provider for local development, the seed and the test suite.
  * PAYMENT_PROVIDER=fake. Refused in production by env validation.
  *
  * Its API calls succeed instantly against in-memory state. Its WEBHOOKS use
- * the real Bachs wire format and signature scheme, so scripts/send-test-webhook.ts
- * and the tests exercise exactly the parsing path production uses.
+ * the real 9jaPay wire format and signature scheme, so
+ * scripts/send-test-webhook.ts and the tests exercise exactly the parsing
+ * path production uses.
  *
  * Test knobs are plain public fields; `calls` records every operation.
  */
 export class FakeProvider implements PaymentProvider {
   readonly name = 'fake';
 
-  /** What verifyIdentity reports. Real KYC resolves later, by webhook. */
-  identityOutcome: IdentityStatus = 'pending';
-  /** What getIdentityStatus reports, per account — set this, then send identity.updated. */
-  identityByAccount = new Map<string, { status: IdentityStatus; payoutsActive: boolean }>();
-  /** What getIdentityStatus reports as still outstanding. */
-  requirementsDue: string[] = [];
   /** Account numbers name enquiry cannot resolve. */
   unresolvable = new Set<string>();
   resolvedName = 'ADA OBI';
-  /** What Bachs charges on top of each payout. */
-  payoutFeeKobo = 5_000;
-  /** The next initiatePayout throws this, once. */
-  failNextPayout: ProviderError | null = null;
+  /** What a new transfer reports: 9jaPay answers SUCCESS, PROCESSING or FAILED up front. */
+  transferOutcome: TransferState = 'processing';
+  /** The next initiateTransfer throws this, once. */
+  failNextTransfer: ProviderError | null = null;
   /** Artificial latency for concurrency tests. */
-  payoutDelayMs = 0;
-  /** Collection status overrides for reconciliation tests. */
+  transferDelayMs = 0;
+  /** What has arrived per one-time account number, for reconciliation tests. */
   collectionStatus = new Map<string, CollectionStatus>();
-  payoutStatus = new Map<string, PayoutResult>();
+  /** Every transfer started, by our reference. Tests set `state` to settle one. */
+  transfers = new Map<string, TransferResult & { input: InitiateTransferInput }>();
 
   calls: { op: string; args: unknown }[] = [];
-  private seq = 0;
 
-  constructor(
-    private readonly webhookSecrets: string[] = ['whsec_fake'],
-    private readonly toleranceSeconds = 300,
-  ) {}
+  constructor(private readonly webhookSecrets: string[] = ['whsec_fake']) {}
 
   private record(op: string, args: unknown): void {
-    // Never retain secrets, even in a test double.
-    const safe = JSON.parse(
-      JSON.stringify(args ?? {}, (k, v) => (['bvn', 'dob', 'idNumbers', 'buffer'].includes(k) ? '[redacted]' : v)),
-    );
-    this.calls.push({ op, args: safe });
+    this.calls.push({ op, args: JSON.parse(JSON.stringify(args ?? {})) });
   }
 
   reset(): void {
-    this.identityOutcome = 'pending';
-    this.requirementsDue = [];
-    this.identityByAccount.clear();
     this.unresolvable.clear();
     this.resolvedName = 'ADA OBI';
-    this.failNextPayout = null;
-    this.payoutDelayMs = 0;
+    this.transferOutcome = 'processing';
+    this.failNextTransfer = null;
+    this.transferDelayMs = 0;
     this.collectionStatus.clear();
-    this.payoutStatus.clear();
+    this.transfers.clear();
     this.calls = [];
+  }
+
+  wireReference(reference: string): string {
+    return reference.replace(/[^A-Za-z0-9]/g, '');
   }
 
   async createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount> {
     this.record('createCollectionAccount', input);
-    const hosted = input.mode === 'hosted';
     return {
-      providerCheckoutId: `chk_fake_${input.reference}`,
-      providerChargeId: `ch_fake_${input.reference}`,
-      accountNumber: hosted ? null : `99${randomInt(10_000_000, 99_999_999)}`,
-      bankName: hosted ? null : 'Fake Bank',
-      accountName: hosted ? null : 'Duevy Checkout',
-      checkoutUrl: hosted ? `https://checkout.fake.test/${input.reference}` : null,
-      totalKobo: input.faceKobo + input.platformFeeKobo,
+      providerCheckoutId: this.wireReference(input.reference),
+      accountNumber: `90${randomInt(10_000_000, 99_999_999)}`,
+      bankName: '9jaPay',
+      accountName: 'Duevy Checkout',
+      totalKobo: input.totalKobo,
       expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
     };
   }
 
-  async getCollectionStatus(providerCheckoutId: string): Promise<CollectionStatus> {
-    this.record('getCollectionStatus', { providerCheckoutId });
-    return this.collectionStatus.get(providerCheckoutId) ?? { state: 'open', receivedKobo: null };
+  async getCollectionStatus(accountNumber: string): Promise<CollectionStatus> {
+    this.record('getCollectionStatus', { accountNumber });
+    return this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
   }
 
-  async verifyIdentity(input: VerifyIdentityInput): Promise<IdentityResult> {
-    this.record('verifyIdentity', input);
-    if (!input.idNumbers.some((n) => n.type === 'nin' && /^\d{11}$/.test(n.value))) {
-      throw new ProviderError('A valid NIN is required', 422, 'VALIDATION_ERROR', false);
-    }
-    const accountId = input.existingAccountId ?? `acct_fake_${input.profile.userId}`;
-    const personId = input.existingPersonId ?? `per_fake_${input.profile.userId}`;
-    const verified = this.identityOutcome === 'verified';
-    this.identityByAccount.set(accountId, { status: this.identityOutcome, payoutsActive: verified });
+  async createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount> {
+    this.record('createSpaceAccount', input);
     return {
-      accountId,
-      personId,
-      status: this.identityOutcome,
-      payoutsActive: verified,
-      failureReason: null,
-      requirementsDue: this.requirementsDue,
+      accountId: `va_fake_${randomUUID()}`,
+      accountNumber: `91${randomInt(10_000_000, 99_999_999)}`,
+      accountName: input.accountName,
+      bankName: '9jaPay',
+      bankCode: '090629',
     };
-  }
-
-  async getIdentityStatus(accountId: string, personId: string): Promise<IdentityResult> {
-    this.record('getIdentityStatus', { accountId, personId });
-    const s = this.identityByAccount.get(accountId) ?? { status: 'pending' as const, payoutsActive: false };
-    return {
-      accountId,
-      personId,
-      status: s.status,
-      payoutsActive: s.payoutsActive,
-      failureReason: s.status === 'rejected' ? 'Identity details did not match' : null,
-      requirementsDue: this.requirementsDue,
-    };
-  }
-
-  async uploadIdentityDocument(input: IdentityDocumentInput): Promise<{ documentId: string }> {
-    this.record('uploadIdentityDocument', {
-      accountId: input.accountId,
-      personId: input.personId,
-      mimeType: input.mimeType,
-      bytes: input.buffer.length,
-    });
-    return { documentId: `doc_fake_${++this.seq}` };
   }
 
   async listBanks(): Promise<Bank[]> {
@@ -153,6 +105,7 @@ export class FakeProvider implements PaymentProvider {
       { code: '033', name: 'United Bank for Africa' },
       { code: '50515', name: 'Moniepoint MFB' },
       { code: '999992', name: 'OPay' },
+      { code: '090629', name: 'AMEGY MFB (9jaPay)' },
     ];
   }
 
@@ -162,48 +115,48 @@ export class FakeProvider implements PaymentProvider {
     return { accountName: this.resolvedName };
   }
 
-  async registerPayoutDestination(input: RegisterDestinationInput): Promise<PayoutDestination> {
-    this.record('registerPayoutDestination', { accountId: input.accountId, bankCode: input.bankCode });
-    return { destinationId: `pd_fake_${++this.seq}`, usable: true, accountName: input.accountName };
-  }
-
-  async submitAccountPayoutDestination(input: RegisterDestinationInput): Promise<void> {
-    this.record('submitAccountPayoutDestination', { accountId: input.accountId, bankCode: input.bankCode });
-    this.requirementsDue = this.requirementsDue.filter((r) => r !== 'payout_destination');
-  }
-
-  async initiatePayout(input: InitiatePayoutInput): Promise<PayoutResult> {
-    this.record('initiatePayout', input);
-    if (this.payoutDelayMs) await new Promise((r) => setTimeout(r, this.payoutDelayMs));
-    if (this.failNextPayout) {
-      const err = this.failNextPayout;
-      this.failNextPayout = null;
+  async initiateTransfer(input: InitiateTransferInput): Promise<TransferResult> {
+    this.record('initiateTransfer', input);
+    if (this.transferDelayMs) await new Promise((r) => setTimeout(r, this.transferDelayMs));
+    if (this.failNextTransfer) {
+      const err = this.failNextTransfer;
+      this.failNextTransfer = null;
       throw err;
     }
-    const result: PayoutResult = {
-      providerPayoutId: `pay_fake_${input.reference}`,
-      state: 'processing',
-      providerFeeKobo: this.payoutFeeKobo,
-      failureReason: null,
+    // Same reference again: like 9jaPay's duplicate check, report the original.
+    const existing = this.transfers.get(input.reference);
+    if (existing) return { providerReference: existing.providerReference, state: existing.state, failureReason: existing.failureReason };
+    const result: TransferResult = {
+      providerReference: this.wireReference(input.reference),
+      state: this.transferOutcome,
+      failureReason: this.transferOutcome === 'failed' ? 'The bank could not complete the transfer' : null,
     };
-    this.payoutStatus.set(result.providerPayoutId, result);
+    this.transfers.set(input.reference, { ...result, input });
     return result;
   }
 
-  async getPayout(accountId: string, providerPayoutId: string): Promise<PayoutResult> {
-    this.record('getPayout', { accountId, providerPayoutId });
-    const p = this.payoutStatus.get(providerPayoutId);
-    if (!p) throw new ProviderError('Payout not found', 404, 'NOT_FOUND', false);
-    return p;
+  async getTransfer(reference: string): Promise<TransferResult> {
+    this.record('getTransfer', { reference });
+    const t = this.transfers.get(reference);
+    if (!t) throw new ProviderError('No record found.', 404, 'NOT_FOUND', false);
+    return { providerReference: t.providerReference, state: t.state, failureReason: t.failureReason };
   }
 
-  async settleFee(input: SettleFeeInput): Promise<{ transferId: string }> {
-    this.record('settleFee', input);
-    return { transferId: `tr_fake_${input.reference}` };
+  /** Test helper: settle a started transfer. */
+  settleTransfer(reference: string, state: TransferState): void {
+    const t = this.transfers.get(reference);
+    if (!t) throw new Error(`no fake transfer ${reference}`);
+    t.state = state;
+    t.failureReason = state === 'failed' ? 'The bank could not complete the transfer' : null;
+  }
+
+  /** The request reference a space account is created with, for webhook tests. */
+  static spaceAccountReference(spaceId: string): string {
+    return `${SPACE_ACCOUNT_PREFIX}${spaceId.replace(/[^A-Za-z0-9]/g, '')}`;
   }
 
   parseWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): ProviderEvent {
-    const check = verifyBachsSignature(rawBody, headers, this.webhookSecrets, this.toleranceSeconds);
+    const check = verifyNineJaPaySignature(rawBody, headers, this.webhookSecrets);
     if (!check.ok) throw new InvalidSignatureError(`Webhook signature ${check.reason}`);
     let body: unknown;
     try {
@@ -211,6 +164,6 @@ export class FakeProvider implements PaymentProvider {
     } catch {
       throw new InvalidSignatureError('Webhook body is not JSON');
     }
-    return normaliseBachsEvent(body);
+    return normaliseNineJaPayEvent(body);
   }
 }

@@ -3,8 +3,8 @@ import { randomInt } from 'crypto';
 /**
  * Money helpers. Every amount in this codebase is an integer number of kobo
  * (₦1 = 100 kobo). No floats are ever used for arithmetic; the only place a
- * decimal appears is at the provider boundary, where Bachs takes and returns
- * decimal strings ("7000.00") — see koboToDecimal / decimalToKobo.
+ * decimal appears where an amount is shown or parsed as naira ("7000.00") —
+ * see koboToDecimal / decimalToKobo. 9jaPay itself works in kobo.
  */
 
 /** Convert kobo to naira (display / email templates only — never for arithmetic). */
@@ -45,9 +45,8 @@ export function koboToDecimal(kobo: number): string {
 }
 
 /**
- * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number (some
- * Bachs responses render an amount as a bare number of naira). More than two
- * decimal places is rounded half-up to the kobo, matching how Bachs stores it.
+ * "7000.00" → 700000. Also accepts "7000", "7000.5" and a JSON number of
+ * naira. More than two decimal places is rounded half-up to the kobo.
  */
 export function decimalToKobo(value: string | number): number {
   const str = typeof value === 'number' ? numberToPlainString(value) : value.trim();
@@ -71,37 +70,48 @@ function numberToPlainString(n: number): string {
 // Fees (server-side only — never accepted from a client)
 // ---------------------------------------------------------------------------
 
-/** Checkout service charge: 2% of the basket, plus a flat ₦20, paid by the student on top. */
-export const CHECKOUT_FEE_PERCENT = 2;
-export const CHECKOUT_FEE_FLAT_KOBO = 2_000; // ₦20
+/**
+ * Checkout processing fee: 1.5% of the basket, paid by the student on top.
+ * Duevy takes no margin; the fee covers 9jaPay's charges on the student's
+ * transfer (0.5%, capped at ₦750, plus ₦50 stamp duty from ₦10,000) and on
+ * the sweep of that money into the space's own account.
+ */
+export const COLLECTION_FEE_BPS = 150;
 
-/** Withdrawal fee: ₦100 under ₦50,000, ₦200 at ₦50,000 and above, deducted from the withdrawal. */
-export const WITHDRAWAL_FEE_LOW_KOBO = 10_000; // ₦100
-export const WITHDRAWAL_FEE_HIGH_KOBO = 20_000; // ₦200
-export const WITHDRAWAL_FEE_THRESHOLD_KOBO = 5_000_000; // ₦50,000
+/**
+ * Withdrawal fee: 9jaPay's transfer charge, passed on and deducted from the
+ * withdrawal. ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000.
+ */
+export const TRANSFER_FEE_BANDS: { belowKobo: number; feeKobo: number }[] = [
+  { belowKobo: 500_000, feeKobo: 1_000 }, // < ₦5,000 → ₦10
+  { belowKobo: 10_000_000, feeKobo: 1_500 }, // < ₦100,000 → ₦15
+];
+export const TRANSFER_FEE_TOP_KOBO = 2_000; // ₦20
 
 /** No withdrawal below ₦1,000. */
 export const MIN_PAYOUT_KOBO = 100_000;
+/** No single withdrawal above ₦500,000. */
+export const MAX_PAYOUT_KOBO = 50_000_000;
+/** A space withdraws at most ₦5,000,000 a day (Africa/Lagos days). */
+export const DAILY_PAYOUT_LIMIT_KOBO = 500_000_000;
+/** 9jaPay refuses any single transfer above ₦1,000,000, so sweeps are split. */
+export const MAX_TRANSFER_KOBO = 100_000_000;
 
 /** round(a × num / den), half-up, in integers. */
 function mulDivRoundHalfUp(a: number, num: number, den: number): number {
   return Math.floor((a * num * 2 + den) / (den * 2));
 }
 
-/**
- * The service charge for one checkout covering `faceKobo` worth of dues.
- * Charged ONCE per checkout: the ₦20 flat does not multiply per due.
- */
+/** The processing fee for one checkout covering `faceKobo` worth of dues, rounded up to the kobo. */
 export function checkoutFee(faceKobo: number): number {
   assertKobo(faceKobo, 'faceKobo');
-  if (faceKobo === 0) return 0;
-  return mulDivRoundHalfUp(faceKobo, CHECKOUT_FEE_PERCENT, 100) + CHECKOUT_FEE_FLAT_KOBO;
+  return Math.ceil((faceKobo * COLLECTION_FEE_BPS) / 10_000);
 }
 
 export interface Charge {
   /** What the space receives — the full face amount. */
   face: number;
-  /** Duevy's service charge, on top. */
+  /** The processing fee, on top. */
   fee: number;
   /** What the student transfers. */
   total: number;
@@ -141,15 +151,20 @@ export function allocate(total: number, weights: number[]): number[] {
   return parts.map(Number);
 }
 
+/** 9jaPay's charge for one transfer of `amountKobo`. */
+export function transferFee(amountKobo: number): number {
+  assertKobo(amountKobo, 'amountKobo');
+  return TRANSFER_FEE_BANDS.find((b) => amountKobo < b.belowKobo)?.feeKobo ?? TRANSFER_FEE_TOP_KOBO;
+}
+
 export function withdrawalFee(grossKobo: number): number {
-  assertKobo(grossKobo, 'grossKobo');
-  return grossKobo < WITHDRAWAL_FEE_THRESHOLD_KOBO ? WITHDRAWAL_FEE_LOW_KOBO : WITHDRAWAL_FEE_HIGH_KOBO;
+  return transferFee(grossKobo);
 }
 
 export interface WithdrawalBreakdown {
   /** Debited from the space's ledger. */
   gross: number;
-  /** Duevy's withdrawal fee, deducted from the gross (after any partner discount). */
+  /** The transfer fee, deducted from the gross (after any partner discount). */
   fee: number;
   /** The fee before the partner discount. */
   feeBeforeDiscount: number;

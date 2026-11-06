@@ -1,18 +1,19 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { MemoryFileStore, setFileStore } from '../../lib/storage';
-import { type FakeProvider } from '../../providers/payment';
+import { type FakeVerifier } from '../../providers/identity';
 import { createCheckout } from '../../services/checkout.service';
-import { api, apiMultipart, installFakeProvider, makeSpace, PNG_BYTES, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, apiMultipart, installFakeProvider, installFakeVerifier, makeSpace, PNG_BYTES, startHttp, stopHttp, tokenFor } from './fixtures';
 
-let fake: FakeProvider;
+let verifier: FakeVerifier;
 const store = new MemoryFileStore();
 beforeAll(async () => {
-  fake = installFakeProvider();
+  installFakeProvider();
+  verifier = installFakeVerifier();
   setFileStore(store);
   await startHttp();
 });
+beforeEach(() => verifier.reset());
 afterAll(stopHttp);
 
 const NIN = '12345678901';
@@ -27,37 +28,40 @@ async function adminToken() {
   return tokenFor(admin);
 }
 
-describe('rep KYC: NIN at Bachs + student ID reviewed by Duevy', () => {
-  it('collects only after Bachs verifies the NIN AND an admin approves the student ID; never stores the NIN', async () => {
+/** Nothing in the database holds the NIN or the date of birth. */
+async function assertNeverStored() {
+  const hits = await db.$queryRawUnsafe<{ n: bigint }[]>(
+    `SELECT COUNT(*)::bigint AS n FROM (
+       SELECT row_to_json(u)::text AS t FROM users u
+       UNION ALL SELECT row_to_json(w)::text FROM webhook_events w
+       UNION ALL SELECT row_to_json(i)::text FROM idempotency_keys i
+       UNION ALL SELECT row_to_json(a)::text FROM admin_audit_logs a
+     ) x WHERE t LIKE '%${NIN}%' OR t LIKE '%${DOB}%'`,
+  );
+  expect(Number(hits[0]!.n)).toBe(0);
+}
+
+describe('rep KYC: NIN + date of birth checked by Didit, student ID reviewed by Duevy', () => {
+  it('collects only after the NIN matches AND an admin approves the student ID; never stores the NIN', async () => {
     const { rep, space, students, dues } = await makeSpace({ verified: false });
     const token = await tokenFor(rep);
 
+    // Older clients still send gender; it's ignored, not refused.
     const submitted = await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, {
       token,
       fields: { nin: NIN, dob: DOB, gender: 'female' },
       files: { studentIdCard: card },
     });
     expect(submitted.status).toBe(202);
-    expect(submitted.body.data).toMatchObject({ kycStatus: 'pending', canCollect: false, studentId: { status: 'pending' } });
+    expect(submitted.body.data).toMatchObject({ kycStatus: 'verified', canCollect: false, nin: { outcome: 'match' }, studentId: { status: 'pending' } });
     expect(JSON.stringify(submitted.body)).not.toContain(NIN);
 
-    // Bachs got the NIN as a typed identifier, no BVN.
-    const call = fake.calls.find((c) => c.op === 'verifyIdentity')!;
-    expect(JSON.stringify(call.args)).not.toContain(NIN); // the test double redacts too
+    // Checked under the rep's own name; the test double never keeps the NIN.
+    expect(verifier.calls.at(-1)).toEqual({ userId: rep.id, firstName: 'Ada', lastName: 'Obi' });
     const user = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
     expect(user.studentIdFileId).toBeTruthy();
+    expect(user.diditRequestId).toMatch(/^req_fake_/);
     expect(store.files.get(user.studentIdFileId!)?.buffer.equals(PNG_BYTES)).toBe(true);
-
-    // Bachs verifies.
-    fake.identityByAccount.set(user.bachsAccountId!, { status: 'verified', payoutsActive: true });
-    await sendWebhook({
-      id: `evt_cap_${rep.id}`,
-      type: 'capability.updated',
-      account: user.bachsAccountId!,
-      data: { account: user.bachsAccountId!, capability: 'payouts', status: 'active', requested: true },
-    });
-    await drainWebhookQueue();
-    expect((await db.user.findUniqueOrThrow({ where: { id: rep.id } })).kycStatus).toBe('verified');
 
     // Still can't collect: the student ID isn't approved yet.
     await expect(createCheckout(students[0]!.id, [dues[0]!.id])).rejects.toMatchObject({ code: 'SPACE_NOT_VERIFIED' });
@@ -74,23 +78,94 @@ describe('rep KYC: NIN at Bachs + student ID reviewed by Duevy', () => {
 
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
     expect(checkout.status).toBe('pending');
+    await assertNeverStored();
+  });
 
-    // Nothing in the database holds the NIN or the date of birth.
-    const hits = await db.$queryRawUnsafe<{ n: bigint }[]>(
-      `SELECT COUNT(*)::bigint AS n FROM (
-         SELECT row_to_json(u)::text AS t FROM users u
-         UNION ALL SELECT row_to_json(w)::text FROM webhook_events w
-         UNION ALL SELECT row_to_json(i)::text FROM idempotency_keys i
-         UNION ALL SELECT row_to_json(a)::text FROM admin_audit_logs a
-       ) x WHERE t LIKE '%${NIN}%' OR t LIKE '%${DOB}%'`,
-    );
-    expect(Number(hits[0]!.n)).toBe(0);
+  it('a partial match waits for an admin, who can approve or reject it', async () => {
+    const admin = await adminToken();
+    for (const decision of ['approved', 'rejected'] as const) {
+      const { rep, space } = await makeSpace({ verified: false });
+      const token = await tokenFor(rep);
+      verifier.outcome = 'partial';
+      const submitted = await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, { token, fields: { nin: NIN, dob: DOB }, files: { studentIdCard: card } });
+      expect(submitted.status).toBe(202);
+      expect(submitted.body.data).toMatchObject({ kycStatus: 'pending', nin: { outcome: 'partial', reviewStatus: 'pending' } });
+
+      // Can't resubmit while it's being reviewed.
+      const again = await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, { token, fields: { nin: NIN, dob: DOB }, files: { studentIdCard: card } });
+      expect(again.status).toBe(409);
+      expect(again.body.error.code).toBe('KYC_PENDING');
+
+      const queue = await api('GET', '/v1/admin/kyc/nin-reviews', { token: admin });
+      const row = queue.body.data.find((r: { userId: string }) => r.userId === rep.id);
+      expect(row).toMatchObject({ nameMatchScore: 0.62, reviewStatus: 'pending' });
+      expect(JSON.stringify(queue.body)).not.toContain(NIN);
+
+      if (decision === 'rejected') {
+        const noReason = await api('POST', `/v1/admin/users/${rep.id}/nin/review`, { token: admin, body: { decision } });
+        expect(noReason.status).toBe(400);
+      }
+      const res = await api('POST', `/v1/admin/users/${rep.id}/nin/review`, {
+        token: admin,
+        body: decision === 'rejected' ? { decision, note: 'Name on the NIN is a different person' } : { decision },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ kycStatus: decision === 'approved' ? 'verified' : 'rejected', nin: { reviewStatus: decision } });
+      const u = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
+      expect(u.kycAttempts).toBe(decision === 'rejected' ? 1 : 0);
+      const twice = await api('POST', `/v1/admin/users/${rep.id}/nin/review`, { token: admin, body: { decision: 'approved' } });
+      expect(twice.status).toBe(409);
+    }
+    await assertNeverStored();
+  });
+
+  it('a no-match uses up an attempt (3 lock retries for a day); an outage does not', async () => {
+    const { rep, space } = await makeSpace({ verified: false });
+    const token = await tokenFor(rep);
+    const submit = () => apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, { token, fields: { nin: NIN, dob: DOB }, files: { studentIdCard: card } });
+
+    verifier.outcome = 'unavailable';
+    const down = await submit();
+    expect(down.status).toBe(503);
+    expect(down.body.error.code).toBe('KYC_PROVIDER_UNAVAILABLE');
+    expect((await db.user.findUniqueOrThrow({ where: { id: rep.id } })).kycAttempts).toBe(0);
+
+    verifier.outcome = 'no_match';
+    for (let i = 1; i <= 3; i++) {
+      const res = await submit();
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('KYC_REJECTED');
+    }
+    const user = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
+    expect(user).toMatchObject({ kycAttempts: 3, kycStatus: 'rejected', ninCheckOutcome: 'no_match' });
+    expect(user.kycRetryLockedUntil!.getTime()).toBeGreaterThan(Date.now());
+    // No student ID was kept for a refused check.
+    expect(user.studentIdFileId).toBeNull();
+
+    verifier.outcome = 'match';
+    const locked = await submit();
+    expect(locked.status).toBe(429);
+    await assertNeverStored();
+  });
+
+  it('a rep verified on Bachs before the switch carries over: no re-verification', async () => {
+    const { rep, space, students, dues } = await makeSpace({ verified: false });
+    // As the migration leaves them: verified, student ID approved, Bachs ids kept as history.
+    await db.user.update({
+      where: { id: rep.id },
+      data: { kycStatus: 'verified', studentIdStatus: 'approved', bachsAccountId: `acct_${rep.id}`, bachsPersonId: `per_${rep.id}`, ninCheckOutcome: null },
+    });
+    const state = await api('GET', `/v1/spaces/${space.id}/payout/kyc-status`, { token: await tokenFor(rep) });
+    expect(state.body.data).toMatchObject({ kycStatus: 'verified', canCollect: true, canWithdraw: true });
+    const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
+    expect(checkout.status).toBe('pending');
+    expect(verifier.calls).toHaveLength(0);
   });
 
   it('a rejected student ID can be replaced; the old file is deleted', async () => {
     const { rep, space } = await makeSpace({ verified: false });
     const token = await tokenFor(rep);
-    await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, { token, fields: { nin: NIN, dob: DOB, gender: 'male' }, files: { studentIdCard: card } });
+    await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, { token, fields: { nin: NIN, dob: DOB }, files: { studentIdCard: card } });
     const first = (await db.user.findUniqueOrThrow({ where: { id: rep.id } })).studentIdFileId!;
 
     const admin = await adminToken();
@@ -104,22 +179,6 @@ describe('rep KYC: NIN at Bachs + student ID reviewed by Duevy', () => {
     const second = (await db.user.findUniqueOrThrow({ where: { id: rep.id } })).studentIdFileId!;
     expect(second).not.toBe(first);
     expect(store.files.has(first)).toBe(false);
-  });
-
-  it('forwards a government ID to Bachs, and reports what Bachs still asks for', async () => {
-    const { rep, space } = await makeSpace({ verified: false });
-    const token = await tokenFor(rep);
-    fake.requirementsDue = ['persons.per_x.id_document'];
-    const res = await apiMultipart(`/v1/spaces/${space.id}/payout/kyc`, {
-      token,
-      fields: { nin: NIN, dob: DOB, gender: 'female' },
-      files: { studentIdCard: card, governmentId: { bytes: PNG_BYTES, name: 'nin-slip.png', type: 'image/png' } },
-    });
-    expect(res.status).toBe(202);
-    expect(res.body.data.requirementsDue).toEqual(['persons.per_x.id_document']);
-    expect(res.body.data.governmentIdSubmittedAt).toBeTruthy();
-    expect(fake.calls.some((c) => c.op === 'uploadIdentityDocument')).toBe(true);
-    fake.requirementsDue = [];
   });
 
   it('validates input without echoing it, rejects non-images, requires the card, refuses non-reps', async () => {
@@ -166,41 +225,11 @@ describe('rep KYC: NIN at Bachs + student ID reviewed by Duevy', () => {
   });
 });
 
-describe('rep KYC: payout_destination requirement', () => {
-  it("sends the rep's own bank account to Bachs and clears the requirement", async () => {
+describe('rep KYC: retired Bachs steps', () => {
+  it('no longer serves the government ID and payout-destination steps', async () => {
     const { rep } = await makeSpace({ verified: false });
     const token = await tokenFor(rep);
-    fake.requirementsDue = ['payout_destination'];
-
-    const before = await api('POST', '/v1/me/kyc/payout-destination', {
-      token,
-      body: { bankCode: '058', accountNumber: '0123456789' },
-    });
-    expect(before.status).toBe(409);
-    expect(before.body.error.code).toBe('KYC_NOT_STARTED');
-
-    const submitted = await apiMultipart('/v1/me/kyc', {
-      token,
-      fields: { nin: NIN, dob: DOB, gender: 'female' },
-      files: { studentIdCard: card },
-    });
-    expect(submitted.body.data.requirementsDue).toEqual(['payout_destination']);
-    expect(submitted.body.data.payoutDestination).toBeNull();
-
-    const res = await api('POST', '/v1/me/kyc/payout-destination', {
-      token,
-      body: { bankCode: '058', accountNumber: '0123456789' },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.data.requirementsDue).toEqual([]);
-    expect(res.body.data.payoutDestination).toMatchObject({ bankCode: '058' });
-    expect(res.body.data.payoutDestination.accountNumber).not.toContain('0123456789');
-    const user = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
-    expect(fake.calls.find((c) => c.op === 'submitAccountPayoutDestination')?.args).toMatchObject({
-      accountId: user.bachsAccountId,
-      bankCode: '058',
-    });
-    expect(user.kycRequirementsDue).toEqual([]);
+    const res = await api('POST', '/v1/me/kyc/payout-destination', { token, body: { bankCode: '058', accountNumber: '0123456789' } });
+    expect(res.status).toBe(404);
   });
 });
-

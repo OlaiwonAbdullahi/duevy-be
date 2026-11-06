@@ -3,10 +3,10 @@ import { ulid } from 'ulid';
 import { db } from '../config/db';
 import { logger, scrub } from '../lib/logger';
 import { type ProviderEvent } from '../providers/payment';
-import { expireCheckout, findCheckoutId, fulfilCheckout, markUnderpaid } from './checkout.service';
-import { completePayout, failPayoutByReference } from './withdrawal.service';
-import { refreshIdentity } from './kyc.service';
-import { reconcileCheckout } from '../jobs/reconciliation';
+import { findCheckoutId } from './checkout.service';
+import { refreshPayout } from './withdrawal.service';
+import { refreshSweep, refreshSweepsForAccount } from './sweep.service';
+import { confirmReceivedPayment } from '../jobs/reconciliation';
 
 /**
  * Inbound webhook pipeline.
@@ -18,6 +18,10 @@ import { reconcileCheckout } from '../jobs/reconciliation';
  * enqueue, and idempotent handlers (state machine + row locks + ledger unique
  * keys) for the same OUTCOME arriving under different event ids, e.g. a
  * webhook racing the reconciliation poll.
+ *
+ * 9jaPay events carry no timestamp, so a captured one could be replayed. No
+ * handler acts on an event's contents: each asks 9jaPay (the account's
+ * transactions, the transfer status query) and applies that answer.
  */
 
 export interface StoredEventPayload {
@@ -63,51 +67,31 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
   const log = { eventId: event.eventId, type: event.rawType, kind: event.kind };
 
   switch (event.kind) {
-    case 'payment.succeeded': {
-      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
-      const outcome = await fulfilCheckout(id, event.receivedKobo, event.overpaidKobo, `webhook ${event.eventId}`, event.providerChargeId);
-      logger.info({ ...log, ref: event.reference, outcome }, 'payment event applied');
-      return;
-    }
-    case 'payment.completed': {
+    case 'payment.received': {
       // Ask the provider what actually arrived; only its answer moves the checkout.
-      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
+      const id = await findCheckoutId(null, event.providerCheckoutId);
       const c = await db.checkout.findUniqueOrThrow({ where: { id } });
-      await reconcileCheckout(c, { expireIfPastDue: false, source: `webhook ${event.eventId}` });
-      logger.info({ ...log, ref: c.reference }, 'checkout completion checked with the provider');
+      await confirmReceivedPayment(c, `webhook ${event.eventId}`);
+      logger.info({ ...log, ref: c.reference }, 'payment checked with the provider');
       return;
     }
-    case 'payment.underpaid': {
-      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
-      await markUnderpaid(id, event.receivedKobo, event.expectedKobo, `webhook ${event.eventId}`);
+    case 'account.credited':
+      await refreshSweepsForAccount(event.accountNumber);
+      return;
+    case 'transfer.updated': {
+      const sweep = await db.sweep.findUnique({ where: { providerReference: event.providerReference }, select: { id: true } });
+      if (sweep) {
+        await refreshSweep(sweep.id);
+        return;
+      }
+      const payout = await db.payout.findUnique({ where: { providerPayoutId: event.providerReference }, select: { id: true } });
+      if (!payout) {
+        logger.warn({ ...log, providerReference: event.providerReference }, 'transfer event for nothing we sent');
+        return;
+      }
+      await refreshPayout(payout.id);
       return;
     }
-    case 'payment.expired': {
-      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
-      await expireCheckout(id);
-      return;
-    }
-    case 'payment.failed': {
-      // On a bank transfer a failed charge means the one-time account is dead;
-      // the student needs a new checkout. Closed as expired (the spec's states).
-      const id = await findCheckoutId(event.reference, event.providerCheckoutId);
-      await expireCheckout(id, `provider failed: ${event.reason ?? 'unknown reason'}`);
-      return;
-    }
-    case 'payout.succeeded': {
-      if (!event.reference) throw new Error('payout event without a reference');
-      const applied = await completePayout(event.reference, event.providerFeeKobo);
-      if (!applied) logger.info({ ...log, ref: event.reference }, 'payout success already applied or unknown');
-      return;
-    }
-    case 'payout.failed': {
-      if (!event.reference) throw new Error('payout event without a reference');
-      await failPayoutByReference(event.reference, event.reason ?? 'The bank could not complete the transfer');
-      return;
-    }
-    case 'identity.updated':
-      await refreshIdentity(event.accountId);
-      return;
     case 'ignored':
       return;
   }

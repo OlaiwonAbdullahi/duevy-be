@@ -3,7 +3,8 @@ import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { getPaymentProvider } from '../providers/payment';
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
-import { dispatchPayout, refreshPayout, settleWithdrawalFee } from '../services/withdrawal.service';
+import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
+import { reconcileSweeps, runDailySweeps } from '../services/sweep.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
 import { retryGuestAccountInvites } from '../services/guestAccount.service';
 
@@ -49,17 +50,17 @@ export async function reconcileCheckouts(): Promise<void> {
  * webhook. Only the provider's answer moves the checkout, never the caller.
  */
 export async function reconcileCheckout(
-  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'providerCheckoutId' | 'totalKobo' | 'expiresAt'>,
+  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'expiresAt'>,
   opts: { expireIfPastDue: boolean; source: string },
 ): Promise<void> {
   if (c.status !== 'pending') return;
   const pastExpiry = c.expiresAt.getTime() + EXPIRY_GRACE_MS < Date.now();
-  if (!c.providerCheckoutId) {
+  if (!c.vaAccountNumber) {
     // The account was never opened; nothing can be paid into it.
     if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
     return;
   }
-  const status = await getPaymentProvider().getCollectionStatus(c.providerCheckoutId);
+  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber);
   if (status.state === 'paid') {
     // Never assume our own expected total arrived: an unknown amount could hide
     // an underpayment. Leave it for the webhook or the next sweep.
@@ -72,6 +73,25 @@ export async function reconcileCheckout(
   else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
   else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
   else if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id);
+}
+
+/**
+ * A payment event for a checkout in ANY state: read what arrived from the
+ * provider and apply it. Unlike reconcileCheckout this also honours money that
+ * lands after the checkout expired or was underpaid (fulfilCheckout flags it);
+ * a paid checkout is a no-op there.
+ */
+export async function confirmReceivedPayment(
+  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo'>,
+  source: string,
+): Promise<void> {
+  if (c.status === 'paid' || !c.vaAccountNumber) return;
+  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber);
+  if (status.state !== 'paid' || status.receivedKobo === null) {
+    logger.warn({ ref: c.reference, source, state: status.state }, 'payment event without a matching credit at the provider; nothing applied');
+    return;
+  }
+  await fulfilCheckout(c.id, status.receivedKobo, 0, source);
 }
 
 export async function reconcilePayouts(): Promise<void> {
@@ -96,14 +116,6 @@ export async function reconcilePayouts(): Promise<void> {
     await refreshPayout(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'payout refresh failed'));
   }
 
-  const unsettledFees = await db.payout.findMany({
-    where: { provider: provider.name, status: 'success', feeSettledAt: null },
-    take: 25,
-  });
-  for (const p of unsettledFees) {
-    await settleWithdrawalFee(p.id).catch((err) => logger.warn({ ref: p.reference, err: (err as Error).message }, 'fee settlement retry failed'));
-  }
-
   // Multisig withdrawals nobody approved in time: cancel and restore the balance.
   await expireStaleApprovals();
 }
@@ -121,6 +133,8 @@ export async function purgeExpiredIdempotencyKeys(): Promise<void> {
 export async function runReconciliationOnce(): Promise<void> {
   await reconcileCheckouts().catch((err) => logger.error({ err: (err as Error).message }, 'checkout reconciliation run failed'));
   await reconcilePayouts().catch((err) => logger.error({ err: (err as Error).message }, 'payout reconciliation run failed'));
+  await reconcileSweeps().catch((err) => logger.error({ err: (err as Error).message }, 'sweep reconciliation run failed'));
+  await runDailySweeps().catch((err) => logger.error({ err: (err as Error).message }, 'daily sweep run failed'));
   await retryGuestAccountInvites().catch((err) => logger.error({ err: (err as Error).message }, 'guest account invite sweep failed'));
   await purgeExpiredIdempotencyKeys().catch(() => {});
 }

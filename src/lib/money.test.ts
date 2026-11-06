@@ -7,31 +7,34 @@ import {
   decimalToKobo,
   discountedFee,
   koboToDecimal,
+  transferFee,
   withdrawalFee,
-  WITHDRAWAL_FEE_THRESHOLD_KOBO,
 } from './money';
 
 const NAIRA = 100;
 
-describe('checkoutFee — 2% + ₦20, on top', () => {
-  it('charges 2% plus ₦20 and leaves the face amount whole', () => {
+describe('checkoutFee — 1.5%, on top', () => {
+  it('charges 1.5% and leaves the face amount whole', () => {
     const c = computeCharge(5_000 * NAIRA);
     expect(c.face).toBe(500_000);
-    expect(c.fee).toBe(10_000 + 2_000); // ₦100 + ₦20
-    expect(c.total).toBe(512_000); // student pays ₦5,120, space receives ₦5,000
+    expect(c.fee).toBe(7_500); // ₦75
+    expect(c.total).toBe(507_500); // student pays ₦5,075, space receives ₦5,000
   });
 
-  it('rounds the 2% half-up to the kobo', () => {
-    expect(checkoutFee(25)).toBe(1 + 2_000); // 0.5 kobo → 1
-    expect(checkoutFee(24)).toBe(0 + 2_000); // 0.48 kobo → 0
-    expect(checkoutFee(12_345)).toBe(247 + 2_000); // 246.9 → 247
+  it('rounds up to the kobo', () => {
+    expect(checkoutFee(1 * NAIRA)).toBe(2); // 1.5 kobo → 2
+    expect(checkoutFee(1)).toBe(1); // 0.015 kobo → 1
+    expect(checkoutFee(12_345)).toBe(186); // 185.175 → 186
   });
 
-  it('charges the ₦20 once per checkout, not once per due', () => {
-    const dues = [300_000, 150_000, 50_000];
-    const basket = dues.reduce((a, b) => a + b, 0);
-    expect(checkoutFee(basket)).toBe(10_000 + 2_000);
-    expect(checkoutFee(basket)).toBeLessThan(dues.reduce((a, d) => a + checkoutFee(d), 0));
+  it('always covers 9jaPay on the student’s transfer (0.5% capped at ₦750, + ₦50 from ₦10,000)', () => {
+    for (const face of [10_000 * NAIRA, 9_900 * NAIRA, 150_000 * NAIRA, 500_000 * NAIRA]) {
+      const total = face + checkoutFee(face);
+      const cost = Math.min(Math.ceil(total * 0.005), 75_000) + (total >= 10_000 * NAIRA ? 5_000 : 0);
+      expect(checkoutFee(face)).toBeGreaterThanOrEqual(cost);
+    }
+    expect(checkoutFee(10_000 * NAIRA)).toBe(15_000); // ₦150 against ₦100.75
+    expect(checkoutFee(500_000 * NAIRA)).toBe(750_000); // ₦7,500, uncapped
   });
 
   it('is zero for an empty basket and rejects non-integer or negative kobo', () => {
@@ -41,24 +44,25 @@ describe('checkoutFee — 2% + ₦20, on top', () => {
   });
 });
 
-describe('withdrawalFee — ₦100 under ₦50,000, ₦200 from ₦50,000', () => {
-  it('uses the low fee just under the threshold', () => {
-    expect(withdrawalFee(WITHDRAWAL_FEE_THRESHOLD_KOBO - 1)).toBe(10_000); // ₦49,999.99
-  });
-
-  it('uses the high fee at exactly ₦50,000 and above', () => {
-    expect(withdrawalFee(WITHDRAWAL_FEE_THRESHOLD_KOBO)).toBe(20_000);
-    expect(withdrawalFee(1_000_000 * NAIRA)).toBe(20_000);
+describe('withdrawalFee — 9jaPay’s transfer charge: ₦10 / ₦15 / ₦20', () => {
+  it('bands by amount', () => {
+    expect(transferFee(1 * NAIRA)).toBe(1_000);
+    expect(transferFee(4_999_99)).toBe(1_000); // ₦4,999.99
+    expect(transferFee(5_000 * NAIRA)).toBe(1_500);
+    expect(transferFee(99_999_99)).toBe(1_500);
+    expect(transferFee(100_000 * NAIRA)).toBe(2_000);
+    expect(transferFee(10_000_000 * NAIRA)).toBe(2_000);
+    expect(withdrawalFee(20_000 * NAIRA)).toBe(1_500);
   });
 
   it('deducts the fee from the withdrawal', () => {
-    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 10_000, feeBeforeDiscount: 10_000, discount: 0, net: 1_990_000 });
-    expect(computeWithdrawal(50_000 * NAIRA)).toEqual({ gross: 5_000_000, fee: 20_000, feeBeforeDiscount: 20_000, discount: 0, net: 4_980_000 });
+    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 1_500, feeBeforeDiscount: 1_500, discount: 0, net: 1_998_500 });
+    expect(computeWithdrawal(150_000 * NAIRA)).toEqual({ gross: 15_000_000, fee: 2_000, feeBeforeDiscount: 2_000, discount: 0, net: 14_998_000 });
   });
 
   it('applies a partner discount to the fee only', () => {
-    expect(computeWithdrawal(20_000 * NAIRA, 50)).toEqual({ gross: 2_000_000, fee: 5_000, feeBeforeDiscount: 10_000, discount: 5_000, net: 1_995_000 });
-    expect(computeWithdrawal(50_000 * NAIRA, 100)).toEqual({ gross: 5_000_000, fee: 0, feeBeforeDiscount: 20_000, discount: 20_000, net: 5_000_000 });
+    expect(computeWithdrawal(20_000 * NAIRA, 50)).toEqual({ gross: 2_000_000, fee: 750, feeBeforeDiscount: 1_500, discount: 750, net: 1_999_250 });
+    expect(computeWithdrawal(150_000 * NAIRA, 100)).toEqual({ gross: 15_000_000, fee: 0, feeBeforeDiscount: 2_000, discount: 2_000, net: 15_000_000 });
   });
 
   it('rounds the discount half-up and rejects bad percentages', () => {

@@ -7,25 +7,33 @@ import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
 import { encrypt, maskAccountNumber } from '../../lib/encryption';
 import { FakeProvider, setPaymentProvider } from '../../providers/payment';
-import { computeBachsSignature } from '../../providers/payment/bachs/signature';
+import { computeNineJaPaySignature } from '../../providers/payment/ninejapay/signature';
+import { FakeVerifier, setIdentityVerifier } from '../../providers/identity';
 import { appendLedgerEntry } from '../../services/ledger.service';
 
 /** Withdrawal security code every fixture space is given (see makeSpace). */
 export const TEST_PIN = '2580';
 const TEST_PIN_HASH = bcrypt.hashSync(TEST_PIN, 4);
 
-export const WEBHOOK_SECRET = process.env.BACHS_WEBHOOK_SECRET ?? 'whsec_test_secret';
+export const WEBHOOK_SECRET = process.env.NINEJAPAY_SECRET_KEY ?? 'whsec_test_secret';
 
 export function installFakeProvider(): FakeProvider {
-  const fake = new FakeProvider([WEBHOOK_SECRET], 300);
+  const fake = new FakeProvider([WEBHOOK_SECRET]);
   setPaymentProvider(fake);
   return fake;
 }
 
+export function installFakeVerifier(): FakeVerifier {
+  const fake = new FakeVerifier();
+  setIdentityVerifier(fake);
+  return fake;
+}
+
 let seq = 0;
+let accountSeq = Math.floor(Math.random() * 1_000_000);
 const uniq = () => `${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-/** A KYC-verified lead rep with a space, a payout account, and N members. */
+/** A KYC-verified lead rep with a space (and its own 9jaPay account), a beneficiary, and N members. */
 export async function makeSpace(opts: { members?: number; dues?: number[]; verified?: boolean } = {}) {
   const u = uniq();
   const verified = opts.verified ?? true;
@@ -37,9 +45,7 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       isRep: true,
       repApplicationStatus: 'approved',
       kycStatus: verified ? 'verified' : 'unverified',
-      bachsAccountId: verified ? `acct_fake_${u}` : null,
-      bachsPersonId: verified ? `per_fake_${u}` : null,
-      bachsPayoutsActive: verified,
+      ninCheckOutcome: verified ? 'match' : null,
       studentIdStatus: verified ? 'approved' : null,
     },
   });
@@ -47,6 +53,8 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
     data: {
       name: `Space ${u}`, short: 'TST', kind: 'department', school: 'LAUTECH', joinCode: `TST-${u}`.slice(0, 24),
       withdrawalPinHash: TEST_PIN_HASH, withdrawalPinSetAt: new Date(),
+      walletAccountId: `va_${u}`, walletAccountNumber: `91${String(++accountSeq).padStart(8, '0')}`,
+      walletAccountName: `DUEVY/Space ${u}`, walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date(),
     },
   });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
@@ -61,8 +69,6 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
         accountNumber: encrypt('0123456789'),
         accountNumberMasked: maskAccountNumber('0123456789'),
         accountName: 'ADA OBI',
-        bachsDestinationId: `pd_fake_${u}`,
-        bachsAccountId: rep.bachsAccountId,
       },
     });
   }
@@ -142,17 +148,54 @@ export async function api(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** POST a signed Bachs-format event to the webhook route. */
-export async function sendWebhook(event: { id: string; type: string; data: Record<string, unknown>; account?: string }) {
-  const raw = JSON.stringify({ created_at: new Date().toISOString(), organization_id: 'acct_platform', ...event });
-  const t = Math.floor(Date.now() / 1000);
-  const sig = computeBachsSignature(WEBHOOK_SECRET, t, raw);
-  const res = await fetch(`${base}/v1/webhooks/bachs`, {
+/** POST a signed 9jaPay-format event to the webhook route. */
+export async function sendWebhook(event: Record<string, unknown>) {
+  const raw = JSON.stringify(event);
+  const res = await fetch(`${base}/v1/webhooks/9japay`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${t},v1=${sig}` },
+    headers: { 'Content-Type': 'application/json', Signature: computeNineJaPaySignature(WEBHOOK_SECRET, raw) },
     body: raw,
   });
   return res.status;
+}
+
+/** A 9jaPay credit into an account, as `new_transaction` sends it. */
+export function creditEvent(opts: { accountNumber: string; accountRequestReference: string; amountKobo: number; id?: string }) {
+  return {
+    eventType: 'new_transaction',
+    data: {
+      id: opts.id ?? randomUUID(),
+      transactionReference: randomUUID(),
+      accountNumber: opts.accountNumber,
+      accountName: 'Duevy',
+      accountRequestReference: opts.accountRequestReference,
+      amount: opts.amountKobo,
+      senderName: 'STUDENT',
+      senderAccountNumber: '0123456789',
+      narration: 'dues',
+      transactionType: 'Credit',
+      transactionDate: new Date().toISOString(),
+    },
+  };
+}
+
+/**
+ * A student's transfer lands in a checkout's one-time account: 9jaPay's
+ * records show it (what the handler reads back) and the webhook says so.
+ * Pass `receivedKobo` for an under- or overpayment. Drain the queue after.
+ */
+export async function payCheckout(fake: FakeProvider, reference: string, opts: { receivedKobo?: number; eventId?: string } = {}) {
+  const c = await db.checkout.findUniqueOrThrow({ where: { reference } });
+  const amountKobo = opts.receivedKobo ?? c.totalKobo;
+  fake.collectionStatus.set(c.vaAccountNumber!, { state: 'paid', receivedKobo: amountKobo });
+  return sendWebhook(
+    creditEvent({ id: opts.eventId, accountNumber: c.vaAccountNumber!, accountRequestReference: c.providerCheckoutId!, amountKobo }),
+  );
+}
+
+/** 9jaPay's report that a transfer we started has a final status. */
+export function transferEvent(providerReference: string, status: 'Success' | 'Failed', eventId = randomUUID()) {
+  return { eventId, eventType: 'transfer_response', data: { requestReference: providerReference, sessionId: '999', status } };
 }
 
 export const newKey = () => randomUUID();

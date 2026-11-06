@@ -8,18 +8,20 @@ import { env } from '../config/env';
 export const webhooksRouter = Router();
 
 /**
- * POST /webhooks/bachs — public; authenticated by signature only.
+ * POST /webhooks/9japay — public; authenticated by signature only. Register
+ * this URL in the 9jaPay dashboard (Settings → Developer), test and live.
  *
  * Does the minimum and returns 200 fast:
  *   1. Verify the signature over the exact raw bytes (401 if it fails).
- *   2. Enqueue, deduplicated by Bachs's event id (a duplicate is a no-op).
+ *   2. Enqueue, deduplicated by the event id (a duplicate is a no-op).
  *   3. 200. The work happens in src/jobs/webhookWorker.ts.
  *
- * A 5xx is returned only if we could not durably store the event, so Bachs
- * retries it. Anything authenticated but unreadable is stored as `dead` for a
- * human and acknowledged — retrying it would never succeed.
+ * A 5xx is returned only if we could not durably store the event, so 9jaPay
+ * resends it (up to 10 times). Anything authenticated but unreadable is
+ * stored as `dead` for a human and acknowledged — retrying it would never
+ * succeed.
  */
-webhooksRouter.post('/bachs', async (req: Request, res: Response): Promise<void> => {
+webhooksRouter.post('/9japay', async (req: Request, res: Response): Promise<void> => {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
   const provider = getPaymentProvider();
 
@@ -54,4 +56,12 @@ webhooksRouter.post('/bachs', async (req: Request, res: Response): Promise<void>
 
   res.status(200).json({ success: true });
   if (env.RUN_WORKERS && env.NODE_ENV !== 'test') kickWebhookWorker();
+});
+
+/**
+ * POST /webhooks/bachs — retired. Acknowledged and dropped so Bachs stops
+ * retrying while the old endpoint is switched off; nothing is processed.
+ */
+webhooksRouter.post('/bachs', (_req: Request, res: Response): void => {
+  res.status(200).json({ success: true });
 });

@@ -1,5 +1,7 @@
 # Bachs Connect integration
 
+> **Superseded.** Duevy moved to 9jaPay in November 2026 — see [`NINEJAPAY.md`](NINEJAPAY.md). Kept for the history of Bachs-era rows (`provider = 'bachs'`).
+
 This covers how Duevy uses Bachs (docs.bachs.io), why it is built this way, what to set up in the Bachs dashboard, and what the Bachs docs leave open. Everything stated as "Bachs does X" is quoted or paraphrased from the docs (October 2026). Anything else is marked as an assumption.
 
 ## Shape

@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { db } from '../../config/db';
-import { koboToDecimal } from '../../lib/money';
 import { sendAccountActivationEmail, sendDuePaymentReceiptEmail } from '../../lib/email';
 import { guestCheckoutToken } from '../../services/checkout.service';
 import { retryGuestAccountInvites } from '../../services/guestAccount.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { type FakeProvider } from '../../providers/payment';
-import { api, installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { expireCheckout, findCheckoutId } from '../../services/checkout.service';
+import { api, installFakeProvider, makeSpace, payCheckout, startHttp, stopHttp, tokenFor } from './fixtures';
 
 // Each test plays a different guest, so give each its own client IP: the
 // checkout limiter (10/min per IP) would otherwise see one very busy guest.
@@ -50,15 +50,11 @@ const asNewGuest = () => ({ 'X-Forwarded-For': `10.9.${Math.floor(++ip / 250)}.$
 async function open(dueId: string, body: Record<string, unknown>, token?: string) {
   const res = await api('POST', `/v1/public/dues/${dueId}/checkout`, { body, token, headers: asNewGuest() });
   expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
-  return res.body.data as { reference: string; token: string; amount: number; checkoutUrl: string | null };
+  return res.body.data as { reference: string; token: string; amount: number; bankTransfer: { accountNumber: string } | null };
 }
 
-async function pay(reference: string, amountKobo: number, eventId = `evt_acct_${reference}`) {
-  await sendWebhook({
-    id: eventId,
-    type: 'collection.succeeded',
-    data: { reference, status: 'SUCCEEDED', amount: koboToDecimal(amountKobo), currency: 'NGN' },
-  });
+async function pay(reference: string, amountKobo: number, eventId = `txn_acct_${reference}`) {
+  await payCheckout(fake, reference, { receivedKobo: amountKobo, eventId });
   await drainWebhookQueue();
 }
 
@@ -154,7 +150,7 @@ describe('guest checkout account opt-in', () => {
     const { due } = await guestDue();
     const email = guestEmail();
     const c = await open(due.id, { name: 'Tolu Ade', matricNo: 'CSC/21/001', email });
-    expect(c.checkoutUrl).toBeTruthy(); // hosted mode: the URL the overlay opens
+    expect(c.bankTransfer?.accountNumber).toBeTruthy(); // the one-time account to transfer into
 
     await pay(c.reference, c.amount);
     const status = await statusOf(c.reference, c.token);
@@ -223,18 +219,12 @@ describe('guest checkout account opt-in', () => {
   it('never creates the account for an expired or underpaid checkout', async () => {
     const { due } = await guestDue();
     const expired = await open(due.id, { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail(), createAccount: true });
-    await sendWebhook({ id: `evt_exp_${expired.reference}`, type: 'checkout.expired', data: { reference: expired.reference } });
-    await drainWebhookQueue();
+    await expireCheckout(await findCheckoutId(expired.reference, null));
     expect((await statusOf(expired.reference, expired.token)).status).toBe('expired');
 
     const { due: due2 } = await guestDue();
     const short = await open(due2.id, { name: 'Bisi Ola', matricNo: 'CSC/21/001', email: guestEmail(), createAccount: true });
-    await sendWebhook({
-      id: `evt_short_${short.reference}`,
-      type: 'collection.underpaid',
-      data: { reference: short.reference, amount_paid: koboToDecimal(1000), amount_expected: koboToDecimal(short.amount) },
-    });
-    await drainWebhookQueue();
+    await pay(short.reference, 1000);
     expect((await statusOf(short.reference, short.token)).status).toBe('underpaid');
 
     await retryGuestAccountInvites();
@@ -323,27 +313,25 @@ describe('guest checkout account opt-in', () => {
   });
 });
 
-describe('checkout.completed from the overlay', () => {
+describe('a payment event', () => {
   it('reads the payment back from the provider instead of trusting the event', async () => {
     const { due } = await guestDue();
     const c = await open(due.id, { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail() });
-    const providerCheckoutId = `chk_fake_${c.reference}`;
-    const completed = (id: string) =>
-      sendWebhook({ id, type: 'checkout.completed', data: { checkout_id: providerCheckoutId, reference: c.reference } });
+    const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } });
 
-    // The provider hasn't seen the money yet: nothing changes.
-    await completed(`evt_done1_${c.reference}`);
+    // A signed credit event, but 9jaPay's records don't show the money yet: nothing changes.
+    const { creditEvent, sendWebhook } = await import('./fixtures');
+    await sendWebhook(
+      creditEvent({ id: `txn_early_${c.reference}`, accountNumber: checkout.vaAccountNumber!, accountRequestReference: checkout.providerCheckoutId!, amountKobo: c.amount }),
+    );
     await drainWebhookQueue();
     expect((await statusOf(c.reference, c.token)).status).toBe('pending');
 
-    fake.collectionStatus.set(providerCheckoutId, { state: 'paid', receivedKobo: c.amount });
-    await completed(`evt_done2_${c.reference}`);
-    await drainWebhookQueue();
+    await pay(c.reference, c.amount, `txn_done_${c.reference}`);
     expect((await statusOf(c.reference, c.token)).status).toBe('paid');
 
-    // collection.succeeded arriving afterwards records nothing twice.
-    await pay(c.reference, c.amount);
-    const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } });
+    // The same money reported again records nothing twice.
+    await pay(c.reference, c.amount, `txn_again_${c.reference}`);
     expect(await db.duePayment.count({ where: { checkoutId: checkout.id } })).toBe(1);
     expect(await db.ledgerEntry.count({ where: { reference: c.reference } })).toBe(1);
   });

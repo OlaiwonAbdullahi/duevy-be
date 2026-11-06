@@ -12,16 +12,16 @@ import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
-import { adminKycSummary, listStudentIdsForReview, reviewStudentId } from '../services/kyc.service';
+import { adminKycSummary, listNinReviews, listStudentIdsForReview, reviewNin, reviewStudentId } from '../services/kyc.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
-import { getPaymentSettings, setCheckoutMode } from '../services/settings.service';
 import { redeemForSpace } from '../services/partner.service';
 import { AppError } from '../lib/errors';
+import { openSpaceAccountInBackground } from '../services/sweep.service';
 import { adminPartnersRouter } from './partners';
 
 export const adminRouter = Router();
@@ -297,8 +297,9 @@ adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Reque
 
 /**
  * Duevy's revenue and payment counts, all-time and for the last 30 days.
- *  revenue      = service fees on paid checkouts + the withdrawal fees kept
- *                 (feeSettlementKobo: Duevy's fee minus Bachs's payout fee)
+ *  revenue      = processing fees on paid checkouts + the withdrawal fees kept
+ *                 (feeSettlementKobo; Bachs-era withdrawals only — under
+ *                 9jaPay the withdrawal fee is 9jaPay's own charge)
  *  transactions = paid student checkouts; volume is what students paid
  */
 async function platformMetrics() {
@@ -527,8 +528,8 @@ adminRouter.post('/users/:userId/deactivate', requireAdminPermission('userManage
   res.status(204).end();
 });
 
-// Identity is Bachs's decision: an admin may revoke a rep's verification
-// (block them) but can never mark someone verified.
+// An admin may revoke a rep's verification (block them) here but never mark
+// someone verified; the only way in is a NIN match or a partial-match review.
 const kycSchema = z.object({ decision: z.literal('rejected'), note: z.string().max(500).optional() });
 
 adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManagement'), validate(kycSchema), async (req: Request, res: Response): Promise<void> => {
@@ -545,7 +546,37 @@ adminRouter.post('/users/:userId/kyc/review', requireAdminPermission('userManage
 
 
 // ---------------------------------------------------------------------------
-// Rep student ID review. Bachs verifies identity (NIN); Duevy verifies the rep
+// Rep NIN review: a NIN check that only partly matched (name or date of birth)
+// waits here. Approving verifies the rep; rejecting counts as a failed attempt.
+// The NIN was never stored, so only the match score is shown.
+// ---------------------------------------------------------------------------
+adminRouter.get('/kyc/nin-reviews', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const raw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+  const status = (['pending', 'approved', 'rejected'].includes(raw) ? raw : 'pending') as 'pending' | 'approved' | 'rejected';
+  const { total, rows } = await listNinReviews(status, skip, take);
+  ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+const ninReviewSchema = z
+  .object({ decision: z.enum(['approved', 'rejected']), note: z.string().trim().min(1).max(500).optional() })
+  .strict();
+
+adminRouter.post(
+  '/users/:userId/nin/review',
+  requireAdminPermission('userManagement'),
+  validate(ninReviewSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.params.userId as string;
+    const { decision, note } = req.body as z.infer<typeof ninReviewSchema>;
+    const state = await reviewNin((req as AuthenticatedRequest).user.sub as string, userId, decision, note);
+    await writeAdminAudit(req, 'user.nin_review', { target: userId, severity: 'warning', metadata: { decision, note: note ?? null } });
+    ok(res, state);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Rep student ID review. Didit checks identity (NIN); Duevy verifies the rep
 // is a student. A space can only collect once its lead rep's student ID is
 // approved here. View links are signed and expire after a few minutes.
 // ---------------------------------------------------------------------------
@@ -632,11 +663,8 @@ function serializeAdminRep(
     kyc: {
       status: user.kycStatus,
       studentIdStatus: user.studentIdStatus,
-      payoutsActive: user.bachsPayoutsActive,
+      ninReviewStatus: user.ninReviewStatus,
       submittedAt: user.kycSubmittedAt?.toISOString() ?? null,
-      payoutAccount: user.payoutDestinationAccountMasked
-        ? { bankName: user.payoutDestinationBankName, accountMasked: user.payoutDestinationAccountMasked, accountName: user.payoutDestinationAccountName }
-        : null,
     },
     application: application
       ? {
@@ -685,8 +713,11 @@ const applicantSelect = {
   gender: true,
   kycStatus: true,
   kycRejectionReason: true,
-  kycRequirementsDue: true,
   kycSubmittedAt: true,
+  ninCheckOutcome: true,
+  ninNameMatchScore: true,
+  ninReviewStatus: true,
+  ninReviewNote: true,
   kycResolvedAt: true,
   studentIdStatus: true,
   studentIdFilePath: true,
@@ -704,7 +735,7 @@ function serializeRepApplication(app: RepApplication, user?: Applicant) {
     applicant: user
       ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level, phone: user.phone, gender: user.gender }
       : null,
-    // NIN verification (Bachs) and the student ID card, so the admin can give final approval.
+    // The NIN check and the student ID card, so the admin can give final approval.
     kyc: user ? adminKycSummary(user) : null,
     status: app.status,
     requestedSpace: {
@@ -777,7 +808,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
     return;
   }
-  // Final approval comes after KYC: Bachs must have verified the NIN, and the
+  // Final approval comes after KYC: the NIN must be verified, and the
   // student ID card must be on file (approving the application approves it).
   if (user.kycStatus !== 'verified') {
     errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
@@ -836,6 +867,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     },
     { timeout: 20_000 },
   );
+  openSpaceAccountInBackground(space.id);
 
   // Link the referral outside the provisioning transaction (best-effort).
   if (app.referralCode) {
@@ -1022,6 +1054,7 @@ adminRouter.post('/spaces', requireAdminPermission('userManagement'), validate(c
     joinCode = generateJoinCode(d.short);
   }
   const space = await db.space.create({ data: { name: d.name, short: d.short, kind: d.kind, school: d.school, faculty: d.faculty, joinCode } });
+  openSpaceAccountInBackground(space.id);
   await writeAdminAudit(req, 'space.create', { target: space.id, metadata: { name: d.name } });
   ok(res, { id: space.id, name: space.name, short: space.short, kind: space.kind, school: space.school, joinCode: space.joinCode }, 201);
 });
@@ -1679,30 +1712,6 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
   );
   await writeAdminAudit(req, 'roles.update', { target: role, severity: 'critical', metadata: perms });
   ok(res, { role, permissions: perms });
-});
-
-// ===========================================================================
-// Payment settings — how students pay (hosted redirect vs. custom bank account)
-// ===========================================================================
-adminRouter.get('/settings/payments', async (_req: Request, res: Response): Promise<void> => {
-  ok(res, await getPaymentSettings());
-});
-
-const paymentSettingsSchema = z.object({ checkoutMode: z.enum(['hosted', 'custom']) });
-
-adminRouter.put('/settings/payments', requireSuperAdmin(), validate(paymentSettingsSchema), async (req: Request, res: Response): Promise<void> => {
-  const { checkoutMode } = req.body as z.infer<typeof paymentSettingsSchema>;
-  const before = await getPaymentSettings();
-  const adminId = (req as AuthenticatedRequest).user.sub as string;
-  const settings = await setCheckoutMode(checkoutMode, adminId);
-  if (before.checkoutMode !== checkoutMode) {
-    await writeAdminAudit(req, 'settings.checkout_mode', {
-      target: 'checkout_mode',
-      severity: 'warning',
-      metadata: { from: before.checkoutMode, to: checkoutMode },
-    });
-  }
-  ok(res, settings);
 });
 
 // ===========================================================================

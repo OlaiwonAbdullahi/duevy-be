@@ -12,17 +12,14 @@ import { serializePayout, serializeBeneficiary } from '../lib/serializers';
 import { maskAccountNumber } from '../lib/encryption';
 import {
   discountedFee,
+  MAX_PAYOUT_KOBO,
   MIN_PAYOUT_KOBO,
-  WITHDRAWAL_FEE_HIGH_KOBO,
-  WITHDRAWAL_FEE_LOW_KOBO,
-  WITHDRAWAL_FEE_THRESHOLD_KOBO,
+  TRANSFER_FEE_BANDS,
+  TRANSFER_FEE_TOP_KOBO,
 } from '../lib/money';
-import { getKycState, getSpaceKycState } from '../services/kyc.service';
+import { canCollect, getKycState, getSpaceKycState } from '../services/kyc.service';
 import { getActiveDiscount, serializeSpacePartner } from '../services/partner.service';
 import {
-  governmentIdHandlers,
-  payoutDestinationHandlers,
-  payoutDestinationLookupHandlers,
   resubmitStudentIdHandlers,
   submitKycHandlers,
 } from './kycHandlers';
@@ -34,6 +31,7 @@ import { sendEmail, renderEmail } from '../lib/email';
 import { escapeHtml } from '../lib/html';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
 import { listSignatories, REQUIRED_SIGNATORIES, setSignatories, setWithdrawalAuthMode } from '../services/signatory.service';
+import { getSpaceFunds } from '../services/sweep.service';
 import { announceForApproval, approvePayout, getApprovalState, rejectPayout, sendApprovalOtp } from '../services/withdrawalApproval.service';
 
 // Mounted at /spaces/:spaceId; every route is rep-gated. Withdrawals are open
@@ -67,6 +65,13 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     getActiveDiscount(sid),
   ]);
   const discountPercent = partner?.discountPercent ?? 0;
+  const [account, funds] = await Promise.all([
+    db.space.findUnique({
+      where: { id: sid },
+      select: { walletAccountNumber: true, walletAccountName: true, walletBankName: true },
+    }),
+    getSpaceFunds(sid, ledger.balance),
+  ]);
   ok(res, {
     available: ledger.balance,
     balance: ledger.balance,
@@ -76,6 +81,13 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     inFlight: ledger.inFlight,
     // Kept for older clients: lifetime amount withdrawn.
     lifetime: ledger.withdrawn,
+    // The space's own 9jaPay account (null while it's being opened), and where
+    // its balance sits: swept into that account, or still awaiting the daily
+    // sweep in Duevy's account. Withdrawals sweep what they need first.
+    account: account?.walletAccountNumber
+      ? { accountNumber: account.walletAccountNumber, accountName: account.walletAccountName, bankName: account.walletBankName }
+      : null,
+    funds,
     kyc,
     beneficiaryCount,
     // Withdrawals need the security code the lead rep sets; say if it's missing, locked or on hold.
@@ -88,10 +100,22 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     signatoriesComplete: signatories.length >= REQUIRED_SIGNATORIES,
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
-    // Already net of the space's partner discount, if any.
+    maxPayout: MAX_PAYOUT_KOBO,
+    // 9jaPay's transfer charge by withdrawal amount, already net of the
+    // space's partner discount, if any. `toKobo` is exclusive; null = no upper bound.
     fees: {
-      below: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_LOW_KOBO, discountPercent) },
-      atOrAbove: { thresholdKobo: WITHDRAWAL_FEE_THRESHOLD_KOBO, feeKobo: discountedFee(WITHDRAWAL_FEE_HIGH_KOBO, discountPercent) },
+      bands: [
+        ...TRANSFER_FEE_BANDS.map((b, i) => ({
+          fromKobo: i === 0 ? 0 : TRANSFER_FEE_BANDS[i - 1]!.belowKobo,
+          toKobo: b.belowKobo as number | null,
+          feeKobo: discountedFee(b.feeKobo, discountPercent),
+        })),
+        {
+          fromKobo: TRANSFER_FEE_BANDS[TRANSFER_FEE_BANDS.length - 1]!.belowKobo,
+          toKobo: null,
+          feeKobo: discountedFee(TRANSFER_FEE_TOP_KOBO, discountPercent),
+        },
+      ],
     },
     partner: partner ? serializeSpacePartner(partner) : null,
   });
@@ -223,7 +247,7 @@ payoutsRouter.get('/payout/beneficiaries', async (req: Request, res: Response): 
   ok(res, (await listBeneficiaries(spaceId(req))).map(serializeBeneficiary));
 });
 
-// POST /payout/beneficiaries — lead rep only; registers the account with the provider.
+// POST /payout/beneficiaries — lead rep only; the account is name-checked and saved on the space.
 payoutsRouter.post(
   '/payout/beneficiaries',
   requireSpaceRep(true),
@@ -233,15 +257,15 @@ payoutsRouter.post(
     const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
     const me = await db.user.findUniqueOrThrow({
       where: { id: uid(req) },
-      select: { id: true, name: true, bachsAccountId: true, kycStatus: true },
+      select: { id: true, name: true, kycStatus: true, studentIdStatus: true },
     });
-    if (!me.bachsAccountId || me.kycStatus !== 'verified') {
+    if (!canCollect(me)) {
       errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
     }
     const { beneficiary, created } = await addBeneficiary({
       spaceId: spaceId(req),
-      actor: { id: me.id, name: me.name, bachsAccountId: me.bachsAccountId },
+      actor: { id: me.id, name: me.name },
       bankCode,
       accountNumber,
       label,
@@ -266,9 +290,6 @@ payoutsRouter.delete(
 // ---------------------------------------------------------------------------
 payoutsRouter.post('/payout/kyc', ...submitKycHandlers);
 payoutsRouter.post('/payout/kyc/student-id', ...resubmitStudentIdHandlers);
-payoutsRouter.post('/payout/kyc/government-id', ...governmentIdHandlers);
-payoutsRouter.post('/payout/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
-payoutsRouter.post('/payout/kyc/payout-destination', ...payoutDestinationHandlers);
 
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
   const [space, mine] = await Promise.all([getSpaceKycState(spaceId(req)), getKycState(uid(req))]);

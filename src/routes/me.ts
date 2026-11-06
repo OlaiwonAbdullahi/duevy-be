@@ -14,9 +14,6 @@ import { hashToken } from '../lib/tokens';
 import { sniffDocumentType } from '../lib/storage';
 import { getKycState } from '../services/kyc.service';
 import {
-  governmentIdHandlers,
-  payoutDestinationHandlers,
-  payoutDestinationLookupHandlers,
   resubmitStudentIdHandlers,
   submitKycHandlers,
 } from './kycHandlers';
@@ -39,9 +36,6 @@ meRouter.get('/kyc-status', async (req: Request, res: Response): Promise<void> =
 });
 meRouter.post('/kyc', ...submitKycHandlers);
 meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
-meRouter.post('/kyc/government-id', ...governmentIdHandlers);
-meRouter.post('/kyc/payout-destination/lookup', ...payoutDestinationLookupHandlers);
-meRouter.post('/kyc/payout-destination', ...payoutDestinationHandlers);
 
 // Default notification preferences (§3.4) applied when the column is null.
 const DEFAULT_NOTIFICATION_PREFS = {

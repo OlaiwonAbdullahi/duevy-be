@@ -6,8 +6,8 @@ import { sendKycReminderEmail } from '../lib/email';
 /**
  * "Finish your verification" emails to rep applicants who signed up but still
  * owe a KYC step — the same test as the frontend's onboarding gate: NIN not
- * submitted (or refused), student ID missing (or refused), or no payout
- * account. Anything merely pending review is on us, so it isn't nagged.
+ * submitted (or refused), or student ID missing (or refused). Anything merely
+ * pending review is on us, so it isn't nagged.
  *
  * Reminders go out 24 hours, 3 days and 7 days after sign-up, at most one per
  * run. Someone found late (e.g. on the first run after deploy) gets only the
@@ -28,7 +28,6 @@ const KYC_OUTSTANDING: Prisma.UserWhereInput = {
     { kycStatus: 'rejected' },
     { studentIdStatus: null },
     { studentIdStatus: 'rejected' },
-    { payoutDestinationSubmittedAt: null },
   ],
 };
 

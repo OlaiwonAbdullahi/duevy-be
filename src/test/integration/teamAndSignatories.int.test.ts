@@ -115,7 +115,7 @@ describe('team management', () => {
     expect(own.body.data.assignedRepId).toBe(t.bola.id);
   });
 
-  it('a co-rep withdraws only from a due assigned to them, capped at what it collected, out of the lead account', async () => {
+  it('a co-rep withdraws only from a due assigned to them, capped at what it collected, out of the space account', async () => {
     const t = await team();
     const [due] = t.dues;
     await creditDue(t.space.id, due!.id, 500_000);
@@ -131,7 +131,7 @@ describe('team management', () => {
     await expect(req({ dueId: due!.id, amountKobo: 600_000 })).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
 
     const p = await req({ dueId: due!.id });
-    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id, providerAccountId: t.lead.bachsAccountId });
+    expect(p).toMatchObject({ status: 'processing', dueId: due!.id, requestedById: t.bola.id });
     expect(await dueLeft(t.space.id, due!.id)).toBe(200_000);
     expect(await getSpaceBalance(t.space.id)).toBe(2_200_000);
 
@@ -200,7 +200,7 @@ describe('signatory approval (multisig)', () => {
     const id = created.body.data.id as string;
     // Funds are reserved, and nothing has gone to the bank.
     expect(await getSpaceBalance(t.space.id)).toBe(600_000);
-    expect(fake.calls.filter((c) => c.op === 'initiatePayout')).toHaveLength(0);
+    expect(fake.calls.filter((c) => c.op === 'initiateTransfer')).toHaveLength(0);
 
     const wrong = await api('POST', `${t.base}/payout/${id}/approve`, { token: t.leadToken, body: { otp: codes.get(t.lead.email) === '000000' ? '111111' : '000000' } });
     expect(wrong.body.error.code).toBe('INVALID_OTP');
@@ -215,7 +215,7 @@ describe('signatory approval (multisig)', () => {
 
     const second = await sign(t.base, id, t.chidi);
     expect(second.body.data.status).toBe('processing');
-    expect(fake.calls.filter((c) => c.op === 'initiatePayout')).toHaveLength(1);
+    expect(fake.calls.filter((c) => c.op === 'initiateTransfer')).toHaveLength(1);
   });
 
   it('a co-rep who is not a signatory needs two signatures; a rejection cancels and restores the due', async () => {
@@ -237,7 +237,7 @@ describe('signatory approval (multisig)', () => {
     expect(rejected.body.data.failureReason).toContain('rejected by Chidi');
     expect(await dueLeft(t.space.id, due!.id)).toBe(800_000);
     expect(await getSpaceBalance(t.space.id)).toBe(800_000);
-    expect(fake.calls.filter((c) => c.op === 'initiatePayout')).toHaveLength(0);
+    expect(fake.calls.filter((c) => c.op === 'initiateTransfer')).toHaveLength(0);
 
     // The space is free for the next withdrawal; its requester can withdraw it themselves.
     const again = await requestWithdrawal({ spaceId: t.space.id, userId: dayo.id, dueId: due!.id, beneficiaryId: t.beneficiary!.id, amountKobo: 200_000 });

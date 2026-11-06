@@ -2,13 +2,14 @@ import { readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { koboToDecimal } from '../../lib/money';
+import { type FakeProvider } from '../../providers/payment';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { createCheckout } from '../../services/checkout.service';
-import { api, apiMultipart, installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp, tokenFor } from './fixtures';
+import { api, apiMultipart, installFakeProvider, makeSpace, payCheckout, startHttp, stopHttp, tokenFor } from './fixtures';
 
+let fake: FakeProvider;
 beforeAll(async () => {
-  installFakeProvider();
+  fake = installFakeProvider();
   await startHttp();
 });
 afterAll(stopHttp);
@@ -152,11 +153,7 @@ describe('receipt design', () => {
     const studentToken = await tokenFor(students[0]!);
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
     const { reference, amount } = checkout;
-    await sendWebhook({
-      id: `evt_design_${reference}`,
-      type: 'collection.succeeded',
-      data: { reference, status: 'SUCCEEDED', amount: koboToDecimal(amount), currency: 'NGN' },
-    });
+    await payCheckout(fake, reference, { receivedKobo: amount });
     await drainWebhookQueue();
 
     const receipt = await db.receipt.findFirstOrThrow({ where: { checkout: { reference } } });

@@ -300,7 +300,7 @@ function emailReceiptCard(input: DuePaymentReceipt, amountPaid: string): string 
         <td style="padding:12px 18px 6px;border-top:1px solid ${LINE};">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
             ${total(single ? 'Due amount' : 'Dues total', nairaExact(input.faceKobo))}
-            ${total('Service fee', nairaExact(input.feeKobo))}
+            ${total('Processing fee', nairaExact(input.feeKobo))}
           </table>
         </td>
       </tr>
@@ -352,7 +352,7 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
       ['Reference', escapeHtml(input.reference)],
     ])}
     <a href="${receiptLink}" class="btn">View receipt</a>
-    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the service fee is 2% + ₦20 per payment. Questions? Reply here or reach us at support@duevy.app</p>
+    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the processing fee is 1.5% of the dues. Questions? Reply here or reach us at support@duevy.app</p>
   `,
     undefined,
     { preheader: `${amount} paid for ${summary} — your receipt is inside.` },
@@ -362,7 +362,7 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
   const text =
     `Hi ${name},\n\nYour payment of ${amount}${input.spaceName ? ` to ${input.spaceName}` : ''} is confirmed.\n\n` +
     `${single ? 'Due paid' : `Dues paid (${input.items.length})`}:\n${lines}\n\n` +
-    `${single ? 'Due amount' : 'Dues total'}: ${nairaExact(input.faceKobo)}\nService fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
+    `${single ? 'Due amount' : 'Dues total'}: ${nairaExact(input.faceKobo)}\nProcessing fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
     `${input.receiptNumber ? `Receipt no.: ${input.receiptNumber}\n` : ''}Reference: ${input.reference}\nMethod: Bank transfer\nDate: ${paidAt}\n\n` +
     `View your receipt: ${receiptLink}`;
 
@@ -410,12 +410,12 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     1: {
       subject: 'Finish setting up your Duevy rep account',
       heading: 'You\'re almost there',
-      body: `Hi ${first}, thanks for signing up as a rep on Duevy. One step is left: verify your identity so your department can start collecting dues. It takes about three minutes.`,
+      body: `Hi ${first}, thanks for signing up as a rep on Duevy. One step is left: verify your identity so your department can start collecting dues. It takes about two minutes.`,
     },
     2: {
       subject: 'Your department is waiting — finish your Duevy verification',
       heading: 'Your department can\'t collect dues yet',
-      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your NIN, your student ID card and your bank account.`,
+      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your NIN, your date of birth and your student ID card.`,
     },
     3: {
       subject: 'Last reminder: complete your Duevy rep verification',
@@ -432,7 +432,7 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     <p class="muted">Already done? You can ignore this email.</p>
   `,
     BRAND,
-    { preheader: 'Verify your NIN, student ID and payout account in about three minutes.' },
+    { preheader: 'Verify your NIN and student ID in about two minutes.' },
   );
 
   await sendEmail({ to, subject: copy.subject, html });

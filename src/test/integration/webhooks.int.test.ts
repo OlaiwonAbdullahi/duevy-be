@@ -1,41 +1,48 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { db } from '../../config/db';
-import { koboToDecimal } from '../../lib/money';
-import { createCheckout } from '../../services/checkout.service';
+import { createCheckout, expireCheckout } from '../../services/checkout.service';
 import { getSpaceBalance } from '../../services/ledger.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
-import { installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp } from './fixtures';
+import { type FakeProvider } from '../../providers/payment';
+import { creditEvent, installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp } from './fixtures';
+
+let fake: FakeProvider;
 
 beforeAll(async () => {
-  installFakeProvider();
+  fake = installFakeProvider();
   await startHttp();
 });
 afterAll(stopHttp);
 
-async function paidEvent(id: string, reference: string, amountKobo: number, extra: Record<string, unknown> = {}) {
-  return sendWebhook({
-    id,
-    type: 'collection.succeeded',
-    data: { reference, status: 'SUCCEEDED', amount: koboToDecimal(amountKobo), currency: 'NGN', ...extra },
-  });
+/**
+ * A student's transfer lands in the checkout's one-time account: 9jaPay's
+ * records show it (what the handler reads back), and the webhook says so.
+ */
+async function pay(checkout: { reference: string }, receivedKobo: number, eventId: string) {
+  const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
+  fake.collectionStatus.set(c.vaAccountNumber!, { state: 'paid', receivedKobo });
+  return sendWebhook(
+    creditEvent({ id: eventId, accountNumber: c.vaAccountNumber!, accountRequestReference: c.providerCheckoutId!, amountKobo: receivedKobo }),
+  );
 }
 
 describe('webhook idempotency', () => {
   it('applies a payment once however many times, and however concurrently, it is delivered', async () => {
     const { space, students, dues } = await makeSpace({ dues: [500_000, 150_000] });
     const { checkout } = await createCheckout(students[0]!.id, dues.map((d) => d.id));
-    expect(checkout.breakdown).toEqual({ face: 650_000, fee: 13_000 + 2_000, total: 665_000 });
+    expect(checkout.breakdown).toEqual({ face: 650_000, fee: 9_750, total: 659_750 });
+    expect(checkout.bankTransfer).toMatchObject({ bankName: '9jaPay', amountKobo: 659_750 });
 
     // Same event id, five times — three of them concurrently.
-    expect(await paidEvent('evt_dup_1', checkout.reference, checkout.amount)).toBe(200);
-    const concurrent = await Promise.all([1, 2, 3].map(() => paidEvent('evt_dup_1', checkout.reference, checkout.amount)));
+    expect(await pay(checkout, checkout.amount, 'txn_dup_1')).toBe(200);
+    const concurrent = await Promise.all([1, 2, 3].map(() => pay(checkout, checkout.amount, 'txn_dup_1')));
     expect(concurrent).toEqual([200, 200, 200]);
-    expect(await paidEvent('evt_dup_1', checkout.reference, checkout.amount)).toBe(200);
-    // The same OUTCOME under a different event id (e.g. a provider re-send).
-    expect(await paidEvent('evt_dup_2', checkout.reference, checkout.amount)).toBe(200);
+    expect(await pay(checkout, checkout.amount, 'txn_dup_1')).toBe(200);
+    // The same OUTCOME under a different event id (e.g. a resent notification).
+    expect(await pay(checkout, checkout.amount, 'txn_dup_2')).toBe(200);
 
-    // Two queued rows (one per distinct event id), processed by concurrent drains.
-    expect(await db.webhookEvent.count({ where: { providerEventId: { in: ['evt_dup_1', 'evt_dup_2'] } } })).toBe(2);
+    const ids = ['new_transaction:txn_dup_1', 'new_transaction:txn_dup_2'];
+    expect(await db.webhookEvent.count({ where: { providerEventId: { in: ids } } })).toBe(2);
     await Promise.all([drainWebhookQueue(), drainWebhookQueue()]);
 
     const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
@@ -44,19 +51,37 @@ describe('webhook idempotency', () => {
     expect(await db.ledgerEntry.count({ where: { spaceId: space.id, type: 'due_payment' } })).toBe(2);
     expect(await db.receipt.count({ where: { checkoutId: c.id } })).toBe(1);
     expect(await getSpaceBalance(space.id)).toBe(650_000); // face value, not the fee
-    const events = await db.webhookEvent.findMany({ where: { providerEventId: { in: ['evt_dup_1', 'evt_dup_2'] } } });
+    const events = await db.webhookEvent.findMany({ where: { providerEventId: { in: ids } } });
     expect(events.every((e) => e.status === 'processed')).toBe(true);
     expect((await db.transaction.findUniqueOrThrow({ where: { reference: c.reference } })).status).toBe('completed');
   });
 
+  it('never trusts the event body: a credit 9jaPay has no record of changes nothing', async () => {
+    const { space, students, dues } = await makeSpace();
+    const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
+    const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
+    // Correctly signed, but 9jaPay's transaction list shows nothing arrived.
+    await sendWebhook(creditEvent({ accountNumber: c.vaAccountNumber!, accountRequestReference: c.providerCheckoutId!, amountKobo: c.totalKobo }));
+    await drainWebhookQueue();
+    expect((await db.checkout.findUniqueOrThrow({ where: { id: c.id } })).status).toBe('pending');
+    expect(await getSpaceBalance(space.id)).toBe(0);
+  });
+
   it('rejects an unsigned or wrongly signed delivery with 401 and stores nothing', async () => {
     const before = await db.webhookEvent.count();
-    const res = await fetch(`${(await startHttp())}/v1/webhooks/bachs`, {
+    const res = await fetch(`${await startHttp()}/v1/webhooks/9japay`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Bachs-Signature-V2': `t=${Math.floor(Date.now() / 1000)},v1=${'a'.repeat(64)}` },
-      body: JSON.stringify({ id: 'evt_forged', type: 'collection.succeeded', data: {} }),
+      headers: { 'Content-Type': 'application/json', Signature: 'bm90IGEgcmVhbCBzaWduYXR1cmU=' },
+      body: JSON.stringify({ eventType: 'new_transaction', data: { id: 'forged', transactionType: 'Credit' } }),
     });
     expect(res.status).toBe(401);
+    expect(await db.webhookEvent.count()).toBe(before);
+  });
+
+  it('acknowledges and drops deliveries to the retired Bachs endpoint', async () => {
+    const before = await db.webhookEvent.count();
+    const res = await fetch(`${await startHttp()}/v1/webhooks/bachs`, { method: 'POST', body: '{}' });
+    expect(res.status).toBe(200);
     expect(await db.webhookEvent.count()).toBe(before);
   });
 });
@@ -65,11 +90,7 @@ describe('payment outcomes', () => {
   it('underpayment: no due is marked paid, the checkout is flagged', async () => {
     const { space, students, dues } = await makeSpace();
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
-    await sendWebhook({
-      id: `evt_under_${checkout.reference}`,
-      type: 'collection.underpaid',
-      data: { reference: checkout.reference, amount_paid: '3000.00', amount_expected: koboToDecimal(checkout.amount), status: 'UNDERPAID' },
-    });
+    await pay(checkout, 300_000, `txn_under_${checkout.reference}`);
     await drainWebhookQueue();
     const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
     expect(c.status).toBe('underpaid');
@@ -82,17 +103,7 @@ describe('payment outcomes', () => {
   it('overpayment: dues are paid at face value and the excess is flagged', async () => {
     const { space, students, dues } = await makeSpace();
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
-    await sendWebhook({
-      id: `evt_over_${checkout.reference}`,
-      type: 'collection.succeeded',
-      data: {
-        reference: checkout.reference,
-        status: 'OVERPAID',
-        amount: koboToDecimal(checkout.amount),
-        received_amount: koboToDecimal(checkout.amount + 100_000),
-        overpaid_amount: '1000.00',
-      },
-    });
+    await pay(checkout, checkout.amount + 100_000, `txn_over_${checkout.reference}`);
     await drainWebhookQueue();
     const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
     expect(c.status).toBe('paid');
@@ -104,15 +115,12 @@ describe('payment outcomes', () => {
   it('expiry closes the checkout; money arriving afterwards is still honoured', async () => {
     const { space, students, dues } = await makeSpace();
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
-    await sendWebhook({ id: `evt_exp_${checkout.reference}`, type: 'collection.failed', data: { reference: checkout.reference, status: 'EXPIRED' } });
-    await drainWebhookQueue();
-    expect((await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } })).status).toBe('expired');
+    const c0 = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
+    await expireCheckout(c0.id);
+    await expireCheckout(c0.id); // a second expiry is a no-op
+    expect((await db.checkout.findUniqueOrThrow({ where: { id: c0.id } })).status).toBe('expired');
 
-    // A duplicate expiry is a no-op.
-    await sendWebhook({ id: `evt_exp2_${checkout.reference}`, type: 'checkout.expired', data: { reference: checkout.reference } });
-    await drainWebhookQueue();
-
-    await paidEvent(`evt_late_${checkout.reference}`, checkout.reference, checkout.amount);
+    await pay(checkout, checkout.amount, `txn_late_${checkout.reference}`);
     await drainWebhookQueue();
     const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
     expect(c.status).toBe('paid');
@@ -121,9 +129,9 @@ describe('payment outcomes', () => {
   });
 
   it('an event for an unknown checkout is retried, not dropped', async () => {
-    await paidEvent('evt_unknown_ref', 'DVY-NOPE-NOPE', 100_000);
+    await sendWebhook(creditEvent({ id: 'txn_unknown_ref', accountNumber: '9000000000', accountRequestReference: 'DVYNOPENOPE', amountKobo: 100_000 }));
     await drainWebhookQueue();
-    const e = await db.webhookEvent.findFirstOrThrow({ where: { providerEventId: 'evt_unknown_ref' } });
+    const e = await db.webhookEvent.findFirstOrThrow({ where: { providerEventId: 'new_transaction:txn_unknown_ref' } });
     expect(e.status).toBe('failed');
     expect(e.attempts).toBe(1);
     expect(e.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
@@ -134,6 +142,10 @@ describe('checkout rules', () => {
   it('computes fees server-side and reuses an open checkout for the same basket', async () => {
     const { students, dues } = await makeSpace({ dues: [100_000, 200_000] });
     const first = await createCheckout(students[0]!.id, [dues[0]!.id, dues[1]!.id]);
+    expect(first.checkout.breakdown).toEqual({ face: 300_000, fee: 4_500, total: 304_500 });
+    // The one-time account is opened for exactly the total.
+    expect(fake.calls.find((c) => c.op === 'createCollectionAccount' && (c.args as { reference: string }).reference === first.checkout.reference)?.args)
+      .toMatchObject({ totalKobo: 304_500 });
     const again = await createCheckout(students[0]!.id, [dues[1]!.id, dues[0]!.id]);
     expect(again.reused).toBe(true);
     expect(again.checkout.reference).toBe(first.checkout.reference);

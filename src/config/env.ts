@@ -22,23 +22,32 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Payment rail. 'bachs' is the only live provider; 'fake' is an in-memory
-  // stand-in for local development, the seed and the test suite. See
-  // src/providers/payment/.
-  PAYMENT_PROVIDER: z.enum(['bachs', 'fake']).default('bachs'),
+  // Payment rail. 'ninejapay' is the only live provider; 'fake' is an
+  // in-memory stand-in for local development, the seed and the test suite.
+  // See src/providers/payment/ and docs/NINEJAPAY.md.
+  PAYMENT_PROVIDER: z.enum(['ninejapay', 'fake']).default('ninejapay'),
 
-  // Bachs (docs.bachs.io) — Connect platform. sk_sandbox_… against the sandbox
-  // URL, sk_live_… against https://api.bachs.io; going live is a key swap.
-  BACHS_BASE_URL: z.string().url().default('https://sandbox-api.bachs.io'),
-  BACHS_SECRET_KEY: z.string().optional(),
-  // The signing secret of the webhook endpoint registered for /v1/webhooks/bachs
-  // (returned once, at endpoint creation). During a rotation Bachs keeps the old
-  // secret valid for 24h, so the outgoing one can be kept here meanwhile.
-  BACHS_WEBHOOK_SECRET: z.string().optional(),
-  BACHS_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
-  // Reject signed deliveries whose timestamp is further than this from now.
-  WEBHOOK_TOLERANCE_SECONDS: z.coerce.number().int().positive().default(300),
-  // How long a checkout's one-time bank account stays open (Bachs allows 1–1440).
+  // 9jaPay (docs.9japay.com) — virtual accounts under Duevy's own business.
+  // The live base URL comes from 9jaPay at onboarding.
+  NINEJAPAY_BASE_URL: z.string().url().default('https://developer.test.9japay.com'),
+  NINEJAPAY_API_KEY: z.string().optional(),
+  // Also the webhook signing key: 9jaPay signs deliveries with it.
+  NINEJAPAY_SECRET_KEY: z.string().optional(),
+  // Duevy's business (collection) account: where collections settle and
+  // sweeps are sent from. Its name is looked up from 9jaPay, not configured.
+  NINEJAPAY_BUSINESS_ACCOUNT_NUMBER: z.string().optional(),
+  // 9jaPay's own bank code, for transfers into a space's account.
+  NINEJAPAY_BANK_CODE: z.string().default('090629'),
+  // A space's unswept collections below this wait for the next day's sweep.
+  SWEEP_MIN_KOBO: z.coerce.number().int().positive().default(100_000),
+
+  // Didit (docs.didit.me) — rep NIN + date of birth checks against NIMC.
+  // Required with the live rail. Under PAYMENT_PROVIDER=fake, leaving the key
+  // unset uses an in-memory verifier instead.
+  DIDIT_BASE_URL: z.string().url().default('https://verification.didit.me'),
+  DIDIT_API_KEY: z.string().optional(),
+
+  // How long a checkout's one-time bank account stays open, in minutes.
   CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
   // Run the webhook/job worker and reconciliation inside the API process.
   // Turn off when they run as a separate process (npm run worker).
@@ -104,28 +113,17 @@ const envSchema = z.object({
   LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
   LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
-  if (val.PAYMENT_PROVIDER === 'bachs') {
-    for (const key of ['BACHS_SECRET_KEY', 'BACHS_WEBHOOK_SECRET'] as const) {
-      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=bachs' });
+  if (val.PAYMENT_PROVIDER === 'ninejapay') {
+    for (const key of [
+      'NINEJAPAY_API_KEY',
+      'NINEJAPAY_SECRET_KEY',
+      'NINEJAPAY_BUSINESS_ACCOUNT_NUMBER',
+    ] as const) {
+      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=ninejapay' });
     }
   }
-  if (val.PAYMENT_PROVIDER === 'bachs' && val.BACHS_SECRET_KEY) {
-    // Dev and prod are separate databases with separate keys: sandbox keys
-    // everywhere except production, which takes the live key. Refuse a key
-    // that points at the wrong Bachs environment, and a live key outside
-    // production (a dev database must never move real money).
-    const live = val.BACHS_SECRET_KEY.startsWith('sk_live_');
-    const liveUrl = new URL(val.BACHS_BASE_URL).hostname === 'api.bachs.io';
-    if (live !== liveUrl) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['BACHS_BASE_URL'],
-        message: live ? 'an sk_live_ key needs https://api.bachs.io' : 'an sk_sandbox_ key needs https://sandbox-api.bachs.io',
-      });
-    }
-    if (live && val.NODE_ENV !== 'production') {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BACHS_SECRET_KEY'], message: 'live Bachs keys only run with NODE_ENV=production' });
-    }
+  if (val.PAYMENT_PROVIDER !== 'fake' && !val.DIDIT_API_KEY) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['DIDIT_API_KEY'], message: 'required for rep NIN checks' });
   }
   if (val.FILE_STORAGE === 'imagekit') {
     for (const key of ['IMAGEKIT_PRIVATE_KEY', 'IMAGEKIT_URL_ENDPOINT'] as const) {

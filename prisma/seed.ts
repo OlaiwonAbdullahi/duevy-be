@@ -2,11 +2,11 @@
  * Development seed: one super admin, one approved test rep with a LAUTECH
  * space and dues, one test student who has joined it.
  *
- * With PAYMENT_PROVIDER=fake the rep is also KYC-verified (against fake
- * provider ids) with a payout account, and the student has one paid checkout,
- * created through the real checkout service, so the ledger, receipt and rep
- * dashboard all have data. With PAYMENT_PROVIDER=bachs the rep is left
- * unverified: KYC must be done for real against the Bachs sandbox.
+ * With PAYMENT_PROVIDER=fake the rep is also KYC-verified with a beneficiary,
+ * the space has a (fake) 9jaPay account, and the student has one paid
+ * checkout, created through the real checkout service, so the ledger, receipt
+ * and rep dashboard all have data. With PAYMENT_PROVIDER=ninejapay the rep is
+ * left unverified: KYC must be done for real (Didit sandbox).
  *
  * Idempotent: safe to re-run. Refuses to run with NODE_ENV=production.
  *
@@ -70,9 +70,7 @@ async function main() {
       ...(fake
         ? {
             kycStatus: 'verified' as const,
-            bachsAccountId: 'acct_fake_seed_rep',
-            bachsPersonId: 'per_fake_seed_rep',
-            bachsPayoutsActive: true,
+            ninCheckOutcome: 'match',
             studentIdStatus: 'approved' as const,
             studentIdUploadedAt: now,
             studentIdReviewedAt: now,
@@ -97,6 +95,16 @@ async function main() {
       school: 'Ladoke Akintola University of Technology',
       institution: 'LAUTECH',
       joinCode: JOIN_CODE,
+      ...(fake
+        ? {
+            walletAccountId: 'va_fake_seed_space',
+            walletAccountNumber: '9100000001',
+            walletAccountName: 'DUEVY/Computer Science Department',
+            walletBankName: '9jaPay',
+            walletBankCode: '090629',
+            walletCreatedAt: new Date(),
+          }
+        : {}),
     },
   });
   await db.spaceRep.upsert({
@@ -122,8 +130,6 @@ async function main() {
           accountNumber: encrypt(accountNumber),
           accountNumberMasked: maskAccountNumber(accountNumber),
           accountName: 'OKAFOR TUNDE',
-          bachsDestinationId: 'pd_fake_seed_rep',
-          bachsAccountId: 'acct_fake_seed_rep',
           createdById: rep.id,
         },
       });
@@ -193,7 +199,7 @@ async function main() {
   const balance = await getSpaceBalance(space.id);
   console.log('Seeded.\n');
   console.log(`  super admin  admin@duevy.test / ${PASSWORD}`);
-  console.log(`  rep          rep@duevy.test / ${PASSWORD}   (KYC: ${fake ? 'verified (fake provider)' : 'not verified — run KYC against the Bachs sandbox'})`);
+  console.log(`  rep          rep@duevy.test / ${PASSWORD}   (KYC: ${fake ? 'verified (fake provider)' : 'not verified — run KYC against the Didit sandbox'})`);
   console.log(`  student      student@duevy.test / ${PASSWORD}`);
   console.log(`  space        ${space.name} — join code ${space.joinCode}`);
   console.log(`  paid example ${paidNote}`);
