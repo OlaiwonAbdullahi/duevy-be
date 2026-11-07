@@ -403,7 +403,27 @@ export async function sendRepApplicationReceivedEmail(
 }
 
 /** Nudges for a rep applicant who hasn't finished verification (stage 1–3). */
-export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 2 | 3): Promise<void> {
+/**
+ * What to have ready, from the KYC policy at send time: "your student ID card
+ * and a camera for a quick photo or video of your face", and the NIN/date of
+ * birth only while they're required.
+ */
+function kycNeeds(req: { nin: boolean; liveness: boolean }): string {
+  const items = [
+    req.nin ? 'your NIN' : null,
+    req.nin ? 'your date of birth' : null,
+    'your student ID card',
+    req.liveness ? 'your phone camera for a quick photo or video of your face' : null,
+  ].filter(Boolean) as string[];
+  return items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : items[0]!;
+}
+
+export async function sendKycReminderEmail(
+  to: string,
+  name: string,
+  stage: 1 | 2 | 3,
+  requirements: { nin: boolean; liveness: boolean } = { nin: false, liveness: true },
+): Promise<void> {
   const link = `${env.FRONTEND_URL}/onboarding`;
   const first = escapeHtml(name.split(' ')[0]);
   const copy = {
@@ -415,7 +435,7 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     2: {
       subject: 'Your department is waiting — finish your Duevy verification',
       heading: 'Your department can\'t collect dues yet',
-      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need your NIN, your date of birth and your student ID card.`,
+      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need ${kycNeeds(requirements)}.`,
     },
     3: {
       subject: 'Last reminder: complete your Duevy rep verification',
@@ -432,7 +452,7 @@ export async function sendKycReminderEmail(to: string, name: string, stage: 1 | 
     <p class="muted">Already done? You can ignore this email.</p>
   `,
     BRAND,
-    { preheader: 'Verify your NIN and student ID in about two minutes.' },
+    { preheader: requirements.nin ? 'Verify your NIN and student ID in a few minutes.' : 'Verify your student ID in a few minutes.' },
   );
 
   await sendEmail({ to, subject: copy.subject, html });

@@ -13,7 +13,8 @@ import { writeAdminAudit } from '../lib/adminAudit';
 import { computeCharge, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
-import { adminKycSummary, listNinReviews, listStudentIdsForReview, reviewNin, reviewStudentId } from '../services/kyc.service';
+import { adminKycSummary, listLivenessForReview, listNinReviews, listStudentIdsForReview, reviewLiveness, reviewNin, reviewStudentId } from '../services/kyc.service';
+import { getKycPolicy, leadRepsNotMeeting, setKycPolicy } from '../services/kycPolicy.service';
 import { notify } from '../lib/notifications';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
@@ -608,6 +609,60 @@ adminRouter.post(
   },
 );
 
+// ---------------------------------------------------------------------------
+// Face capture (liveness) review: the photo or short video the rep took in
+// the app, shown next to their student ID card. Links are signed and expire.
+// ---------------------------------------------------------------------------
+adminRouter.get('/kyc/liveness', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
+  const { page, perPage, skip, take } = parseListQuery(req);
+  const raw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+  const status = (['pending', 'approved', 'rejected'].includes(raw) ? raw : 'pending') as 'pending' | 'approved' | 'rejected';
+  const { total, rows } = await listLivenessForReview(status, skip, take);
+  ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+adminRouter.post(
+  '/users/:userId/liveness/review',
+  requireAdminPermission('userManagement'),
+  validate(studentIdReviewSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.params.userId as string;
+    const { decision, note } = req.body as z.infer<typeof studentIdReviewSchema>;
+    const state = await reviewLiveness((req as AuthenticatedRequest).user.sub as string, userId, decision, note);
+    await writeAdminAudit(req, 'user.liveness_review', { target: userId, metadata: { decision, note: note ?? null } });
+    ok(res, state);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// KYC policy: which checks a rep must pass before their space can collect.
+// The student ID is always required. Changing it takes effect for every rep
+// at once (within seconds on every instance) and is audit-logged.
+// ---------------------------------------------------------------------------
+adminRouter.get('/settings/kyc', requireAdminPermission('userManagement'), async (_req: Request, res: Response): Promise<void> => {
+  const policy = await getKycPolicy();
+  ok(res, { ...policy, studentIdRequired: true, leadRepsNotMeetingPolicy: await leadRepsNotMeeting(policy) });
+});
+
+const kycPolicySchema = z
+  .object({ ninRequired: z.boolean().optional(), livenessRequired: z.boolean().optional() })
+  .strict()
+  .refine((v) => v.ninRequired !== undefined || v.livenessRequired !== undefined, 'send ninRequired and/or livenessRequired');
+
+adminRouter.put(
+  '/settings/kyc',
+  requireAdminPermission('overrides'),
+  validate(kycPolicySchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const patch = req.body as z.infer<typeof kycPolicySchema>;
+    const before = await getKycPolicy();
+    const policy = await setKycPolicy((req as AuthenticatedRequest).user.sub as string, patch);
+    await writeAdminAudit(req, 'settings.kyc_policy', { severity: 'warning', metadata: { before: { ...before }, after: { ...policy } } });
+    // How many spaces' lead reps don't meet the new rules (their spaces can't collect until they do).
+    ok(res, { ...policy, studentIdRequired: true, leadRepsNotMeetingPolicy: await leadRepsNotMeeting(policy) });
+  },
+);
+
 // ===========================================================================
 // §14.3 Reps
 // ===========================================================================
@@ -728,6 +783,12 @@ const applicantSelect = {
   studentIdUploadedAt: true,
   studentIdReviewedAt: true,
   studentIdReviewNote: true,
+  livenessStatus: true,
+  livenessFilePath: true,
+  livenessMimeType: true,
+  livenessUploadedAt: true,
+  livenessReviewedAt: true,
+  livenessReviewNote: true,
 } satisfies Prisma.UserSelect;
 
 type Applicant = Prisma.UserGetPayload<{ select: typeof applicantSelect }>;
@@ -738,7 +799,7 @@ function serializeRepApplication(app: RepApplication, user?: Applicant) {
     applicant: user
       ? { id: user.id, name: user.name, email: user.email, emailVerified: user.emailVerified, matricNo: user.matricNo, level: user.level, phone: user.phone, gender: user.gender }
       : null,
-    // The NIN check and the student ID card, so the admin can give final approval.
+    // The NIN check, the student ID card and the face capture, so the admin can give final approval.
     kyc: user ? adminKycSummary(user) : null,
     status: app.status,
     requestedSpace: {

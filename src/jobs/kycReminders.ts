@@ -2,12 +2,14 @@ import { type Prisma } from '@prisma/client';
 import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { sendKycReminderEmail } from '../lib/email';
+import { getKycPolicy, type KycPolicy } from '../services/kycPolicy.service';
 
 /**
  * "Finish your verification" emails to rep applicants who signed up but still
- * owe a KYC step — the same test as the frontend's onboarding gate: NIN not
- * submitted (or refused), or student ID missing (or refused). Anything merely
- * pending review is on us, so it isn't nagged.
+ * owe a KYC step under the current policy (kycPolicy.service.ts): student ID
+ * missing (or refused); while required, the face capture missing (or
+ * refused) and the NIN not submitted (or refused). Anything merely pending
+ * review is on us, so it isn't nagged.
  *
  * Reminders go out 24 hours, 3 days and 7 days after sign-up, at most one per
  * run. Someone found late (e.g. on the first run after deploy) gets only the
@@ -22,19 +24,22 @@ const STAGES = [
 ] as const;
 type Stage = (typeof STAGES)[number]['stage'];
 
-const KYC_OUTSTANDING: Prisma.UserWhereInput = {
-  OR: [
-    { kycSubmittedAt: null },
-    { kycStatus: 'rejected' },
-    { studentIdStatus: null },
-    { studentIdStatus: 'rejected' },
-  ],
-};
+function kycOutstanding(policy: KycPolicy): Prisma.UserWhereInput {
+  return {
+    OR: [
+      { studentIdStatus: null },
+      { studentIdStatus: 'rejected' },
+      ...(policy.livenessRequired ? [{ livenessStatus: null }, { livenessStatus: 'rejected' as const }] : []),
+      ...(policy.ninRequired ? [{ kycSubmittedAt: null }, { kycStatus: 'rejected' as const }] : []),
+    ],
+  };
+}
 
 const BATCH = 100;
 
 export async function sendKycRemindersOnce(now = new Date()): Promise<number> {
   const ago = (ms: number) => new Date(now.getTime() - ms);
+  const policy = await getKycPolicy();
   const users = await db.user.findMany({
     where: {
       repApplicationStatus: 'pending',
@@ -42,7 +47,7 @@ export async function sendKycRemindersOnce(now = new Date()): Promise<number> {
       isSuspended: false,
       isDeactivated: false,
       AND: [
-        KYC_OUTSTANDING,
+        kycOutstanding(policy),
         // A reminder is due: past a stage's age without having had it yet.
         { OR: STAGES.map(({ stage, afterMs }) => ({ kycReminderStage: { lt: stage }, createdAt: { lte: ago(afterMs) } })) },
       ],
@@ -66,7 +71,7 @@ export async function sendKycRemindersOnce(now = new Date()): Promise<number> {
     if (claimed.count === 0) continue;
 
     try {
-      await sendKycReminderEmail(u.email, u.name, due);
+      await sendKycReminderEmail(u.email, u.name, due, { nin: policy.ninRequired, liveness: policy.livenessRequired });
       sent += 1;
     } catch (err) {
       // Give the stage back so the next run retries it.

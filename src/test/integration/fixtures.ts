@@ -47,6 +47,7 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       kycStatus: verified ? 'verified' : 'unverified',
       ninCheckOutcome: verified ? 'match' : null,
       studentIdStatus: verified ? 'approved' : null,
+      livenessStatus: verified ? 'approved' : null,
     },
   });
   const space = await db.space.create({

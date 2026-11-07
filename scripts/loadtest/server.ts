@@ -109,7 +109,7 @@ async function main() {
   const spaces: { id: string; dueIds: string[] }[] = [];
   for (let s = 0; s < SPACES; s++) {
     const rep = await db.user.create({
-      data: { name: `Rep ${s}`, email: `rep${s}@lt.duevy`, passwordHash, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved' },
+      data: { name: `Rep ${s}`, email: `rep${s}@lt.duevy`, passwordHash, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved' },
     });
     const space = await db.space.create({
       data: { name: `Load Space ${s}`, short: `LS${s}`, kind: 'department', school: 'LAUTECH', joinCode: `LT-${s}-${Date.now()}`.slice(0, 24), walletAccountId: `va_lt_${s}`, walletAccountNumber: `91${String(s).padStart(8, '0')}`, walletAccountName: `DUEVY/LS${s}`, walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() },

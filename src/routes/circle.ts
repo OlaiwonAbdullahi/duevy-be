@@ -3,6 +3,8 @@ import { verifyPassword } from '../lib/password';
 import { z } from 'zod';
 import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
+import { getKycPolicy } from '../services/kycPolicy.service';
+import { canCollect } from '../services/kyc.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -134,13 +136,14 @@ circleRouter.post('/join-code/regenerate', requireSpaceRep(), async (req: Reques
 // ---------------------------------------------------------------------------
 circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [reps, assigned] = await Promise.all([
+  const [reps, assigned, kycPolicy] = await Promise.all([
     db.spaceRep.findMany({
       where: { spaceId: sid },
-      include: { user: { select: { id: true, name: true, email: true, kycStatus: true } } },
+      include: { user: { select: { id: true, name: true, email: true, kycStatus: true, studentIdStatus: true, livenessStatus: true } } },
       orderBy: [{ role: 'asc' }, { addedAt: 'asc' }],
     }),
     db.due.groupBy({ by: ['assignedRepId'], where: { spaceId: sid, assignedRepId: { not: null } }, _count: { _all: true } }),
+    getKycPolicy(),
   ]);
   const duesByRep = new Map(assigned.map((a) => [a.assignedRepId, a._count._all]));
 
@@ -152,7 +155,8 @@ circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response)
       email: r.user.email,
       role: r.role,
       isSignatory: r.role === 'lead' || r.isSignatory,
-      kycVerified: r.user.kycStatus === 'verified',
+      // Passed every check the current KYC policy requires.
+      kycVerified: canCollect(r.user, kycPolicy),
       assignedDues: duesByRep.get(r.userId) ?? 0,
       addedAt: r.addedAt.toISOString(),
     })),

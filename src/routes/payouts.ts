@@ -17,8 +17,10 @@ import {
   TRANSFER_FEE_TOP_KOBO,
 } from '../lib/money';
 import { canCollect, getKycState, getSpaceKycState } from '../services/kyc.service';
+import { getKycPolicy } from '../services/kycPolicy.service';
 import {
   resubmitStudentIdHandlers,
+  submitLivenessHandlers,
   submitKycHandlers,
 } from './kycHandlers';
 import { getDueAvailability, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
@@ -256,11 +258,14 @@ payoutsRouter.post(
   validate(beneficiarySchema),
   async (req: Request, res: Response): Promise<void> => {
     const { bankCode, accountNumber, label } = req.body as z.infer<typeof beneficiarySchema>;
-    const me = await db.user.findUniqueOrThrow({
-      where: { id: uid(req) },
-      select: { id: true, name: true, kycStatus: true, studentIdStatus: true },
-    });
-    if (!canCollect(me)) {
+    const [me, kycPolicy] = await Promise.all([
+      db.user.findUniqueOrThrow({
+        where: { id: uid(req) },
+        select: { id: true, name: true, kycStatus: true, studentIdStatus: true, livenessStatus: true },
+      }),
+      getKycPolicy(),
+    ]);
+    if (!canCollect(me, kycPolicy)) {
       errors.conflict(res, 'KYC_NOT_VERIFIED', 'Verify your identity before adding a beneficiary');
       return;
     }
@@ -291,6 +296,7 @@ payoutsRouter.delete(
 // ---------------------------------------------------------------------------
 payoutsRouter.post('/payout/kyc', ...submitKycHandlers);
 payoutsRouter.post('/payout/kyc/student-id', ...resubmitStudentIdHandlers);
+payoutsRouter.post('/payout/kyc/liveness', ...submitLivenessHandlers);
 
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
   const [space, mine] = await Promise.all([getSpaceKycState(spaceId(req)), getKycState(uid(req))]);

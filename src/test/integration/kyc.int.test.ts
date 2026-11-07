@@ -3,18 +3,26 @@ import { db } from '../../config/db';
 import { MemoryFileStore, setFileStore } from '../../lib/storage';
 import { type FakeVerifier } from '../../providers/identity';
 import { createCheckout } from '../../services/checkout.service';
+import { DEFAULT_KYC_POLICY, setKycPolicy } from '../../services/kycPolicy.service';
 import { api, apiMultipart, installFakeProvider, installFakeVerifier, makeSpace, PNG_BYTES, startHttp, stopHttp, tokenFor } from './fixtures';
 
 let verifier: FakeVerifier;
 const store = new MemoryFileStore();
+// This suite covers the NIN path, so it runs with NIN required and the face
+// capture off; the default policy (student ID + face capture, NIN optional)
+// is covered in kycPolicy.int.test.ts.
 beforeAll(async () => {
   installFakeProvider();
   verifier = installFakeVerifier();
   setFileStore(store);
+  await setKycPolicy('test', { ninRequired: true, livenessRequired: false });
   await startHttp();
 });
 beforeEach(() => verifier.reset());
-afterAll(stopHttp);
+afterAll(async () => {
+  await setKycPolicy('test', DEFAULT_KYC_POLICY);
+  await stopHttp();
+});
 
 const NIN = '12345678901';
 const DOB = '2001-04-12';
@@ -129,6 +137,17 @@ describe('rep KYC: NIN + date of birth checked by Didit, student ID reviewed by 
     expect(down.status).toBe(503);
     expect(down.body.error.code).toBe('KYC_PROVIDER_UNAVAILABLE');
     expect((await db.user.findUniqueOrThrow({ where: { id: rep.id } })).kycAttempts).toBe(0);
+
+    // The verifier refusing the request as we built it (e.g. a name it can't
+    // read) is not the rep's failure either: no attempt, no lockout, ever.
+    verifier.outcome = 'invalid_input';
+    for (let i = 0; i < 4; i++) {
+      const refused = await submit();
+      expect(refused.status).toBe(422);
+      expect(refused.body.error.code).toBe('KYC_INPUT_UNREADABLE');
+    }
+    const afterRefusals = await db.user.findUniqueOrThrow({ where: { id: rep.id } });
+    expect(afterRefusals).toMatchObject({ kycAttempts: 0, kycRetryLockedUntil: null, studentIdFileId: null });
 
     verifier.outcome = 'no_match';
     for (let i = 1; i <= 3; i++) {

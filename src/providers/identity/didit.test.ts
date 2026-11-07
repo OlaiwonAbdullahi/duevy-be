@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DiditVerifier } from './didit';
+import { DiditVerifier, diditName } from './didit';
 
 const input = { userId: 'usr_1', firstName: 'Ada', lastName: 'Obi', nin: '12345678901', dob: '2003-04-05' };
 
@@ -38,9 +38,46 @@ describe('DiditVerifier — reads the service outcome_code, not the HTTP status'
     expect((await v.verifyNin(input)).outcome).toBe('unavailable');
   });
 
-  it('a 400 (refused before reaching NIMC) is a no-match', async () => {
-    respond(400, { detail: 'national_id must be exactly 11 characters long' });
-    expect((await new DiditVerifier('https://verification.didit.me', 'key').verifyNin(input)).outcome).toBe('no_match');
+  it('every documented outcome code: verdicts, admin review, or "did not run"', async () => {
+    const v = new DiditVerifier('https://verification.didit.me', 'key');
+    const cases: [string, string][] = [
+      ['DOCUMENT_NOT_FOUND', 'no_match'], ['DOCUMENT_SUPERSEDED', 'no_match'], ['INVALID_DOCUMENT_FORMAT', 'no_match'],
+      ['DECEASED', 'no_match'], ['MINOR_BLOCKED', 'no_match'], ['INCONCLUSIVE', 'partial'], ['INVALID_INPUT', 'invalid_input'],
+      ['REGISTRY_ERROR', 'unavailable'], ['SOMETHING_NEW', 'unavailable'],
+    ];
+    for (const [code, expected] of cases) {
+      respond(200, validation(code));
+      expect((await v.verifyNin(input)).outcome, code).toBe(expected);
+    }
+  });
+
+  it('a 400 (our request refused before any lookup) is invalid_input, not the rep failing', async () => {
+    respond(400, { detail: 'first_name has invalid characters' });
+    expect((await new DiditVerifier('https://verification.didit.me', 'key').verifyNin(input)).outcome).toBe('invalid_input');
+  });
+
+  it('Didit refusing our account (key, credits, plan) is unavailable for the rep', async () => {
+    const v = new DiditVerifier('https://verification.didit.me', 'key');
+    // The exact answer the live key got on 2026-11-07.
+    respond(403, { detail: "To protect against abuse, database validation is disabled until your organization's first top-up." });
+    expect((await v.verifyNin(input)).outcome).toBe('unavailable');
+    respond(401, { detail: 'Authentication credentials were not provided or are invalid.' });
+    expect((await v.verifyNin(input)).outcome).toBe('unavailable');
+    respond(402, {});
+    expect((await v.verifyNin(input)).outcome).toBe('unavailable');
+  });
+
+  it('sends names Didit accepts: diacritics and other characters stripped', async () => {
+    expect(diditName('Adébáyọ̀')).toBe('Adebayo');
+    expect(diditName('Ọlámídé')).toBe('Olamide');
+    expect(diditName('Ṣẹ̀gun')).toBe('Segun');
+    expect(diditName("O'Neil-Okoro")).toBe("O'Neil-Okoro");
+    expect(diditName('Chi 🙂 Chi2')).toBe('Chi Chi');
+    const fetchMock = vi.fn(async (_url: unknown, _init?: RequestInit) => new Response(JSON.stringify(validation('MATCH')), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await new DiditVerifier('https://verification.didit.me', 'k').verifyNin({ ...input, firstName: 'Adébáyọ̀', lastName: 'Ọlámídé' });
+    const form = fetchMock.mock.calls[0]![1]!.body as FormData;
+    expect([form.get('first_name'), form.get('last_name')]).toEqual(['Adebayo', 'Olamide']);
   });
 
   it('sends the NIN and date of birth as multipart with the API key', async () => {

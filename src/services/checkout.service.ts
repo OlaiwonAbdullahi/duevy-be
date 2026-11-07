@@ -12,6 +12,7 @@ import { generateId } from '../lib/id';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
 import { canCollect } from './kyc.service';
+import { getKycPolicy } from './kycPolicy.service';
 import { guestAccountState, sendGuestAccountInvite } from './guestAccount.service';
 import { readGuestAnswers } from '../lib/guestForm';
 import { renderReceiptByNumber } from './receipt.service';
@@ -142,7 +143,7 @@ export async function createCheckout(
   // run in the same order as before. With mixed spaces, member/lead may be
   // any of them, but that request is refused before they're used.
   const viaDues = { dues: { some: { id: { in: dueIds } } } };
-  const [user, dues, spaces, member, paid, leadUser] = await Promise.all([
+  const [user, dues, spaces, member, paid, leadUser, kycPolicy] = await Promise.all([
     db.user.findUnique({ where: { id: userId }, select: { id: true } }),
     db.due.findMany({ where: { id: { in: dueIds } } }),
     db.space.findMany({ where: viaDues, select: { id: true, name: true, isArchived: true } }),
@@ -150,8 +151,9 @@ export async function createCheckout(
     db.duePayment.findFirst({ where: { userId, dueId: { in: dueIds } }, select: { dueId: true } }),
     db.user.findFirst({
       where: { spaceReps: { some: { role: 'lead', space: viaDues } } },
-      select: { kycStatus: true, studentIdStatus: true },
+      select: { kycStatus: true, studentIdStatus: true, livenessStatus: true },
     }),
+    getKycPolicy(),
   ]);
   if (!user) throw notFound('User not found');
   if (dues.length !== dueIds.length) throw notFound('One or more dues could not be found');
@@ -177,7 +179,7 @@ export async function createCheckout(
   if (paid) throw conflict('DUE_ALREADY_PAID', `"${dues.find((d) => d.id === paid.dueId)!.title}" has already been paid`);
 
   // The space can only collect once the rep accountable for it has passed KYC.
-  if (!leadUser || !canCollect(leadUser)) {
+  if (!leadUser || !canCollect(leadUser, kycPolicy)) {
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
 

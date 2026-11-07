@@ -15,7 +15,7 @@ const db = new PrismaClient();
 async function main() {
   const run = Date.now();
   const rep = await db.user.create({
-    data: { name: 'Rehearsal Rep', email: `rep_${run}@rehearsal.duevy`, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved' },
+    data: { name: 'Rehearsal Rep', email: `rep_${run}@rehearsal.duevy`, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved' },
   });
   const space = await db.space.create({
     data: { name: `Rehearsal ${run}`, short: 'RHS', kind: 'department', school: 'LAUTECH', joinCode: `RH-${run}`.slice(0, 24), walletAccountId: `va_rh_${run}`, walletAccountNumber: `92${String(run).slice(-8)}`, walletAccountName: 'DUEVY/RHS', walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() },

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { db } from '../../config/db';
 
 const sent: { to: string; stage: number }[] = [];
@@ -10,6 +10,12 @@ vi.mock('../../lib/email', async (importOriginal) => ({
 }));
 
 const { sendKycRemindersOnce } = await import('../../jobs/kycReminders');
+const { DEFAULT_KYC_POLICY, setKycPolicy } = await import('../../services/kycPolicy.service');
+
+// These cases were written for NIN + student ID; the default policy's
+// reminders are covered in kycPolicy.int.test.ts.
+beforeAll(() => setKycPolicy('test', { ninRequired: true, livenessRequired: false }));
+afterAll(() => setKycPolicy('test', DEFAULT_KYC_POLICY));
 
 const HOUR = 60 * 60 * 1000;
 let seq = 0;
@@ -78,5 +84,23 @@ describe('KYC reminder emails', () => {
     });
     await sendKycRemindersOnce();
     expect(sent.map((s) => s.stage)).toEqual([1]);
+  });
+});
+
+describe('KYC reminder emails under the default policy (student ID + face capture, NIN optional)', () => {
+  beforeAll(() => setKycPolicy('test', DEFAULT_KYC_POLICY));
+  afterAll(() => setKycPolicy('test', { ninRequired: true, livenessRequired: false }));
+  beforeEach(async () => {
+    sent.length = 0;
+    await db.user.updateMany({ where: { repApplicationStatus: 'pending' }, data: { kycReminderStage: 3 } });
+  });
+
+  it('reminds about a missing or rejected face capture, never about a NIN that is not required', async () => {
+    const noFace = await applicant(30, { studentIdStatus: 'approved' });
+    const rejectedFace = await applicant(30, { studentIdStatus: 'pending', livenessStatus: 'rejected' });
+    await applicant(30, { studentIdStatus: 'pending', livenessStatus: 'pending' }); // all submitted, no NIN: nothing to nag
+    await applicant(30, { studentIdStatus: 'approved', livenessStatus: 'approved', kycStatus: 'rejected' }); // a failed NIN doesn't matter now
+    await sendKycRemindersOnce();
+    expect(sent.map((s) => s.to).sort()).toEqual([noFace.email, rejectedFace.email].sort());
   });
 });

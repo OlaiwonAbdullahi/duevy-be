@@ -23,9 +23,12 @@ export interface VerifyNinInput {
  *  - partial: the NIN exists but the name or date of birth only partly matched
  *    (nicknames, spelling) — an admin decides.
  *  - no_match: the NIN wasn't found or nothing matched.
- *  - unavailable: the register couldn't be reached; not the rep's fault.
+ *  - unavailable: the check didn't run (register down, or the verifier
+ *    refused OUR account: key, credits, plan); not the rep's fault.
+ *  - invalid_input: the verifier refused the request as we sent it (e.g. a
+ *    name it can't read) before any lookup; not the rep's fault, not billed.
  */
-export type NinOutcome = 'match' | 'partial' | 'no_match' | 'unavailable';
+export type NinOutcome = 'match' | 'partial' | 'no_match' | 'unavailable' | 'invalid_input';
 
 export interface NinCheckResult {
   outcome: NinOutcome;

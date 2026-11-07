@@ -16,6 +16,7 @@ import { logger } from '../lib/logger';
 import { getKycState } from '../services/kyc.service';
 import {
   resubmitStudentIdHandlers,
+  submitLivenessHandlers,
   submitKycHandlers,
 } from './kycHandlers';
 
@@ -37,6 +38,7 @@ meRouter.get('/kyc-status', async (req: Request, res: Response): Promise<void> =
 });
 meRouter.post('/kyc', ...submitKycHandlers);
 meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
+meRouter.post('/kyc/liveness', ...submitLivenessHandlers);
 
 // Default notification preferences (§3.4) applied when the column is null.
 const DEFAULT_NOTIFICATION_PREFS = {

@@ -204,44 +204,51 @@ All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the s
 
 The money is the **space's**, never the rep's. Each space has its own 9jaPay account (`account` on `GET /payout/summary`); reps manage it. KYC records who is accountable for the space, so a new rep verifies before they can act.
 
-KYC has two parts, and a space collects only when **both** pass:
+Which checks a rep must pass is set by an admin (`PUT /admin/settings/kyc`), and a space collects only when **every required check** passes. Read the current set from `requirements` in any KYC state (e.g. `GET /me/kyc-status`) and build the form from it.
 
-- **Identity:** NIN + date of birth, checked against NIMC (through Didit) as you submit. No BVN, no gender, no ID document.
-- **Student status, verified by a Duevy admin:** the rep's student ID card.
+- **Student ID** (always required): the rep's student ID card, approved by a Duevy admin.
+- **Face capture / liveness** (`requirements.liveness`, **on** by default): a photo or short video of the rep's face, taken in the app, approved by a Duevy admin who sees it next to the student ID card. No third party is involved.
+- **NIN** (`requirements.nin`, **off** by default): NIN + date of birth, checked against NIMC (through Didit) as you submit. While off it is optional and ignored: nothing is sent to Didit or stored.
 
 ### `POST /payout/kyc` (`multipart/form-data`) (also `/me/kyc`)
 
 | Part | Required | Notes |
 |---|---|---|
-| `nin` | yes | 11 digits. Checked, never stored or logged. |
-| `dob` | yes | `YYYY-MM-DD`. Checked, never stored or logged. |
 | `studentIdCard` | yes | File: JPEG, PNG, WebP or PDF, max 5 MB, checked by its bytes. Stored privately in ImageKit for admin review. |
+| `liveness` | while `requirements.liveness` | File: the face capture. A JPEG/PNG/WebP photo, or an MP4/MOV/WebM video (what a browser's `MediaRecorder` produces), max 15 MB, checked by its bytes. Stored privately for admin review. Not needed if one is already pending or approved. |
+| `nin` | while `requirements.nin` | 11 digits. Checked, never stored or logged. Ignored while NIN is off. |
+| `dob` | while `requirements.nin` | `YYYY-MM-DD`. Checked, never stored or logged. Ignored while NIN is off. |
 
 Fields older clients still send (`gender`, `bvn`, `firstName`, `lastName`, `phone`, a `governmentId` file) are ignored. The NIN is checked under the name on the rep's account.
 
 `202`, with the result already known:
 
 ```json
-{ "kycStatus": "verified", "canCollect": false, "canWithdraw": false,
-  "nin": { "outcome": "match", "reviewStatus": null, "reviewNote": null },
+{ "kycStatus": "unverified", "canCollect": false, "canWithdraw": false,
+  "requirements": { "nin": false, "studentId": true, "liveness": true },
+  "nin": { "outcome": null, "reviewStatus": null, "reviewNote": null },
   "studentId": { "status": "pending", "uploadedAt": "…", "reviewedAt": null, "reviewNote": null },
+  "liveness": { "status": "pending", "uploadedAt": "…", "reviewedAt": null, "reviewNote": null },
   "rejectionReason": null, "retryLockedUntil": null, "submittedAt": "…", "resolvedAt": "…",
   "payoutsActive": false, "requirementsDue": [] }
 ```
 
-| NIN check | Result |
+`kycStatus` is the NIN check's own status; whether the rep is verified is `canCollect`.
+
+| NIN check (only while required) | Result |
 |---|---|
 | Match | `kycStatus: "verified"`. Collection opens once the student ID is approved. |
 | Partial match (name or date of birth only partly matched) | `kycStatus: "pending"`, `nin.reviewStatus: "pending"`. An admin decides; the rep is notified. |
 | No match | `422 KYC_REJECTED`; counts as a failed attempt. |
-| NIMC unreachable | `503 KYC_PROVIDER_UNAVAILABLE`; not counted. Try again later. |
+| NIMC unreachable, or Didit refuses our account | `503 KYC_PROVIDER_UNAVAILABLE`; not counted. Try again later. |
+| Didit refuses the request as sent (usually the name) | `422 KYC_INPUT_UNREADABLE`; not counted. |
 
 `payoutsActive` and `requirementsDue` are deprecated: always `canWithdraw` and `[]`. Validation errors never echo the NIN or date of birth.
 
 | Error | When |
 |---|---|
-| `400 VALIDATION_ERROR` | Bad field, missing `studentIdCard`, or a file that isn't really a JPEG/PNG/WebP/PDF. |
-| `413 FILE_TOO_LARGE` | A file over 5 MB. |
+| `400 VALIDATION_ERROR` | Bad field; missing `studentIdCard`; missing `liveness` or `nin`/`dob` while required; a file that isn't really the allowed type. |
+| `413 FILE_TOO_LARGE` | A student ID over 5 MB, or a face capture over 15 MB. |
 | `403 REP_NOT_APPROVED` | The caller is not a rep or rep applicant. |
 | `409 ALREADY_VERIFIED`, `409 KYC_PENDING` | Already verified, or a partial match is awaiting review. |
 | `422 KYC_REJECTED` | The NIN and date of birth didn't match the register. |
@@ -251,6 +258,10 @@ Fields older clients still send (`gender`, `bvn`, `firstName`, `lastName`, `phon
 ### `POST /payout/kyc/student-id` (`multipart/form-data`)
 
 Replaces the student ID card after an admin rejected it (or if none was sent). Part: `studentIdCard`. Returns `202` with the KYC state. `409 STUDENT_ID_PENDING` / `STUDENT_ID_APPROVED` if there is nothing to replace.
+
+### `POST /payout/kyc/liveness` (`multipart/form-data`) (also `/me/kyc/liveness`)
+
+A new face capture: the first one, a retake after an admin rejected it, or a real capture for a rep verified before liveness existed. Part: `liveness` (as above). Returns `202` with the KYC state. `409 LIVENESS_PENDING` while one awaits review; `409 LIVENESS_APPROVED` if an approved capture is already on file.
 
 ### `GET /payout/kyc-status`
 
@@ -459,6 +470,10 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `GET /admin/reps` | userManagement | Reps with their collections. |
 | `GET /admin/kyc/student-ids?status=pending` | userManagement | Student ID cards to review: `[{ userId, name, email, matricNo, institution, kycStatus, studentId: { status, mimeType, uploadedAt, reviewedAt, reviewNote, viewUrl, viewUrlExpiresInSeconds } }]`. `viewUrl` is a signed ImageKit link that expires after 10 minutes. |
 | `POST /admin/users/:userId/student-id/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. The rep is notified. |
+| `GET /admin/kyc/liveness?status=pending` | userManagement | Face captures to review, with the student ID card to compare: `[{ userId, name, email, matricNo, institution, liveness: { status, kind: "photo" \| "video", mimeType, uploadedAt, reviewedAt, reviewNote, viewUrl, viewUrlExpiresInSeconds }, studentId: { status, mimeType, viewUrl, viewUrlExpiresInSeconds } }]`. Links are signed and expire after 10 minutes; play `kind: "video"` in a `<video>` element. A rep verified before liveness existed shows `status: "approved"` with no `viewUrl` and a note saying so. |
+| `POST /admin/users/:userId/liveness/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. The rep is notified. Audit-logged as `user.liveness_review`. |
+| `GET /admin/settings/kyc` | userManagement | `{ ninRequired, livenessRequired, studentIdRequired: true, leadRepsNotMeetingPolicy }`. |
+| `PUT /admin/settings/kyc` | **overrides** | Body: `{ ninRequired?, livenessRequired? }`. Applies to every rep at once (within ~10 s on every server): turning a check on stops collection for spaces whose lead rep hasn't passed it; the response's `leadRepsNotMeetingPolicy` says how many. Audit-logged as `settings.kyc_policy`. |
 | `GET /admin/kyc/nin-reviews?status=pending` | userManagement | NIN checks that only partly matched: `[{ userId, name, email, matricNo, institution, kycStatus, submittedAt, nameMatchScore, reviewStatus, reviewedAt, reviewNote, providerReference, studentIdStatus }]`. The NIN itself is never stored, so never shown; look the check up in the Didit console by `providerReference`. |
 | `POST /admin/users/:userId/nin/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. Approve verifies the rep; reject counts as a failed attempt. Audit-logged as `user.nin_review`. |
 | `GET /admin/spaces?q=&school=&type=` | userManagement | `[{ id, name, short, kind, school, memberCount, duesTarget, collectedAmount, assignedRepIds, isArchived, payoutsFrozen }]` |

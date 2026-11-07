@@ -207,3 +207,31 @@ export function sniffDocumentType(buffer: Buffer): { mime: string; ext: string }
   const hit = SIGNATURES.find((s) => buffer.length >= 12 && s.test(buffer));
   return hit ? { mime: hit.mime, ext: hit.ext } : null;
 }
+
+// ---------------------------------------------------------------------------
+// Liveness captures: a photo or a short video of the rep's face, recorded by
+// the app. Same rule: the type comes from the bytes, never the client.
+// ---------------------------------------------------------------------------
+
+/** Short selfie videos from a phone or browser fit comfortably; photos are far smaller. */
+export const MAX_LIVENESS_BYTES = 15 * 1024 * 1024;
+
+/** ISO-BMFF brands that are still images (HEIC/AVIF), not video, despite the same container. */
+const STILL_IMAGE_BRANDS = new Set(['heic', 'heix', 'heim', 'heis', 'mif1', 'msf1', 'avif', 'avis']);
+
+/** A liveness capture's real type: JPEG/PNG/WebP photo or MP4/MOV/WebM video. Null otherwise. */
+export function sniffLivenessType(buffer: Buffer): { mime: string; ext: string; kind: 'photo' | 'video' } | null {
+  const doc = sniffDocumentType(buffer);
+  if (doc && doc.mime.startsWith('image/')) return { ...doc, kind: 'photo' };
+  if (buffer.length < 12) return null;
+  if (buffer.subarray(4, 8).toString('latin1') === 'ftyp') {
+    const brand = buffer.subarray(8, 12).toString('latin1');
+    if (STILL_IMAGE_BRANDS.has(brand)) return null;
+    return brand === 'qt  ' ? { mime: 'video/quicktime', ext: 'mov', kind: 'video' } : { mime: 'video/mp4', ext: 'mp4', kind: 'video' };
+  }
+  // EBML header: WebM (what browsers' MediaRecorder produces) / Matroska.
+  if (buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) {
+    return { mime: 'video/webm', ext: 'webm', kind: 'video' };
+  }
+  return null;
+}

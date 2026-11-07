@@ -405,6 +405,17 @@ model User {
   studentIdReviewedAt            DateTime?
   studentIdReviewedById          String?
   studentIdReviewNote            String?
+  // Liveness: a photo or short video of the rep's face, captured by the app,
+  // stored privately in ImageKit and approved by an admin (who sees it next
+  // to the student ID card). Required while the KYC policy says so.
+  livenessFileId                 String?
+  livenessFilePath               String?
+  livenessMimeType               String?
+  livenessStatus                 DocumentReviewStatus?
+  livenessUploadedAt             DateTime?
+  livenessReviewedAt             DateTime?
+  livenessReviewedById           String?
+  livenessReviewNote             String?
   // Rep identity: NIN + date of birth checked against NIMC by Didit
   // (src/providers/identity). Only the outcome is kept, never the NIN or DOB.
   // A partial match (name or DOB only partly matched) leaves kycStatus
@@ -468,6 +479,7 @@ model User {
 
   @@index([institution])
   @@index([studentIdStatus])
+  @@index([livenessStatus])
   @@index([role])
   @@map("users")
 }

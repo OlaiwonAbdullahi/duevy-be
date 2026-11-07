@@ -99,7 +99,7 @@ async function main() {
 
   // ---- seed (no added latency) ----------------------------------------------
   const t0 = Date.now();
-  const rep = await db.user.create({ data: { name: 'Rep', email: 'rep@dash.duevy', role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', emailVerified: true } });
+  const rep = await db.user.create({ data: { name: 'Rep', email: 'rep@dash.duevy', role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved', emailVerified: true } });
   const admin = await db.user.create({ data: { name: 'Admin', email: 'admin@dash.duevy', role: 'admin', adminSubRole: 'super_admin', emailVerified: true } });
   await db.adminPermission.create({ data: { userId: admin.id, userManagement: true, payouts: true, disputes: true, overrides: true } });
   const space = await db.space.create({ data: { name: 'CSC 300L', short: 'CSC', kind: 'department', school: 'LAUTECH', joinCode: 'CSC-DASH', walletAccountId: 'va_dash', walletAccountNumber: '9100000001', walletAccountName: 'DUEVY/CSC', walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() } });
