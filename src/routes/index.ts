@@ -15,6 +15,7 @@ import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
 import { guestPayRouter } from './guestPay';
 import { publicMetricsRouter } from './publicMetrics';
+import { devRouter } from './dev';
 
 export const apiRouter = Router();
 
@@ -35,3 +36,5 @@ apiRouter.use('/referrals', requireFeature('referrals'), referralsRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
 apiRouter.use('/feedback', feedbackRouter);
+// Sandbox-only helpers (404 anywhere else); see routes/dev.ts.
+apiRouter.use('/dev', devRouter);

@@ -1,6 +1,7 @@
 import { type Prisma } from '@prisma/client';
 import { ulid } from 'ulid';
 import { db } from '../config/db';
+import { syncDirectDepositsForAccount } from './directDeposit.service';
 import { logger, scrub } from '../lib/logger';
 import { type ProviderEvent } from '../providers/payment';
 import { CheckoutNotFoundError, findCheckoutId } from './checkout.service';
@@ -92,7 +93,10 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
       return;
     }
     case 'account.credited':
+      // A sweep landing, or money sent straight to the space account: 9jaPay's
+      // records say which.
       await refreshSweepsForAccount(event.accountNumber);
+      await syncDirectDepositsForAccount(event.accountNumber);
       return;
     case 'transfer.updated': {
       const sweep = await db.sweep.findUnique({ where: { providerReference: event.providerReference }, select: { id: true } });

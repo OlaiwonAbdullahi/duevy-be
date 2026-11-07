@@ -1,3 +1,4 @@
+import { type Prisma } from '@prisma/client';
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { db } from '../config/db';
@@ -74,17 +75,10 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
   const { page, perPage, skip, take } = parseListQuery(req);
   const now = new Date();
 
-  const memberships = await db.spaceMembership.findMany({ where: { userId: id }, select: { spaceId: true } });
-  let spaceIds = memberships.map((m) => m.spaceId);
-  if (filters.spaceId) spaceIds = spaceIds.filter((s) => s === filters.spaceId);
-
-  if (spaceIds.length === 0) {
-    ok(res, [], 200, buildMeta(page, perPage, 0));
-    return;
-  }
-
   // The viewer status is derived from payment + deadline, so it maps onto a
-  // DB filter and pagination can happen in the query.
+  // DB filter and pagination can happen in the query. Membership is a relation
+  // filter and the viewer's payment rides along in the same statement, so the
+  // whole page is one round trip.
   const statusWhere =
     filters.status === 'paid'
       ? { payments: { some: { userId: id } } }
@@ -93,22 +87,25 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
         : filters.status === 'overdue'
           ? { payments: { none: { userId: id } }, dueDate: { lt: now } }
           : {};
-  const where = {
-    spaceId: { in: spaceIds },
-    status: { in: ['active' as const, 'closed' as const] },
+  const where: Prisma.DueWhereInput = {
+    space: { memberships: { some: { userId: id } } },
+    ...(filters.spaceId ? { spaceId: filters.spaceId } : {}),
+    status: { in: ['active', 'closed'] },
     ...(type ? { category: type } : {}),
     ...statusWhere,
   };
 
   const [total, dues] = await Promise.all([
     db.due.count({ where }),
-    db.due.findMany({ where, orderBy: [{ dueDate: 'asc' }, { id: 'asc' }], skip, take }),
+    db.due.findMany({
+      where,
+      orderBy: [{ dueDate: 'asc' }, { id: 'asc' }],
+      skip,
+      take,
+      include: { payments: { where: { userId: id }, take: 1 } },
+    }),
   ]);
-
-  const payments = dues.length
-    ? await db.duePayment.findMany({ where: { userId: id, dueId: { in: dues.map((d) => d.id) } } })
-    : [];
-  const paymentByDue = new Map(payments.map((p) => [p.dueId, p]));
+  const paymentByDue = new Map(dues.flatMap((d) => (d.payments[0] ? [[d.id, d.payments[0]] as const] : [])));
 
   const items = dues.map((d) => serializeStudentDue(d, paymentByDue.get(d.id), now));
   ok(res, items, 200, buildMeta(page, perPage, total));

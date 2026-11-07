@@ -17,12 +17,13 @@ Under Bachs every rep held their own provider account, so every rep had to clear
 | 1. Checkout | A one-time (transient) account for exactly face + 1.5%, single payment, expires with the checkout. `requestReference` = the checkout reference without punctuation. | `checkout.service` → `createCollectionAccount` |
 | 2. Payment | Settles straight into Duevy's business account. `new_transaction` arrives; Duevy reads the account's transactions back (`GET /v1/api/transactions?account-number=`) and credits the space's ledger with the face amount. | `webhookProcessor` → `confirmReceivedPayment` |
 | 3. Sweep | Once a Lagos day from 02:00, and whenever a withdrawal needs it, the space's collections move from the business account to the space's own account (`POST /v1/api/transfers`). The ledger doesn't change. | `sweep.service` |
+| Direct deposit | Someone sends money straight to the space's own account number, not through a checkout. It is already in the space's account, so it's credited to the space as it is (ledger `direct_deposit`, no due attached) and never swept. Found from the credit webhook, or by reconciliation reading each space account every 6 hours. | `directDeposit.service` |
 | 4. Withdrawal | From the space's account to a beneficiary saved on the space (`POST /v1/api/transfers/virtual-account`). If the space's account doesn't hold enough yet, a sweep goes first and the withdrawal waits `pending`. | `withdrawal.service` |
 
 Where a space's money is:
 
 - **Unswept** = its 9jaPay collections (`due_payment` ledger credits on 9jaPay checkouts) − its sweeps that haven't failed.
-- **In the space's account** = ledger balance − unswept.
+- **In the space's account** = ledger balance − unswept. Direct deposits are in the ledger and never unswept.
 
 A manual credit by an admin moves no money. It is counted as already in the space's account, so a withdrawal against it fails at the bank and is restored.
 
@@ -43,7 +44,7 @@ Duevy's own, all on Lagos days and checked before anything is debited:
 |---|---|---|
 | One withdrawal | ₦1,000 – ₦500,000 | `422 BELOW_MIN_PAYOUT` / `ABOVE_MAX_PAYOUT` |
 | Withdrawn per space per day | ₦5,000,000 | `422 DAILY_LIMIT_EXCEEDED` |
-| Moved through a space account per day (sweeps in + withdrawals out) | ₦10,000,000 | `422 DAILY_LIMIT_EXCEEDED` (withdrawals); a sweep stops there and the rest goes the next day |
+| Moved through a space account per day (sweeps and direct deposits in + withdrawals out) | ₦10,000,000 | `422 DAILY_LIMIT_EXCEEDED` (withdrawals); a sweep stops there and the rest goes the next day |
 | One sweep transfer | ₦1,000,000 | — a bigger sweep goes as several transfers |
 
 A failed, reversed or cancelled withdrawal gives its share of the day back.
@@ -56,6 +57,9 @@ A failed, reversed or cancelled withdrawal gives its share of the day back.
 - **No timestamp, so no replay protection.** Every event is deduplicated by id (`eventId`, or `new_transaction:<data.id>`), and **no handler acts on the body**: each asks 9jaPay (transactions list, TSQ) and applies that.
 - 9jaPay resends up to 10 times until it gets a 200.
 - `new_transaction` doesn't say which kind of account was credited. Space accounts are created with a request reference starting `SPACE`, and that prefix is how they're told apart.
+- Credits and debits on **Duevy's business account itself** are ignored: they name no checkout or space.
+- A credit on a space account is told apart by 9jaPay's transaction list, not the event: `metadata.senderAccountNumber` = the business account is our sweep; the space account itself, or a narration containing "revers", is a bounced withdrawal (already restored in our books); anything else is a direct deposit.
+- An authenticated body that isn't JSON is acknowledged (200) and logged, since resending it would never help.
 - `transfer_response` is only sent for transfers that started `PROCESSING`. Ones that answered `SUCCESS` or `FAILED` up front are settled from that answer: `data.status` decides it (the envelope's status is the request's), and without it only `statusCode` `00` counts as done.
 - A transfer TSQ says it has never heard of (`25`) is sent again under the same reference, for withdrawals as for sweeps. TSQ `Reversed` counts as failed.
 
@@ -103,7 +107,7 @@ Tested against `https://developer.test.9japay.com` with Duevy's test keys:
 | Space account | Created. Name enquiry shows **"DUEVY/<accountName>"**: 9jaPay prefixes the business name, so Duevy sends just the space name and stores the name the bank shows. `GET /v1/api/virtual-accounts/{number}` on a permanent account returned 500, so Duevy doesn't rely on it. |
 | Sweep with no funds | HTTP 400, `09` "insufficient funds" — the sweep fails and the money counts as unswept. TSQ then reports `Failed`. |
 | TSQ, never sent | HTTP 404, `25` "No record found." — sent again. |
-| `simulate-deposit` | `27` "The auth key is invalid" with both the Test Secret Key and the Test API Key. |
+| `simulate-deposit` | Needs the separate sandbox `authKey` (`NINEJAPAY_SANDBOX_AUTH_KEY`); the API and secret keys give `27` "The auth key is invalid". Body: `{ recipientAccountNumber, amount (kobo), authKey }`. A wrong amount or a closed account is refused (`25` "Recipient account is invalid", or a 500). Wrapped as `POST /v1/dev/simulate-deposit` (sandbox only). |
 
 **Money in, sweep and withdrawal (2026-11-07, with the sandbox `authKey`):**
 
@@ -137,6 +141,9 @@ The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be vali
 - **Transactions list** takes `start-date` / `end-date` (days). Duevy bounds each lookup to the checkout's Lagos days, a day either side, then applies the exact window.
 
 ## Open questions for 9jaPay
+
+- How a withdrawal the recipient bank bounces comes back to the space account (sender and narration). Until confirmed, a reversal is recognised by the space account as sender or "revers" in the narration; if 9jaPay marks it differently, it would be credited as a direct deposit **on top of** the restore. Check this with the first real bounce.
+- Who pays 9jaPay's inflow charge on a direct deposit (0.5% + ₦50 from ₦10k, if it applies to permanent accounts). Duevy collects no 1.5% on these, so if billed to the business, Duevy absorbs it.
 
 1. **Live base URL** (later).
 2. If opening a space account times out, a retry with the same reference is refused as a duplicate, and the account number from the first attempt is unknown. Left as is: Duevy opens it under the next reference (`SPACE<id>R1`, …, up to 5) and logs the possibly orphaned account. (`GET /v1/api/virtual-accounts` lists accounts with their `requestReference`, if a cleanup is ever needed.)

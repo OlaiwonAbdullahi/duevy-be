@@ -130,6 +130,40 @@ When the page does load it takes ~6–8 ms server-side, before and after; the ne
   The first version never failed a request, but stalled for ~4s on the second replica of each roll. Caddy still had the first replica marked down from a refused connection during its restart (10s memory, longer than the script's 5s pause), so for a moment neither replica counted as up. That's fixed and re-measured. Two earlier runs showed failures that turned out to be the test itself tripping real limits (one IP for all traffic; a student checking out 12×/min). Those were fixed in the test, not by loosening the app. The join-code limit stayed at exactly 10/20 across both replicas throughout.
 - **Not tested here:** the Docker image and compose stack themselves. Docker isn't usable on this machine: the Colima VM image downloaded at ~80 KB/s. Both compose files validate (`docker compose config`), and the rehearsal resolves with no service loading `.env`. **Before the first production deploy, run the rehearsal once on a machine with Docker.** It is also the first real build of the native `bcrypt` module inside the image.
 
+### 3.11 Dashboards: round trips, not query speed
+- **Problem:** with the database next to the API every dashboard endpoint answered in 1–6 ms, so the queries were already fast. But every *sequential* query costs one network round trip to the database, and the endpoints made 2–8 of them in a row. At 60 ms between the API and Postgres (a VPS and Supabase in different places) they took **130–480 ms**. Two causes: Prisma 5 loads each `include`d relation level with its own query, one after another, and handlers awaited independent queries one by one, or read a list of ids only to filter the next query by it.
+- **Changes:**
+  - `relationJoins` (Prisma preview feature): an `include` tree is one SQL statement (LATERAL joins). The full suite passes and all 20 dashboard responses are unchanged (below).
+  - Handlers issue their independent reads together, and filter by relation instead of reading ids first. Affected: `/me/overview`, `/dues`, the rep overview, rep dues, collections, payout summary and payout dues, plus the ledger summary, daily-usage and funds helpers. Ownership checks that ran before the reads now run alongside them; the results are discarded and a 404 returned if the check fails, so nothing leaks.
+  - Fewer statements per request, because a wide fan-out queues on a pool of 5–10 connections. The payout summary folds three reads into the space row, and today's withdrawals are summed once instead of twice (same arithmetic, which also speeds up the withdrawal path).
+  - `/admin/overview` (platform-wide aggregates whose cost grows with the whole database) goes through `src/lib/cache.ts`: a 30s read-through cache shared through Redis, with single-flight and a fallback to process memory. Rep approval/rejection clears it. It is never used for anything a money decision reads.
+  - Rep due lists break `createdAt` ties by id, so their order is stable (it wasn't before).
+- **Measured** (`scripts/loadtest/dashboard-latency.ts`: a TCP proxy adds latency in front of Postgres; 300 members, 150 real checkouts; median of 20 warm runs):
+
+  | Endpoint (60 ms from the database) | Before | After |
+  |---|---|---|
+  | `/me/overview` | 322 ms | 69 ms |
+  | `/receipts` | 380 ms | 67 ms |
+  | `/auth/me` | 257 ms | 69 ms |
+  | `/dues` | 198 ms | 68 ms |
+  | rep overview | 455 ms | 137 ms |
+  | rep collections | 458 ms | 142 ms |
+  | payout summary | 392 ms | 137 ms |
+  | `/admin/overview` | 268 ms | 1 ms cached (once per 30s: ~190 ms) |
+
+  Every student endpoint is now **1 round trip** and every rep endpoint **2** (the rep check, then one batch). Admin spaces and transactions are 3 (a page, then data keyed by that page's ids). With the database on the same host nothing got slower except `/admin/users` (4 → 8 ms, Postgres doing the join work).
+- **Same output:** every endpoint's response was captured on the old and new code over identical seeded data, with ids and timestamps normalised. All 20 match, except the two rep dues lists, whose rows are identical but whose same-millisecond ties now come back in a stable order.
+
+### 3.12 The connection string matters more than any of the above
+Behind Supabase's **transaction** pooler (port 6543, `pgbouncer=true`), Prisma runs every query as its own transaction with an unnamed statement, about **4 statements and ~5 round trips per query**. Measured with the database 60 ms away, on the optimised code:
+
+| | Session pooler / direct | Transaction pooler (`pgbouncer=true`) |
+|---|---|---|
+| Student dashboard pages | ~68 ms | ~322 ms |
+| Rep dashboard pages | ~135 ms | ~640–1,270 ms |
+
+`.env.production` in the working copy (untracked) uses port 6543 with `pgbouncer=true&connection_limit=5`. **If production does too, switch `DATABASE_URL` to the session pooler (port 5432, without `pgbouncer=true`) or a direct connection.** That alone makes every endpoint ~5× faster. The API now logs a warning at startup when it sees `pgbouncer=true`. And keep the API in the same region as the database: whatever the round-trip time is, dashboards pay it once (students) or twice (reps).
+
 ## 4. Testing
 
 **Regression:** typecheck clean; unit **52/52** (2 new); integration **108/108** (5 in `uploadsAndGuestLimits.int.test.ts`: avatar upload/replace/delete and ImageKit-down handling, the legacy-upload migration, guest link and checkout limits; 4 in `scaling.int.test.ts`: a 25-payment burst with duplicate deliveries drained by 3 concurrent workers, the cross-instance poll throttle and its response shape, the token purge, readiness). Baseline before any change: 50/50 unit and 99/99 integration.
@@ -166,7 +200,7 @@ Per API process (pool 10), from the runs above: dashboard reads p95 < 300 ms up 
 
 1. **Run the upload migration** (§3.7) in production, then remove the `/uploads` route and volume.
 2. **Keep migrations expand-only** (§3.10). A destructive migration would break the replica still running old code during a deploy.
-3. **Production `.env`:** set `connection_limit` / `pool_timeout` (and `pgbouncer=true` if on port 6543), sized as `(API + worker processes) × connection_limit < pooler size`.
+3. **Production `.env`:** use the session pooler or a direct connection, not `pgbouncer=true` (§3.12); set `connection_limit` / `pool_timeout`, sized as `(API + worker processes) × connection_limit < pooler size`.
 4. **bcrypt cost.** Cost 11 halves login CPU (about 2× login capacity) at a modest security cost. This is a product/security call; it isn't changed here. Existing hashes keep working either way.
 5. **Monitoring:** alert on `/health/ready`, on the `redis unavailable` log line, on dead webhook events (already shown on `GET /admin/health`), on 5xx rate and on p95 latency. Export event-loop delay (the harness shows how) and Prisma pool wait time.
 6. **Later, at much larger scale:** balances are a `SUM` over the space's ledger on each read. That's fine at thousands of entries per space; past ~100k per space, add a covering index `(spaceId) INCLUDE (direction, amountKobo)` (index-only scans suit an append-only table) or periodic balance snapshots.

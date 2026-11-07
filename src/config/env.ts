@@ -38,6 +38,9 @@ const envSchema = z.object({
   NINEJAPAY_BUSINESS_ACCOUNT_NUMBER: z.string().optional(),
   // 9jaPay's own bank code, for transfers into a space's account.
   NINEJAPAY_BANK_CODE: z.string().default('090629'),
+  // Sandbox only: the key 9jaPay issues for its simulate-deposit call. Set, on
+  // the sandbox base URL, it turns on POST /v1/dev/simulate-deposit.
+  NINEJAPAY_SANDBOX_AUTH_KEY: z.string().optional(),
   // A space's unswept collections below this wait for the next day's sweep.
   SWEEP_MIN_KOBO: z.coerce.number().int().positive().default(100_000),
   // 9jaPay's daily transfer limit on the business account (₦10M for now; it

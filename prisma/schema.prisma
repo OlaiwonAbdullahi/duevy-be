@@ -3,7 +3,13 @@
 // =============================================================================
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  // Load `include`d relations in the same SQL statement (LATERAL joins)
+  // instead of one query per relation level, sent one after another. With
+  // the API and Postgres in different places every query is a network round
+  // trip, so a nested include (receipt → checkout → items → due) cost four
+  // in a row. See docs/SCALING.md §3.11.
+  previewFeatures = ["relationJoins"]
 }
 
 datasource db {
@@ -171,6 +177,7 @@ enum LedgerEntryType {
   payout_fee // debit: the withdrawal fee, deducted from the withdrawal
   payout_reversal // credit: a failed or reversed withdrawal, restored in full
   manual_credit
+  direct_deposit // credit: money sent straight to the space's own account, not through a checkout
 }
 
 enum LedgerDirection {
@@ -571,6 +578,8 @@ model Space {
   walletBankName              String?
   walletBankCode              String?
   walletCreatedAt             DateTime?
+  // When reconciliation last read the space account for direct deposits.
+  walletDepositsCheckedAt     DateTime?
   // --- Legacy (Anchor era). Read-only. These stay so any balance still
   // held in an Anchor deposit account can be traced and paid out by an admin.
   anchorAccountId             String?            @unique
@@ -598,6 +607,7 @@ model Space {
   receiptDesign     ReceiptDesign?
   partnerRedemption PartnerRedemption?
   sweeps            Sweep[]
+  directDeposits    DirectDeposit[]
 
   @@index([institution])
   @@map("spaces")
@@ -1091,6 +1101,29 @@ model Payout {
 // to Duevy, covered by the checkout processing fee. A space's unswept money
 // is its 9jaPay collections minus its sweeps that haven't failed
 // (sweep.service). Each space account may move at most ₦10M a day.
+/// Money someone sent straight to a space's own account number instead of
+/// paying through a checkout. It is already in the space account (nothing to
+/// sweep), so it is credited to the space as it is. One row per 9jaPay
+/// transaction, so a deposit is credited once however often it is seen.
+model DirectDeposit {
+  id                    String   @id @default(cuid())
+  spaceId               String
+  providerTransactionId String   @unique
+  amountKobo            Int
+  senderName            String?
+  senderAccountNumber   String?
+  senderBank            String?
+  narration             String?
+  receivedAt            DateTime
+  createdAt             DateTime @default(now())
+
+  space         Space         @relation(fields: [spaceId], references: [id])
+  ledgerEntries LedgerEntry[]
+
+  @@index([spaceId, receivedAt])
+  @@map("direct_deposits")
+}
+
 model Sweep {
   id                String       @id @default(cuid())
   spaceId           String
@@ -1155,31 +1188,35 @@ model PayoutOtp {
 }
 
 model LedgerEntry {
-  id           String          @id @default(cuid())
-  spaceId      String
-  dueId        String?
-  txnId        String?
-  duePaymentId String?
-  payoutId     String?
-  type         LedgerEntryType
-  direction    LedgerDirection
-  amountKobo   Int // always positive; direction gives the sign
-  grossKobo    Int?
-  feeKobo      Int?
-  netKobo      Int?
-  reference    String // Transaction.reference / Payout.reference — traceability
-  description  String
-  actorId      String? // set for refund / manual_credit (the admin who acted)
-  createdAt    DateTime        @default(now())
+  id              String          @id @default(cuid())
+  spaceId         String
+  dueId           String?
+  txnId           String?
+  duePaymentId    String?
+  payoutId        String?
+  // Set for direct_deposit entries: one entry per deposit.
+  directDepositId String?
+  type            LedgerEntryType
+  direction       LedgerDirection
+  amountKobo      Int // always positive; direction gives the sign
+  grossKobo       Int?
+  feeKobo         Int?
+  netKobo         Int?
+  reference       String // Transaction.reference / Payout.reference — traceability
+  description     String
+  actorId         String? // set for refund / manual_credit (the admin who acted)
+  createdAt       DateTime        @default(now())
 
-  space      Space        @relation(fields: [spaceId], references: [id])
-  due        Due?         @relation(fields: [dueId], references: [id])
-  txn        Transaction? @relation(fields: [txnId], references: [id])
-  duePayment DuePayment?  @relation(fields: [duePaymentId], references: [id])
-  payout     Payout?      @relation(fields: [payoutId], references: [id])
+  space         Space          @relation(fields: [spaceId], references: [id])
+  due           Due?           @relation(fields: [dueId], references: [id])
+  txn           Transaction?   @relation(fields: [txnId], references: [id])
+  duePayment    DuePayment?    @relation(fields: [duePaymentId], references: [id])
+  payout        Payout?        @relation(fields: [payoutId], references: [id])
+  directDeposit DirectDeposit? @relation(fields: [directDepositId], references: [id])
 
   @@unique([type, duePaymentId])
   @@unique([type, payoutId])
+  @@unique([type, directDepositId])
   @@index([spaceId, createdAt])
   @@index([dueId])
   @@index([reference])

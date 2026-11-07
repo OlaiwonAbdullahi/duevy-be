@@ -266,18 +266,15 @@ circleRouter.get('/audit-log', requireSpaceRep(), async (req: Request, res: Resp
 circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
 
-  const space = await db.space.findUnique({
-    where: { id: sid },
-    include: { _count: { select: { memberships: true } } },
-  });
-  if (!space) {
-    errors.notFound(res, 'Space not found');
-    return;
-  }
-  const memberCount = space._count.memberships;
-
-  const [activeDues, newMembers, ledger] = await Promise.all([
-    db.due.findMany({ where: { spaceId: sid, status: 'active' } }),
+  // One round trip. The payment groupings filter by relation (the space's
+  // active dues) instead of waiting for the due list to collect its ids.
+  const activeDueOfSpace = { spaceId: sid, status: 'active' as const };
+  const [space, activeDues, newMembers, ledger, grouped, memberPaid] = await Promise.all([
+    db.space.findUnique({
+      where: { id: sid },
+      include: { _count: { select: { memberships: true } } },
+    }),
+    db.due.findMany({ where: activeDueOfSpace }),
     db.spaceMembership.findMany({
       where: { spaceId: sid },
       include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
@@ -285,26 +282,25 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       take: 3,
     }),
     getSpaceLedgerSummary(sid),
+    db.duePayment.groupBy({
+      by: ['dueId'],
+      where: { due: activeDueOfSpace },
+      _count: { _all: true },
+      _sum: { netToSpace: true },
+    }),
+    // Collected includes guests; the paid count is members only (it's set against memberCount).
+    db.duePayment.groupBy({
+      by: ['dueId'],
+      where: { due: activeDueOfSpace, user: { isGuest: false } },
+      _count: { _all: true },
+    }),
   ]);
-  const dueIds = activeDues.map((d) => d.id);
+  if (!space) {
+    errors.notFound(res, 'Space not found');
+    return;
+  }
+  const memberCount = space._count.memberships;
 
-  const grouped = dueIds.length
-    ? await db.duePayment.groupBy({
-        by: ['dueId'],
-        where: { dueId: { in: dueIds } },
-        _count: { _all: true },
-        _sum: { netToSpace: true },
-      })
-    : [];
-
-  // Collected includes guests; the paid count is members only (it's set against memberCount).
-  const memberPaid = dueIds.length
-    ? await db.duePayment.groupBy({
-        by: ['dueId'],
-        where: { dueId: { in: dueIds }, user: { isGuest: false } },
-        _count: { _all: true },
-      })
-    : [];
   const memberPaidByDue = new Map(memberPaid.map((g) => [g.dueId, g._count._all]));
   const paidByDue = new Map<string, { count: number; sum: number }>(
     grouped.map((g) => [g.dueId, { count: memberPaidByDue.get(g.dueId) ?? 0, sum: g._sum.netToSpace ?? 0 }]),

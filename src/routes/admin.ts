@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { Prisma, KycStatus, TxnStatus, TxnType, DisputeStatus, DisputeType, PollStatus, type RepApplication, type User } from '@prisma/client';
 import { db } from '../config/db';
+import { cached, invalidate } from '../lib/cache';
 import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { requireAdmin, requireSuperAdmin, requireAdminPermission } from '../middleware/requireRole';
@@ -337,16 +338,30 @@ async function platformMetrics() {
   };
 }
 
+/**
+ * Platform-wide aggregates: their cost grows with the whole database, not the
+ * page, so they're cached for 30s and shared by every API instance (Redis).
+ * Rep approval/rejection drops the cache so its alert updates at once.
+ */
+const ADMIN_OVERVIEW_TTL_MS = 30_000;
+const ADMIN_OVERVIEW_CACHE_KEY = 'admin:overview';
+
 adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void> => {
-  const [totalUsers, activeReps, pendingReps, metrics] = await Promise.all([
+  ok(res, await cached(ADMIN_OVERVIEW_CACHE_KEY, ADMIN_OVERVIEW_TTL_MS, computeAdminOverview));
+});
+
+async function computeAdminOverview() {
+  const now = new Date();
+  // Overdue: active dues past their date, still short of full collection.
+  const overdueWhere: Prisma.DueWhereInput = { status: 'active', dueDate: { lt: now } };
+
+  // One round trip: every figure below is independent (the overdue counts
+  // filter by relation, not by a list of due ids read first).
+  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, overdueDues, memberGroups, paidGroups] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
     platformMetrics(),
-  ]);
-
-  const now = new Date();
-  const [fin, breachedRows] = await Promise.all([
     spacesFinancials({ isArchived: false }),
     // Open disputes past their SLA window, counted in the database.
     db.$queryRaw<{ n: number }[]>`
@@ -354,35 +369,26 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
       WHERE "status" IN ('open', 'under_review')
         AND "createdAt" + make_interval(days => "slaDays") < ${now}
     `,
+    db.due.findMany({ where: overdueWhere, select: { id: true, spaceId: true, amount: true } }),
+    db.spaceMembership.groupBy({
+      by: ['spaceId'],
+      where: { space: { dues: { some: overdueWhere } } },
+      _count: { _all: true },
+    }),
+    db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
   ]);
   const lowCollectionCount = fin.lowCollectionCount;
   const breachedDisputes = breachedRows[0]?.n ?? 0;
 
-  // Overdue: active dues past their date, still short of full collection.
-  const overdueWhere: Prisma.DueWhereInput = { status: 'active', dueDate: { lt: now } };
-  const overdueDues = await db.due.findMany({
-    where: overdueWhere,
-    select: { id: true, spaceId: true, amount: true },
-  });
   let overdueAmount = 0;
   let overdueCount = 0;
-  if (overdueDues.length) {
-    const [memberGroups, paidGroups] = await Promise.all([
-      db.spaceMembership.groupBy({
-        by: ['spaceId'],
-        where: { space: { dues: { some: overdueWhere } } },
-        _count: { _all: true },
-      }),
-      db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
-    ]);
-    const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-    const paidCounts = new Map(paidGroups.map((p) => [p.dueId, p._count._all]));
-    for (const d of overdueDues) {
-      const unpaid = Math.max(0, (memberCount.get(d.spaceId) ?? 0) - (paidCounts.get(d.id) ?? 0));
-      if (unpaid > 0) {
-        overdueCount += 1;
-        overdueAmount += d.amount * unpaid;
-      }
+  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
+  const paidCounts = new Map(paidGroups.map((p) => [p.dueId, p._count._all]));
+  for (const d of overdueDues) {
+    const unpaid = Math.max(0, (memberCount.get(d.spaceId) ?? 0) - (paidCounts.get(d.id) ?? 0));
+    if (unpaid > 0) {
+      overdueCount += 1;
+      overdueAmount += d.amount * unpaid;
     }
   }
 
@@ -432,7 +438,7 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
     });
   }
 
-  ok(res, {
+  return {
     totalUsers,
     activeReps,
     duesCollected: fin.collected,
@@ -442,8 +448,8 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
     revenue: metrics.revenue,
     transactions: metrics.transactions,
     attention,
-  });
-});
+  };
+}
 
 // ===========================================================================
 // §14.2 Users
@@ -882,6 +888,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
 
   await writeAdminAudit(req, 'rep.verify', { target: userId, metadata: { spaceId: space.id } });
   sendRepApprovedEmail(user.email, user.name, space.name).catch(console.error);
+  await invalidate(ADMIN_OVERVIEW_CACHE_KEY);
 
   ok(res, await buildAdminRep({ ...user, role: 'rep', isRep: true, repApplicationStatus: 'approved' }));
 });
@@ -902,6 +909,7 @@ adminRouter.post('/reps/:repId/reject', requireAdminPermission('userManagement')
   ]);
   await writeAdminAudit(req, 'rep.reject', { target: userId, severity: 'warning', metadata: { reason } });
   sendRepRejectedEmail(user.email, user.name, reason).catch(console.error);
+  await invalidate(ADMIN_OVERVIEW_CACHE_KEY);
   res.status(204).end();
 });
 

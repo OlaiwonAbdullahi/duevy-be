@@ -56,8 +56,8 @@ describe('reused one-time account numbers', () => {
       state: 'paid',
       receivedKobo: a.totalKobo * 2,
       credits: [
-        { transactionId: 'tx_a', amountKobo: a.totalKobo, at: new Date(Date.now() - 60_000) },
-        { transactionId: 'tx_b', amountKobo: b.totalKobo, at: new Date() },
+        { transactionId: 'tx_a', amountKobo: a.totalKobo, at: new Date() },
+        { transactionId: 'tx_b', amountKobo: b.totalKobo, at: new Date(Date.now() + 1_000) },
       ],
     });
     await reconcileCheckout(a, { expireIfPastDue: false, source: 'test' });
@@ -67,6 +67,29 @@ describe('reused one-time account numbers', () => {
       ['paid', 'tx_a', a.totalKobo],
       ['paid', 'tx_b', b.totalKobo],
     ]);
+  });
+
+  it("ignores a credit for another amount in its window (an earlier holder's payment), instead of calling it underpaid", async () => {
+    const { a, number } = await twoCheckoutsOnOneNumber();
+    // Seen in the sandbox: the number's previous holder was paid ₦1,015 just before.
+    fake.collectionStatus.set(number, {
+      state: 'paid',
+      receivedKobo: 101_500 + a.totalKobo,
+      credits: [
+        { transactionId: 'tx_prev', amountKobo: 101_500, at: new Date() },
+        { transactionId: 'tx_mine', amountKobo: a.totalKobo, at: new Date(Date.now() + 1_000) },
+      ],
+    });
+    await reconcileCheckout(a, { expireIfPastDue: false, source: 'test' });
+    const ra = await db.checkout.findUniqueOrThrow({ where: { id: a.id } });
+    expect([ra.status, ra.providerTransactionId, ra.receivedKobo]).toEqual(['paid', 'tx_mine', a.totalKobo]);
+  });
+
+  it('with only a different-amount credit, stays open (not underpaid)', async () => {
+    const { a, number } = await twoCheckoutsOnOneNumber();
+    fake.collectionStatus.set(number, { state: 'paid', receivedKobo: 101_500, credits: [{ transactionId: 'tx_prev2', amountKobo: 101_500, at: new Date() }] });
+    await reconcileCheckout(a, { expireIfPastDue: false, source: 'test' });
+    expect((await db.checkout.findUniqueOrThrow({ where: { id: a.id } })).status).toBe('pending');
   });
 
   it('a webhook still naming the earlier (closed) checkout pays the checkout now holding the number', async () => {

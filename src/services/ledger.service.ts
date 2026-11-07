@@ -11,7 +11,8 @@ import { PAYOUT_ACTIVE } from '../lib/stateMachine';
  *   balance = Σ credits − Σ debits
  *
  *   credits: due_payment (a collection, at face value), manual_credit,
- *            payout_reversal (a failed/reversed withdrawal restored in full)
+ *            payout_reversal (a failed/reversed withdrawal restored in full),
+ *            direct_deposit (money sent straight to the space's own account)
  *   debits:  payout (what was sent to the bank), payout_fee (Duevy's
  *            withdrawal fee), refund
  *
@@ -33,13 +34,14 @@ export interface LedgerWrite {
   txnId?: string | null;
   duePaymentId?: string | null;
   payoutId?: string | null;
+  directDepositId?: string | null;
   grossKobo?: number | null;
   feeKobo?: number | null;
   netKobo?: number | null;
   actorId?: string | null;
 }
 
-const CREDIT_TYPES: LedgerEntryType[] = ['due_payment', 'manual_credit', 'payout_reversal'];
+const CREDIT_TYPES: LedgerEntryType[] = ['due_payment', 'manual_credit', 'payout_reversal', 'direct_deposit'];
 const DEBIT_TYPES: LedgerEntryType[] = ['payout', 'payout_fee', 'refund'];
 
 /**
@@ -61,11 +63,11 @@ export async function appendLedgerEntry(tx: Tx, entry: LedgerWrite): Promise<boo
   // abort the surrounding Postgres transaction.
   const inserted = await tx.$executeRaw`
     INSERT INTO "ledger_entries"
-      ("id", "spaceId", "dueId", "txnId", "duePaymentId", "payoutId", "type", "direction",
+      ("id", "spaceId", "dueId", "txnId", "duePaymentId", "payoutId", "directDepositId", "type", "direction",
        "amountKobo", "grossKobo", "feeKobo", "netKobo", "reference", "description", "actorId", "createdAt")
     VALUES
       (${cuidLike()}, ${entry.spaceId}, ${entry.dueId ?? null}, ${entry.txnId ?? null}, ${entry.duePaymentId ?? null},
-       ${entry.payoutId ?? null}, ${entry.type}::"LedgerEntryType", ${entry.direction}::"LedgerDirection",
+       ${entry.payoutId ?? null}, ${entry.directDepositId ?? null}, ${entry.type}::"LedgerEntryType", ${entry.direction}::"LedgerDirection",
        ${entry.amountKobo}, ${entry.grossKobo ?? null}, ${entry.feeKobo ?? null}, ${entry.netKobo ?? null},
        ${entry.reference}, ${entry.description}, ${entry.actorId ?? null}, (${new Date()}::timestamptz AT TIME ZONE 'UTC'))
     ON CONFLICT DO NOTHING`;
@@ -130,7 +132,7 @@ export async function getDueAvailability(spaceId: string, tx: Tx | typeof db = d
 export interface SpaceLedgerSummary {
   /** Withdrawable now. */
   balance: number;
-  /** Lifetime collections credited at face value (incl. manual credits). */
+  /** Lifetime collections credited at face value (incl. manual credits and direct deposits). */
   collected: number;
   /** Lifetime sent to the bank on withdrawals, net of reversals. */
   withdrawn: number;
@@ -141,20 +143,19 @@ export interface SpaceLedgerSummary {
 }
 
 export async function getSpaceLedgerSummary(spaceId: string): Promise<SpaceLedgerSummary> {
-  const [byType, inFlight] = await Promise.all([
+  const [byType, inFlight, reversed] = await Promise.all([
     db.ledgerEntry.groupBy({ by: ['type'], where: { spaceId }, _sum: { amountKobo: true } }),
     db.payout.aggregate({ where: { spaceId, status: { in: [...PAYOUT_ACTIVE] } }, _sum: { amount: true } }),
+    // A reversal restores a whole withdrawal (fee included). Split it back out
+    // so lifetime figures describe money that actually left.
+    db.payout.aggregate({
+      where: { spaceId, status: { in: ['failed', 'reversed', 'cancelled'] }, ledgerEntries: { some: { type: 'payout_reversal' } } },
+      _sum: { netKobo: true, feeKobo: true },
+    }),
   ]);
   const sum = (t: LedgerEntryType) => byType.find((r) => r.type === t)?._sum.amountKobo ?? 0;
 
-  // A reversal restores a whole withdrawal (fee included). Split it back out
-  // so lifetime figures describe money that actually left.
-  const reversed = await db.payout.aggregate({
-    where: { spaceId, status: { in: ['failed', 'reversed', 'cancelled'] }, ledgerEntries: { some: { type: 'payout_reversal' } } },
-    _sum: { netKobo: true, feeKobo: true },
-  });
-
-  const collected = sum('due_payment') + sum('manual_credit');
+  const collected = sum('due_payment') + sum('manual_credit') + sum('direct_deposit');
   const balance =
     collected + sum('payout_reversal') - sum('payout') - sum('payout_fee') - sum('refund');
   return {

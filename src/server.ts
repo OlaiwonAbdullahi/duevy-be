@@ -12,6 +12,14 @@ async function startServer() {
   try {
     await db.$connect();
     logger.info({ provider: getPaymentProvider().name }, 'connected to database');
+    // Prisma behind a transaction pooler (pgbouncer=true) wraps every query in
+    // its own transaction with an unnamed statement: ~5 round trips per query
+    // instead of 1. Measured: a dashboard page at 60 ms from the database took
+    // ~320 ms instead of ~68 ms. A long-running server should use the session
+    // pooler (Supabase port 5432) or a direct connection. docs/SCALING.md §3.11.
+    if (/[?&]pgbouncer=true\b/.test(env.DATABASE_URL)) {
+      logger.warn('DATABASE_URL uses pgbouncer=true (transaction pooler): every query costs ~5 database round trips. Use the session pooler (port 5432) or a direct connection.');
+    }
     if (!env.REDIS_URL && env.NODE_ENV === 'production') {
       logger.warn('REDIS_URL is not set: rate limits are per process, so they loosen with every extra instance');
     }

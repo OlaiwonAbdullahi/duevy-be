@@ -50,4 +50,26 @@ describe('normaliseNineJaPayEvent', () => {
     expect(() => normaliseNineJaPayEvent({ eventType: 'new_transaction', data: { transactionType: 'Credit' } })).toThrow(MalformedEventError);
     expect(() => normaliseNineJaPayEvent({ eventId: 'x', eventType: 'transfer_response', data: {} })).toThrow(MalformedEventError);
   });
+
+  // The docs' own samples, verbatim apart from the missing comma they ship with.
+  const DOCS_NEW_TRANSACTION = `{  "eventId": "7cb4dc1b-dace-4e1a-95a7-e27cc34c54bf",  "eventType": "new_transaction",  "data": {    "id": "f97996a9-3241-476d-a4e1-2422ac436d4a",    "transactionReference": "100004240220210739126986960617",    "accountNumber": "9000002140",    "accountName": "TOBI ADELAJA 29",    "accountRequestReference": "00000001",    "amount": 101000,    "balance": 9798000,    "senderName": "Michael Onyirimba",    "senderAccountNumber": "2000011041",    "senderBank": "9jaPay",    "senderBankCode": "090629",    "narration": "TRF: Michael Onyirimba|test transfer",    "transactionType": "Credit",    "transactionDate": "2024-02-20T21:07:39.775Z"  }}`;
+  const DOCS_TRANSFER_RESPONSE = `{  "eventId": "ca5c3963-0b4d-4964-a207-94c82dff419c",  "eventType": "transfer_response",  "data": {    "requestReference": "00000007",    "sessionId": "999999240226070016257381097481",    "status": "Success"  }}`;
+
+  it('reads the docs’ new_transaction sample: its eventId is the dedupe key, its UTC date is kept', () => {
+    const e = normaliseNineJaPayEvent(JSON.parse(DOCS_NEW_TRANSACTION));
+    expect(e).toMatchObject({ kind: 'payment.received', providerCheckoutId: '00000001', accountNumber: '9000002140', eventId: '7cb4dc1b-dace-4e1a-95a7-e27cc34c54bf' });
+    expect(e.occurredAt.toISOString()).toBe('2024-02-20T21:07:39.775Z');
+  });
+
+  it('reads the docs’ transfer_response sample', () => {
+    expect(normaliseNineJaPayEvent(JSON.parse(DOCS_TRANSFER_RESPONSE))).toMatchObject({
+      kind: 'transfer.updated', providerReference: '00000007', eventId: 'ca5c3963-0b4d-4964-a207-94c82dff419c',
+    });
+  });
+
+  it('ignores movements on Duevy’s own business account', () => {
+    const body = JSON.parse(DOCS_NEW_TRANSACTION);
+    expect(normaliseNineJaPayEvent(body, { businessAccountNumber: '9000002140' }).kind).toBe('ignored');
+    expect(normaliseNineJaPayEvent(body, { businessAccountNumber: '1111111111' }).kind).toBe('payment.received');
+  });
 });

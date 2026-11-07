@@ -110,24 +110,23 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
   const { status } = parsed.data;
   const category = parsed.data.type ?? parsed.data.category;
 
-  const dues = await db.due.findMany({
-    where: { spaceId: sid, ...(status ? { status } : {}), ...(category ? { category } : {}) },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  const memberCount = await db.spaceMembership.count({ where: { spaceId: sid } });
-  // Paid counts are members only (they're compared with memberCount); guest
-  // payments are counted on their own.
-  const dueIds = dues.map((d) => d.id);
-  const [paidCounts, guestCounts] = await Promise.all([
+  // One round trip: the counts filter by the same due criteria as a relation
+  // instead of waiting for the due list to collect its ids.
+  const dueWhere = { spaceId: sid, ...(status ? { status } : {}), ...(category ? { category } : {}) };
+  const [dues, memberCount, paidCounts, guestCounts] = await Promise.all([
+    // id breaks createdAt ties, so the order is the same on every request.
+    db.due.findMany({ where: dueWhere, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] }),
+    db.spaceMembership.count({ where: { spaceId: sid } }),
+    // Paid counts are members only (they're compared with memberCount); guest
+    // payments are counted on their own.
     db.duePayment.groupBy({
       by: ['dueId'],
-      where: { dueId: { in: dueIds }, ...paidByMember(sid) },
+      where: { due: dueWhere, ...paidByMember(sid) },
       _count: { _all: true },
     }),
     db.duePayment.groupBy({
       by: ['dueId'],
-      where: { dueId: { in: dueIds }, ...paidByOutsider(sid) },
+      where: { due: dueWhere, ...paidByOutsider(sid) },
       _count: { _all: true },
     }),
   ]);
@@ -448,8 +447,8 @@ async function buildRoster(
   q?: string,
   pageOpts?: { skip: number; take: number },
 ) {
-  // Filter and paginate memberships in the DB; payments are then fetched only
-  // for the page's users.
+  // Filter and paginate memberships in the DB; each member's payment for the
+  // due comes back in the same statement.
   const userConds: Prisma.UserWhereInput[] = [];
   if (filter === 'paid') userConds.push({ duePayments: { some: { dueId } } });
   if (filter === 'unpaid') userConds.push({ duePayments: { none: { dueId } } });
@@ -464,26 +463,27 @@ async function buildRoster(
   }
   const where: Prisma.SpaceMembershipWhereInput = { spaceId: sid, ...(userConds.length ? { user: { AND: userConds } } : {}) };
 
+  // One round trip: each member's payment for this due rides along in the
+  // same statement (relationJoins) instead of a second query after the page.
   const [matching, memberships] = await Promise.all([
     db.spaceMembership.count({ where }),
     db.spaceMembership.findMany({
       where,
-      include: { user: { select: { id: true, name: true, matricNo: true, level: true, email: true } } },
+      include: {
+        user: {
+          select: {
+            id: true, name: true, matricNo: true, level: true, email: true,
+            duePayments: { where: { dueId }, select: { paidAt: true, reference: true }, take: 1 },
+          },
+        },
+      },
       orderBy: [{ joinedAt: 'asc' }, { id: 'asc' }],
       ...(pageOpts ? { skip: pageOpts.skip, take: pageOpts.take } : {}),
     }),
   ]);
 
-  const payments = memberships.length
-    ? await db.duePayment.findMany({
-        where: { dueId, userId: { in: memberships.map((m) => m.userId) } },
-        select: { userId: true, paidAt: true, reference: true },
-      })
-    : [];
-  const paymentByUser = new Map(payments.map((p) => [p.userId, p]));
-
   const students = memberships.map((m) => {
-    const payment = paymentByUser.get(m.userId);
+    const payment = m.user.duePayments[0];
     return {
       id: m.user.id,
       name: m.user.name,
@@ -508,29 +508,32 @@ const collectionsQuery = z.object({
 
 repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const due = await loadDue(sid, req.params.dueId as string);
-  if (!due) {
-    errors.notFound(res, 'Due not found');
-    return;
-  }
+  const dueId = req.params.dueId as string;
 
   const parsed = collectionsQuery.safeParse(req.query);
   const statusFilter = parsed.success ? parsed.data.status : 'all';
   const { page, perPage, skip, take, q } = parseListQuery(req);
 
-  const [{ matching, students }, memberCount, agg, guests] = await Promise.all([
-    buildRoster(sid, due.id, statusFilter, q, { skip, take }),
+  // Everything in one round trip. The due's ownership check runs alongside
+  // the reads, not before them: if the due isn't this space's, the results
+  // are discarded and nothing but the 404 leaves.
+  const [due, { matching, students }, memberCount, agg, guests, paidCount] = await Promise.all([
+    loadDue(sid, dueId),
+    buildRoster(sid, dueId, statusFilter, q, { skip, take }),
     db.spaceMembership.count({ where: { spaceId: sid } }),
     // Money totals include guests: that money really arrived.
     db.duePayment.aggregate({
-      where: { dueId: due.id },
+      where: { dueId },
       _sum: { amountPaid: true, processingFee: true, duevyFee: true, netToSpace: true },
     }),
-    guestPayers(sid, due.id),
+    guestPayers(sid, dueId),
+    // Paid/unpaid compare against members, so guests are left out of them.
+    db.duePayment.count({ where: { dueId, ...paidByMember(sid) } }),
   ]);
-
-  // Paid/unpaid compare against members, so guests are left out of them.
-  const paidCount = await db.duePayment.count({ where: { dueId: due.id, ...paidByMember(sid) } });
+  if (!due) {
+    errors.notFound(res, 'Due not found');
+    return;
+  }
   const collected = agg._sum.amountPaid ?? 0;
   const fees = (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0);
   const net = agg._sum.netToSpace ?? 0;

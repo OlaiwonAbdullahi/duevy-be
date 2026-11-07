@@ -24,10 +24,13 @@ import { dispatchPayout } from './withdrawal.service';
  *              − its sweeps that haven't failed
  *   in space account = ledger balance − unswept
  *
+ * Money sent straight to the space account (directDeposit.service) is
+ * credited to the ledger but never counted as unswept: it is already there.
+ *
  * A sweep doesn't touch the ledger: the money is the space's either way, and
  * 9jaPay bills the transfer to Duevy (covered by the checkout processing
  * fee). Each space account may move at most DAILY_LIMIT_KOBO a day, counting
- * both sweeps in and withdrawals out (Africa/Lagos days), and a space may
+ * sweeps and direct deposits in and withdrawals out (Africa/Lagos days), and a space may
  * withdraw at most DAILY_PAYOUT_LIMIT_KOBO of that. 9jaPay refuses a single
  * transfer over MAX_TRANSFER_KOBO, so a large sweep goes as several.
  *
@@ -146,12 +149,31 @@ export async function getBusinessSweepAllowanceKobo(tx: Tx | typeof db = db): Pr
   return Math.max(0, env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO - Number(rows[0]?.swept ?? 0));
 }
 
-/** What the space's account has moved today, counting sweeps in and withdrawals out. */
-export async function getDailyUsageKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
+/** What has been swept into the space's account today. */
+async function getDailySweptKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
   const rows = await tx.$queryRaw<{ swept: bigint | null }[]>`
     SELECT COALESCE(SUM("amountKobo"), 0)::bigint AS swept FROM "sweeps"
      WHERE "spaceId" = ${spaceId} AND "status" <> 'failed' AND "createdAt" >= ${startOfLagosDay()}`;
-  return Number(rows[0]?.swept ?? 0) + (await getDailyWithdrawnKobo(spaceId, tx));
+  return Number(rows[0]?.swept ?? 0);
+}
+
+/** What arrived in the space's account today straight from outside (direct deposits). */
+async function getDailyDepositedKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
+  const rows = await tx.$queryRaw<{ deposited: bigint | null }[]>`
+    SELECT COALESCE(SUM("amountKobo"), 0)::bigint AS deposited FROM "direct_deposits"
+     WHERE "spaceId" = ${spaceId} AND "receivedAt" >= ${startOfLagosDay()}`;
+  return Number(rows[0]?.deposited ?? 0);
+}
+
+/** What the space's account has moved today: sweeps and direct deposits in, withdrawals out. */
+export async function getDailyUsageKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
+  // Independent sums: issued together, not one after the other.
+  const [swept, deposited, withdrawn] = await Promise.all([
+    getDailySweptKobo(spaceId, tx),
+    getDailyDepositedKobo(spaceId, tx),
+    getDailyWithdrawnKobo(spaceId, tx),
+  ]);
+  return swept + deposited + withdrawn;
 }
 
 export async function getDailyAllowanceKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
@@ -160,13 +182,23 @@ export async function getDailyAllowanceKobo(spaceId: string, tx: Tx | typeof db 
 
 /** What the space may still withdraw today: its own ₦5M, within the account's ₦10M. */
 export async function getWithdrawalAllowanceKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
-  const [withdrawn, account] = await Promise.all([getDailyWithdrawnKobo(spaceId, tx), getDailyAllowanceKobo(spaceId, tx)]);
+  // Today's withdrawals feed both limits; read them once (they used to be
+  // summed twice, once more inside the account's daily usage).
+  const [withdrawn, swept, deposited] = await Promise.all([
+    getDailyWithdrawnKobo(spaceId, tx),
+    getDailySweptKobo(spaceId, tx),
+    getDailyDepositedKobo(spaceId, tx),
+  ]);
+  const account = Math.max(0, DAILY_LIMIT_KOBO - (swept + deposited + withdrawn));
   return Math.max(0, Math.min(DAILY_PAYOUT_LIMIT_KOBO - withdrawn, account));
 }
 
-/** A space's money split by where it sits, for the wallet screen. */
-export async function getSpaceFunds(spaceId: string, balanceKobo: number) {
-  const [unswept, allowance] = await Promise.all([getUnsweptKobo(spaceId), getWithdrawalAllowanceKobo(spaceId)]);
+/**
+ * A space's money split by where it sits, for the wallet screen. The balance
+ * may be passed still pending, so its query runs alongside these.
+ */
+export async function getSpaceFunds(spaceId: string, balance: number | Promise<number>) {
+  const [unswept, allowance, balanceKobo] = await Promise.all([getUnsweptKobo(spaceId), getWithdrawalAllowanceKobo(spaceId), balance]);
   return {
     inSpaceAccountKobo: Math.max(0, balanceKobo - unswept),
     awaitingSweepKobo: unswept,

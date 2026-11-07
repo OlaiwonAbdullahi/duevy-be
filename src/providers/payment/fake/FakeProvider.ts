@@ -2,6 +2,7 @@ import { randomInt, randomUUID } from 'crypto';
 import {
   InvalidSignatureError,
   ProviderError,
+  type AccountCredit,
   type Bank,
   type CollectionAccount,
   type CollectionStatus,
@@ -15,7 +16,7 @@ import {
   type TransferResult,
   type TransferState,
 } from '../types';
-import { normaliseNineJaPayEvent, SPACE_ACCOUNT_PREFIX } from '../ninejapay/events';
+import { MalformedEventError, normaliseNineJaPayEvent, SPACE_ACCOUNT_PREFIX } from '../ninejapay/events';
 import { verifyNineJaPaySignature } from '../ninejapay/signature';
 
 /**
@@ -43,6 +44,8 @@ export class FakeProvider implements PaymentProvider {
   transferDelayMs = 0;
   /** What has arrived per one-time account number, for reconciliation tests. */
   collectionStatus = new Map<string, CollectionStatus>();
+  /** Credits on each permanent (space) account, for direct-deposit tests. */
+  accountCredits = new Map<string, AccountCredit[]>();
   /** Every transfer started, by our reference. Tests set `state` to settle one. */
   transfers = new Map<string, TransferResult & { input: InitiateTransferInput }>();
 
@@ -61,6 +64,7 @@ export class FakeProvider implements PaymentProvider {
     this.failNextTransfer = null;
     this.transferDelayMs = 0;
     this.collectionStatus.clear();
+    this.accountCredits.clear();
     this.transfers.clear();
     this.calls = [];
   }
@@ -81,6 +85,11 @@ export class FakeProvider implements PaymentProvider {
     };
   }
 
+  async listAccountCredits(accountNumber: string, window: { from: Date; to: Date }): Promise<AccountCredit[]> {
+    this.record('listAccountCredits', { accountNumber, window });
+    return (this.accountCredits.get(accountNumber) ?? []).filter((c) => c.at >= window.from && c.at <= window.to);
+  }
+
   async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
     this.record('getCollectionStatus', { accountNumber, window });
     const status = this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
@@ -90,6 +99,14 @@ export class FakeProvider implements PaymentProvider {
     return credits.length
       ? { state: 'paid', receivedKobo: credits.reduce((s, c) => s + c.amountKobo, 0), credits }
       : { state: 'open', receivedKobo: null, credits };
+  }
+
+  /** Local development: record the credit where getCollectionStatus will find it. */
+  async simulateDeposit(accountNumber: string, amountKobo: number): Promise<void> {
+    this.record('simulateDeposit', { accountNumber, amountKobo });
+    const existing = this.collectionStatus.get(accountNumber)?.credits ?? [];
+    const credits = [...existing, { transactionId: `fake_${randomUUID()}`, amountKobo, at: new Date() }];
+    this.collectionStatus.set(accountNumber, { state: 'paid', receivedKobo: credits.reduce((s, c) => s + c.amountKobo, 0), credits });
   }
 
   async createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount> {
@@ -168,7 +185,7 @@ export class FakeProvider implements PaymentProvider {
     try {
       body = JSON.parse(rawBody.toString('utf8'));
     } catch {
-      throw new InvalidSignatureError('Webhook body is not JSON');
+      throw new MalformedEventError(null, null, 'webhook body is not JSON');
     }
     return normaliseNineJaPayEvent(body);
   }

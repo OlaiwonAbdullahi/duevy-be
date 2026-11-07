@@ -258,3 +258,35 @@ describe('space accounts', () => {
     expect(account).toMatchObject({ accountNumber: '9000999999', accountName: 'DUEVY/Space' });
   });
 });
+
+describe('credits on a space account', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('tells our sweep from money sent straight to the account (recorded 2026-11-07)', async () => {
+    respond(200, {
+      status: 'SUCCESS',
+      statusCode: '00',
+      data: [
+        {
+          transactionId: '0a25b830-2127-45fa-81b5-b89824574765', accountNumber: '9000143519', transactionType: 'Credit', amount: 25000,
+          narration: 'Virtual account test deposit', transactionDate: '2026-11-07T14:43:16.655952',
+          metadata: { senderAccountName: 'Test Account', senderAccountNumber: '11906', senderBank: '9jaPay', senderBankCode: '090629' },
+        },
+        {
+          transactionId: '2d22af13-5192-44b4-88d8-d912fad4dc8a', accountNumber: '9000143519', transactionType: 'Credit', amount: 10000,
+          narration: 'Duevy collections probe FROM Duevy Labs Ltd-test-account TO DUEVY/Direct', transactionDate: '2026-11-07T14:43:15.237',
+          metadata: { senderAccountName: 'Duevy Labs Ltd-test-account', senderAccountNumber: '3000000000', senderBank: '9jaPay', senderBankCode: '090629' },
+        },
+        { transactionId: 'r1', accountNumber: '9000143519', transactionType: 'Credit', amount: 5000, narration: 'REVERSAL: failed transfer', transactionDate: '2026-11-07T14:50:00.000' },
+        { transactionId: 'w1', accountNumber: '9000143519', transactionType: 'Debit', amount: 5000, narration: 'withdrawal', transactionDate: '2026-11-07T14:45:00.000' },
+      ],
+    });
+    const credits = await provider.listAccountCredits('9000143519', { from: new Date('2026-11-07T00:00:00Z'), to: new Date('2026-11-08T00:00:00Z') });
+    expect(credits.map((c) => [c.transactionId, c.source, c.amountKobo])).toEqual([
+      ['2d22af13-5192-44b4-88d8-d912fad4dc8a', 'business', 10000],
+      ['0a25b830-2127-45fa-81b5-b89824574765', 'external', 25000],
+      ['r1', 'reversal', 5000],
+    ]);
+    expect(credits[1]).toMatchObject({ senderName: 'Test Account', senderAccountNumber: '11906', at: new Date('2026-11-07T13:43:16.655Z') });
+  });
+});

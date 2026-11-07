@@ -2,6 +2,7 @@ import { logger } from '../../../lib/logger';
 import {
   InvalidSignatureError,
   ProviderError,
+  type AccountCredit,
   type Bank,
   type CollectionAccount,
   type CollectionCredit,
@@ -17,7 +18,7 @@ import {
   type TransferState,
 } from '../types';
 import { NineJaPayClient } from './client';
-import { normaliseNineJaPayEvent, parseNineJaPayDate, SPACE_ACCOUNT_PREFIX } from './events';
+import { MalformedEventError, normaliseNineJaPayEvent, parseNineJaPayDate, SPACE_ACCOUNT_PREFIX } from './events';
 import { verifyNineJaPaySignature } from './signature';
 
 /**
@@ -53,6 +54,8 @@ export interface NineJaPayConfig {
   businessAccountNumber: string;
   /** 9jaPay's own bank code, for transfers into a space's account. */
   bankCode: string;
+  /** Sandbox only: simulate-deposit's key. */
+  sandboxAuthKey?: string;
 }
 
 interface CreatedAccount {
@@ -73,6 +76,13 @@ interface Transaction {
   amount?: number | string;
   transactionDate?: string;
   notificationStatus?: string;
+  narration?: string;
+  metadata?: {
+    senderAccountName?: string;
+    senderAccountNumber?: string;
+    senderBank?: string;
+    senderBankCode?: string;
+  };
 }
 
 export { parseNineJaPayDate };
@@ -167,6 +177,22 @@ export class NineJaPayProvider implements PaymentProvider {
     };
   }
 
+  /**
+   * POST /v1/api/transactions/simulate-deposit (sandbox). Body found by
+   * probing, 2026-11-07: recipientAccountNumber, amount (kobo), authKey.
+   * A wrong amount on a one-time account answers 404 "25" "Recipient account
+   * is invalid", the same as an unknown or closed account.
+   */
+  async simulateDeposit(accountNumber: string, amountKobo: number): Promise<void> {
+    if (!this.config.sandboxAuthKey) throw new ProviderError('No sandbox auth key is configured', null, 'NOT_CONFIGURED', false);
+    await this.client.request({
+      method: 'POST',
+      path: '/v1/api/transactions/simulate-deposit',
+      op: 'sandbox.simulate_deposit',
+      body: { recipientAccountNumber: accountNumber, amount: amountKobo, authKey: this.config.sandboxAuthKey },
+    });
+  }
+
   async describeCollectionAccount(accountNumber: string): Promise<{ accountName: string | null; expiresAt: Date | null } | null> {
     const details = await this.getAccount(accountNumber);
     if (!details) return null;
@@ -183,21 +209,24 @@ export class NineJaPayProvider implements PaymentProvider {
    * students' payments too. The closing "VIRTUAL ACCOUNT CLOSURE TRANSFER"
    * debit (the money moving to the collection account) is ignored.
    */
-  async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
+  /**
+   * Every transaction on an account within the window's days. The day
+   * filters are inclusive with an unstated timezone, so a day's margin each
+   * side; callers apply the exact window.
+   */
+  private async listTransactions(accountNumber: string, window: { from: Date; to: Date }): Promise<Transaction[]> {
     // A reused number accumulates two rows per checkout (credit + closure
-    // debit), so the window's credit can be past page 1. Read every page.
+    // debit), so the window's rows can be past page 1. Read every page.
     const rows: Transaction[] = [];
     for (let page = 1; page <= TRANSACTION_PAGE_LIMIT; page++) {
       const res = await this.client.request<Transaction[]>({
         method: 'GET',
         path: '/v1/api/transactions',
-        op: 'collection.transactions',
+        op: 'account.transactions',
         query: {
           'page-size': String(TRANSACTION_PAGE_SIZE),
           'page-number': String(page),
           'account-number': accountNumber,
-          // Day filters (inclusive, timezone unstated), so a day's margin each side;
-          // the exact window is applied below.
           'start-date': lagosDate(window.from, -1),
           'end-date': lagosDate(window.to, 1),
         },
@@ -207,7 +236,11 @@ export class NineJaPayProvider implements PaymentProvider {
       if (batch.length < TRANSACTION_PAGE_SIZE) break;
       if (page === TRANSACTION_PAGE_LIMIT) throw new ProviderError(`9jaPay transactions for ${accountNumber} run past ${page} pages`, null, null, true);
     }
+    return rows;
+  }
 
+  async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
+    const rows = await this.listTransactions(accountNumber, window);
     const credits: CollectionCredit[] = [];
     for (const t of rows) {
       if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) continue;
@@ -218,6 +251,38 @@ export class NineJaPayProvider implements PaymentProvider {
     credits.sort((a, b) => a.at.getTime() - b.at.getTime());
     if (credits.length === 0) return { state: 'open', receivedKobo: null, credits };
     return { state: 'paid', receivedKobo: credits.reduce((sum, c) => sum + c.amountKobo, 0), credits };
+  }
+
+  /**
+   * Credits on a permanent account. The sandbox shows each with
+   * metadata.senderAccountNumber: our sweeps come from the business account,
+   * anything else was sent to the account directly.
+   */
+  async listAccountCredits(accountNumber: string, window: { from: Date; to: Date }): Promise<AccountCredit[]> {
+    const rows = await this.listTransactions(accountNumber, window);
+    const credits: AccountCredit[] = [];
+    for (const t of rows) {
+      if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) continue;
+      const at = parseNineJaPayDate(t.transactionDate);
+      if (at === null || at < window.from || at > window.to || !t.transactionId) continue;
+      const sender = t.metadata?.senderAccountNumber ?? null;
+      const narration = t.narration ?? null;
+      const source: AccountCredit['source'] =
+        sender === this.config.businessAccountNumber ? 'business'
+        : sender === accountNumber || /revers/i.test(narration ?? '') ? 'reversal'
+        : 'external';
+      credits.push({
+        transactionId: String(t.transactionId),
+        amountKobo: Number(t.amount ?? 0),
+        at,
+        source,
+        senderName: t.metadata?.senderAccountName ?? null,
+        senderAccountNumber: sender,
+        senderBank: t.metadata?.senderBank ?? null,
+        narration,
+      });
+    }
+    return credits.sort((a, b) => a.at.getTime() - b.at.getTime());
   }
 
   /**
@@ -382,8 +447,9 @@ export class NineJaPayProvider implements PaymentProvider {
     try {
       body = JSON.parse(rawBody.toString('utf8'));
     } catch {
-      throw new InvalidSignatureError('Webhook body is not JSON');
+      // Authentic but unreadable: acknowledge (a non-200 only makes 9jaPay resend it 10 times).
+      throw new MalformedEventError(null, null, 'webhook body is not JSON');
     }
-    return normaliseNineJaPayEvent(body);
+    return normaliseNineJaPayEvent(body, { businessAccountNumber: this.config.businessAccountNumber });
   }
 }

@@ -50,24 +50,29 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval] = await Promise.all([
-    getSpaceLedgerSummary(sid),
+  // One round trip: the funds split takes the balance as a pending promise,
+  // and the space row is read once for both the code and the account.
+  const ledgerP = getSpaceLedgerSummary(sid);
+  const [ledger, kyc, pin, signatories, funds] = await Promise.all([
+    ledgerP,
     getSpaceKycState(sid),
-    db.payoutBeneficiary.count({ where: { spaceId: sid } }),
+    // The space row, its beneficiary count and any withdrawal awaiting
+    // approval: one statement (relationJoins), not three.
     db.space.findUnique({
       where: { id: sid },
-      select: { withdrawalAuthMode: true, withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinHoldUntil: true },
+      select: {
+        withdrawalAuthMode: true, withdrawalPinHash: true, withdrawalPinLockedUntil: true, withdrawalPinHoldUntil: true,
+        walletAccountNumber: true, walletAccountName: true, walletBankName: true,
+        _count: { select: { beneficiaries: true } },
+        payouts: { where: { status: 'awaiting_approval' }, select: { id: true }, take: 1 },
+      },
     }),
     listSignatories(sid),
-    db.payout.findFirst({ where: { spaceId: sid, status: 'awaiting_approval' }, select: { id: true } }),
+    getSpaceFunds(sid, ledgerP.then((l) => l.balance)),
   ]);
-  const [account, funds] = await Promise.all([
-    db.space.findUnique({
-      where: { id: sid },
-      select: { walletAccountNumber: true, walletAccountName: true, walletBankName: true },
-    }),
-    getSpaceFunds(sid, ledger.balance),
-  ]);
+  const account = pin;
+  const beneficiaryCount = pin?._count.beneficiaries ?? 0;
+  const awaitingApproval = pin?.payouts[0] ?? null;
   ok(res, {
     available: ledger.balance,
     balance: ledger.balance,
@@ -122,12 +127,14 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/dues', async (req: Request, res: Response): Promise<void> => {
   const rep = (req as AuthenticatedRequest).spaceRep!;
-  const dues = await db.due.findMany({
-    where: { spaceId: spaceId(req), ...(rep.role === 'lead' ? {} : { assignedRepId: uid(req) }) },
-    select: { id: true, title: true, category: true, status: true, assignedRepId: true },
-    orderBy: { createdAt: 'desc' },
-  });
-  const available = await getDueAvailability(spaceId(req));
+  const [dues, available] = await Promise.all([
+    db.due.findMany({
+      where: { spaceId: spaceId(req), ...(rep.role === 'lead' ? {} : { assignedRepId: uid(req) }) },
+      select: { id: true, title: true, category: true, status: true, assignedRepId: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    }),
+    getDueAvailability(spaceId(req)),
+  ]);
   ok(
     res,
     dues.map((d) => ({ id: d.id, title: d.title, type: d.category, status: d.status, assignedRepId: d.assignedRepId, available: available.get(d.id) ?? 0 })),

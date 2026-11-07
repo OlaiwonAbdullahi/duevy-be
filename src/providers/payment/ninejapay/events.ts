@@ -54,7 +54,17 @@ function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
-export function normaliseNineJaPayEvent(body: unknown): ProviderEvent {
+export interface NormaliseOptions {
+  /**
+   * Duevy's own business (collection) account. Movements on it — checkout
+   * money settling in, sweeps leaving — are ignored: the docs send
+   * new_transaction for every credit and debit, and none of these name a
+   * checkout or a space.
+   */
+  businessAccountNumber?: string;
+}
+
+export function normaliseNineJaPayEvent(body: unknown, opts: NormaliseOptions = {}): ProviderEvent {
   const env = (body ?? {}) as Envelope;
   const rawType = str(env.eventType);
   const data = (env.data ?? {}) as Record<string, unknown>;
@@ -71,6 +81,7 @@ export function normaliseNineJaPayEvent(body: unknown): ProviderEvent {
     case 'new_transaction': {
       if ((str(data.transactionType) ?? '').toLowerCase() !== 'credit') return { ...base, kind: 'ignored' };
       const accountNumber = str(data.accountNumber);
+      if (accountNumber && accountNumber === opts.businessAccountNumber) return { ...base, kind: 'ignored' };
       const reference = str(data.accountRequestReference);
       if (!accountNumber || !reference) {
         throw new MalformedEventError(eventId, rawType, 'data.accountNumber or data.accountRequestReference is missing');

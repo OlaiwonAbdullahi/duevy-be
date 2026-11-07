@@ -5,6 +5,7 @@ import { getPaymentProvider, type CollectionStatus } from '../providers/payment'
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
 import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
 import { reconcileSweeps, runDailySweeps } from '../services/sweep.service';
+import { reconcileDirectDeposits } from '../services/directDeposit.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
 import { retryGuestAccountInvites } from '../services/guestAccount.service';
 
@@ -27,12 +28,13 @@ const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
 
 /**
  * When a payment into a checkout's one-time account can have landed: from
- * when the checkout was created (less some slack, since that's our clock) to
- * when it expired. No slack after expiry: expiresAt is 9jaPay's own, it
- * refuses money after it, and the number can be handed to the next checkout
- * straight away, whose payment must not count for this one.
+ * when the checkout was created (less a little slack for clock skew: the
+ * account itself opens after that) to when it expired. No slack after
+ * expiry: expiresAt is 9jaPay's own, it refuses money after it, and the
+ * number can be handed to the next checkout straight away. Kept tight both
+ * ends, since a reused number's previous payment can sit just before.
  */
-const PAYMENT_WINDOW_SLACK_MS = 2 * 60 * 1000;
+const PAYMENT_WINDOW_SLACK_MS = 30 * 1000;
 function paymentWindow(c: Pick<Checkout, 'createdAt' | 'expiresAt'>) {
   return { from: new Date(c.createdAt.getTime() - PAYMENT_WINDOW_SLACK_MS), to: c.expiresAt };
 }
@@ -42,7 +44,9 @@ type ReconcilableCheckout = Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAc
 /**
  * What the provider says arrived for this checkout, minus any credit another
  * checkout has already claimed (reused account numbers). With individual
- * credits, the earliest unclaimed one is this checkout's payment.
+ * credits, the earliest unclaimed one for EXACTLY the checkout's total is its
+ * payment: a one-time account refuses any other amount, so a different one
+ * in the window was paid to an earlier holder of the number.
  */
 async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string }): Promise<CollectionStatus & { transactionId: string | null }> {
   const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
@@ -54,8 +58,14 @@ async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string
           .map((r) => r.providerTransactionId)
       : [],
   );
-  const credit = status.credits.find((cr) => !claimed.has(cr.transactionId));
-  if (!credit) return { state: 'open', receivedKobo: null, transactionId: null };
+  const unclaimed = status.credits.filter((cr) => !claimed.has(cr.transactionId));
+  const credit = unclaimed.find((cr) => cr.amountKobo === c.totalKobo);
+  if (!credit) {
+    if (unclaimed.length) {
+      logger.warn({ ref: c.reference, amounts: unclaimed.map((cr) => cr.amountKobo), expected: c.totalKobo }, "credits in this checkout's window that aren't its amount; left alone");
+    }
+    return { state: 'open', receivedKobo: null, transactionId: null };
+  }
   return { state: 'paid', receivedKobo: credit.amountKobo, transactionId: credit.transactionId };
 }
 
@@ -208,6 +218,7 @@ export async function runReconciliationOnce(): Promise<void> {
   await reconcileCheckouts().catch((err) => logger.error({ err: (err as Error).message }, 'checkout reconciliation run failed'));
   await reconcilePayouts().catch((err) => logger.error({ err: (err as Error).message }, 'payout reconciliation run failed'));
   await reconcileSweeps().catch((err) => logger.error({ err: (err as Error).message }, 'sweep reconciliation run failed'));
+  await reconcileDirectDeposits().catch((err) => logger.error({ err: (err as Error).message }, 'direct deposit reconciliation failed'));
   await runDailySweeps().catch((err) => logger.error({ err: (err as Error).message }, 'daily sweep run failed'));
   await retryGuestAccountInvites().catch((err) => logger.error({ err: (err as Error).message }, 'guest account invite sweep failed'));
   await purgeExpiredIdempotencyKeys().catch(() => {});

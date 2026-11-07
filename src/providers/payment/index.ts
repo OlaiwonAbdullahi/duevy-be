@@ -30,6 +30,7 @@ export function getPaymentProvider(): PaymentProvider {
             secretKey: env.NINEJAPAY_SECRET_KEY as string,
             businessAccountNumber: env.NINEJAPAY_BUSINESS_ACCOUNT_NUMBER as string,
             bankCode: env.NINEJAPAY_BANK_CODE,
+            sandboxAuthKey: env.NINEJAPAY_SANDBOX_AUTH_KEY,
           },
           secrets,
         );

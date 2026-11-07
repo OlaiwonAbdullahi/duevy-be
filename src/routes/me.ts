@@ -307,22 +307,30 @@ meRouter.put('/notification-preferences', validate(prefsSchema), async (req: Req
 meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => {
   const uid = userId(req);
 
-  const memberships = await db.spaceMembership.findMany({ where: { userId: uid }, select: { spaceId: true } });
-
-  const spaceIds = memberships.map((m) => m.spaceId);
   const now = new Date();
 
-  // Active dues in the caller's spaces that they have not yet paid.
-  const openDuesAll = spaceIds.length
-    ? await db.due.findMany({
-        where: {
-          spaceId: { in: spaceIds },
-          status: 'active',
-          payments: { none: { userId: uid } },
-        },
-        include: { space: { select: { id: true, name: true, short: true, hue: true } } },
-      })
-    : [];
+  // One round trip: membership is a relation filter (no lookup of the
+  // caller's spaces first), and the three reads go out together.
+  const [openDuesAll, paidAgg, recentTransactions] = await Promise.all([
+    // Active dues in the caller's spaces that they have not yet paid.
+    db.due.findMany({
+      where: {
+        space: { memberships: { some: { userId: uid } } },
+        status: 'active',
+        payments: { none: { userId: uid } },
+      },
+      include: { space: { select: { id: true, name: true, short: true, hue: true } } },
+    }),
+    db.duePayment.aggregate({
+      where: { userId: uid },
+      _sum: { amountPaid: true },
+    }),
+    db.transaction.findMany({
+      where: { userId: uid },
+      orderBy: { createdAt: 'desc' },
+      take: 4,
+    }),
+  ]);
 
   // Overdue first, then earliest deadline.
   openDuesAll.sort((a, b) => {
@@ -333,17 +341,6 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
   });
 
   const outstandingAmount = openDuesAll.reduce((sum, d) => sum + d.amount, 0);
-
-  const paidAgg = await db.duePayment.aggregate({
-    where: { userId: uid },
-    _sum: { amountPaid: true },
-  });
-
-  const recentTransactions = await db.transaction.findMany({
-    where: { userId: uid },
-    orderBy: { createdAt: 'desc' },
-    take: 4,
-  });
 
   ok(res, {
     outstanding: { amount: outstandingAmount, count: openDuesAll.length },
