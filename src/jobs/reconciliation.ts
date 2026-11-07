@@ -25,6 +25,17 @@ const EXPIRY_GRACE_MS = 5 * 60 * 1000;
 const RETRY_DISPATCH_AFTER_MS = 2 * 60 * 1000;
 const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
 
+/**
+ * When a payment into a checkout's one-time account can have landed: from
+ * when the checkout was created to shortly after it expired (9jaPay refuses
+ * money after expiry; the slack covers clock skew). Anything outside belongs
+ * to another checkout that was given the same reused account number.
+ */
+const PAYMENT_WINDOW_SLACK_MS = 2 * 60 * 1000;
+function paymentWindow(c: Pick<Checkout, 'createdAt' | 'expiresAt'>) {
+  return { from: new Date(c.createdAt.getTime() - PAYMENT_WINDOW_SLACK_MS), to: new Date(c.expiresAt.getTime() + PAYMENT_WINDOW_SLACK_MS) };
+}
+
 export async function reconcileCheckouts(): Promise<void> {
   const provider = getPaymentProvider();
   const now = Date.now();
@@ -50,7 +61,7 @@ export async function reconcileCheckouts(): Promise<void> {
  * webhook. Only the provider's answer moves the checkout, never the caller.
  */
 export async function reconcileCheckout(
-  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'expiresAt'>,
+  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'createdAt' | 'expiresAt'>,
   opts: { expireIfPastDue: boolean; source: string },
 ): Promise<void> {
   if (c.status !== 'pending') return;
@@ -60,7 +71,7 @@ export async function reconcileCheckout(
     if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
     return;
   }
-  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber);
+  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
   if (status.state === 'paid') {
     // Never assume our own expected total arrived: an unknown amount could hide
     // an underpayment. Leave it for the webhook or the next sweep.
@@ -82,11 +93,11 @@ export async function reconcileCheckout(
  * a paid checkout is a no-op there.
  */
 export async function confirmReceivedPayment(
-  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo'>,
+  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'createdAt' | 'expiresAt'>,
   source: string,
 ): Promise<void> {
   if (c.status === 'paid' || !c.vaAccountNumber) return;
-  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber);
+  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
   if (status.state !== 'paid' || status.receivedKobo === null) {
     logger.warn({ ref: c.reference, source, state: status.state }, 'payment event without a matching credit at the provider; nothing applied');
     return;

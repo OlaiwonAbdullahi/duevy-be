@@ -113,3 +113,38 @@ describe('NineJaPayProvider against recorded sandbox responses', () => {
     });
   });
 });
+
+describe('one-time account numbers are reused', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Recorded 2026-11-07: account 9000143193 had served a checkout the day
+  // before. Its list shows the new credit and the closure debit (Lagos times).
+  const listing = (credits: { date: string; amount: number }[]) => ({
+    status: 'SUCCESS',
+    statusCode: '00',
+    data: [
+      { transactionId: 'd1', accountNumber: '9000143193', transactionType: 'Debit', amount: 507500, narration: 'VIRTUAL ACCOUNT CLOSURE TRANSFER', transactionDate: '2026-11-07T08:35:41.471726' },
+      ...credits.map((c, i) => ({ transactionId: `c${i}`, accountNumber: '9000143193', transactionType: 'Credit', amount: c.amount, transactionDate: c.date })),
+    ],
+  });
+
+  it('reads 9jaPay’s offset-less dates as Lagos time', async () => {
+    const { parseNineJaPayDate } = await import('./NineJaPayProvider');
+    expect(parseNineJaPayDate('2026-11-07T08:35:38.005074')?.toISOString()).toBe('2026-11-07T07:35:38.005Z');
+    expect(parseNineJaPayDate('2026-11-07T08:05:36.059909Z')?.toISOString()).toBe('2026-11-07T08:05:36.059Z');
+    expect(parseNineJaPayDate(undefined)).toBeNull();
+  });
+
+  it("counts only the credit inside this checkout's window, never another checkout's on the same number", async () => {
+    respond(200, listing([
+      { date: '2026-11-06T19:40:00.000000', amount: 999_900 }, // yesterday's checkout on this number
+      { date: '2026-11-07T08:35:38.005074', amount: 507_500 }, // this one
+    ]));
+    const window = { from: new Date('2026-11-07T07:30:00Z'), to: new Date('2026-11-07T08:07:00Z') };
+    expect(await provider.getCollectionStatus('9000143193', window)).toEqual({ state: 'paid', receivedKobo: 507_500 });
+
+    // An older checkout that once had this number sees nothing of today's money.
+    const old = { from: new Date('2026-11-06T18:00:00Z'), to: new Date('2026-11-06T18:30:00Z') };
+    expect(await provider.getCollectionStatus('9000143193', old)).toEqual({ state: 'open', receivedKobo: null });
+  });
+});

@@ -160,8 +160,13 @@ export interface PaymentProvider {
 
   /** Open a one-time bank account for one checkout. */
   createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount>;
-  /** What has arrived in a checkout's one-time account, read from the provider's own records. */
-  getCollectionStatus(accountNumber: string): Promise<CollectionStatus>;
+  /**
+   * What has arrived in a checkout's one-time account, read from the
+   * provider's own records. Only money that landed within `window` counts:
+   * 9jaPay reuses one-time account numbers, so the same number carries other
+   * checkouts' payments from before and after this one.
+   */
+  getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus>;
 
   /** Open a space's own permanent account. Money stays in it until paid out. */
   createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount>;

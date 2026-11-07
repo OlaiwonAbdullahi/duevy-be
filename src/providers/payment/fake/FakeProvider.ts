@@ -81,8 +81,8 @@ export class FakeProvider implements PaymentProvider {
     };
   }
 
-  async getCollectionStatus(accountNumber: string): Promise<CollectionStatus> {
-    this.record('getCollectionStatus', { accountNumber });
+  async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
+    this.record('getCollectionStatus', { accountNumber, window });
     return this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
   }
 

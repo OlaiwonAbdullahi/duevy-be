@@ -104,7 +104,20 @@ Tested against `https://developer.test.9japay.com` with Duevy's test keys:
 | TSQ, never sent | HTTP 404, `25` "No record found." — sent again. |
 | `simulate-deposit` | `27` "The auth key is invalid" with both the Test Secret Key and the Test API Key. |
 
+**Money in, sweep and withdrawal (2026-11-07, with the sandbox `authKey`):**
+
+| Step | Result |
+|---|---|
+| Pay a one-time account the wrong amount | Refused at the bank: `09` "Amount is different from configured amount". So an underpayment can't reach us. |
+| Pay it the exact amount | Credited. 9jaPay closes the account at once and moves the money to the collection account ("VIRTUAL ACCOUNT CLOSURE TRANSFER" debit). The collection account went up by the **full** amount: no fee taken from it. |
+| Pay it again | Refused (`06`): single payment only. |
+| **Reused account numbers** | The new checkout got **the same account number and id** as the previous day's. Its transaction list therefore holds earlier checkouts' payments too. Duevy only counts credits between the checkout's creation and its expiry (`getCollectionStatus` window). |
+| Transaction dates | `transactionDate` is Lagos time with **no offset** (`2026-11-07T08:35:38`), unlike `expiresAt` (UTC, `Z`). Read as UTC+1. |
+| Sweep ₦1,000, collection → space account | `00` SUCCESS at once (no webhook needed); TSQ `Success`. The space account received the full ₦1,000: **a sweep is not charged as an incoming payment**. The collection account was debited ₦1,002: a ₦2 sandbox transfer fee, charged to the sender. |
+| Withdrawal ₦500, space account → bank | `00` SUCCESS at once; TSQ `Success`. The space account went down by exactly ₦500. No fee showed on either account in the sandbox. |
+
 The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be valid GUID."
+
 
 ## Limits (from the dashboard)
 
@@ -114,10 +127,11 @@ The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be vali
 
 ## Open questions for 9jaPay
 
-1. **The sandbox `authKey` for `simulate-deposit`.** It isn't the API key or the secret key, and the dashboard doesn't show one. Without it no inflow (and so no `new_transaction` webhook) can be tested in the sandbox.
-2. **Live base URL.**
-3. Do transfers **out of a space's own account** (`/transfers/virtual-account`) count toward the business's ₦10M a day? If they do, every swept naira is counted twice.
-4. Must `senderAccountName` match the collection account's name exactly? Duevy sidesteps it: the name is taken from name enquiry on the collection account ("Duevy Labs Ltd-test-account" in the sandbox).
-5. Is `transfer_response`'s `requestReference` the `paymentReference` we sent? The handler assumes so and also accepts `paymentReference`.
-6. TSQ for a transfer still processing: what does `data.status` say? Duevy treats anything other than Success/Failed as processing.
-7. If opening a space account times out, a retry with the same reference is refused as a duplicate, and the account number from the first attempt is unknown. Is there a lookup by request reference?
+1. **Live base URL.**
+2. Do transfers **out of a space's own account** (`/transfers/virtual-account`) count toward the business's ₦10M a day? If they do, every swept naira is counted twice.
+3. **Who pays the live transfer fee on a withdrawal from a space account**: the space account or the collection account? Duevy debits the space's ledger the fee (₦10/₦15/₦20) and sends the net. If 9jaPay charges the collection account instead (as the sandbox suggests), each space account keeps the fee amounts, which are really Duevy's; they'd need reconciling now and then.
+4. How long before a reused one-time account number is handed to another checkout? Duevy's window copes either way; this is only to know.
+5. Must `senderAccountName` match the collection account's name exactly? Duevy sidesteps it: the name is taken from name enquiry on the collection account ("Duevy Labs Ltd-test-account" in the sandbox).
+6. Is `transfer_response`'s `requestReference` the `paymentReference` we sent? The handler assumes so and also accepts `paymentReference`.
+7. TSQ for a transfer still processing: what does `data.status` say? Duevy treats anything other than Success/Failed as processing.
+8. If opening a space account times out, a retry with the same reference is refused as a duplicate, and the account number from the first attempt is unknown. Is there a lookup by request reference?

@@ -62,7 +62,20 @@ interface Transaction {
   accountNumber?: string;
   transactionType?: string;
   amount?: number | string;
+  transactionDate?: string;
   notificationStatus?: string;
+}
+
+/**
+ * 9jaPay's transactionDate is Lagos wall-clock time with no offset
+ * ("2026-11-07T08:35:38.005074" while expiresAt is "…07:05:36Z"-style UTC).
+ * Read it as UTC+1 unless it carries its own offset.
+ */
+export function parseNineJaPayDate(raw: string | undefined): Date | null {
+  if (!raw) return null;
+  const hasOffset = /(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const ms = Date.parse(hasOffset ? raw : `${raw.replace(/(\.\d{3})\d+$/, '$1')}+01:00`);
+  return Number.isNaN(ms) ? null : new Date(ms);
 }
 interface NameEnquiry {
   accountName: string;
@@ -139,19 +152,25 @@ export class NineJaPayProvider implements PaymentProvider {
 
   /**
    * What has been paid into a one-time account, from 9jaPay's transaction
-   * list. Any credit counts as paid with that amount: the checkout service
-   * decides whether it covers the total.
+   * list. Any credit inside the window counts as paid with that amount: the
+   * checkout service decides whether it covers the total. The window matters:
+   * 9jaPay hands the same account number to a later checkout once this one
+   * closes (seen in the sandbox, 2026-11-07), so its list holds other
+   * students' payments too. The closing "VIRTUAL ACCOUNT CLOSURE TRANSFER"
+   * debit (the money moving to the collection account) is ignored.
    */
-  async getCollectionStatus(accountNumber: string): Promise<CollectionStatus> {
+  async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
     const res = await this.client.request<Transaction[]>({
       method: 'GET',
       path: '/v1/api/transactions',
       op: 'collection.transactions',
-      query: { 'page-size': '20', 'page-number': '1', 'account-number': accountNumber },
+      query: { 'page-size': '50', 'page-number': '1', 'account-number': accountNumber },
     });
-    const credits = (res.data ?? []).filter(
-      (t) => (t.transactionType ?? '').toLowerCase() === 'credit' && (t.accountNumber ?? accountNumber) === accountNumber,
-    );
+    const credits = (res.data ?? []).filter((t) => {
+      if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) return false;
+      const at = parseNineJaPayDate(t.transactionDate);
+      return at !== null && at >= window.from && at <= window.to;
+    });
     if (credits.length === 0) return { state: 'open', receivedKobo: null };
     const received = credits.reduce((sum, t) => sum + Number(t.amount ?? 0), 0);
     return { state: 'paid', receivedKobo: received };
