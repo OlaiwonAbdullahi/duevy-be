@@ -141,10 +141,118 @@ describe('one-time account numbers are reused', () => {
       { date: '2026-11-07T08:35:38.005074', amount: 507_500 }, // this one
     ]));
     const window = { from: new Date('2026-11-07T07:30:00Z'), to: new Date('2026-11-07T08:07:00Z') };
-    expect(await provider.getCollectionStatus('9000143193', window)).toEqual({ state: 'paid', receivedKobo: 507_500 });
+    expect(await provider.getCollectionStatus('9000143193', window)).toEqual({
+      state: 'paid',
+      receivedKobo: 507_500,
+      credits: [{ transactionId: 'c1', amountKobo: 507_500, at: new Date('2026-11-07T07:35:38.005Z') }],
+    });
 
     // An older checkout that once had this number sees nothing of today's money.
     const old = { from: new Date('2026-11-06T18:00:00Z'), to: new Date('2026-11-06T18:30:00Z') };
-    expect(await provider.getCollectionStatus('9000143193', old)).toEqual({ state: 'open', receivedKobo: null });
+    expect(await provider.getCollectionStatus('9000143193', old)).toMatchObject({ state: 'open', receivedKobo: null });
+  });
+
+  it('reads past page 1: a much-reused number has more rows than one page', async () => {
+    const row = (i: number, date: string, type = 'Debit') => ({ transactionId: `t${i}`, accountNumber: '9000143193', transactionType: type, amount: 100_000, transactionDate: date });
+    const page1 = Array.from({ length: 50 }, (_, i) => row(i, '2026-10-01T10:00:00'));
+    const page2 = [row(50, '2026-11-07T08:35:38', 'Credit')];
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const page = new URL(String(url)).searchParams.get('page-number');
+      return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: page === '1' ? page1 : page2 }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const window = { from: new Date('2026-11-07T07:30:00Z'), to: new Date('2026-11-07T08:07:00Z') };
+    expect(await provider.getCollectionStatus('9000143193', window)).toMatchObject({ state: 'paid', receivedKobo: 100_000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('transfer status from the create response', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const transferWith = (transfer: unknown) =>
+    vi.fn(async (url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? '{}');
+      if (String(url).endsWith('/name-enquiry')) {
+        return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { accountName: 'X', accountNumber: body.accountNumber, bankCode: '058', nameEnquiryReference: 'ne' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify(transfer), { status: 200 });
+    });
+  const send = (reference: string) =>
+    provider.initiateTransfer({ from: { accountNumber: '9000143203', accountName: 'DUEVY/Space' }, bankCode: '058', accountNumber: '0123456789', accountName: 'x', amountKobo: 50_000, reference, narration: 'w' });
+
+  it('an outer SUCCESS with data.status Processing is processing, not done', async () => {
+    vi.stubGlobal('fetch', transferWith({ status: 'SUCCESS', statusCode: '01', data: { paymentReference: 'WD1', status: 'Processing' } }));
+    expect(await send('WD-1')).toMatchObject({ state: 'processing' });
+  });
+
+  it('an outer SUCCESS with data.status Failed is failed', async () => {
+    vi.stubGlobal('fetch', transferWith({ status: 'SUCCESS', statusCode: '00', data: { paymentReference: 'WD2', status: 'Failed' } }));
+    expect(await send('WD-2')).toMatchObject({ state: 'failed' });
+  });
+
+  it('no data.status: only "00" counts as done', async () => {
+    vi.stubGlobal('fetch', transferWith({ status: 'SUCCESS', statusCode: '01', data: { paymentReference: 'WD3' } }));
+    expect(await send('WD-3')).toMatchObject({ state: 'processing' });
+    vi.stubGlobal('fetch', transferWith({ status: 'SUCCESS', statusCode: '00', data: { paymentReference: 'WD4' } }));
+    expect(await send('WD-4')).toMatchObject({ state: 'succeeded' });
+  });
+
+  it('TSQ: a reversed transfer is failed', async () => {
+    respond(200, { status: 'SUCCESS', statusCode: '00', data: { paymentReference: 'WD5', status: 'Reversed' } });
+    expect(await provider.getTransfer('WD-5')).toMatchObject({ state: 'failed' });
+  });
+});
+
+describe('withdrawals from a space account', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("sends the space account's name as the bank holds it, not the one stored with the space", async () => {
+    const names: Record<string, string> = { '9000777001': 'DUEVY/Computer Science', '0123456789': 'ADA OBI' };
+    const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? '{}');
+      if (String(url).endsWith('/name-enquiry')) {
+        return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { accountName: names[body.accountNumber], accountNumber: body.accountNumber, bankCode: body.bankCode, nameEnquiryReference: `ne_${body.accountNumber}` } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { id: 't1' } }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await provider.initiateTransfer({ from: { accountNumber: '9000777001', accountName: 'Computer Science' }, bankCode: '058', accountNumber: '0123456789', accountName: 'x', amountKobo: 50_000, reference: 'WD-NAME', narration: 'w' });
+    expect(result.state).toBe('succeeded');
+    const transfer = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/transfers/virtual-account'))!;
+    expect(JSON.parse(transfer[1]!.body as string)).toMatchObject({ senderAccountName: 'DUEVY/Computer Science', recipientAccountName: 'ADA OBI' });
+  });
+});
+
+describe('the transactions lookup', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is bounded to the window's Lagos days, a day either side", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    // 23:30 UTC is already the next day in Lagos.
+    await provider.getCollectionStatus('9000143193', { from: new Date('2026-11-06T23:30:00Z'), to: new Date('2026-11-07T00:10:00Z') });
+    const url = new URL(String((fetchMock.mock.calls[0] as unknown[])[0]));
+    expect([url.searchParams.get('start-date'), url.searchParams.get('end-date')]).toEqual(['2026-11-06', '2026-11-08']);
+  });
+});
+
+describe('space accounts', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('a reference already used (an earlier attempt timed out) moves on to the next one instead of blocking the space', async () => {
+    const sent: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? '{}');
+      if (String(url).endsWith('/permanent')) {
+        sent.push(body.requestReference);
+        if (sent.length === 1) return new Response(JSON.stringify({ status: 'FAILED', statusCode: '26', message: 'Duplicate request reference' }), { status: 400 });
+        return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { id: 'va2', accountNumber: '9000999999' } }), { status: 201 });
+      }
+      return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { accountName: 'DUEVY/Space', accountNumber: '9000999999', bankCode: '090629', nameEnquiryReference: 'ne' } }), { status: 200 });
+    }));
+    const account = await provider.createSpaceAccount({ reference: 'spc_123', accountName: 'Space' });
+    expect(sent).toEqual(['SPACEspc123', 'SPACEspc123R1']);
+    expect(account).toMatchObject({ accountNumber: '9000999999', accountName: 'DUEVY/Space' });
   });
 });

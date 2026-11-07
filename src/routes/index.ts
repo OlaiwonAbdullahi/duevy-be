@@ -14,7 +14,6 @@ import { banksRouter } from './banks';
 import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
 import { guestPayRouter } from './guestPay';
-import { partnersRouter } from './partners';
 import { publicMetricsRouter } from './publicMetrics';
 
 export const apiRouter = Router();
@@ -33,7 +32,6 @@ apiRouter.use('/notifications', notificationsRouter);
 apiRouter.use('/polls', pollsPublicRouter);
 apiRouter.use('/admin', adminRouter);
 apiRouter.use('/referrals', requireFeature('referrals'), referralsRouter);
-apiRouter.use('/partners', partnersRouter);
 apiRouter.use('/disputes', disputesRouter);
 apiRouter.use('/banks', banksRouter);
 apiRouter.use('/feedback', feedbackRouter);

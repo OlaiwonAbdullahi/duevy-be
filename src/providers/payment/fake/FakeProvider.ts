@@ -83,7 +83,13 @@ export class FakeProvider implements PaymentProvider {
 
   async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
     this.record('getCollectionStatus', { accountNumber, window });
-    return this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
+    const status = this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
+    if (!status.credits) return status;
+    // Like 9jaPay's list: only the credits inside the checkout's window.
+    const credits = status.credits.filter((c) => c.at >= window.from && c.at <= window.to);
+    return credits.length
+      ? { state: 'paid', receivedKobo: credits.reduce((s, c) => s + c.amountKobo, 0), credits }
+      : { state: 'open', receivedKobo: null, credits };
   }
 
   async createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount> {

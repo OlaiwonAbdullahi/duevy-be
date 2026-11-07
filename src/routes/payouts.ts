@@ -11,14 +11,12 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePayout, serializeBeneficiary } from '../lib/serializers';
 import { maskAccountNumber } from '../lib/encryption';
 import {
-  discountedFee,
   MAX_PAYOUT_KOBO,
   MIN_PAYOUT_KOBO,
   TRANSFER_FEE_BANDS,
   TRANSFER_FEE_TOP_KOBO,
 } from '../lib/money';
 import { canCollect, getKycState, getSpaceKycState } from '../services/kyc.service';
-import { getActiveDiscount, serializeSpacePartner } from '../services/partner.service';
 import {
   resubmitStudentIdHandlers,
   submitKycHandlers,
@@ -52,7 +50,7 @@ function spaceId(req: Request): string {
 // ---------------------------------------------------------------------------
 payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval, partner] = await Promise.all([
+  const [ledger, kyc, beneficiaryCount, pin, signatories, awaitingApproval] = await Promise.all([
     getSpaceLedgerSummary(sid),
     getSpaceKycState(sid),
     db.payoutBeneficiary.count({ where: { spaceId: sid } }),
@@ -62,9 +60,7 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     }),
     listSignatories(sid),
     db.payout.findFirst({ where: { spaceId: sid, status: 'awaiting_approval' }, select: { id: true } }),
-    getActiveDiscount(sid),
   ]);
-  const discountPercent = partner?.discountPercent ?? 0;
   const [account, funds] = await Promise.all([
     db.space.findUnique({
       where: { id: sid },
@@ -101,23 +97,21 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
     maxPayout: MAX_PAYOUT_KOBO,
-    // 9jaPay's transfer charge by withdrawal amount, already net of the
-    // space's partner discount, if any. `toKobo` is exclusive; null = no upper bound.
+    // 9jaPay's transfer charge by withdrawal amount. `toKobo` is exclusive; null = no upper bound.
     fees: {
       bands: [
         ...TRANSFER_FEE_BANDS.map((b, i) => ({
           fromKobo: i === 0 ? 0 : TRANSFER_FEE_BANDS[i - 1]!.belowKobo,
           toKobo: b.belowKobo as number | null,
-          feeKobo: discountedFee(b.feeKobo, discountPercent),
+          feeKobo: b.feeKobo,
         })),
         {
           fromKobo: TRANSFER_FEE_BANDS[TRANSFER_FEE_BANDS.length - 1]!.belowKobo,
           toKobo: null,
-          feeKobo: discountedFee(TRANSFER_FEE_TOP_KOBO, discountPercent),
+          feeKobo: TRANSFER_FEE_TOP_KOBO,
         },
       ],
     },
-    partner: partner ? serializeSpacePartner(partner) : null,
   });
 });
 

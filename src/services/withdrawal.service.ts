@@ -15,13 +15,14 @@ import {
   dailyLimitError,
   dispatchSweep,
   ensureSpaceAccount,
+  getBusinessSweepAllowanceKobo,
   getDailyAllowanceKobo,
   getUnsweptKobo,
+  lockBusinessSweeps,
   getWithdrawalAllowanceKobo,
 } from './sweep.service';
 import { decrypt, encrypt } from '../lib/encryption';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
-import { getActiveDiscount } from './partner.service';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
@@ -33,7 +34,7 @@ import { getActiveDiscount } from './partner.service';
  *
  *   gross = what the rep asks for, debited from the space's ledger
  *   fee   = 9jaPay's transfer charge (₦10 / ₦15 / ₦20 by amount), deducted
- *           from the gross, less the space's partner discount if any
+ *           from the gross
  *   net   = gross − fee, sent to the bank
  *
  * Limits, all checked up front before anything is debited: ₦1,000 to
@@ -229,16 +230,11 @@ export async function setWithdrawalPinByRep(input: {
 }
 
 export async function quoteWithdrawal(spaceId: string, amountKobo: number) {
-  const partner = await getActiveDiscount(spaceId);
-  const discountPercent = partner?.discountPercent ?? 0;
-  const b = computeWithdrawal(amountKobo, discountPercent);
+  const b = computeWithdrawal(amountKobo);
   return {
     amount: b.gross,
     fee: b.fee,
     net: b.net,
-    feeBeforeDiscount: b.feeBeforeDiscount,
-    discount: b.discount,
-    discountPercent,
     minPayout: MIN_PAYOUT_KOBO,
     maxPayout: MAX_PAYOUT_KOBO,
     belowMinimum: amountKobo < MIN_PAYOUT_KOBO,
@@ -267,8 +263,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
       `The most you can withdraw at once is ₦${(MAX_PAYOUT_KOBO / 100).toLocaleString('en-NG')}. Split it into several withdrawals.`,
     );
   }
-  const partner = await getActiveDiscount(spaceId);
-  const breakdown = computeWithdrawal(amountKobo, partner?.discountPercent ?? 0);
+  const breakdown = computeWithdrawal(amountKobo);
 
   const [space, user, rep, lead] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
@@ -334,7 +329,21 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
         const sweepNeeded = Math.max(0, amountKobo - Math.max(0, balance - unswept));
         const accountAllowance = await getDailyAllowanceKobo(spaceId, tx);
         if (amountKobo + sweepNeeded > accountAllowance) throw dailyLimitError(Math.min(withdrawable, Math.max(0, accountAllowance - sweepNeeded)));
-        if (sweepNeeded > 0) sweepId = (await createSweep(tx, spaceId, sweepNeeded, 'withdrawal')).id;
+        if (sweepNeeded > 0) {
+          await lockBusinessSweeps(tx);
+          const business = await getBusinessSweepAllowanceKobo(tx);
+          if (sweepNeeded > business) {
+            // Only what is already in the space's account can go today.
+            const inAccount = Math.min(withdrawable, Math.max(0, balance - unswept) + business);
+            throw new AppError(
+              422,
+              'DAILY_LIMIT_EXCEEDED',
+              `Part of this space's money can't be moved into its account until tomorrow. ₦${(inAccount / 100).toLocaleString('en-NG')} can be withdrawn today.`,
+              [{ field: 'amount', issue: `withdrawable today is ${inAccount} kobo` }],
+            );
+          }
+          sweepId = (await createSweep(tx, spaceId, sweepNeeded, 'withdrawal')).id;
+        }
 
         const created = await tx.payout.create({
           data: {
@@ -342,8 +351,6 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
             amount: breakdown.gross,
             feeKobo: breakdown.fee,
             netKobo: breakdown.net,
-            feeDiscountKobo: breakdown.discount,
-            partnerRedemptionId: breakdown.discount > 0 ? partner!.id : null,
             reference,
             dueId: due?.id ?? null,
             status: needsApproval ? 'awaiting_approval' : 'pending',
@@ -421,7 +428,7 @@ async function debit(tx: Tx, p: Payout): Promise<void> {
     reference: p.reference,
     description: `Withdrawal to ${p.accountMasked}`,
   });
-  // A 100% partner discount leaves no fee, and ledger entries must be positive.
+  // Ledger entries must be positive; skip a zero fee.
   if (p.feeKobo === 0) return;
   await appendLedgerEntry(tx, {
     spaceId: p.spaceId,
@@ -597,7 +604,22 @@ export async function cancelPayout(payoutId: string, reason: string): Promise<Pa
 export async function refreshPayout(payoutId: string): Promise<void> {
   const p = await db.payout.findUnique({ where: { id: payoutId } });
   if (!p || p.status !== 'processing') return;
-  const result = await getPaymentProvider().getTransfer(p.reference);
+  let result;
+  try {
+    result = await getPaymentProvider().getTransfer(p.reference);
+  } catch (err) {
+    // 9jaPay has no record of it: it never arrived, so send it again. The
+    // reference stops a double send if it turns up after all.
+    if (err instanceof ProviderError && err.code === 'NOT_FOUND') {
+      const { count } = await db.payout.updateMany({ where: { id: p.id, status: 'processing' }, data: { status: 'pending', processingAt: null } });
+      if (count === 1) {
+        logger.warn({ ref: p.reference }, 'withdrawal unknown to 9jaPay — sending it again');
+        await dispatchPayout(p.id);
+      }
+      return;
+    }
+    throw err;
+  }
   if (result.state === 'succeeded') await completePayout(p.reference);
   else if (result.state === 'failed') await failPayout(p.id, result.failureReason ?? 'The bank could not complete the transfer');
 }

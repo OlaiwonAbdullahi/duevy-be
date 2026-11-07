@@ -128,6 +128,24 @@ export async function getDailyWithdrawnKobo(spaceId: string, tx: Tx | typeof db 
   return Number(rows[0]?.used ?? 0);
 }
 
+/**
+ * Every sweep leaves from Duevy's business account, which 9jaPay lets send
+ * NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO a Lagos day across all spaces. Callers
+ * take this lock (after the space's) before reading the allowance and
+ * recording a sweep, so two spaces can't both spend the last of it.
+ */
+export async function lockBusinessSweeps(tx: Tx): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'sweeps:business'}, 0))`;
+}
+
+/** What the business account may still send in sweeps today. */
+export async function getBusinessSweepAllowanceKobo(tx: Tx | typeof db = db): Promise<number> {
+  const rows = await tx.$queryRaw<{ swept: bigint | null }[]>`
+    SELECT COALESCE(SUM("amountKobo"), 0)::bigint AS swept FROM "sweeps"
+     WHERE "status" <> 'failed' AND "createdAt" >= ${startOfLagosDay()}`;
+  return Math.max(0, env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO - Number(rows[0]?.swept ?? 0));
+}
+
 /** What the space's account has moved today, counting sweeps in and withdrawals out. */
 export async function getDailyUsageKobo(spaceId: string, tx: Tx | typeof db = db): Promise<number> {
   const rows = await tx.$queryRaw<{ swept: bigint | null }[]>`
@@ -189,8 +207,14 @@ export async function startSweep(spaceId: string, trigger: SweepTrigger, maxKobo
   if (!space.walletAccountNumber) return [];
   const sweeps = await db.$transaction(async (tx) => {
     await lockSpace(tx, spaceId);
-    const [unswept, allowance] = await Promise.all([getUnsweptKobo(spaceId, tx), getDailyAllowanceKobo(spaceId, tx)]);
-    let left = Math.min(unswept, allowance, maxKobo);
+    await lockBusinessSweeps(tx);
+    const [unswept, allowance, business] = await Promise.all([
+      getUnsweptKobo(spaceId, tx),
+      getDailyAllowanceKobo(spaceId, tx),
+      getBusinessSweepAllowanceKobo(tx),
+    ]);
+    // Past the business account's limit, the rest waits for tomorrow's run.
+    let left = Math.min(unswept, allowance, business, maxKobo);
     const created: Sweep[] = [];
     while (left > 0) {
       const amount = Math.min(left, MAX_TRANSFER_KOBO);

@@ -20,6 +20,18 @@ import { type ProviderEvent } from '../types';
 
 export const SPACE_ACCOUNT_PREFIX = 'SPACE';
 
+/**
+ * 9jaPay's transactionDate is Lagos wall-clock time with no offset
+ * ("2026-11-07T08:35:38.005074" while expiresAt is "…07:05:36Z"-style UTC).
+ * Read it as UTC+1 unless it carries its own offset.
+ */
+export function parseNineJaPayDate(raw: string | undefined | null): Date | null {
+  if (!raw) return null;
+  const hasOffset = /(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const ms = Date.parse(hasOffset ? raw : `${raw.replace(/(\.\d{3})\d+$/, '$1')}+01:00`);
+  return Number.isNaN(ms) ? null : new Date(ms);
+}
+
 export class MalformedEventError extends Error {
   constructor(
     public readonly eventId: string | null,
@@ -52,8 +64,7 @@ export function normaliseNineJaPayEvent(body: unknown): ProviderEvent {
     throw new MalformedEventError(str(env.eventId), rawType, 'event is missing an id or type');
   }
 
-  const date = str(data.transactionDate);
-  const occurredAt = date && !Number.isNaN(Date.parse(date)) ? new Date(date) : new Date();
+  const occurredAt = parseNineJaPayDate(str(data.transactionDate)) ?? new Date();
   const base = { eventId, rawType, occurredAt };
 
   switch (rawType) {
@@ -65,7 +76,7 @@ export function normaliseNineJaPayEvent(body: unknown): ProviderEvent {
         throw new MalformedEventError(eventId, rawType, 'data.accountNumber or data.accountRequestReference is missing');
       }
       if (reference.startsWith(SPACE_ACCOUNT_PREFIX)) return { ...base, kind: 'account.credited', accountNumber };
-      return { ...base, kind: 'payment.received', providerCheckoutId: reference };
+      return { ...base, kind: 'payment.received', providerCheckoutId: reference, accountNumber };
     }
     case 'transfer_response': {
       const reference = str(data.requestReference) ?? str(data.paymentReference);

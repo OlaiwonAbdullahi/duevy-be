@@ -33,7 +33,7 @@ A manual credit by an admin moves no money. It is counted as already in the spac
 | Student | Face + **1.5%** (rounded up), shown separately | 9jaPay's 0.5% (capped at ₦750) + ₦50 stamp duty from ₦10,000 on the student's transfer, **and** the same charges again when the sweep lands in the space's account, plus the sweep's transfer fee |
 | Space | **₦10 / ₦15 / ₦20** per withdrawal (under ₦5,000 / under ₦100,000 / from ₦100,000), deducted from it | 9jaPay's transfer charge |
 
-Duevy pays for sweeps out of the 1.5%. `Sweep.feeKobo` is for Duevy's own reporting and is not on any space's ledger. Partner discounts still apply to the withdrawal fee; Duevy covers what they take off.
+Duevy pays for sweeps out of the 1.5%. `Sweep.feeKobo` is for Duevy's own reporting and is not on any space's ledger.
 
 ## Limits
 
@@ -56,7 +56,8 @@ A failed, reversed or cancelled withdrawal gives its share of the day back.
 - **No timestamp, so no replay protection.** Every event is deduplicated by id (`eventId`, or `new_transaction:<data.id>`), and **no handler acts on the body**: each asks 9jaPay (transactions list, TSQ) and applies that.
 - 9jaPay resends up to 10 times until it gets a 200.
 - `new_transaction` doesn't say which kind of account was credited. Space accounts are created with a request reference starting `SPACE`, and that prefix is how they're told apart.
-- `transfer_response` is only sent for transfers that started `PROCESSING`. Ones that answered `SUCCESS` or `FAILED` up front are settled from that answer.
+- `transfer_response` is only sent for transfers that started `PROCESSING`. Ones that answered `SUCCESS` or `FAILED` up front are settled from that answer: `data.status` decides it (the envelope's status is the request's), and without it only `statusCode` `00` counts as done.
+- A transfer TSQ says it has never heard of (`25`) is sent again under the same reference, for withdrawals as for sweeps. TSQ `Reversed` counts as failed.
 
 ## References
 
@@ -111,7 +112,7 @@ Tested against `https://developer.test.9japay.com` with Duevy's test keys:
 | Pay a one-time account the wrong amount | Refused at the bank: `09` "Amount is different from configured amount". So an underpayment can't reach us. |
 | Pay it the exact amount | Credited. 9jaPay closes the account at once and moves the money to the collection account ("VIRTUAL ACCOUNT CLOSURE TRANSFER" debit). The collection account went up by the **full** amount: no fee taken from it. |
 | Pay it again | Refused (`06`): single payment only. |
-| **Reused account numbers** | The new checkout got **the same account number and id** as the previous day's. Its transaction list therefore holds earlier checkouts' payments too. Duevy only counts credits between the checkout's creation and its expiry (`getCollectionStatus` window). |
+| **Reused account numbers** | The new checkout got **the same account number and id** as the previous day's. Its transaction list therefore holds earlier checkouts' payments too. Duevy only counts credits between the checkout's creation and its 9jaPay expiry (no slack after it), reads every page of the list, and records the paying credit's `transactionId` on the checkout (`providerTransactionId`, unique) so one credit can never pay two checkouts. A `new_transaction` is also checked against every pending checkout now holding that number, in case it still carries the earlier checkout's reference. |
 | Transaction dates | `transactionDate` is Lagos time with **no offset** (`2026-11-07T08:35:38`), unlike `expiresAt` (UTC, `Z`). Read as UTC+1. |
 | Sweep ₦1,000, collection → space account | `00` SUCCESS at once (no webhook needed); TSQ `Success`. The space account received the full ₦1,000: **a sweep is not charged as an incoming payment**. The collection account was debited ₦1,002: a ₦2 sandbox transfer fee, charged to the sender. |
 | Withdrawal ₦500, space account → bank | `00` SUCCESS at once; TSQ `Success`. The space account went down by exactly ₦500. No fee showed on either account in the sandbox. |
@@ -121,17 +122,21 @@ The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be vali
 
 ## Limits (from the dashboard)
 
-- **₦1,000,000 per transfer** and **₦10,000,000 of transfers a day for the whole business**, for now.
-- Per transfer: handled. Withdrawals are capped at ₦500,000 and sweeps are split into ₦1M transfers.
-- Per day, business-wide: **not enforced by Duevy**. Two spaces can each withdraw ₦5M, and sweeps count too if 9jaPay counts them. A transfer past 9jaPay's cap is refused by 9jaPay: a withdrawal fails and is restored, a sweep fails and stays unswept for the next run. Revisit once 9jaPay answers question 3 below.
+- **₦1,000,000 per transfer.** Withdrawals are capped at ₦500,000 and sweeps are split into ₦1M transfers.
+- **₦10,000,000 of transfers a day per sending account** (to be raised soon):
+  - **The business account** sends every sweep, so all spaces' sweeps in a Lagos day share its ₦10M (`NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO`; raise it there when 9jaPay does). The daily run stops at the limit and the rest is swept the next day. A withdrawal that would need a sweep past it is refused up front (`422 DAILY_LIMIT_EXCEEDED`), telling the rep what can still go today.
+  - **Each space account** has its own ₦10M for withdrawals; they don't count against the business account. Duevy's own ₦5M per space per day sits inside it.
+
+## Answered by 9jaPay and the API docs (2026-11-07)
+
+- **Transfer fees** are charged to the sender **on top of** the amount; the recipient gets the full amount. A withdrawal debits the space's ledger the gross, sends the net (gross − ₦10/₦15/₦20), and 9jaPay takes net + its fee from the space account, which comes to the gross. A sweep's fee comes out of the business account, covered by the 1.5%.
+- **One-time account lifetime** is ours to set: `timeToLive` is in seconds (Duevy sends the checkout's expiry), and `IsSinglePayment` closes it on the first payment. A number is only handed to another checkout after it closes, so payments are matched by window and claimed by `transactionId`.
+- **Sender name:** name enquiry is the source for every sending account, the business account and each space account ("DUEVY/<space>"), cached per process.
+- **`transfer_response`:** `data.requestReference` is "the unique identifier of the transfer request generated by the client": the `paymentReference` Duevy sent. Its `data.status` is the final status.
+- **Statuses:** request status `SUCCESS` / `PROCESSING` / `FAILED` (outer `status`), transaction status `Success` / `Processing` / `Failed` (`data.status`, TSQ only). A create-transfer response carries only `data.id`, so its outer status / `statusCode` (`00` done, `01` processing) is the answer there; TSQ's outer status is only the query's.
+- **Transactions list** takes `start-date` / `end-date` (days). Duevy bounds each lookup to the checkout's Lagos days, a day either side, then applies the exact window.
 
 ## Open questions for 9jaPay
 
-1. **Live base URL.**
-2. Do transfers **out of a space's own account** (`/transfers/virtual-account`) count toward the business's ₦10M a day? If they do, every swept naira is counted twice.
-3. **Who pays the live transfer fee on a withdrawal from a space account**: the space account or the collection account? Duevy debits the space's ledger the fee (₦10/₦15/₦20) and sends the net. If 9jaPay charges the collection account instead (as the sandbox suggests), each space account keeps the fee amounts, which are really Duevy's; they'd need reconciling now and then.
-4. How long before a reused one-time account number is handed to another checkout? Duevy's window copes either way; this is only to know.
-5. Must `senderAccountName` match the collection account's name exactly? Duevy sidesteps it: the name is taken from name enquiry on the collection account ("Duevy Labs Ltd-test-account" in the sandbox).
-6. Is `transfer_response`'s `requestReference` the `paymentReference` we sent? The handler assumes so and also accepts `paymentReference`.
-7. TSQ for a transfer still processing: what does `data.status` say? Duevy treats anything other than Success/Failed as processing.
-8. If opening a space account times out, a retry with the same reference is refused as a duplicate, and the account number from the first attempt is unknown. Is there a lookup by request reference?
+1. **Live base URL** (later).
+2. If opening a space account times out, a retry with the same reference is refused as a duplicate, and the account number from the first attempt is unknown. Left as is: Duevy opens it under the next reference (`SPACE<id>R1`, …, up to 5) and logs the possibly orphaned account. (`GET /v1/api/virtual-accounts` lists accounts with their `requestReference`, if a cleanup is ever needed.)

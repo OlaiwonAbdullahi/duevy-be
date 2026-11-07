@@ -40,6 +40,11 @@ const envSchema = z.object({
   NINEJAPAY_BANK_CODE: z.string().default('090629'),
   // A space's unswept collections below this wait for the next day's sweep.
   SWEEP_MIN_KOBO: z.coerce.number().int().positive().default(100_000),
+  // 9jaPay's daily transfer limit on the business account (₦10M for now; it
+  // will be raised). Every sweep leaves from it, so all spaces' sweeps in a
+  // Lagos day share it. Withdrawals leave from each space's own account and
+  // don't count here.
+  NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO: z.coerce.number().int().positive().default(1_000_000_000),
 
   // Didit (docs.didit.me) — rep NIN + date of birth checks against NIMC.
   // Required with the live rail. Under PAYMENT_PROVIDER=fake, leaving the key

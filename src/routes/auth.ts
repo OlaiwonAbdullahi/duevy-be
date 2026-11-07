@@ -18,7 +18,6 @@ import { verifyGoogleIdToken } from "../lib/googleAuth";
 import { verifyRefreshToken } from "../lib/jwt";
 import { parseExpiryMs } from "../lib/jwt";
 import { authLimiter } from "../middleware/rateLimiter";
-import { findRedeemablePartner } from "../services/partner.service";
 
 export const authRouter = Router();
 
@@ -80,15 +79,6 @@ const spaceDraftSchema = z.object({
   faculty: z.string().trim().max(120).optional(),
 });
 
-// A rep's partner code (SUG, NACOS, …) is checked at signup so a typo is caught
-// on the form, and redeemed for their space when an admin approves them.
-// Throws a 422 for a bad code; ignored for students.
-async function checkPartnerCode(data: { role: "student" | "rep"; partnerCode?: string }): Promise<string | undefined> {
-  if (data.role !== "rep" || !data.partnerCode) return undefined;
-  const partner = await findRedeemablePartner(data.partnerCode);
-  return partner.code;
-}
-
 // ---------------------------------------------------------------------------
 // POST /auth/register
 // ---------------------------------------------------------------------------
@@ -104,7 +94,6 @@ const registerSchema = z
     acceptedTerms: z.literal(true),
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().max(32).optional(),
-    partnerCode: z.string().trim().max(20).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -139,7 +128,6 @@ authRouter.post(
       return;
     }
 
-    const partnerCode = await checkPartnerCode(data);
     const passwordHash = await bcrypt.hash(data.password, env.BCRYPT_ROUNDS);
 
     // Begin transaction to create user and potentially rep application
@@ -169,7 +157,6 @@ authRouter.post(
             faculty: data.space.faculty,
             theme: "emerald", // not chosen at registration; the rep can change it later
             referralCode: data.referralCode,
-            partnerCode,
           },
         });
       }
@@ -221,7 +208,6 @@ const googleSchema = z
     matricNo: z.string().trim().min(1).max(32).optional(),
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().max(32).optional(),
-    partnerCode: z.string().trim().max(20).optional(),
     space: spaceDraftSchema.optional(),
   })
   .refine(
@@ -275,7 +261,6 @@ authRouter.post(
         return;
       }
 
-      const partnerCode = await checkPartnerCode(data);
       const created = await db.$transaction(async (tx) => {
         const newUser = await tx.user.create({
           data: {
@@ -300,7 +285,6 @@ authRouter.post(
               faculty: data.space.faculty,
               theme: "emerald", // not chosen at registration; the rep can change it later
               referralCode: data.referralCode,
-              partnerCode,
             },
           });
         }

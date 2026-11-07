@@ -201,5 +201,5 @@ prisma/
 
 ## Notes
 
-- **Out of MVP scope:** polls, the assistant, referrals and co-rep features exist behind feature flags, but their payment paths are disabled. This includes paid voting and discount codes at checkout. The payout approval quorum is gone.
+- **Out of MVP scope:** polls, referrals and co-rep features exist behind feature flags, but their payment paths are disabled. This includes paid voting and discount codes at checkout. The payout approval quorum is gone.
 - **Earlier rails' columns** (`anchor*`, `kycTier`, `bachs*`, `payoutDestination*`, the remittance and fee-settlement fields) are kept read-only. Rows from before each cutover keep `provider = 'anchor'` or `'bachs'`, and reconciliation only touches the current provider's. See [`docs/NINEJAPAY.md`](docs/NINEJAPAY.md) for the Bachs → 9jaPay cutover.

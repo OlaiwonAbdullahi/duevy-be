@@ -772,45 +772,48 @@ model DuePayment {
 // one-time bank account opened for this checkout. Fees are computed server
 // side when it is created and never change afterwards.
 model Checkout {
-  id                   String         @id @default(cuid())
-  reference            String         @unique // our reference; also the provider's
-  userId               String
-  spaceId              String
-  status               CheckoutStatus @default(pending)
-  faceKobo             Int // sum of the dues' face amounts — what the space receives
-  feeKobo              Int // the 1.5% processing fee, on top
-  totalKobo            Int // faceKobo + feeKobo — what the student must transfer
-  receivedKobo         Int? // what the provider reported as received
-  overpaidKobo         Int            @default(0)
+  id                    String         @id @default(cuid())
+  reference             String         @unique // our reference; also the provider's
+  userId                String
+  spaceId               String
+  status                CheckoutStatus @default(pending)
+  faceKobo              Int // sum of the dues' face amounts — what the space receives
+  feeKobo               Int // the 1.5% processing fee, on top
+  totalKobo             Int // faceKobo + feeKobo — what the student must transfer
+  receivedKobo          Int? // what the provider reported as received
+  overpaidKobo          Int            @default(0)
   // The sorted due ids, so a repeat request for the same basket returns the
   // still-open checkout instead of opening a second account.
-  dueSetKey            String
-  provider             String         @default("ninejapay")
-  providerCheckoutId   String?        @unique
-  providerChargeId     String? // legacy (Bachs)
-  destinationAccountId String? // legacy (Bachs): the rep's Connect account
+  dueSetKey             String
+  provider              String         @default("ninejapay")
+  providerCheckoutId    String?        @unique
+  providerChargeId      String? // legacy (Bachs)
+  // The 9jaPay credit that paid it. Unique: account numbers are reused, so one
+  // credit can fall inside two checkouts' windows and must pay only one.
+  providerTransactionId String?        @unique
+  destinationAccountId  String? // legacy (Bachs): the rep's Connect account
   // The one-time bank account the student transfers into.
-  vaAccountNumber      String?
-  vaBankName           String?
-  vaAccountName        String?
+  vaAccountNumber       String?
+  vaBankName            String?
+  vaAccountName         String?
   // Legacy (Bachs): a hosted checkout's page.
-  checkoutUrl          String?
+  checkoutUrl           String?
   // A guest's answers to the due's guestFields, labels copied in (lib/guestForm.ts).
-  guestAnswers         Json?
+  guestAnswers          Json?
   // A guest ticked "create a free Duevy account for me". The account is only
   // claimed after payment: an activation link goes out once it's paid.
-  accountRequestedAt   DateTime?
-  accountInviteSentAt  DateTime?
-  expiresAt            DateTime
-  paidAt               DateTime?
-  expiredAt            DateTime?
-  underpaidAt          DateTime?
+  accountRequestedAt    DateTime?
+  accountInviteSentAt   DateTime?
+  expiresAt             DateTime
+  paidAt                DateTime?
+  expiredAt             DateTime?
+  underpaidAt           DateTime?
   // Set on anything a human has to look at: underpaid, overpaid, late money,
   // or a paid checkout whose dues had already been settled elsewhere.
-  needsReview          Boolean        @default(false)
-  reviewReason         String?
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
+  needsReview           Boolean        @default(false)
+  reviewReason          String?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
 
   user        User           @relation(fields: [userId], references: [id])
   space       Space          @relation(fields: [spaceId], references: [id])

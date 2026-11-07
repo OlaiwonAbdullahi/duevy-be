@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { db } from '../config/db';
 import { logger, scrub } from '../lib/logger';
 import { type ProviderEvent } from '../providers/payment';
-import { findCheckoutId } from './checkout.service';
+import { CheckoutNotFoundError, findCheckoutId } from './checkout.service';
 import { refreshPayout } from './withdrawal.service';
 import { refreshSweep, refreshSweepsForAccount } from './sweep.service';
 import { confirmReceivedPayment } from '../jobs/reconciliation';
@@ -69,10 +69,26 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
   switch (event.kind) {
     case 'payment.received': {
       // Ask the provider what actually arrived; only its answer moves the checkout.
-      const id = await findCheckoutId(null, event.providerCheckoutId);
-      const c = await db.checkout.findUniqueOrThrow({ where: { id } });
-      await confirmReceivedPayment(c, `webhook ${event.eventId}`);
-      logger.info({ ...log, ref: c.reference }, 'payment checked with the provider');
+      // A reused account number may still carry the reference of the checkout
+      // it was first opened for, so the open checkouts now holding that number
+      // are checked too. Each one only takes a credit inside its own window
+      // that no other checkout has claimed.
+      const byRef = await findCheckoutId(null, event.providerCheckoutId).catch((err) => {
+        if (err instanceof CheckoutNotFoundError && event.accountNumber) return null;
+        throw err;
+      });
+      const holding = event.accountNumber
+        ? await db.checkout.findMany({
+            where: { vaAccountNumber: event.accountNumber, status: 'pending', id: byRef ? { not: byRef } : undefined },
+            orderBy: { createdAt: 'asc' },
+          })
+        : [];
+      const checkouts = [...(byRef ? [await db.checkout.findUniqueOrThrow({ where: { id: byRef } })] : []), ...holding];
+      if (checkouts.length === 0) throw new CheckoutNotFoundError(event.providerCheckoutId);
+      for (const c of checkouts) {
+        await confirmReceivedPayment(c, `webhook ${event.eventId}`);
+        logger.info({ ...log, ref: c.reference }, 'payment checked with the provider');
+      }
       return;
     }
     case 'account.credited':

@@ -1,7 +1,7 @@
 import { type Checkout } from '@prisma/client';
 import { db } from '../config/db';
 import { logger } from '../lib/logger';
-import { getPaymentProvider } from '../providers/payment';
+import { getPaymentProvider, type CollectionStatus } from '../providers/payment';
 import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
 import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
 import { reconcileSweeps, runDailySweeps } from '../services/sweep.service';
@@ -27,13 +27,36 @@ const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
 
 /**
  * When a payment into a checkout's one-time account can have landed: from
- * when the checkout was created to shortly after it expired (9jaPay refuses
- * money after expiry; the slack covers clock skew). Anything outside belongs
- * to another checkout that was given the same reused account number.
+ * when the checkout was created (less some slack, since that's our clock) to
+ * when it expired. No slack after expiry: expiresAt is 9jaPay's own, it
+ * refuses money after it, and the number can be handed to the next checkout
+ * straight away, whose payment must not count for this one.
  */
 const PAYMENT_WINDOW_SLACK_MS = 2 * 60 * 1000;
 function paymentWindow(c: Pick<Checkout, 'createdAt' | 'expiresAt'>) {
-  return { from: new Date(c.createdAt.getTime() - PAYMENT_WINDOW_SLACK_MS), to: new Date(c.expiresAt.getTime() + PAYMENT_WINDOW_SLACK_MS) };
+  return { from: new Date(c.createdAt.getTime() - PAYMENT_WINDOW_SLACK_MS), to: c.expiresAt };
+}
+
+type ReconcilableCheckout = Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'createdAt' | 'expiresAt'>;
+
+/**
+ * What the provider says arrived for this checkout, minus any credit another
+ * checkout has already claimed (reused account numbers). With individual
+ * credits, the earliest unclaimed one is this checkout's payment.
+ */
+async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string }): Promise<CollectionStatus & { transactionId: string | null }> {
+  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
+  if (!status.credits) return { ...status, transactionId: null };
+  const ids = status.credits.map((cr) => cr.transactionId);
+  const claimed = new Set(
+    ids.length
+      ? (await db.checkout.findMany({ where: { providerTransactionId: { in: ids }, id: { not: c.id } }, select: { providerTransactionId: true } }))
+          .map((r) => r.providerTransactionId)
+      : [],
+  );
+  const credit = status.credits.find((cr) => !claimed.has(cr.transactionId));
+  if (!credit) return { state: 'open', receivedKobo: null, transactionId: null };
+  return { state: 'paid', receivedKobo: credit.amountKobo, transactionId: credit.transactionId };
 }
 
 export async function reconcileCheckouts(): Promise<void> {
@@ -61,7 +84,7 @@ export async function reconcileCheckouts(): Promise<void> {
  * webhook. Only the provider's answer moves the checkout, never the caller.
  */
 export async function reconcileCheckout(
-  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'createdAt' | 'expiresAt'>,
+  c: ReconcilableCheckout,
   opts: { expireIfPastDue: boolean; source: string },
 ): Promise<void> {
   if (c.status !== 'pending') return;
@@ -71,7 +94,7 @@ export async function reconcileCheckout(
     if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
     return;
   }
-  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
+  const status = await collectionFor({ ...c, vaAccountNumber: c.vaAccountNumber });
   if (status.state === 'paid') {
     // Never assume our own expected total arrived: an unknown amount could hide
     // an underpayment. Leave it for the webhook or the next sweep.
@@ -79,7 +102,7 @@ export async function reconcileCheckout(
       logger.warn({ ref: c.reference, source: opts.source }, 'provider reports paid without a received amount; not fulfilling');
       return;
     }
-    await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source);
+    await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source, null, status.transactionId);
   }
   else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
   else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
@@ -92,17 +115,14 @@ export async function reconcileCheckout(
  * lands after the checkout expired or was underpaid (fulfilCheckout flags it);
  * a paid checkout is a no-op there.
  */
-export async function confirmReceivedPayment(
-  c: Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAccountNumber' | 'totalKobo' | 'createdAt' | 'expiresAt'>,
-  source: string,
-): Promise<void> {
+export async function confirmReceivedPayment(c: ReconcilableCheckout, source: string): Promise<void> {
   if (c.status === 'paid' || !c.vaAccountNumber) return;
-  const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
+  const status = await collectionFor({ ...c, vaAccountNumber: c.vaAccountNumber });
   if (status.state !== 'paid' || status.receivedKobo === null) {
     logger.warn({ ref: c.reference, source, state: status.state }, 'payment event without a matching credit at the provider; nothing applied');
     return;
   }
-  await fulfilCheckout(c.id, status.receivedKobo, 0, source);
+  await fulfilCheckout(c.id, status.receivedKobo, 0, source, null, status.transactionId);
 }
 
 export async function reconcilePayouts(): Promise<void> {

@@ -43,7 +43,8 @@ export const CHECKOUT_TRANSITIONS: Graph<CheckoutStatus> = {
 export const PAYOUT_TRANSITIONS: Graph<PayoutStatus> = {
   awaiting_approval: ['pending', 'cancelled'],
   pending: ['processing', 'failed'],
-  processing: ['success', 'failed', 'reversed'],
+  // → pending: 9jaPay has no record of it (TSQ "25"), so it is sent again.
+  processing: ['success', 'failed', 'reversed', 'pending'],
   success: ['reversed'],
   failed: [],
   reversed: [],

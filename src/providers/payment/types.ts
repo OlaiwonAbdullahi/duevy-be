@@ -35,9 +35,22 @@ export interface CollectionAccount {
 
 export type CollectionState = 'open' | 'paid' | 'expired' | 'failed' | 'underpaid';
 
+export interface CollectionCredit {
+  /** The provider's id for this credit: one payment, claimable by one checkout only. */
+  transactionId: string;
+  amountKobo: number;
+  at: Date;
+}
+
 export interface CollectionStatus {
   state: CollectionState;
   receivedKobo: number | null;
+  /**
+   * The individual credits inside the window, oldest first, when the provider
+   * reports them. Account numbers are reused, so a credit may already belong
+   * to another checkout; the caller skips those.
+   */
+  credits?: CollectionCredit[];
 }
 
 export interface CreateSpaceAccountInput {
@@ -108,6 +121,8 @@ export type ProviderEvent =
       /** Money arrived in a checkout's one-time account. */
       kind: 'payment.received';
       providerCheckoutId: string;
+      /** The account that was credited, when the provider says (it may have been reused). */
+      accountNumber?: string;
     })
   | (EventBase & {
       /** Money arrived in a space's own account — a sweep landing. */

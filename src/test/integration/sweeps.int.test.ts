@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { db } from '../../config/db';
+import { env } from '../../config/env';
 import { type FakeProvider } from '../../providers/payment';
 import { createCheckout, findCheckoutId, fulfilCheckout } from '../../services/checkout.service';
 import { getSpaceBalance } from '../../services/ledger.service';
@@ -8,6 +9,7 @@ import { MAX_PAYOUT_KOBO, MAX_TRANSFER_KOBO, MIN_PAYOUT_KOBO } from '../../lib/m
 import {
   DAILY_LIMIT_KOBO,
   ensureSpaceAccount,
+  getBusinessSweepAllowanceKobo,
   getDailyAllowanceKobo,
   getWithdrawalAllowanceKobo,
   getUnsweptKobo,
@@ -226,5 +228,49 @@ describe('space accounts', () => {
     expect(opened.walletAccountNumber).toMatch(/^91\d{8}$/);
     expect((await ensureSpaceAccount(s.space.id)).walletAccountNumber).toBe(opened.walletAccountNumber);
     expect(fake.calls.filter((c) => c.op === 'createSpaceAccount' && (c.args as { reference: string }).reference === s.space.id)).toHaveLength(1);
+  });
+});
+
+describe("the business account's daily limit (shared by every space's sweeps)", () => {
+  /** Leave exactly `leftKobo` of today's business allowance, whatever earlier tests swept. */
+  function capBusinessAt(leftKobo: number) {
+    const original = env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO;
+    return getBusinessSweepAllowanceKobo().then((allowance) => {
+      env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO = original - allowance + leftKobo;
+      return () => {
+        env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO = original;
+      };
+    });
+  }
+
+  it('sweeps only what is left of it today; the rest waits', async () => {
+    const s = await makeSpace({ members: 2, dues: [500_000, 300_000] });
+    await collect(s, 0, 0);
+    await collect(s, 1, 1);
+    const restore = await capBusinessAt(300_000);
+    try {
+      await runDailySweeps(afterSweepHour());
+      const sweeps = await db.sweep.findMany({ where: { spaceId: s.space.id } });
+      expect(sweeps.map((w) => w.amountKobo)).toEqual([300_000]);
+      expect(await getUnsweptKobo(s.space.id)).toBe(500_000);
+      expect(await getBusinessSweepAllowanceKobo()).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('refuses a withdrawal that needs a sweep the business account can no longer send today', async () => {
+    const s = await makeSpace({ dues: [1_000_000] });
+    await collect(s); // ₦10,000, all unswept
+    const restore = await capBusinessAt(200_000);
+    try {
+      await expect(
+        requestWithdrawal({ spaceId: s.space.id, userId: s.rep.id, beneficiaryId: s.beneficiary!.id, amountKobo: 500_000, pin: TEST_PIN }),
+      ).rejects.toMatchObject({ code: 'DAILY_LIMIT_EXCEEDED' });
+      expect(await getSpaceBalance(s.space.id)).toBe(1_000_000);
+      expect(await db.sweep.count({ where: { spaceId: s.space.id } })).toBe(0);
+    } finally {
+      restore();
+    }
   });
 });

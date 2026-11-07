@@ -395,6 +395,11 @@ export async function fulfilCheckout(
   source = 'webhook',
   /** The provider charge the money arrived on, when the event names one. */
   providerChargeId: string | null = null,
+  /**
+   * The provider credit that paid it (9jaPay transactionId). Unique across
+   * checkouts: a second checkout claiming the same credit fails to commit.
+   */
+  providerTransactionId: string | null = null,
 ): Promise<FulfilOutcome> {
   const result = await db.$transaction(
     async (tx) => {
@@ -487,6 +492,7 @@ export async function fulfilCheckout(
           paidAt: new Date(),
           receivedKobo,
           overpaidKobo: excess,
+          ...(providerTransactionId ? { providerTransactionId } : {}),
           needsReview: flags.length > 0 || checkout.needsReview,
           reviewReason: flags.length ? flags.join('; ') : checkout.reviewReason,
         },

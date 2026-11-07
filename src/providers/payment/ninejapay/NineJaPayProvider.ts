@@ -1,8 +1,10 @@
+import { logger } from '../../../lib/logger';
 import {
   InvalidSignatureError,
   ProviderError,
   type Bank,
   type CollectionAccount,
+  type CollectionCredit,
   type CollectionStatus,
   type CreateCollectionInput,
   type CreateSpaceAccountInput,
@@ -15,7 +17,7 @@ import {
   type TransferState,
 } from '../types';
 import { NineJaPayClient } from './client';
-import { normaliseNineJaPayEvent, SPACE_ACCOUNT_PREFIX } from './events';
+import { normaliseNineJaPayEvent, parseNineJaPayDate, SPACE_ACCOUNT_PREFIX } from './events';
 import { verifyNineJaPaySignature } from './signature';
 
 /**
@@ -35,6 +37,11 @@ import { verifyNineJaPaySignature } from './signature';
  */
 
 const BANK_NAME = '9jaPay';
+const TRANSACTION_PAGE_SIZE = 50;
+/** 1,000 rows: far beyond any one account's history; hitting it means something is wrong. */
+const TRANSACTION_PAGE_LIMIT = 20;
+/** Fresh references tried when opening a space account keeps hitting a duplicate. */
+const SPACE_ACCOUNT_ATTEMPTS = 5;
 
 export interface NineJaPayConfig {
   baseUrl: string;
@@ -66,16 +73,11 @@ interface Transaction {
   notificationStatus?: string;
 }
 
-/**
- * 9jaPay's transactionDate is Lagos wall-clock time with no offset
- * ("2026-11-07T08:35:38.005074" while expiresAt is "…07:05:36Z"-style UTC).
- * Read it as UTC+1 unless it carries its own offset.
- */
-export function parseNineJaPayDate(raw: string | undefined): Date | null {
-  if (!raw) return null;
-  const hasOffset = /(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
-  const ms = Date.parse(hasOffset ? raw : `${raw.replace(/(\.\d{3})\d+$/, '$1')}+01:00`);
-  return Number.isNaN(ms) ? null : new Date(ms);
+export { parseNineJaPayDate };
+
+/** YYYY-MM-DD of an instant in Lagos (UTC+1), shifted by whole days. */
+function lagosDate(at: Date, shiftDays = 0): string {
+  return new Date(at.getTime() + 60 * 60 * 1000 + shiftDays * 86_400_000).toISOString().slice(0, 10);
 }
 interface NameEnquiry {
   accountName: string;
@@ -89,23 +91,36 @@ interface Transfer {
   status?: string;
 }
 
-function mapTransferStatus(raw: string | undefined, statusCode?: string): TransferState {
+function mapTransferStatus(raw: string | undefined): TransferState {
   switch ((raw ?? '').toLowerCase()) {
     case 'success':
     case 'successful':
       return 'succeeded';
     case 'failed':
+    case 'reversed':
       return 'failed';
     default:
-      return statusCode === '00' ? 'succeeded' : 'processing';
+      return 'processing';
   }
+}
+
+/**
+ * A transfer's state from the create response. The envelope's status is the
+ * request's, not the transfer's (TSQ answers outer SUCCESS for a Failed
+ * transfer), so data.status wins. Without it, "01" means processing and only
+ * an explicit "00" counts as done.
+ */
+function createdTransferState(res: { status?: string; statusCode?: string; data?: Transfer }): TransferState {
+  if (res.data?.status) return mapTransferStatus(res.data.status);
+  if (res.statusCode === '00') return 'succeeded';
+  return 'processing';
 }
 
 export class NineJaPayProvider implements PaymentProvider {
   readonly name = 'ninejapay';
   private readonly client: NineJaPayClient;
-  /** The business account's name as the bank holds it, looked up once. */
-  private businessAccountName: Promise<string> | null = null;
+  /** Sending accounts' names as the bank holds them, looked up once per process. */
+  private readonly senderNames = new Map<string, Promise<string>>();
 
   constructor(
     private readonly config: NineJaPayConfig,
@@ -160,31 +175,68 @@ export class NineJaPayProvider implements PaymentProvider {
    * debit (the money moving to the collection account) is ignored.
    */
   async getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus> {
-    const res = await this.client.request<Transaction[]>({
-      method: 'GET',
-      path: '/v1/api/transactions',
-      op: 'collection.transactions',
-      query: { 'page-size': '50', 'page-number': '1', 'account-number': accountNumber },
-    });
-    const credits = (res.data ?? []).filter((t) => {
-      if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) return false;
+    // A reused number accumulates two rows per checkout (credit + closure
+    // debit), so the window's credit can be past page 1. Read every page.
+    const rows: Transaction[] = [];
+    for (let page = 1; page <= TRANSACTION_PAGE_LIMIT; page++) {
+      const res = await this.client.request<Transaction[]>({
+        method: 'GET',
+        path: '/v1/api/transactions',
+        op: 'collection.transactions',
+        query: {
+          'page-size': String(TRANSACTION_PAGE_SIZE),
+          'page-number': String(page),
+          'account-number': accountNumber,
+          // Day filters (inclusive, timezone unstated), so a day's margin each side;
+          // the exact window is applied below.
+          'start-date': lagosDate(window.from, -1),
+          'end-date': lagosDate(window.to, 1),
+        },
+      });
+      const batch = res.data ?? [];
+      rows.push(...batch);
+      if (batch.length < TRANSACTION_PAGE_SIZE) break;
+      if (page === TRANSACTION_PAGE_LIMIT) throw new ProviderError(`9jaPay transactions for ${accountNumber} run past ${page} pages`, null, null, true);
+    }
+
+    const credits: CollectionCredit[] = [];
+    for (const t of rows) {
+      if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) continue;
       const at = parseNineJaPayDate(t.transactionDate);
-      return at !== null && at >= window.from && at <= window.to;
-    });
-    if (credits.length === 0) return { state: 'open', receivedKobo: null };
-    const received = credits.reduce((sum, t) => sum + Number(t.amount ?? 0), 0);
-    return { state: 'paid', receivedKobo: received };
+      if (at === null || at < window.from || at > window.to || !t.transactionId) continue;
+      credits.push({ transactionId: String(t.transactionId), amountKobo: Number(t.amount ?? 0), at });
+    }
+    credits.sort((a, b) => a.at.getTime() - b.at.getTime());
+    if (credits.length === 0) return { state: 'open', receivedKobo: null, credits };
+    return { state: 'paid', receivedKobo: credits.reduce((sum, c) => sum + c.amountKobo, 0), credits };
   }
 
+  /**
+   * A timed-out attempt may have opened the account, and 9jaPay then refuses
+   * the same reference as a duplicate without saying which number it gave
+   * (no lookup by reference). Rather than block the space for good, open it
+   * under the next reference (SPACE<id>, SPACE<id>R1, …); the account the lost
+   * attempt opened, if any, is unused and logged for cleanup.
+   */
   async createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount> {
-    const reference = `${SPACE_ACCOUNT_PREFIX}${this.wireReference(input.reference)}`;
-    const res = await this.client.request<CreatedAccount>({
-      method: 'POST',
-      path: '/v1/api/virtual-accounts/permanent',
-      op: 'space_account.create',
-      ref: input.reference,
-      body: { requestReference: reference, accountName: input.accountName, autoPayoutEnabled: false },
-    });
+    const base = `${SPACE_ACCOUNT_PREFIX}${this.wireReference(input.reference)}`;
+    let res: { data?: CreatedAccount } | null = null;
+    for (let attempt = 0; attempt < SPACE_ACCOUNT_ATTEMPTS && !res; attempt++) {
+      const reference = attempt === 0 ? base : `${base}R${attempt}`;
+      try {
+        res = await this.client.request<CreatedAccount>({
+          method: 'POST',
+          path: '/v1/api/virtual-accounts/permanent',
+          op: 'space_account.create',
+          ref: input.reference,
+          body: { requestReference: reference, accountName: input.accountName, autoPayoutEnabled: false },
+        });
+      } catch (err) {
+        if (!(err instanceof ProviderError && err.code === 'DUPLICATE')) throw err;
+        logger.warn({ spaceRef: input.reference, requestReference: reference }, 'space account reference already used (an earlier attempt may have opened an unused account); trying the next');
+      }
+    }
+    if (!res) throw new ProviderError(`Every space account reference for ${input.reference} is already used`, null, 'DUPLICATE', false);
     const created = res.data;
     if (!created?.accountNumber) throw new ProviderError('9jaPay returned no account number', null, null, false);
     // 9jaPay prefixes the business name ("DUEVY/<name>"); keep the name the
@@ -247,9 +299,8 @@ export class NineJaPayProvider implements PaymentProvider {
     if (!enquiry) throw new ProviderError('The recipient account could not be verified', 422, 'ACCOUNT_UNVERIFIABLE', false);
 
     const fromBusiness = input.from === 'business';
-    const sender = input.from === 'business'
-      ? { accountNumber: this.config.businessAccountNumber, accountName: await this.getBusinessAccountName() }
-      : input.from;
+    const senderAccount = input.from === 'business' ? this.config.businessAccountNumber : input.from.accountNumber;
+    const sender = { accountNumber: senderAccount, accountName: await this.getSenderName(senderAccount) };
     try {
       const res = await this.client.request<Transfer>({
         method: 'POST',
@@ -268,7 +319,8 @@ export class NineJaPayProvider implements PaymentProvider {
           narration: input.narration.slice(0, 100),
         },
       });
-      return { providerReference: reference, state: mapTransferStatus(res.status, res.statusCode), failureReason: null };
+      const state = createdTransferState(res);
+      return { providerReference: reference, state, failureReason: state === 'failed' ? 'The bank could not complete the transfer' : null };
     } catch (err) {
       // Already sent under this reference (an earlier attempt timed out): its status is the answer.
       if (err instanceof ProviderError && err.code === 'DUPLICATE') return this.getTransfer(input.reference);
@@ -277,17 +329,22 @@ export class NineJaPayProvider implements PaymentProvider {
   }
 
   /**
-   * The sender name for transfers from the business account: whatever name
-   * enquiry says, so it always matches the bank's record. Cached for the
+   * The sender name for a transfer, from the business account (a sweep) or a
+   * space's account (a withdrawal): whatever name enquiry says, so it always
+   * matches the bank's record ("DUEVY/<space>" for a space). Cached for the
    * process; a failed lookup isn't cached, so the next transfer retries it.
    */
-  private getBusinessAccountName(): Promise<string> {
-    this.businessAccountName ??= this.nameEnquiry(this.config.bankCode, this.config.businessAccountNumber).then((found) => {
-      if (!found) throw new ProviderError('The business account could not be verified with 9jaPay', null, 'BUSINESS_ACCOUNT_UNVERIFIABLE', true);
-      return found.accountName;
-    });
-    return this.businessAccountName.catch((err) => {
-      this.businessAccountName = null;
+  private getSenderName(accountNumber: string): Promise<string> {
+    let name = this.senderNames.get(accountNumber);
+    if (!name) {
+      name = this.nameEnquiry(this.config.bankCode, accountNumber).then((found) => {
+        if (!found) throw new ProviderError(`Sending account ${accountNumber} could not be verified with 9jaPay`, null, 'SENDER_UNVERIFIABLE', true);
+        return found.accountName;
+      });
+      this.senderNames.set(accountNumber, name);
+    }
+    return name.catch((err) => {
+      this.senderNames.delete(accountNumber);
       throw err;
     });
   }
