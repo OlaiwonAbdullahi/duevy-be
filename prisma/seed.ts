@@ -74,6 +74,10 @@ async function main() {
             studentIdStatus: 'approved' as const,
             studentIdUploadedAt: now,
             studentIdReviewedAt: now,
+            // Face capture is required by default (KYC policy); approved here so the demo space can collect.
+            livenessStatus: 'approved' as const,
+            livenessReviewedAt: now,
+            livenessReviewNote: 'Seeded demo rep',
             kycSubmittedAt: now,
             kycResolvedAt: now,
           }

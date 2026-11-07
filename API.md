@@ -38,9 +38,12 @@ Base URL: `/v1`. Request and response bodies are JSON.
 ```json
 { "name": "Aisha Bello", "matricNo": "210805019", "email": "aisha@example.com", "password": "min 8 chars",
   "acceptedTerms": true, "role": "student" | "rep",
-  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" }  // required when role = rep
+  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" },  // required when role = rep
+  "withdrawalPin": "2580"  // optional, rep only: 4 digits, not 1111/1234-style
 }
 ```
+
+- A rep's `withdrawalPin` is stored hashed on the application and becomes the space's withdrawal code when an admin approves it. The lead rep can change it later with `PUT /spaces/:spaceId/payout/pin`.
 
 - `201`: `{ user, accessToken }` for a student.
 - `403 REP_APPROVAL_PENDING`: returned for a rep, together with `data: { user, accessToken }`. The rep can sign in, but rep actions wait for admin approval.

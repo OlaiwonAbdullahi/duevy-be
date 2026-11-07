@@ -904,6 +904,8 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
           school: app.school,
           faculty: app.faculty,
           joinCode,
+          // The withdrawal code the rep chose at signup, if any.
+          ...(app.withdrawalPinHash ? { withdrawalPinHash: app.withdrawalPinHash, withdrawalPinSetAt: new Date() } : {}),
         },
       });
       await tx.spaceRep.create({ data: { userId, spaceId: created.id, role: 'lead' } });

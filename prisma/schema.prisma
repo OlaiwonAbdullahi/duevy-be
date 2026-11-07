@@ -689,6 +689,9 @@ model RepApplication {
   referralCode String?
   // Partner code entered at signup (validated then); redeemed for the space on approval.
   partnerCode  String?
+  // Withdrawal security code chosen at signup (bcrypt hash); copied onto the
+  // space when it's provisioned on approval, so the lead rep doesn't set it again.
+  withdrawalPinHash String?
   status       RepApplicationStatus @default(pending)
   reviewNote   String?
   reviewedAt   DateTime?
