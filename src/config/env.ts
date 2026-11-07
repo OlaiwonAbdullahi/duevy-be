@@ -94,24 +94,7 @@ const envSchema = z.object({
   // pilot scope. Off by default; flip to 'true' (no code change) to re-enable
   // for Phase 2. See src/middleware/requireFeature.ts.
   FEATURE_POLLS: z.string().transform((v) => v === 'true').default('false'),
-  FEATURE_ASSISTANT: z.string().transform((v) => v === 'true').default('false'),
   FEATURE_REFERRALS: z.string().transform((v) => v === 'true').default('false'),
-
-  // Duey (AI assistant) classification backend — 'ollama' talks to a local/dev
-  // Ollama instance; 'gemini' talks to Google's Gemini API natively (no
-  // OpenAI-compat shim); 'hosted' talks to any other OpenAI-chat-completions
-  // -compatible endpoint (self-hosted vLLM box, etc.). Handler code never
-  // changes regardless of which is picked (§ Duey adapter contract).
-  LLM_PROVIDER: z.enum(['ollama', 'gemini', 'hosted']).default('ollama'),
-  OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),
-  OLLAMA_MODEL: z.string().default('gemma2:9b'),
-  GEMINI_BASE_URL: z.string().url().default('https://generativelanguage.googleapis.com'),
-  GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().default('gemini-2.0-flash'),
-  LLM_HOSTED_BASE_URL: z.string().url().optional(),
-  LLM_HOSTED_API_KEY: z.string().optional(),
-  LLM_HOSTED_MODEL: z.string().default('gemma-2-9b-it'),
-  LLM_TIMEOUT_MS: z.coerce.number().default(8000),
 }).superRefine((val, ctx) => {
   if (val.PAYMENT_PROVIDER === 'ninejapay') {
     for (const key of [
@@ -135,9 +118,6 @@ const envSchema = z.object({
   }
   if (val.NODE_ENV === 'production' && val.PAYMENT_PROVIDER === 'fake') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['PAYMENT_PROVIDER'], message: 'the fake provider cannot run in production' });
-  }
-  if (val.LLM_PROVIDER === 'gemini' && !val.GEMINI_API_KEY) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'required when LLM_PROVIDER=gemini' });
   }
 });
 

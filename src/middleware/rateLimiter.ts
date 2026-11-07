@@ -46,17 +46,6 @@ export const lookupLimiter = rateLimit({
   },
 });
 
-// Duey chat assistant: 20/min per user — generous enough for a real
-// conversation, tight enough to bound LLM spend/abuse from one account.
-export const assistantLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  keyGenerator: (req: Request) =>
-    (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
-  handler: (req, res) => {
-    fail(res, 429, "RATE_LIMITED", "Too many messages, please slow down.");
-  },
-});
 
 // Checkout: 10/min per user. Each checkout opens a real bank account at the
 // provider, so this also bounds how fast one account can mint them.
