@@ -23,7 +23,7 @@ import {
   submitLivenessHandlers,
   submitKycHandlers,
 } from './kycHandlers';
-import { getDueAvailability, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
+import { getDueAvailability, getSpaceLedgerEntry, getSpaceLedgerSummary, listSpaceLedger } from '../services/ledger.service';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { quoteWithdrawal, requestWithdrawal, setWithdrawalPinByRep, type PinChange } from '../services/withdrawal.service';
@@ -150,6 +150,16 @@ payoutsRouter.get('/ledger', async (req: Request, res: Response): Promise<void> 
   const { page, perPage, skip, take } = parseListQuery(req);
   const { total, rows } = await listSpaceLedger(spaceId(req), skip, take);
   ok(res, rows, 200, buildMeta(page, perPage, total));
+});
+
+// GET /ledger/:entryId — one entry with its payer / sender / due, for the activity detail view.
+payoutsRouter.get('/ledger/:entryId', async (req: Request, res: Response): Promise<void> => {
+  const entry = await getSpaceLedgerEntry(spaceId(req), req.params.entryId as string);
+  if (!entry) {
+    errors.notFound(res, 'Activity not found');
+    return;
+  }
+  ok(res, entry);
 });
 
 // ---------------------------------------------------------------------------

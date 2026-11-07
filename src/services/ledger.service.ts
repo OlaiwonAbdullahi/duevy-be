@@ -189,6 +189,81 @@ export async function listSpaceLedger(spaceId: string, skip: number, take: numbe
   };
 }
 
+/** Last 4 digits only: enough to recognise a sender's account, not to reuse it. */
+function maskAccount(n: string | null): string | null {
+  return n ? `•••• ${n.slice(-4)}` : null;
+}
+
+/**
+ * One ledger entry with what's behind it, for the activity detail view: the
+ * payer and due for a payment, the sender for a direct deposit, and the admin
+ * for a refund or manual credit. Withdrawals have their own detail endpoint
+ * (`payoutId`). Null when the entry isn't on this space.
+ */
+export async function getSpaceLedgerEntry(spaceId: string, entryId: string) {
+  const e = await db.ledgerEntry.findFirst({
+    where: { id: entryId, spaceId },
+    include: {
+      due: { select: { id: true, title: true } },
+      txn: { select: { method: true } },
+      duePayment: {
+        select: {
+          paidAt: true,
+          amountPaid: true,
+          processingFee: true,
+          duevyFee: true,
+          netToSpace: true,
+          user: { select: { name: true, matricNo: true, email: true, isGuest: true } },
+        },
+      },
+      directDeposit: {
+        select: { senderName: true, senderBank: true, senderAccountNumber: true, narration: true, receivedAt: true },
+      },
+    },
+  });
+  if (!e) return null;
+  const actor = e.actorId ? await db.user.findUnique({ where: { id: e.actorId }, select: { name: true } }) : null;
+  const p = e.duePayment;
+  const d = e.directDeposit;
+  return {
+    id: e.id,
+    type: e.type,
+    direction: e.direction,
+    amount: e.amountKobo,
+    signedAmount: e.direction === 'credit' ? e.amountKobo : -e.amountKobo,
+    reference: e.reference,
+    description: e.description,
+    dueId: e.dueId,
+    payoutId: e.payoutId,
+    createdAt: e.createdAt.toISOString(),
+    due: e.due,
+    payment: p
+      ? {
+          payerName: p.user.name,
+          matricNo: p.user.matricNo,
+          email: p.user.email,
+          guest: p.user.isGuest,
+          paidAt: p.paidAt.toISOString(),
+          method: e.txn?.method ?? null,
+          /** What the payer sent for this due: its face value plus its share of the fee. */
+          amountPaid: p.amountPaid,
+          fee: p.processingFee + p.duevyFee,
+          netToSpace: p.netToSpace,
+        }
+      : null,
+    deposit: d
+      ? {
+          senderName: d.senderName,
+          senderBank: d.senderBank,
+          senderAccount: maskAccount(d.senderAccountNumber),
+          narration: d.narration,
+          receivedAt: d.receivedAt.toISOString(),
+        }
+      : null,
+    actorName: actor?.name ?? null,
+  };
+}
+
 /**
  * Serialise all balance-changing work on one space. Transaction-scoped: the
  * lock is released when the surrounding transaction commits or rolls back.
