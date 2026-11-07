@@ -328,23 +328,6 @@ enum PartnerRedemptionSource {
   admin
 }
 
-enum AssistantIntent {
-  pay_dues
-  join_department
-  check_balance
-  view_history
-  contact_rep
-  fund_wallet
-  create_due
-  rep_summary
-  unknown
-}
-
-enum AssistantRole {
-  user
-  assistant
-}
-
 // ---------------------------------------------------------------------------
 // Users & Auth
 // ---------------------------------------------------------------------------
@@ -448,32 +431,31 @@ model User {
   updatedAt                      DateTime              @updatedAt
 
   // Relations
-  refreshTokens          RefreshToken[]
-  emailVerifications     EmailVerification[]
-  passwordResets         PasswordReset[]
-  spaceMemberships       SpaceMembership[]
-  spaceReps              SpaceRep[]
-  spaceJoinRequests      SpaceJoinRequest[]
-  duePayments            DuePayment[]
-  transactions           Transaction[]
-  notifications          Notification[]
-  pollVotes              PollVote[]
-  referralsMade          Referral[]              @relation("referrer")
-  referralReceived       Referral?               @relation("referred")
-  discountCodes          DiscountCode[]
-  adminPermissions       AdminPermission?
-  disputes               Dispute[]
-  feedback               Feedback[]
-  idempotencyKeys        IdempotencyKey[]
-  sessions               Session[]
-  assistantConversations AssistantConversation[]
-  assignedDues           Due[]                   @relation("DueAssignedRep")
-  requestedPayouts       Payout[]                @relation("PayoutRequestedBy")
-  payoutApprovals        PayoutApproval[]
-  payoutOtps             PayoutOtp[]
-  checkouts              Checkout[]
-  receipts               Receipt[]
-  partnerRedemptions     PartnerRedemption[]
+  refreshTokens      RefreshToken[]
+  emailVerifications EmailVerification[]
+  passwordResets     PasswordReset[]
+  spaceMemberships   SpaceMembership[]
+  spaceReps          SpaceRep[]
+  spaceJoinRequests  SpaceJoinRequest[]
+  duePayments        DuePayment[]
+  transactions       Transaction[]
+  notifications      Notification[]
+  pollVotes          PollVote[]
+  referralsMade      Referral[]          @relation("referrer")
+  referralReceived   Referral?           @relation("referred")
+  discountCodes      DiscountCode[]
+  adminPermissions   AdminPermission?
+  disputes           Dispute[]
+  feedback           Feedback[]
+  idempotencyKeys    IdempotencyKey[]
+  sessions           Session[]
+  assignedDues       Due[]               @relation("DueAssignedRep")
+  requestedPayouts   Payout[]            @relation("PayoutRequestedBy")
+  payoutApprovals    PayoutApproval[]
+  payoutOtps         PayoutOtp[]
+  checkouts          Checkout[]
+  receipts           Receipt[]
+  partnerRedemptions PartnerRedemption[]
 
   @@index([institution])
   @@index([studentIdStatus])
@@ -1490,39 +1472,6 @@ model IdempotencyKey {
 
   @@index([expiresAt])
   @@map("idempotency_keys")
-}
-
-// ---------------------------------------------------------------------------
-// Duey — AI chat assistant
-// ---------------------------------------------------------------------------
-
-model AssistantConversation {
-  id        String   @id @default(cuid())
-  userId    String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages AssistantMessage[]
-
-  @@index([userId, updatedAt])
-  @@map("assistant_conversations")
-}
-
-model AssistantMessage {
-  id             String           @id @default(cuid())
-  conversationId String
-  role           AssistantRole
-  content        String
-  intent         AssistantIntent?
-  params         Json?
-  confidence     Float?
-  createdAt      DateTime         @default(now())
-
-  conversation AssistantConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-
-  @@index([conversationId, createdAt])
-  @@map("assistant_messages")
 }
 
 // Platform-wide switches an admin can change at runtime, one row per key.
