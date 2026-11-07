@@ -1,3 +1,26 @@
+# Mounted as a directory (docker-compose.yml: ./deploy/caddy:/etc/caddy), not
+# as a single file: `git reset --hard` replaces files with new inodes, and a
+# single-file bind mount would keep showing the container the old one.
 api.duevy.app {
-    reverse_proxy api:3000
+	# Two API replicas. A deploy restarts them one at a time
+	# (scripts/deploy.sh); Caddy routes around the one that is down.
+	reverse_proxy api_a:3000 api_b:3000 {
+		lb_policy round_robin
+
+		# Active check: an instance that is starting, draining for shutdown
+		# (503) or has lost its database is taken out of rotation.
+		health_uri /health/ready
+		health_interval 2s
+		health_timeout 3s
+		health_status 200
+
+		# Passive: a refused connection marks the upstream down briefly and the
+		# request is retried on the other one instead of failing. Keep
+		# fail_duration under the pause between replicas in scripts/deploy.sh
+		# (5s): at 10s, the replica restarted first was still marked down when
+		# the second went down, and requests stalled ~4s with neither "up".
+		fail_duration 3s
+		lb_try_duration 10s
+		lb_try_interval 100ms
+	}
 }

@@ -14,6 +14,7 @@ import { ok, fail } from './lib/response';
 import { logger } from './lib/logger';
 import { db } from './config/db';
 import { isShuttingDown } from './lib/lifecycle';
+import { redisStatus } from './lib/redis';
 
 export const app = express();
 
@@ -122,7 +123,10 @@ app.get('/health/ready', async (_req, res) => {
         timer = setTimeout(() => reject(new Error('database ping timed out')), 2_000);
       }),
     ]);
-    ok(res, { status: 'ready', dbLatencyMs: Date.now() - started });
+    const dbLatencyMs = Date.now() - started;
+    // Reported, not fatal: without Redis the rate limits fail open, and
+    // draining every instance over it would turn a blip into an outage.
+    ok(res, { status: 'ready', dbLatencyMs, redis: await redisStatus() });
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'readiness check failed');
     fail(res, 503, 'NOT_READY', 'Database unavailable');

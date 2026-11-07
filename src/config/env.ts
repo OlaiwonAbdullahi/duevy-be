@@ -78,6 +78,11 @@ const envSchema = z.object({
   // CDN. Must not be the KYC folder or under it.
   IMAGEKIT_PUBLIC_FOLDER: z.string().default('/duevy/public'),
 
+  // Shared state across API instances (rate-limit counters). Required to run
+  // more than one instance; unset = per-process limits (tests, local dev).
+  // e.g. redis://redis:6379 (docker-compose.yml sets this for the API).
+  REDIS_URL: z.string().url().optional(),
+
   // Structured logging (pino)
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 

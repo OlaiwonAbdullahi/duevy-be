@@ -28,9 +28,9 @@ The design was sound. The bottlenecks were CPU on the event loop, a few per-proc
 | 10 | Public metrics cache: on expiry every concurrent request recomputed 7 platform-wide aggregates. | Cache stampede on the biggest tables. | **Fixed** |
 | 11 | Receipt PDF re-read ~1.25 MB of fonts (twice) and images from disk per render, synchronously. | 183 ms on the event loop per receipt. | **Improved** (−22%) |
 | 12 | Four redundant indexes duplicating `@unique` columns. | Write amplification. | **Fixed** |
-| 13 | Rate limits are per process, in memory. | With N instances every limit is N× looser (including the checkout limit that bounds account minting at 9jaPay), and limits reset on every deploy. | **Open: needs a decision (§6)** |
+| 13 | Rate limits are per process, in memory. | With N instances every limit is N× looser (including the checkout limit that bounds account minting at 9jaPay), and limits reset on every deploy. | **Fixed** (§3.9) |
 | 14 | Uploads (avatars, poll images) are written to the container's local disk. | A second instance can't see the files; this blocks horizontal scaling. | **Fixed** (§3.7); run the one-off migration in production |
-| 15 | Deploy recreates the only container. | Downtime on every deploy. | **Open (§6)** |
+| 15 | Deploy recreates the only container. | Downtime on every deploy. | **Fixed** (§3.10) |
 | 16 | No Prisma pool settings (`connection_limit` / `pool_timeout`). | The pool size depends on the host's CPU count; under saturation requests hang instead of failing fast. | **Documented** (`.env.example`); needs setting in production `.env` |
 | 17 | Guest pay link (`GET /public/dues/:id`) shares the 10/min per-IP join-code limiter; guest checkout is 10/min per IP; the guest flow also counts against the 1,500/15 min IP-wide limit. | Measured: of 300 students opening a shared link from one campus IP, **290 (97%) were refused**. | **Fixed** (§3.8) |
 | 18 | Signup and password reset wait on Resend in the request. | Resend latency or outage is on the critical path. | Open, low priority |
@@ -98,6 +98,38 @@ Measured with `load-tests/guest-link.js` (one IP, the page's data request):
 
 When the page does load it takes ~6–8 ms server-side, before and after; the network to the student dominates. The remaining throttle is starting payments: 60 a minute per network, so a class of 300 all starting at once is through in about 5 minutes. That bounds how many one-time accounts one address can open at 9jaPay; raise it if real classes need it.
 
+### 3.9 Shared rate limits in Redis (finding 13)
+- **Change:** `src/lib/redis.ts` (ioredis, `REDIS_URL`) and `rate-limit-redis`. Every limiter is built by one helper in `src/middleware/rateLimiter.ts` with its own key prefix (`rl:<name>:`), so limiters never count each other's requests. `REDIS_URL` unset means per-process limits, as before (tests, local development); production logs a warning if it's missing. The unused `bullmq` dependency is gone.
+- **Redis is never on the money path.** If Redis is unreachable, limits fail **open**: requests pass, nothing is logged per request, and `src/lib/redis.ts` logs one alert a minute. While disconnected, limiter commands fail at once (no added latency); a connected-but-stuck Redis times out at 300 ms. `/health/ready` reports `redis: ok|down|disabled` but never fails on it, because draining every instance over Redis would turn a blip into an outage.
+- **Infrastructure:** a `redis:7-alpine` service in `docker-compose.yml`. It holds counters only, so there's no persistence, 64 MB, and keys with a TTL are evicted first. It isn't exposed outside the Docker network.
+- **Tested:** the integration suite passes with Redis-backed limiters (108/108), and a unit test pins fail-open. Two separate API processes sharing one Redis, with requests alternating between them, let exactly **10 of 20** join-code lookups through the 10/min limit (per-process limits would allow 20). With Redis killed: 20/20 passed at 2–3 ms each and readiness stayed 200 with `redis: down`. With Redis back, the limit enforced 10/20 again with no restart. A first version of the fail-open waited ~1 s per request (two 500 ms timeouts) and logged a stack trace per request; both were fixed and re-measured.
+- **Trade-off:** one more service to run. During a Redis outage the limits don't apply.
+
+### 3.10 Zero-downtime deploys (finding 15)
+- **Change:** two API replicas (`api_a`, `api_b`, one image) behind Caddy. Caddy load-balances round-robin, health-checks `/health/ready` every 2s, and retries a request on the other replica when a connection is refused (`lb_try_duration 10s`). `scripts/deploy.sh` now:
+  1. builds once;
+  2. runs `prisma migrate deploy` **once**, before any replica runs the new code;
+  3. replaces `api_a`, waits for it to be ready, then does the same for `api_b`;
+  4. reloads Caddy in place;
+  5. removes leftover containers.
+
+  Each replica drains its in-flight requests before exiting (§3.5).
+- The Caddyfile moved to `deploy/caddy/` and is mounted as a directory: `git reset --hard` replaces files with new inodes, and a single-file bind mount keeps showing the container the stale file.
+- **Background jobs** run in both replicas (`RUN_WORKERS` default). That is safe by design, and it keeps webhook processing instant on whichever replica receives the webhook.
+- **The rule this adds:** while a deploy rolls, old and new code run side by side against the new schema. Migrations must be **expand-only** (add columns, tables, indexes); drop or rename in a later deploy, once nothing running uses the old shape. Every migration in this work follows that rule.
+- **First deploy of this change:** Caddy's container is recreated once because its mount changed, a ~1–2s blip, once. The old single `api` container keeps serving until both replicas are up, then it is removed.
+- **Capacity:** two Node processes. Budget about 2 × 250 MB RAM, and `2 × connection_limit` database connections (plus `npm run worker` processes if you add any).
+- **Rehearsal:** `deploy/rehearsal/compose.yml` runs the same stack locally (local Postgres, fake payment rail, Caddy on :8080, your `.env` not loaded): `COMPOSE_FILE=docker-compose.yml:deploy/rehearsal/compose.yml DEPLOY_DIR=$PWD ./scripts/deploy.sh`, with `load-tests/rolling-deploy.js` running alongside.
+- **Tested** with the compiled server (`node dist/server.js`, real shutdown path) ×2 behind Caddy, using the identical proxy block, plus Redis and Postgres, all native, at 40 req/s of reads and checkout writes. Each replica was restarted the way `deploy.sh` does it (SIGTERM, drain, start, wait for ready, 5s pause, next):
+
+  | Run | Requests | Failed | p95 | Slowest |
+  |---|---|---|---|---|
+  | `fail_duration 10s` (first version), 2 full rolls | 3,918 | **0** | 534 ms | 3.8 s |
+  | `fail_duration 3s`, `lb_try_interval 100ms`, 2 full rolls | 3,021 | **0** | **14 ms** | 159 ms |
+
+  The first version never failed a request, but stalled for ~4s on the second replica of each roll. Caddy still had the first replica marked down from a refused connection during its restart (10s memory, longer than the script's 5s pause), so for a moment neither replica counted as up. That's fixed and re-measured. Two earlier runs showed failures that turned out to be the test itself tripping real limits (one IP for all traffic; a student checking out 12×/min). Those were fixed in the test, not by loosening the app. The join-code limit stayed at exactly 10/20 across both replicas throughout.
+- **Not tested here:** the Docker image and compose stack themselves. Docker isn't usable on this machine: the Colima VM image downloaded at ~80 KB/s. Both compose files validate (`docker compose config`), and the rehearsal resolves with no service loading `.env`. **Before the first production deploy, run the rehearsal once on a machine with Docker.** It is also the first real build of the native `bcrypt` module inside the image.
+
 ## 4. Testing
 
 **Regression:** typecheck clean; unit **52/52** (2 new); integration **108/108** (5 in `uploadsAndGuestLimits.int.test.ts`: avatar upload/replace/delete and ImageKit-down handling, the legacy-upload migration, guest link and checkout limits; 4 in `scaling.int.test.ts`: a 25-payment burst with duplicate deliveries drained by 3 concurrent workers, the cross-instance poll throttle and its response shape, the token purge, readiness). Baseline before any change: 50/50 unit and 99/99 integration.
@@ -132,10 +164,9 @@ Per API process (pool 10), from the runs above: dashboard reads p95 < 300 ms up 
 
 ## 6. Remaining work and decisions
 
-1. **Shared rate-limit store (finding 13).** Required before running more than one API instance. Options: Redis (`rate-limit-redis`, which also unlocks a shared cache), or a Postgres-backed store (no new infrastructure, adds a write per request). Recommendation: managed Redis.
-2. **Run the upload migration** (§3.7) in production, then remove the `/uploads` route and volume.
-3. **Zero-downtime deploys (finding 15).** Two API replicas behind Caddy (`lb_policy` plus `health_uri /health/ready`), rolled one at a time. That depends on 1 and 2. Background jobs can stay in-process on every replica (safe by design) or move to one `npm run worker` service with `RUN_WORKERS=false` on the API.
-4. **Production `.env`:** set `connection_limit` / `pool_timeout` (and `pgbouncer=true` if on port 6543), sized as `(API + worker processes) × connection_limit < pooler size`.
-5. **bcrypt cost.** Cost 11 halves login CPU (about 2× login capacity) at a modest security cost. This is a product/security call; it isn't changed here. Existing hashes keep working either way.
-6. **Monitoring:** alert on `/health/ready`, on dead webhook events (already shown on `GET /admin/health`), on 5xx rate and on p95 latency. Export event-loop delay (the harness shows how) and Prisma pool wait time.
-7. **Later, at much larger scale:** balances are a `SUM` over the space's ledger on each read. That's fine at thousands of entries per space; past ~100k per space, add a covering index `(spaceId) INCLUDE (direction, amountKobo)` (index-only scans suit an append-only table) or periodic balance snapshots.
+1. **Run the upload migration** (§3.7) in production, then remove the `/uploads` route and volume.
+2. **Keep migrations expand-only** (§3.10). A destructive migration would break the replica still running old code during a deploy.
+3. **Production `.env`:** set `connection_limit` / `pool_timeout` (and `pgbouncer=true` if on port 6543), sized as `(API + worker processes) × connection_limit < pooler size`.
+4. **bcrypt cost.** Cost 11 halves login CPU (about 2× login capacity) at a modest security cost. This is a product/security call; it isn't changed here. Existing hashes keep working either way.
+5. **Monitoring:** alert on `/health/ready`, on the `redis unavailable` log line, on dead webhook events (already shown on `GET /admin/health`), on 5xx rate and on p95 latency. Export event-loop delay (the harness shows how) and Prisma pool wait time.
+6. **Later, at much larger scale:** balances are a `SUM` over the space's ledger on each read. That's fine at thousands of entries per space; past ~100k per space, add a covering index `(spaceId) INCLUDE (direction, amountKobo)` (index-only scans suit an append-only table) or periodic balance snapshots.

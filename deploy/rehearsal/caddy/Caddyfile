@@ -1,0 +1,33 @@
+# Rehearsal copy of deploy/caddy/Caddyfile, on plain HTTP :8080. Keep the reverse_proxy block identical.
+# Rehearsal only: the load generator plays thousands of clients through
+# X-Forwarded-For, so it is trusted as a proxy here (and the API trusts one
+# more hop: TRUST_PROXY=2). Production trusts no client-supplied header.
+{
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:8080 {
+	# Two API replicas. A deploy restarts them one at a time
+	# (scripts/deploy.sh); Caddy routes around the one that is down.
+	reverse_proxy api_a:3000 api_b:3000 {
+		lb_policy round_robin
+
+		# Active check: an instance that is starting, draining for shutdown
+		# (503) or has lost its database is taken out of rotation.
+		health_uri /health/ready
+		health_interval 2s
+		health_timeout 3s
+		health_status 200
+
+		# Passive: a refused connection marks the upstream down briefly and the
+		# request is retried on the other one instead of failing. Keep
+		# fail_duration under the pause between replicas in scripts/deploy.sh
+		# (5s): at 10s, the replica restarted first was still marked down when
+		# the second went down, and requests stalled ~4s with neither "up".
+		fail_duration 3s
+		lb_try_duration 10s
+		lb_try_interval 100ms
+	}
+}

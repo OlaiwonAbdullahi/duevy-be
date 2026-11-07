@@ -15,6 +15,7 @@ const prefixes = {
   dispute: 'dsp',
   report: 'rpt',
   checkout: 'chk',
+  checkoutItem: 'chi',
   ledger: 'led',
 } as const;
 

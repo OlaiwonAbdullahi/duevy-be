@@ -101,9 +101,16 @@ const guestCheckoutSchema = z.object({
 
 const payerSelect = { id: true, isGuest: true, isSuspended: true, isDeactivated: true, matricNo: true } as const;
 
-/** The guest's user row: reused across their payments, created on first pay. */
-async function guestPayer(input: z.infer<typeof guestCheckoutSchema>) {
-  const existing = await db.user.findUnique({ where: { email: input.email }, select: payerSelect });
+/** The same gate as loadGuestDue, as one query, for the checkout route (which only needs the form). */
+function loadGuestDueForCheckout(dueId: string) {
+  return db.due.findFirst({
+    where: { id: dueId, allowGuests: true, status: 'active', space: { isArchived: false } },
+    select: { id: true, guestFields: true },
+  });
+}
+
+/** The guest's user row: reused across their payments, created on first pay. `existing` is its prefetched lookup by email. */
+async function guestPayer(input: z.infer<typeof guestCheckoutSchema>, existing: Prisma.UserGetPayload<{ select: typeof payerSelect }> | null) {
   if (existing) {
     // A guest row carries their latest matric number; a real account's profile is left alone.
     if (existing.isGuest && input.matricNo && existing.matricNo !== input.matricNo) {
@@ -141,13 +148,21 @@ guestPayRouter.post(
   validate(guestCheckoutSchema),
   async (req: Request, res: Response): Promise<void> => {
     const dueId = req.params.dueId as string;
-    const due = await loadGuestDue(dueId);
+    const input = req.body as z.infer<typeof guestCheckoutSchema>;
+    const sessionUserId = (req as Partial<AuthenticatedRequest>).user?.sub;
+    // One parallel round instead of three in a row: the due, the signed-in
+    // account, and the guest row for this email (only created further down,
+    // once everything checks out).
+    const [due, account, existingGuest] = await Promise.all([
+      loadGuestDueForCheckout(dueId),
+      sessionUserId ? db.user.findUnique({ where: { id: sessionUserId }, select: payerSelect }) : null,
+      sessionUserId ? null : db.user.findUnique({ where: { email: input.email }, select: payerSelect }),
+    ]);
     if (!due) {
       errors.notFound(res, 'This payment link is not open');
       return;
     }
 
-    const input = req.body as z.infer<typeof guestCheckoutSchema>;
     const fields = readGuestFields(due.guestFields);
     const checked = fields ? checkGuestAnswers(fields, input.answers) : { answers: null };
     if ('issues' in checked) {
@@ -157,8 +172,6 @@ guestPayRouter.post(
 
     // Signed in: pay as yourself. The session proves who you are, so the
     // typed name and email are ignored, and the profile's matric number is used.
-    const sessionUserId = (req as Partial<AuthenticatedRequest>).user?.sub;
-    const account = sessionUserId ? await db.user.findUnique({ where: { id: sessionUserId }, select: payerSelect }) : null;
     if (sessionUserId && !account) {
       errors.unauthorized(res);
       return;
@@ -172,7 +185,7 @@ guestPayRouter.post(
       ? account.matricNo || !input.matricNo
         ? account
         : await db.user.update({ where: { id: account.id }, data: { matricNo: input.matricNo }, select: payerSelect })
-      : await guestPayer(input);
+      : await guestPayer(input, existingGuest);
     // A real account pays signed in, so the payment lands in their history.
     if (!sessionUserId && !payer.isGuest) {
       fail(res, 409, 'EMAIL_HAS_ACCOUNT', 'This email has a Duevy account. Sign in to pay.');

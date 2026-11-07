@@ -1,6 +1,7 @@
 import { type Server } from 'http';
 import { db } from '../config/db';
 import { logger } from './logger';
+import { closeRedis } from './redis';
 import { stopWebhookWorker } from '../jobs/webhookWorker';
 import { reconciliationIdle } from '../jobs/reconciliation';
 import { stopKycReminderJob } from '../jobs/kycReminders';
@@ -53,6 +54,7 @@ export function installShutdownHandlers(opts: { server?: Server; timers: NodeJS.
     const results = await Promise.allSettled([closeServer, stopWebhookWorker(), reconciliationIdle(), stopKycReminderJob()]);
     for (const r of results) if (r.status === 'rejected') logger.warn({ err: (r.reason as Error)?.message }, 'error while draining');
 
+    await closeRedis();
     await db.$disconnect().catch(() => {});
     logger.info('shutdown complete');
     process.exit(0);

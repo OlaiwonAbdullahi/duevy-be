@@ -1,0 +1,62 @@
+# Local rehearsal of the production stack and its rolling deploy — never used
+# on the VPS. Layered over docker-compose.yml:
+#
+#   COMPOSE_FILE=docker-compose.yml:deploy/rehearsal/compose.yml DEPLOY_DIR=$PWD ./scripts/deploy.sh
+#
+# Same image, same two replicas, Redis and Caddy; a local Postgres, the fake
+# payment rail and in-memory file storage instead of real services, and Caddy
+# on http://localhost:8080 instead of api.duevy.app. The developer's .env is
+# NOT loaded (env_file is reset), so no real key reaches these containers.
+x-rehearsal-env: &rehearsal-env
+  NODE_ENV: development
+  LOG_LEVEL: warn
+  DATABASE_URL: postgresql://duevy:duevy@postgres:5432/duevy?connection_limit=10&pool_timeout=10
+  DIRECT_URL: postgresql://duevy:duevy@postgres:5432/duevy
+  REDIS_URL: redis://redis:6379
+  JWT_ACCESS_SECRET: rehearsal-access-secret-0123456789abcdef0123
+  JWT_REFRESH_SECRET: rehearsal-refresh-secret-0123456789abcdef012
+  RESEND_API_KEY: re_rehearsal
+  PAYMENT_PROVIDER: fake
+  NINEJAPAY_SECRET_KEY: whsec_rehearsal
+  FILE_STORAGE: memory
+  TRUST_PROXY: "2" # k6 counts as a proxy in the rehearsal (see its Caddyfile)
+  CORS_ORIGINS: http://localhost:8080
+
+services:
+  api_a:
+    env_file: !reset []
+    environment: *rehearsal-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+  api_b:
+    env_file: !reset []
+    environment: *rehearsal-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: duevy
+      POSTGRES_PASSWORD: duevy
+      POSTGRES_DB: duevy
+    ports:
+      - "55440:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "duevy"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  caddy:
+    ports: !override
+      - "8080:8080"
+    volumes: !override
+      - ./deploy/rehearsal/caddy:/etc/caddy:ro
+      - caddy_data:/data

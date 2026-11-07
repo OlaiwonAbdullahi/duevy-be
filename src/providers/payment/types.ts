@@ -173,8 +173,14 @@ export interface PaymentProvider {
    */
   wireReference(reference: string): string;
 
-  /** Open a one-time bank account for one checkout. */
+  /**
+   * Open a one-time bank account for one checkout. Returns as soon as the
+   * account exists: the name and expiry may be close estimates, which
+   * describeCollectionAccount (if the provider has it) can then make exact.
+   */
   createCollectionAccount(input: CreateCollectionInput): Promise<CollectionAccount>;
+  /** The account's exact name and expiry as the provider holds them; null if it can't say. */
+  describeCollectionAccount?(accountNumber: string): Promise<{ accountName: string | null; expiresAt: Date | null } | null>;
   /**
    * What has arrived in a checkout's one-time account, read from the
    * provider's own records. Only money that landed within `window` counts:

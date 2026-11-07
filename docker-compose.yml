@@ -1,21 +1,53 @@
-# Production stack on the VPS (/opt/duevy/app): the API plus Caddy, which
-# terminates HTTPS for api.duevy.app and proxies to api:3000. Deployed by
-# scripts/deploy.sh on every push to main.
+# Production stack on the VPS (/opt/duevy/app): two API replicas behind Caddy
+# (HTTPS for api.duevy.app, load-balanced), plus Redis for state the replicas
+# share (rate-limit counters). Deployed by scripts/deploy.sh on every push to
+# main, which restarts the replicas one at a time so a deploy never takes the
+# API down.
+#
+# Both replicas run the background jobs too (RUN_WORKERS, on by default):
+# that is safe by design (claims use FOR UPDATE SKIP LOCKED, every handler is
+# idempotent) and keeps webhook handling instant on whichever one receives it.
+
+x-api: &api
+  image: duevy-api:latest
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    REDIS_URL: redis://redis:6379
+  volumes:
+    # LEGACY: pre-ImageKit avatars/poll images, shared by both replicas until
+    # src/scripts/migrateUploads.ts has run; then remove (docs/SCALING.md §3.7).
+    - uploads:/app/uploads
+  # Time between SIGTERM and SIGKILL. The API drains in-flight requests and
+  # jobs within 25s (src/lib/lifecycle.ts); Docker's default 10s cut it short.
+  stop_grace_period: 30s
+  depends_on:
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+
 services:
-  api:
+  api_a:
+    <<: *api
     build: .
+  api_b:
+    <<: *api
+
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
-    env_file: .env
-    volumes:
-      - uploads:/app/uploads
-    # Time between SIGTERM and SIGKILL. The API drains in-flight requests and
-    # jobs within 25s (src/lib/lifecycle.ts); Docker's default 10s cut it short.
-    stop_grace_period: 30s
+    # Only rate-limit counters, all with a TTL: nothing worth persisting, and
+    # a bounded footprint (expiring keys are evicted first if it ever fills).
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "volatile-ttl"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   caddy:
     image: caddy:2
@@ -24,10 +56,11 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./deploy/caddy:/etc/caddy:ro
       - caddy_data:/data
     depends_on:
-      - api
+      - api_a
+      - api_b
 
 volumes:
   uploads:

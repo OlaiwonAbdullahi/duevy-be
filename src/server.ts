@@ -12,6 +12,9 @@ async function startServer() {
   try {
     await db.$connect();
     logger.info({ provider: getPaymentProvider().name }, 'connected to database');
+    if (!env.REDIS_URL && env.NODE_ENV === 'production') {
+      logger.warn('REDIS_URL is not set: rate limits are per process, so they loosen with every extra instance');
+    }
 
     const server = app.listen(env.PORT, () => {
       logger.info({ port: env.PORT }, 'server ready');

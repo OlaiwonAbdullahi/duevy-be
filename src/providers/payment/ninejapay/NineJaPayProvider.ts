@@ -37,6 +37,8 @@ import { verifyNineJaPaySignature } from './signature';
  */
 
 const BANK_NAME = '9jaPay';
+/** What 9jaPay names every one-time account (sandbox, 2026-11-07); the real name replaces it when looked up. */
+const COLLECTION_ACCOUNT_NAME = 'DUEVY COLLECTION ACCOUNT';
 const TRANSACTION_PAGE_SIZE = 50;
 /** 1,000 rows: far beyond any one account's history; hitting it means something is wrong. */
 const TRANSACTION_PAGE_LIMIT = 20;
@@ -150,19 +152,26 @@ export class NineJaPayProvider implements PaymentProvider {
     });
     const created = res.data;
     if (!created?.accountNumber) throw new ProviderError('9jaPay returned no account number', null, null, false);
-    const details = await this.getAccount(created.accountNumber, input.reference).catch(() => null);
+    // No second call here: it cost ~1s on the student's wait and 9jaPay often
+    // answers it with a 500 straight after creating the account. The expiry
+    // is counted from 9jaPay's answer, so it is at most one round trip later
+    // than 9jaPay's own (never earlier, so no real payment falls outside the
+    // checkout's window); describeCollectionAccount makes both exact.
     return {
       providerCheckoutId: reference,
       accountNumber: created.accountNumber,
       bankName: BANK_NAME,
-      // "DUEVY COLLECTION ACCOUNT" in the sandbox: 9jaPay names these, not us.
-      accountName: details?.accountName ?? 'Duevy',
+      accountName: COLLECTION_ACCOUNT_NAME,
       totalKobo: input.totalKobo,
-      expiresAt:
-        details?.expiresAt && !Number.isNaN(Date.parse(details.expiresAt))
-          ? new Date(details.expiresAt)
-          : new Date(Date.now() + input.expiresInMinutes * 60_000),
+      expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
     };
+  }
+
+  async describeCollectionAccount(accountNumber: string): Promise<{ accountName: string | null; expiresAt: Date | null } | null> {
+    const details = await this.getAccount(accountNumber);
+    if (!details) return null;
+    const expiresAt = details.expiresAt ? parseNineJaPayDate(details.expiresAt) : null;
+    return { accountName: details.accountName ?? null, expiresAt };
   }
 
   /**

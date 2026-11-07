@@ -79,17 +79,14 @@ export function serializeCheckout(c: CheckoutWithItems) {
 
 const withItems = { items: { include: { due: { select: { title: true } } } } } as const;
 
-/** Pass the transaction client when inside one, so this doesn't hold a second pool connection. */
-async function uniqueCheckoutReference(client: Tx = db): Promise<string> {
-  for (let i = 0; i < 6; i++) {
-    const ref = generateReference();
-    const [c, t] = await Promise.all([
-      client.checkout.findUnique({ where: { reference: ref }, select: { id: true } }),
-      client.transaction.findUnique({ where: { reference: ref }, select: { id: true } }),
-    ]);
-    if (!c && !t) return ref;
-  }
-  throw new Error('could not allocate a unique checkout reference');
+/** A JS Date as a timestamp(3) column value (Prisma stores UTC wall time). */
+const utc = (d: Date | null) => (d ? Prisma.sql`(${d}::timestamptz AT TIME ZONE 'UTC')` : Prisma.sql`NULL`);
+
+/** A reference collided with an existing checkout or transaction (~1 in 10¹² per draw): draw again. */
+function isReferenceCollision(err: unknown): boolean {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  const text = `${err.message} ${JSON.stringify(err.meta ?? {})}`;
+  return (err.code === 'P2010' || err.code === 'P2002') && /23505|unique/i.test(text) && /reference/i.test(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,38 +136,34 @@ export async function createCheckout(
     throw new AppError(400, 'VALIDATION_ERROR', `Select between 1 and ${MAX_DUES_PER_CHECKOUT} dues`);
   }
 
-  const [user, dues] = await Promise.all([
-    db.user.findUnique({ where: { id: userId }, select: { email: true, name: true } }),
-    db.due.findMany({
-      where: { id: { in: dueIds } },
-      include: { space: { select: { id: true, name: true, isArchived: true } } },
+  // Every check's data in ONE parallel round: each lookup reaches the space
+  // through the dues instead of waiting for the dues first, and none uses
+  // `include` (each include is another sequential query). The checks below
+  // run in the same order as before. With mixed spaces, member/lead may be
+  // any of them, but that request is refused before they're used.
+  const viaDues = { dues: { some: { id: { in: dueIds } } } };
+  const [user, dues, spaces, member, paid, leadUser] = await Promise.all([
+    db.user.findUnique({ where: { id: userId }, select: { id: true } }),
+    db.due.findMany({ where: { id: { in: dueIds } } }),
+    db.space.findMany({ where: viaDues, select: { id: true, name: true, isArchived: true } }),
+    db.spaceMembership.findFirst({ where: { userId, space: viaDues }, select: { userId: true } }),
+    db.duePayment.findFirst({ where: { userId, dueId: { in: dueIds } }, select: { dueId: true } }),
+    db.user.findFirst({
+      where: { spaceReps: { some: { role: 'lead', space: viaDues } } },
+      select: { kycStatus: true, studentIdStatus: true },
     }),
   ]);
   if (!user) throw notFound('User not found');
   if (dues.length !== dueIds.length) throw notFound('One or more dues could not be found');
 
-  const spaceIds = new Set(dues.map((d) => d.spaceId));
-  if (spaceIds.size > 1) {
+  if (spaces.length > 1) {
     throw new AppError(422, 'MIXED_SPACES', 'Dues from different spaces must be paid separately');
   }
-  const space = dues[0]!.space;
+  const space = spaces[0]!;
   if (space.isArchived) throw conflict('SPACE_ARCHIVED', 'This space is no longer collecting payments');
 
   const notPayable = dues.find((d) => d.status !== 'active');
   if (notPayable) throw conflict('DUE_NOT_PAYABLE', `"${notPayable.title}" is not open for payment`);
-
-  // Independent lookups, checked below in the same order as before.
-  const [member, paid, lead] = await Promise.all([
-    db.spaceMembership.findUnique({ where: { userId_spaceId: { userId, spaceId: space.id } }, select: { userId: true } }),
-    db.duePayment.findFirst({
-      where: { userId, dueId: { in: dueIds } },
-      include: { due: { select: { title: true } } },
-    }),
-    db.spaceRep.findFirst({
-      where: { spaceId: space.id, role: 'lead' },
-      include: { user: { select: { kycStatus: true, studentIdStatus: true } } },
-    }),
-  ]);
 
   if (opts.guest) {
     // Guests skip membership, but only for dues the rep opened to guests.
@@ -181,27 +174,31 @@ export async function createCheckout(
     throw forbidden('Join this space with its code before paying', 'NOT_A_MEMBER');
   }
 
-  if (paid) throw conflict('DUE_ALREADY_PAID', `"${paid.due.title}" has already been paid`);
+  if (paid) throw conflict('DUE_ALREADY_PAID', `"${dues.find((d) => d.id === paid.dueId)!.title}" has already been paid`);
 
   // The space can only collect once the rep accountable for it has passed KYC.
-  if (!lead || !canCollect(lead.user)) {
+  if (!leadUser || !canCollect(leadUser)) {
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
 
   const dueSetKey = [...dueIds].sort().join(',');
 
   // Serialise checkout creation per student so two tabs can't open two
-  // accounts for the same due.
-  const outcome = await db.$transaction(async (tx) => {
+  // accounts for the same due. Four round trips in the common case: the lock,
+  // the overlap check, one statement writing every row, and the commit.
+  const openTransaction = () => db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'checkout:' + userId}, 0))`;
 
+    // Lean first: the full rows (with items) are only read back on a reuse.
     const open = await tx.checkout.findMany({
       where: { userId, status: 'pending', expiresAt: { gt: new Date() }, items: { some: { dueId: { in: dueIds } } } },
-      include: withItems,
+      select: { id: true, reference: true, dueSetKey: true },
     });
-    const same = open.find((c) => c.dueSetKey === dueSetKey);
-    if (same) {
-      if (opts.guestData) await tx.checkout.update({ where: { id: same.id }, data: opts.guestData, select: { id: true } });
+    const sameRow = open.find((c) => c.dueSetKey === dueSetKey);
+    if (sameRow) {
+      const same = opts.guestData
+        ? await tx.checkout.update({ where: { id: sameRow.id }, data: opts.guestData, include: withItems })
+        : await tx.checkout.findUniqueOrThrow({ where: { id: sameRow.id }, include: withItems });
       return { checkout: same, reused: true };
     }
     if (open.length > 0) {
@@ -215,50 +212,86 @@ export async function createCheckout(
     const fee = checkoutFee(face);
     const ordered = dueIds.map((id) => dues.find((d) => d.id === id)!);
     const feeShares = allocate(fee, ordered.map((d) => d.amount));
-    const reference = await uniqueCheckoutReference(tx);
+    // No look-up first: the unique indexes on reference catch the ~1 in 10¹²
+    // collision, and the caller draws a new one.
+    const reference = generateReference();
     const title = ordered.length === 1 ? ordered[0]!.title : `${ordered.length} dues`;
+    const now = new Date();
 
-    // Written without `include`: reading the rows back would cost three more
-    // round trips, and everything serializeCheckout needs is already in hand.
-    const created = await tx.checkout.create({
-      data: {
-        id: generateId('checkout'),
-        reference,
-        userId,
-        spaceId: space.id,
-        faceKobo: face,
-        feeKobo: fee,
-        totalKobo: face + fee,
-        dueSetKey,
-        provider: getPaymentProvider().name,
-        // Provisional; replaced by the provider's own expiry once the account opens.
-        expiresAt: new Date(Date.now() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
-        ...opts.guestData,
-      },
-    });
-    const items = await tx.checkoutItem.createManyAndReturn({
-      data: ordered.map((d, i) => ({ checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]! })),
-    });
+    // Built here in full, so nothing is read back.
+    const created: Checkout = {
+      id: generateId('checkout'),
+      reference,
+      userId,
+      spaceId: space.id,
+      status: 'pending',
+      faceKobo: face,
+      feeKobo: fee,
+      totalKobo: face + fee,
+      receivedKobo: null,
+      overpaidKobo: 0,
+      dueSetKey,
+      provider: getPaymentProvider().name,
+      providerCheckoutId: null,
+      providerChargeId: null,
+      providerTransactionId: null,
+      destinationAccountId: null,
+      vaAccountNumber: null,
+      vaBankName: null,
+      vaAccountName: null,
+      lastProviderCheckAt: null,
+      checkoutUrl: null,
+      guestAnswers: (opts.guestData?.guestAnswers ?? null) as Checkout['guestAnswers'],
+      accountRequestedAt: (opts.guestData?.accountRequestedAt as Date | null | undefined) ?? null,
+      accountInviteSentAt: null,
+      // Provisional; replaced by the provider's own expiry once the account opens.
+      expiresAt: new Date(now.getTime() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
+      paidAt: null,
+      expiredAt: null,
+      underpaidAt: null,
+      needsReview: false,
+      reviewReason: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const items = ordered.map((d, i) => ({ id: generateId('checkoutItem'), checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]! }));
+
+    // The checkout, its lines and the student's history row (completed on
+    // payment) in ONE statement: Postgres runs every data-modifying CTE.
+    await tx.$executeRaw`
+      WITH c AS (
+        INSERT INTO "checkouts" ("id", "reference", "userId", "spaceId", "status", "faceKobo", "feeKobo", "totalKobo",
+                                 "overpaidKobo", "dueSetKey", "provider", "guestAnswers", "accountRequestedAt",
+                                 "expiresAt", "needsReview", "createdAt", "updatedAt")
+        VALUES (${created.id}, ${reference}, ${userId}, ${space.id}, 'pending'::"CheckoutStatus", ${face}, ${fee}, ${face + fee},
+                0, ${dueSetKey}, ${created.provider},
+                ${created.guestAnswers === null ? null : JSON.stringify(created.guestAnswers)}::jsonb,
+                ${utc(created.accountRequestedAt)}, ${utc(created.expiresAt)}, false, ${utc(now)}, ${utc(now)})
+      ),
+      i AS (
+        INSERT INTO "checkout_items" ("id", "checkoutId", "dueId", "faceKobo", "feeKobo")
+        VALUES ${Prisma.join(items.map((it) => Prisma.sql`(${it.id}, ${it.checkoutId}, ${it.dueId}, ${it.faceKobo}, ${it.feeKobo})`))}
+      )
+      INSERT INTO "transactions" ("id", "userId", "type", "title", "detail", "amount", "method", "status", "reference", "spaceId", "createdAt", "updatedAt")
+      VALUES (${generateId('transaction')}, ${userId}, 'due'::"TxnType", ${title}, ${space.name}, ${-(face + fee)}, 'Bank transfer',
+              'pending'::"TxnStatus", ${reference}, ${space.id}, ${utc(now)}, ${utc(now)})`;
+
     const checkout: CheckoutWithItems = {
       ...created,
       items: items.map((item) => ({ ...item, due: { title: ordered.find((d) => d.id === item.dueId)!.title } })),
     };
-    // The student's transaction history row, completed on payment.
-    await tx.transaction.create({
-      data: {
-        userId,
-        type: 'due',
-        title,
-        detail: space.name,
-        amount: -(face + fee),
-        method: 'Bank transfer',
-        status: 'pending',
-        reference,
-        spaceId: space.id,
-      },
-    });
     return { checkout, reused: false };
-  });
+  }, { timeout: 10_000 }); // 4 round trips normally; headroom for a slow database link
+
+  let outcome: Awaited<ReturnType<typeof openTransaction>> | undefined;
+  for (let attempt = 0; !outcome; attempt++) {
+    try {
+      outcome = await openTransaction();
+    } catch (err) {
+      if (attempt < 3 && isReferenceCollision(err)) continue;
+      throw err;
+    }
+  }
 
   const checkout = outcome.checkout.vaAccountNumber
     ? outcome.checkout
@@ -297,6 +330,7 @@ async function openCollectionAccount(checkout: CheckoutWithItems, reused: boolea
         expiresAt: account.expiresAt,
       },
     });
+    refineCollectionAccount(updated.id, updated.vaAccountNumber!);
     return { ...updated, items: checkout.items };
   } catch (err) {
     // A definite refusal closes the checkout so the student can start again.
@@ -308,6 +342,31 @@ async function openCollectionAccount(checkout: CheckoutWithItems, reused: boolea
     logger.error({ ref: checkout.reference, code: err instanceof ProviderError ? err.code : undefined }, 'could not open checkout account');
     throw err;
   }
+}
+
+/**
+ * After the student already has the account on screen: replace the estimated
+ * name and expiry with 9jaPay's own. Fire-and-forget, one retry (9jaPay tends
+ * to answer the first look-up straight after creation with a 500).
+ */
+function refineCollectionAccount(checkoutId: string, accountNumber: string): void {
+  const provider = getPaymentProvider();
+  if (!provider.describeCollectionAccount) return;
+  const attempt = async (left: number): Promise<void> => {
+    const found = await provider.describeCollectionAccount!(accountNumber).catch(() => null);
+    if (!found) {
+      if (left > 0) setTimeout(() => void attempt(left - 1), 3_000).unref();
+      return;
+    }
+    await db.checkout.updateMany({
+      where: { id: checkoutId, vaAccountNumber: accountNumber },
+      data: {
+        ...(found.accountName ? { vaAccountName: found.accountName } : {}),
+        ...(found.expiresAt ? { expiresAt: found.expiresAt } : {}),
+      },
+    });
+  };
+  void attempt(1).catch((err) => logger.warn({ checkoutId, err: (err as Error).message }, 'could not refine the collection account'));
 }
 
 /**

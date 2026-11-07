@@ -85,32 +85,34 @@ describe('NineJaPayProvider against recorded sandbox responses', () => {
     expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith('/name-enquiry') && (init!.body as string).includes('3000000000'))).toHaveLength(0);
   });
 
-  it('a one-time account takes the name and expiry 9jaPay gives it', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { requestReference: 'DVYPROBE', id: 'id1', accountNumber: '9000143193' } }), { status: 201 }),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            status: 'SUCCESS',
-            statusCode: '00',
-            data: { accountNumber: '9000143193', accountName: 'DUEVY COLLECTION ACCOUNT', expiresAt: '2026-11-06T18:50:32.618536Z', status: 'Active' },
-          }),
-          { status: 200 },
-        ),
-      );
+  it('a one-time account is ready after ONE call; the expiry counts from 9jaPay’s answer', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { requestReference: 'DVYPROBE', id: 'id1', accountNumber: '9000143193' } }), { status: 201 }),
+    );
     vi.stubGlobal('fetch', fetchMock);
+    const before = Date.now();
     const account = await provider.createCollectionAccount({ reference: 'DVY-PROB-E000', totalKobo: 507500, expiresInMinutes: 30 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(account).toMatchObject({ providerCheckoutId: 'DVYPROBE000', accountNumber: '9000143193', accountName: 'DUEVY COLLECTION ACCOUNT', bankName: '9jaPay' });
-    expect(account.expiresAt.toISOString()).toBe('2026-11-06T18:50:32.618Z');
-    expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({
+    // Never before 9jaPay's own expiry, so no real payment falls outside the window.
+    expect(account.expiresAt.getTime()).toBeGreaterThanOrEqual(before + 30 * 60_000);
+    expect(JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual({
       requestReference: 'DVYPROBE000',
       amount: 507500,
       timeToLive: '1800',
       IsSinglePayment: true,
     });
+  });
+
+  it('describes a one-time account with the name and exact expiry 9jaPay holds', async () => {
+    respond(200, {
+      status: 'SUCCESS',
+      statusCode: '00',
+      data: { accountNumber: '9000143193', accountName: 'DUEVY COLLECTION ACCOUNT', expiresAt: '2026-11-06T18:50:32.618536Z', status: 'Active' },
+    });
+    const found = await provider.describeCollectionAccount('9000143193');
+    expect(found?.accountName).toBe('DUEVY COLLECTION ACCOUNT');
+    expect(found?.expiresAt?.toISOString()).toBe('2026-11-06T18:50:32.618Z');
   });
 });
 
