@@ -3,8 +3,6 @@ import { z } from 'zod';
 import { type Poll } from '@prisma/client';
 import multer from 'multer';
 import { randomBytes } from 'crypto';
-import path from 'path';
-import fs from 'fs';
 import { db } from '../config/db';
 import { env } from '../config/env';
 import { validate } from '../middleware/validate';
@@ -17,7 +15,8 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializePoll } from '../lib/serializers';
 import { writeAudit } from '../lib/audit';
 import { generateReference } from '../lib/money';
-import { sniffDocumentType } from '../lib/storage';
+import { getPublicImageStore, sniffDocumentType } from '../lib/storage';
+import { logger } from '../lib/logger';
 import { applyPollVotes, type VoteSelection } from '../services/poll.service';
 
 /** Client-supplied image URLs must be https or one of our own uploads — no javascript:/data:/http: links. */
@@ -162,13 +161,12 @@ pollsRepRouter.post('/polls', validate(createPollSchema), async (req: Request, r
 
 // POST /polls/image — multipart upload, returns a URL to attach to a category
 // or nominee (either inline at poll creation or via the PATCH routes below).
-const POLL_IMAGE_DIR = path.join(process.cwd(), 'uploads', 'polls');
-fs.mkdirSync(POLL_IMAGE_DIR, { recursive: true });
-
+// Stored in ImageKit (public, served from its CDN) so every API instance
+// serves the same file.
 const ALLOWED_POLL_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
 // Held in memory so the real type can be sniffed from the bytes before
-// anything touches disk; the client's filename and Content-Type are ignored.
+// anything is stored; the client's filename and Content-Type are ignored.
 const pollImageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
@@ -193,15 +191,18 @@ pollsRepRouter.post('/polls/image', (req: Request, res: Response): void => {
       return;
     }
 
-    const filename = `${randomBytes(16).toString('hex')}.${sniffed.ext}`;
     try {
-      await fs.promises.writeFile(path.join(POLL_IMAGE_DIR, filename), req.file.buffer);
-    } catch {
-      fail(res, 500, 'INTERNAL_ERROR', 'Could not save the image');
-      return;
+      const image = await getPublicImageStore().upload({
+        buffer: req.file.buffer,
+        fileName: `${randomBytes(16).toString('hex')}.${sniffed.ext}`,
+        folder: 'polls',
+        tags: ['poll', spaceId(req)],
+      });
+      ok(res, { imageUrl: image.url });
+    } catch (e) {
+      logger.error({ err: (e as Error).message }, 'poll image upload to ImageKit failed');
+      fail(res, 502, 'UPLOAD_FAILED', 'Could not save the image. Please try again.');
     }
-    const imageUrl = `${env.APP_BASE_URL}/uploads/polls/${filename}`;
-    ok(res, { imageUrl });
   });
 });
 

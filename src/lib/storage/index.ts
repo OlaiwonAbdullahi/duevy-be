@@ -101,6 +101,95 @@ export function setFileStore(store: PrivateFileStore | null): void {
 }
 
 // ---------------------------------------------------------------------------
+// Public images: avatars and poll images. Uploaded as public files and served
+// straight from ImageKit's CDN, so every API instance sees the same files and
+// none of them pass through the API (they used to sit on one container's disk
+// under /uploads, which a second instance couldn't see).
+// ---------------------------------------------------------------------------
+
+export interface PublicImage {
+  fileId: string;
+  /** Absolute https URL, safe to store and hand to browsers. */
+  url: string;
+}
+
+export interface PublicImageUploadInput {
+  buffer: Buffer;
+  fileName: string;
+  /** Folder under IMAGEKIT_PUBLIC_FOLDER, e.g. "avatars". */
+  folder: string;
+  tags?: string[];
+}
+
+export interface PublicImageStore {
+  readonly name: string;
+  upload(input: PublicImageUploadInput): Promise<PublicImage>;
+  delete(fileId: string): Promise<void>;
+}
+
+class ImageKitPublicStore implements PublicImageStore {
+  readonly name = 'imagekit';
+  private readonly client: ImageKit;
+
+  constructor(
+    privateKey: string,
+    private readonly root: string,
+  ) {
+    this.client = new ImageKit({ privateKey });
+  }
+
+  async upload(input: PublicImageUploadInput): Promise<PublicImage> {
+    const res = await this.client.files.upload({
+      file: await toFile(input.buffer, input.fileName),
+      fileName: input.fileName,
+      folder: `${this.root.replace(/\/$/, '')}/${input.folder}`,
+      isPrivateFile: false,
+      useUniqueFileName: true,
+      tags: input.tags,
+    });
+    if (!res.fileId || !res.url) throw new Error('ImageKit upload returned no file reference');
+    return { fileId: res.fileId, url: res.url };
+  }
+
+  async delete(fileId: string): Promise<void> {
+    await this.client.files.delete(fileId);
+  }
+}
+
+/** In-memory public store for tests and local development. Refused in production. */
+export class MemoryPublicImageStore implements PublicImageStore {
+  readonly name = 'memory';
+  readonly files = new Map<string, { url: string; buffer: Buffer; tags?: string[] }>();
+
+  async upload(input: PublicImageUploadInput): Promise<PublicImage> {
+    const fileId = `mem_${randomUUID()}`;
+    const url = `https://images.memory.invalid/${input.folder}/${fileId}-${input.fileName}`;
+    this.files.set(fileId, { url, buffer: input.buffer, tags: input.tags });
+    return { fileId, url };
+  }
+
+  async delete(fileId: string): Promise<void> {
+    this.files.delete(fileId);
+  }
+}
+
+let publicInstance: PublicImageStore | null = null;
+
+export function getPublicImageStore(): PublicImageStore {
+  if (publicInstance) return publicInstance;
+  publicInstance =
+    env.FILE_STORAGE === 'memory'
+      ? new MemoryPublicImageStore()
+      : new ImageKitPublicStore(env.IMAGEKIT_PRIVATE_KEY as string, env.IMAGEKIT_PUBLIC_FOLDER);
+  return publicInstance;
+}
+
+/** Test seam. */
+export function setPublicImageStore(store: PublicImageStore | null): void {
+  publicInstance = store;
+}
+
+// ---------------------------------------------------------------------------
 // Upload validation: never trust the client's filename or Content-Type.
 // ---------------------------------------------------------------------------
 

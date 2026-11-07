@@ -117,7 +117,7 @@ async function main() {
     await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
     const dueIds: string[] = [];
     for (let d = 0; d < 6; d++) {
-      const due = await db.due.create({ data: { spaceId: space.id, title: `Due ${d}`, amount: 200_000 + d * 50_000, dueDate: new Date(Date.now() + 30 * 86_400_000), category: DUE_CATEGORY, status: 'active' } });
+      const due = await db.due.create({ data: { spaceId: space.id, title: `Due ${d}`, amount: 200_000 + d * 50_000, dueDate: new Date(Date.now() + 30 * 86_400_000), category: DUE_CATEGORY, status: 'active', allowGuests: true } });
       dueIds.push(due.id);
     }
     spaces.push({ id: space.id, dueIds });

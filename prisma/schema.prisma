@@ -342,6 +342,8 @@ model User {
   // From the rep's KYC submission ("male" | "female"); shown to admins.
   gender                         String?
   avatarUrl                      String?
+  // The ImageKit file behind avatarUrl, so a replaced avatar can be deleted.
+  avatarFileId                   String?
   // `role` is the coarse label carried in the access token (admin vs not).
   // Permissions are ADDITIVE: every user is a student; `isRep` is granted on
   // top once an admin approves their rep application, and is what rep-only

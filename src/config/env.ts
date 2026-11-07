@@ -74,6 +74,9 @@ const envSchema = z.object({
   // Folder that holds KYC documents. Restrict it in the ImageKit dashboard
   // (files are uploaded as private, so they are only served via signed URLs).
   IMAGEKIT_KYC_FOLDER: z.string().default('/duevy/kyc'),
+  // Folder for PUBLIC images (avatars, poll images), served from ImageKit's
+  // CDN. Must not be the KYC folder or under it.
+  IMAGEKIT_PUBLIC_FOLDER: z.string().default('/duevy/public'),
 
   // Structured logging (pino)
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
@@ -119,6 +122,14 @@ const envSchema = z.object({
   if (val.FILE_STORAGE === 'imagekit') {
     for (const key of ['IMAGEKIT_PRIVATE_KEY', 'IMAGEKIT_URL_ENDPOINT'] as const) {
       if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when FILE_STORAGE=imagekit' });
+    }
+  }
+  {
+    const norm = (f: string) => `/${f.replace(/^\/+|\/+$/g, '')}/`;
+    const pub = norm(val.IMAGEKIT_PUBLIC_FOLDER);
+    const kyc = norm(val.IMAGEKIT_KYC_FOLDER);
+    if (pub.startsWith(kyc) || kyc.startsWith(pub)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['IMAGEKIT_PUBLIC_FOLDER'], message: 'must not overlap IMAGEKIT_KYC_FOLDER (KYC documents are private)' });
     }
   }
   if (val.NODE_ENV === 'production' && val.FILE_STORAGE === 'memory') {

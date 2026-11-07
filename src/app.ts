@@ -50,7 +50,9 @@ app.use(
 );
 app.use(cookieParser());
 
-// Uploaded assets (avatars §3.2, nominee images §11)
+// LEGACY: avatars and poll images saved before they moved to ImageKit (new
+// uploads are served from its CDN). Remove this, and the uploads volume, once
+// src/scripts/migrateUploads.ts has been run with --apply in production.
 app.use(
   '/uploads',
   express.static('uploads', {

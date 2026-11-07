@@ -3,7 +3,13 @@ import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
-import { checkoutLimiter, lookupLimiter } from '../middleware/rateLimiter';
+import {
+  guestAccountLimiter,
+  guestCheckoutNetworkLimiter,
+  guestCheckoutPersonLimiter,
+  guestCheckoutStatusLimiter,
+  guestLinkLimiter,
+} from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
@@ -50,7 +56,7 @@ async function loadGuestDue(dueId: string) {
 // ---------------------------------------------------------------------------
 // GET /public/dues/{dueId} — what the guest is about to pay
 // ---------------------------------------------------------------------------
-guestPayRouter.get('/dues/:dueId', lookupLimiter, async (req: Request, res: Response): Promise<void> => {
+guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: Response): Promise<void> => {
   const due = await loadGuestDue(req.params.dueId as string);
   if (!due) {
     errors.notFound(res, 'This payment link is not open');
@@ -130,7 +136,8 @@ guestPayRouter.post(
   '/dues/:dueId/checkout',
   // Before the limiter, so a signed-in payer is limited per account, not per (shared campus) IP.
   optionalAuthenticate,
-  checkoutLimiter,
+  guestCheckoutPersonLimiter,
+  guestCheckoutNetworkLimiter,
   validate(guestCheckoutSchema),
   async (req: Request, res: Response): Promise<void> => {
     const dueId = req.params.dueId as string;
@@ -196,7 +203,7 @@ function tokenOf(req: Request): string {
   return typeof req.query.t === 'string' ? req.query.t : '';
 }
 
-guestPayRouter.get('/checkouts/:reference', async (req: Request, res: Response): Promise<void> => {
+guestPayRouter.get('/checkouts/:reference', guestCheckoutStatusLimiter, async (req: Request, res: Response): Promise<void> => {
   const reference = req.params.reference as string;
   // Ask the provider (throttled) so the page reflects a payment, or an expired
   // overlay session, without waiting for the webhook. Token first: an unknown
@@ -211,7 +218,7 @@ guestPayRouter.get('/checkouts/:reference', async (req: Request, res: Response):
 // from the success page, or send the activation link again. Sends only once
 // the checkout is paid; before that it records the request.
 // ---------------------------------------------------------------------------
-guestPayRouter.post('/checkouts/:reference/account', checkoutLimiter, async (req: Request, res: Response): Promise<void> => {
+guestPayRouter.post('/checkouts/:reference/account', guestAccountLimiter, async (req: Request, res: Response): Promise<void> => {
   const checkout = await getGuestCheckout(req.params.reference as string, tokenOf(req));
   if (checkout.account.exists) {
     fail(res, 409, 'ACCOUNT_EXISTS', 'This email already has a Duevy account. Sign in to see this payment.');
@@ -222,7 +229,7 @@ guestPayRouter.post('/checkouts/:reference/account', checkoutLimiter, async (req
   ok(res, { outcome, account });
 });
 
-guestPayRouter.get('/checkouts/:reference/receipt', async (req: Request, res: Response): Promise<void> => {
+guestPayRouter.get('/checkouts/:reference/receipt', guestCheckoutStatusLimiter, async (req: Request, res: Response): Promise<void> => {
   const checkout = await getGuestCheckout(req.params.reference as string, tokenOf(req));
   if (!checkout.receiptNumber) {
     errors.notFound(res, 'The receipt is issued once the payment is confirmed');

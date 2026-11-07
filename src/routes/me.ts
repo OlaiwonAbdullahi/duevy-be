@@ -11,7 +11,8 @@ import { validate } from '../middleware/validate';
 import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { ok, fail, errors } from '../lib/response';
 import { hashToken } from '../lib/tokens';
-import { sniffDocumentType } from '../lib/storage';
+import { getPublicImageStore, sniffDocumentType } from '../lib/storage';
+import { logger } from '../lib/logger';
 import { getKycState } from '../services/kyc.service';
 import {
   resubmitStudentIdHandlers,
@@ -109,7 +110,7 @@ meRouter.patch('/', rejectReadOnly, validate(patchMeSchema), async (req: Request
 
   const data = req.body as z.infer<typeof patchMeSchema>;
 
-  const current = await db.user.findUnique({ where: { id: uid }, select: { email: true, name: true } });
+  const current = await db.user.findUnique({ where: { id: uid }, select: { email: true, name: true, avatarUrl: true, avatarFileId: true } });
   if (!current) {
     errors.notFound(res, 'User not found');
     return;
@@ -118,7 +119,13 @@ meRouter.patch('/', rejectReadOnly, validate(patchMeSchema), async (req: Request
   const update: Record<string, unknown> = {};
   if (data.name !== undefined) update.name = data.name;
   if (data.phone !== undefined) update.phone = data.phone;
-  if (data.avatarUrl !== undefined) update.avatarUrl = data.avatarUrl;
+  // A different avatar URL replaces (and lets go of) the uploaded file; the
+  // same URL echoed back by a profile form changes nothing.
+  const avatarReplaced = data.avatarUrl !== undefined && data.avatarUrl !== current.avatarUrl;
+  if (avatarReplaced) {
+    update.avatarUrl = data.avatarUrl;
+    update.avatarFileId = null;
+  }
 
   // Email is fixed at sign-up. Echoing the current address back is fine (a
   // profile form may send every field); a different one is refused.
@@ -130,25 +137,45 @@ meRouter.patch('/', rejectReadOnly, validate(patchMeSchema), async (req: Request
   }
 
   const updated = await db.user.update({ where: { id: uid }, data: update, select: PROFILE_SELECT });
+  if (avatarReplaced) discardOldAvatar(current, null);
 
   ok(res, updated);
 });
 
 // ---------------------------------------------------------------------------
 // POST /me/avatar — multipart upload (§3.2)
+//
+// Stored in ImageKit (public, served from its CDN), so any API instance can
+// take the upload and every instance serves the same URL. Avatars saved
+// before the move keep their old /uploads/avatars/ URL until
+// scripts/migrate-uploads-to-imagekit.ts rewrites them.
 // ---------------------------------------------------------------------------
-const AVATAR_DIR = path.join(process.cwd(), 'uploads', 'avatars');
-fs.mkdirSync(AVATAR_DIR, { recursive: true });
-
 const ALLOWED_AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-const AVATAR_URL_PREFIX = `${env.APP_BASE_URL}/uploads/avatars/`;
+const LEGACY_AVATAR_URL_PREFIX = `${env.APP_BASE_URL}/uploads/avatars/`;
+const LEGACY_AVATAR_DIR = path.join(process.cwd(), 'uploads', 'avatars');
 
 // Held in memory so the real type can be sniffed from the bytes before
-// anything touches disk; the client's filename and Content-Type are ignored.
+// anything is stored; the client's filename and Content-Type are ignored.
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB
 }).single('file');
+
+/** Best-effort removal of the avatar being replaced. Never fails the request. */
+function discardOldAvatar(previous: { avatarUrl: string | null; avatarFileId: string | null } | null, keepFileId: string | null): void {
+  if (!previous) return;
+  if (previous.avatarFileId && previous.avatarFileId !== keepFileId) {
+    getPublicImageStore()
+      .delete(previous.avatarFileId)
+      .catch((err) => logger.warn({ err: (err as Error).message }, 'old avatar not deleted from ImageKit'));
+  }
+  // A pre-ImageKit upload on this container's disk: only a plain filename we
+  // generated, never a path.
+  const old = previous.avatarUrl?.startsWith(LEGACY_AVATAR_URL_PREFIX) ? previous.avatarUrl.slice(LEGACY_AVATAR_URL_PREFIX.length) : null;
+  if (old && /^[a-f0-9]{32}\.(jpg|png|webp)$/.test(old)) {
+    fs.promises.unlink(path.join(LEGACY_AVATAR_DIR, old)).catch(() => {});
+  }
+}
 
 meRouter.post('/avatar', (req: Request, res: Response): void => {
   avatarUpload(req, res, async (err: unknown) => {
@@ -169,24 +196,30 @@ meRouter.post('/avatar', (req: Request, res: Response): void => {
       return;
     }
 
+    const uid = userId(req);
+    let image;
     try {
-      const uid = userId(req);
-      const filename = `${randomBytes(16).toString('hex')}.${sniffed.ext}`;
-      await fs.promises.writeFile(path.join(AVATAR_DIR, filename), req.file.buffer);
-
-      const previous = await db.user.findUnique({ where: { id: uid }, select: { avatarUrl: true } });
-      const avatarUrl = `${AVATAR_URL_PREFIX}${filename}`;
-      await db.user.update({ where: { id: uid }, data: { avatarUrl } });
-
-      // Clean up the old upload — only a plain filename we generated, never a path.
-      const old = previous?.avatarUrl?.startsWith(AVATAR_URL_PREFIX) ? previous.avatarUrl.slice(AVATAR_URL_PREFIX.length) : null;
-      if (old && /^[a-f0-9]{32}\.(jpg|png|webp)$/.test(old)) {
-        fs.promises.unlink(path.join(AVATAR_DIR, old)).catch(() => {});
-      }
-
-      ok(res, { avatarUrl });
+      image = await getPublicImageStore().upload({
+        buffer: req.file.buffer,
+        fileName: `${randomBytes(16).toString('hex')}.${sniffed.ext}`,
+        folder: 'avatars',
+        tags: ['avatar', uid],
+      });
     } catch (e) {
-      console.error('[avatar] upload failed', e);
+      logger.error({ err: (e as Error).message, userId: uid }, 'avatar upload to ImageKit failed');
+      fail(res, 502, 'UPLOAD_FAILED', 'Could not save the avatar. Please try again.');
+      return;
+    }
+
+    try {
+      const previous = await db.user.findUnique({ where: { id: uid }, select: { avatarUrl: true, avatarFileId: true } });
+      await db.user.update({ where: { id: uid }, data: { avatarUrl: image.url, avatarFileId: image.fileId } });
+      discardOldAvatar(previous, image.fileId);
+      ok(res, { avatarUrl: image.url });
+    } catch (e) {
+      // Not recorded: don't leave the uploaded file behind.
+      getPublicImageStore().delete(image.fileId).catch(() => {});
+      logger.error({ err: (e as Error).message, userId: uid }, 'avatar not saved');
       fail(res, 500, 'INTERNAL_ERROR', 'Could not save the avatar');
     }
   });

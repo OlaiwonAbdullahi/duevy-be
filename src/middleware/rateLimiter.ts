@@ -9,6 +9,10 @@ import { type AuthenticatedRequest } from "./auth";
 export const standardLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 1500,
+  // The guest pay link has its own limits below. A whole class pays a shared
+  // link from one campus address (page, checkout, then a status poll every few
+  // seconds each), which this IP-wide bucket would cut off after ~70 guests.
+  skip: (req: Request) => isGuestPayPath(req.path),
   handler: (req, res) => {
     fail(
       res,
@@ -90,5 +94,82 @@ export const inviteLimiter = rateLimit({
     (req as AuthenticatedRequest).user?.sub ?? req.ip ?? "anon",
   handler: (req, res) => {
     fail(res, 429, "RATE_LIMITED", "You've sent a lot of invites today — try again tomorrow.");
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Guest pay link (/v1/public/dues/…, /v1/public/checkouts/…). Guests have no
+// account, so the IP is all there is to key on, and a class shares one campus
+// IP. Each limit therefore separates "one person" (tight, as before) from
+// "one network" (sized for a class opening the link together).
+// ---------------------------------------------------------------------------
+
+/** Paths (relative to /v1) that carry their own guest limits instead of the IP-wide standard one. */
+export function isGuestPayPath(path: string): boolean {
+  return path.startsWith('/public/dues/') || path.startsWith('/public/checkouts/');
+}
+
+const guestEmail = (req: Request): string => {
+  const email = (req.body as { email?: unknown } | undefined)?.email;
+  return typeof email === 'string' ? email.trim().toLowerCase().slice(0, 254) : '';
+};
+
+// Viewing the link: a cheap read (two indexed queries, ~8 ms). Due ids are
+// random, so there is nothing to enumerate; this only stops floods.
+export const guestLinkLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many requests from your network, please try again in a minute.");
+  },
+});
+
+// Starting a guest payment opens a real one-time account at 9jaPay, so one
+// person stays at 10 a minute (keyed by account when signed in, else by
+// network + email)…
+export const guestCheckoutPersonLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (req: Request) => {
+    const sub = (req as AuthenticatedRequest).user?.sub;
+    return sub ? `user:${sub}` : `guest:${req.ip ?? "anon"}:${guestEmail(req)}`;
+  },
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many payment attempts, please slow down.");
+  },
+});
+
+// …while a whole network of anonymous guests may start 60 a minute: a class
+// of 300 is through in about 5 minutes, and the accounts one address can mint
+// at the provider stay bounded.
+export const guestCheckoutNetworkLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  skip: (req: Request) => !!(req as AuthenticatedRequest).user,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "A lot of payments are starting from your network right now — please try again in a minute.");
+  },
+});
+
+// The success page polls its checkout every few seconds; keyed per checkout
+// so classmates polling their own payments don't share a bucket. Unknown or
+// unauthenticated references never reach the provider (token check first).
+export const guestCheckoutStatusLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  keyGenerator: (req: Request) => `${req.ip ?? "anon"}:${String(req.params.reference ?? "")}`,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many requests, please slow down.");
+  },
+});
+
+// "Create my account" / "send the link again" emails the guest: 5 per 10
+// minutes per checkout is plenty for a real person and useless for spam.
+export const guestAccountLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req: Request) => `${req.ip ?? "anon"}:${String(req.params.reference ?? "")}`,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "We've sent this a few times already — check your inbox, or try again in a few minutes.");
   },
 });
