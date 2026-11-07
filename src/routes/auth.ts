@@ -18,7 +18,6 @@ import { verifyGoogleIdToken } from "../lib/googleAuth";
 import { verifyRefreshToken } from "../lib/jwt";
 import { parseExpiryMs } from "../lib/jwt";
 import { authLimiter } from "../middleware/rateLimiter";
-import { isWeakPin } from "../services/withdrawal.service";
 
 export const authRouter = Router();
 
@@ -97,13 +96,6 @@ const registerSchema = z
     role: z.enum(["student", "rep"]).default("student"),
     referralCode: z.string().max(32).optional(),
     space: spaceDraftSchema.optional(),
-    // Reps only: the space's 4-digit withdrawal code, applied once the space is
-    // provisioned on approval. Optional — it can also be set later from the dashboard.
-    withdrawalPin: z
-      .string()
-      .regex(/^\d{4}$/, "must be 4 digits")
-      .refine((pin) => !isWeakPin(pin), "too easy to guess")
-      .optional(),
   })
   .refine(
     (data) => {
@@ -138,9 +130,6 @@ authRouter.post(
     }
 
     const passwordHash = await hashPassword(data.password, env.BCRYPT_ROUNDS);
-    // Same cost as codes set from the dashboard (withdrawal.service).
-    const withdrawalPinHash =
-      data.role === "rep" && data.withdrawalPin ? await hashPassword(data.withdrawalPin, 10) : null;
 
     // Begin transaction to create user and potentially rep application
     const user = await db.$transaction(async (tx) => {
@@ -169,7 +158,6 @@ authRouter.post(
             faculty: data.space.faculty,
             theme: "emerald", // not chosen at registration; the rep can change it later
             referralCode: data.referralCode,
-            withdrawalPinHash,
           },
         });
       }

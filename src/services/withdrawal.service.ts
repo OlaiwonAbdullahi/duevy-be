@@ -186,6 +186,26 @@ export type PinChange = 'set' | 'changed' | 'reset';
  * password. A first code is just set; changing one also needs the current
  * code; `forgot` replaces it without the current code but starts a 24h hold.
  */
+/**
+ * A rep applicant chooses their space's withdrawal code during onboarding,
+ * before the space exists. It's kept on the application and becomes the
+ * space's code on approval (admin.ts). Re-saving while pending replaces it.
+ */
+export async function setApplicationWithdrawalPin(input: { userId: string; pin: string; password: string }): Promise<void> {
+  await assertPassword(input.userId, input.password);
+  if (isWeakPin(input.pin)) {
+    throw new AppError(422, 'WEAK_PIN', 'Choose a less predictable code', [{ field: 'pin', issue: 'too easy to guess' }]);
+  }
+  const app = await db.repApplication.findUnique({ where: { userId: input.userId }, select: { status: true } });
+  if (!app || app.status !== 'pending') {
+    throw new AppError(409, 'NOT_PENDING', 'You have no pending rep application. Set your code from your space instead.');
+  }
+  await db.repApplication.update({
+    where: { userId: input.userId },
+    data: { withdrawalPinHash: await hashPassword(input.pin, 10) },
+  });
+}
+
 export async function setWithdrawalPinByRep(input: {
   spaceId: string;
   userId: string;

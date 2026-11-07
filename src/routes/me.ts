@@ -14,6 +14,8 @@ import { hashToken } from '../lib/tokens';
 import { getPublicImageStore, sniffDocumentType } from '../lib/storage';
 import { logger } from '../lib/logger';
 import { getKycState } from '../services/kyc.service';
+import { setApplicationWithdrawalPin } from '../services/withdrawal.service';
+import { sensitiveLimiter } from '../middleware/rateLimiter';
 import {
   resubmitStudentIdHandlers,
   submitLivenessHandlers,
@@ -39,6 +41,30 @@ meRouter.get('/kyc-status', async (req: Request, res: Response): Promise<void> =
 meRouter.post('/kyc', ...submitKycHandlers);
 meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
 meRouter.post('/kyc/liveness', ...submitLivenessHandlers);
+
+// ---------------------------------------------------------------------------
+// GET / PUT /me/withdrawal-pin — a rep applicant's withdrawal code, chosen
+// during onboarding and applied to the space on approval. Once the space
+// exists it's managed with /spaces/:spaceId/payout/pin instead.
+// ---------------------------------------------------------------------------
+meRouter.get('/withdrawal-pin', async (req: Request, res: Response): Promise<void> => {
+  const app = await db.repApplication.findUnique({ where: { userId: userId(req) }, select: { status: true, withdrawalPinHash: true } });
+  if (!app || app.status !== 'pending') {
+    errors.notFound(res, 'No pending rep application');
+    return;
+  }
+  ok(res, { withdrawalPinSet: !!app.withdrawalPinHash });
+});
+
+const applicationPinSchema = z
+  .object({ pin: z.string().regex(/^\d{4}$/, 'must be 4 digits'), password: z.string().min(1).max(1024) })
+  .strict();
+
+meRouter.put('/withdrawal-pin', sensitiveLimiter, validate(applicationPinSchema), async (req: Request, res: Response): Promise<void> => {
+  const { pin, password } = req.body as z.infer<typeof applicationPinSchema>;
+  await setApplicationWithdrawalPin({ userId: userId(req), pin, password });
+  ok(res, { withdrawalPinSet: true });
+});
 
 // Default notification preferences (§3.4) applied when the column is null.
 const DEFAULT_NOTIFICATION_PREFS = {

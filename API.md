@@ -38,12 +38,9 @@ Base URL: `/v1`. Request and response bodies are JSON.
 ```json
 { "name": "Aisha Bello", "matricNo": "210805019", "email": "aisha@example.com", "password": "min 8 chars",
   "acceptedTerms": true, "role": "student" | "rep",
-  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" },  // required when role = rep
-  "withdrawalPin": "2580"  // optional, rep only: 4 digits, not 1111/1234-style
+  "space": { "name": "…", "short": "CSC", "kind": "department|association|faculty|club", "school": "…", "faculty": "…" }  // required when role = rep
 }
 ```
-
-- A rep's `withdrawalPin` is stored hashed on the application and becomes the space's withdrawal code when an admin approves it. The lead rep can change it later with `PUT /spaces/:spaceId/payout/pin`.
 
 - `201`: `{ user, accessToken }` for a student.
 - `403 REP_APPROVAL_PENDING`: returned for a rep, together with `data: { user, accessToken }`. The rep can sign in, but rep actions wait for admin approval.
@@ -269,6 +266,13 @@ A new face capture: the first one, a retake after an admin rejected it, or a rea
 ### `GET /payout/kyc-status`
 
 `200`: the space lead's KYC state (shape above) plus `mine`, the caller's own state.
+
+### `GET` / `PUT /me/withdrawal-pin` (rep applicant)
+
+A rep applicant chooses the department's withdrawal code during onboarding, before the space exists. `GET` returns `{ withdrawalPinSet }`. `PUT { pin: "2580", password }` saves it (re-saving while pending replaces it) and returns `{ withdrawalPinSet: true }`. The code becomes the space's code when an admin approves the application. After that it's managed with `PUT /payout/pin`.
+
+- `403 INVALID_PASSWORD`, `409 PASSWORD_REQUIRED` (no password on the account), `422 WEAK_PIN` (1111/1234-style), `400 VALIDATION_ERROR`.
+- `404` on `GET` / `409 NOT_PENDING` on `PUT`: no pending rep application.
 
 ### `GET /payout/summary` (rep dashboard)
 
