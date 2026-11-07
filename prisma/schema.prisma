@@ -476,7 +476,6 @@ model RefreshToken {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
-  @@index([tokenHash])
   @@map("refresh_tokens")
 }
 
@@ -505,7 +504,6 @@ model EmailVerification {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([token])
   @@map("email_verifications")
 }
 
@@ -519,7 +517,6 @@ model PasswordReset {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([tokenHash])
   @@map("password_resets")
 }
 
@@ -796,6 +793,8 @@ model Checkout {
   vaAccountNumber       String?
   vaBankName            String?
   vaAccountName         String?
+  // When the pay-page status poll last asked the provider (cross-instance throttle).
+  lastProviderCheckAt   DateTime?
   // Legacy (Bachs): a hosted checkout's page.
   checkoutUrl           String?
   // A guest's answers to the due's guestFields, labels copied in (lib/guestForm.ts).
@@ -823,6 +822,7 @@ model Checkout {
 
   @@index([userId, status])
   @@index([spaceId, status])
+  @@index([vaAccountNumber, status])
   @@index([status, expiresAt])
   @@index([status, createdAt])
   @@index([needsReview])
@@ -949,7 +949,6 @@ model PendingPayment {
   createdAt DateTime @default(now())
   expiresAt DateTime
 
-  @@index([reference])
   @@map("pending_payments")
 }
 

@@ -1,6 +1,6 @@
 import { randomInt } from 'crypto';
 import { Prisma, type Payout } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import { hashPassword, verifyPassword } from '../lib/password';
 import { db } from '../config/db';
 import { AppError, conflict, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
@@ -54,7 +54,7 @@ export async function sendApprovalOtp(payoutId: string, spaceId: string, userId:
 
   const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
   const expiresAt = new Date(Date.now() + OTP_TTL_MS);
-  const data = { codeHash: await bcrypt.hash(code, 10), attempts: 0, expiresAt, createdAt: new Date() };
+  const data = { codeHash: await hashPassword(code, 10), attempts: 0, expiresAt, createdAt: new Date() };
   await db.payoutOtp.upsert({ where: { payoutId_userId: { payoutId, userId } }, update: data, create: { payoutId, userId, ...data } });
 
   const [signer, space, due, requester] = await Promise.all([
@@ -82,7 +82,7 @@ async function checkOtp(payoutId: string, userId: string, otp: string): Promise<
   if (!row || row.expiresAt <= new Date()) {
     throw new AppError(400, 'OTP_EXPIRED', 'That code has expired. Request a new one.', [{ field: 'otp', issue: 'expired' }]);
   }
-  if (await bcrypt.compare(otp, row.codeHash)) return;
+  if (await verifyPassword(otp, row.codeHash)) return;
   const { attempts } = await db.payoutOtp.update({ where: { id: row.id }, data: { attempts: { increment: 1 } }, select: { attempts: true } });
   if (attempts >= OTP_MAX_ATTEMPTS) {
     await db.payoutOtp.deleteMany({ where: { id: row.id } });

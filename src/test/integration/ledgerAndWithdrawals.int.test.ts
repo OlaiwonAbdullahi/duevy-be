@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import bcrypt from 'bcryptjs';
+import { hashPasswordSync } from '../../lib/password';
 import { db } from '../../config/db';
 import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
@@ -260,7 +260,7 @@ describe('beneficiaries', () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 1_000_000);
     await db.space.update({ where: { id: space.id }, data: { withdrawalPinHash: null } });
-    await db.user.update({ where: { id: rep.id }, data: { passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    await db.user.update({ where: { id: rep.id }, data: { passwordHash: hashPasswordSync('Secret123!', 4) } });
     const token = await tokenFor(rep);
     const pinPath = `/v1/spaces/${space.id}/payout/pin`;
 
@@ -289,9 +289,9 @@ describe('beneficiaries', () => {
 
   it('clears the code when the lead rep changes', async () => {
     const { rep, space } = await makeSpace();
-    const other = await db.user.create({ data: { name: 'Bayo', email: `b_${space.id}@test.duevy`, passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    const other = await db.user.create({ data: { name: 'Bayo', email: `b_${space.id}@test.duevy`, passwordHash: hashPasswordSync('Secret123!', 4) } });
     await db.spaceRep.create({ data: { userId: other.id, spaceId: space.id, role: 'co' } });
-    await db.user.update({ where: { id: rep.id }, data: { passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    await db.user.update({ where: { id: rep.id }, data: { passwordHash: hashPasswordSync('Secret123!', 4) } });
     const res = await api('POST', `/v1/spaces/${space.id}/transfer-lead`, {
       token: await tokenFor(rep),
       body: { userId: other.id, password: 'Secret123!' },
@@ -322,16 +322,16 @@ describe('beneficiaries', () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 1_000_000);
     const next = await db.user.create({
-      data: { name: 'Bayo', email: `next_${space.id}@test.duevy`, isRep: true, role: 'rep', repApplicationStatus: 'approved', passwordHash: bcrypt.hashSync('Secret123!', 4) },
+      data: { name: 'Bayo', email: `next_${space.id}@test.duevy`, isRep: true, role: 'rep', repApplicationStatus: 'approved', passwordHash: hashPasswordSync('Secret123!', 4) },
     });
     await db.spaceRep.create({ data: { userId: next.id, spaceId: space.id, role: 'co' } });
-    await db.user.update({ where: { id: rep.id }, data: { passwordHash: bcrypt.hashSync('Secret123!', 4) } });
+    await db.user.update({ where: { id: rep.id }, data: { passwordHash: hashPasswordSync('Secret123!', 4) } });
     const res = await api('POST', `/v1/spaces/${space.id}/transfer-lead`, { token: await tokenFor(rep), body: { userId: next.id, password: 'Secret123!' } });
     expect(res.status).toBeLessThan(300);
 
     expect(await getSpaceBalance(space.id)).toBe(1_000_000);
     expect(await db.payoutBeneficiary.count({ where: { id: beneficiary!.id, spaceId: space.id } })).toBe(1);
-    await db.space.update({ where: { id: space.id }, data: { withdrawalPinHash: bcrypt.hashSync(TEST_PIN, 4) } });
+    await db.space.update({ where: { id: space.id }, data: { withdrawalPinHash: hashPasswordSync(TEST_PIN, 4) } });
     const req = () => requestWithdrawal({ spaceId: space.id, userId: next.id, beneficiaryId: beneficiary!.id, amountKobo: 200_000, pin: TEST_PIN });
     await expect(req()).rejects.toMatchObject({ code: 'KYC_NOT_VERIFIED' });
 

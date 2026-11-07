@@ -1,4 +1,5 @@
 import { db } from '../config/db';
+import { env } from '../config/env';
 import { logger } from '../lib/logger';
 import { processEvent, type StoredEventPayload } from '../services/webhookProcessor.service';
 
@@ -75,23 +76,45 @@ async function runOne(row: ClaimedRow): Promise<void> {
   }
 }
 
+/**
+ * Run `fn` over `items` with at most `limit` in flight. Every handler makes a
+ * provider round trip (up to its 20s timeout), so one-at-a-time capped a
+ * process at a few events per second and a payment burst queued for minutes.
+ * Running a claimed batch concurrently is safe for the same reasons several
+ * worker processes are: every handler row-locks or claims conditionally, and
+ * the ledger/provider-transaction unique keys stop a double outcome.
+ */
+export async function forEachLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const lanes = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) await fn(items[next++]!);
+  });
+  await Promise.all(lanes);
+}
+
 /** Process everything currently due. Returns how many events were handled. */
-export async function drainWebhookQueue(maxBatches = 20): Promise<number> {
+export async function drainWebhookQueue(maxBatches = 20, concurrency = env.WEBHOOK_WORKER_CONCURRENCY): Promise<number> {
   let handled = 0;
   for (let i = 0; i < maxBatches; i++) {
     const rows = await claimBatch();
     if (rows.length === 0) break;
-    for (const row of rows) await runOne(row);
+    // A handler failure is recorded on the row for retry. If even that write
+    // fails (database gone), the row stays `processing` and is reclaimed
+    // after STALE_LOCK_MS; the other events in the batch still run.
+    await forEachLimit(rows, concurrency, (row) =>
+      runOne(row).catch((err) => logger.error({ eventId: row.providerEventId, err: (err as Error).message }, 'webhook event outcome not recorded')),
+    );
     handled += rows.length;
   }
   return handled;
 }
 
 let draining: Promise<number> | null = null;
+let stopped = false;
 
 /** Nudge the worker now (called right after a webhook is enqueued). Coalesces concurrent nudges. */
 export function kickWebhookWorker(): void {
-  if (draining) return;
+  if (draining || stopped) return;
   draining = drainWebhookQueue()
     .catch((err) => {
       logger.error({ err: (err as Error).message }, 'webhook drain failed');
@@ -104,5 +127,12 @@ export function kickWebhookWorker(): void {
 
 /** Poll the queue on an interval. Returns a handle for shutdown. */
 export function startWebhookWorker(intervalMs = 2_000): NodeJS.Timeout {
+  stopped = false;
   return setInterval(kickWebhookWorker, intervalMs);
+}
+
+/** Shutdown: start no new drain, and resolve once the one in flight has finished. */
+export async function stopWebhookWorker(): Promise<void> {
+  stopped = true;
+  await draining;
 }

@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from 'express';
-import bcrypt from 'bcryptjs';
+import { hashPassword, verifyPassword } from '../lib/password';
 import { z } from 'zod';
 import multer from 'multer';
 import { randomBytes } from 'crypto';
@@ -210,14 +210,14 @@ meRouter.put('/password', validate(putPasswordSchema), async (req: Request, res:
     return;
   }
 
-  if (!(await bcrypt.compare(currentPassword, user.passwordHash))) {
+  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
     fail(res, 400, 'INVALID_CREDENTIALS', 'Current password is incorrect', [
       { field: 'currentPassword', issue: 'incorrect' },
     ]);
     return;
   }
 
-  const passwordHash = await bcrypt.hash(newPassword, env.BCRYPT_ROUNDS);
+  const passwordHash = await hashPassword(newPassword, env.BCRYPT_ROUNDS);
 
   // Keep the caller's current session; revoke every other refresh token.
   const currentCookie = req.cookies?.refreshToken;
@@ -400,7 +400,7 @@ meRouter.delete('/', validate(deleteMeSchema), async (req: Request, res: Respons
     return;
   }
 
-  if (!(await bcrypt.compare(password, user.passwordHash))) {
+  if (!(await verifyPassword(password, user.passwordHash))) {
     fail(res, 400, 'INVALID_CREDENTIALS', 'Password is incorrect', [
       { field: 'password', issue: 'incorrect' },
     ]);

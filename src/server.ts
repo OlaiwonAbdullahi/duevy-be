@@ -6,6 +6,7 @@ import { startReconciliationJob } from './jobs/reconciliation';
 import { startWebhookWorker } from './jobs/webhookWorker';
 import { startKycReminderJob } from './jobs/kycReminders';
 import { getPaymentProvider } from './providers/payment';
+import { installShutdownHandlers } from './lib/lifecycle';
 
 async function startServer() {
   try {
@@ -15,21 +16,20 @@ async function startServer() {
     const server = app.listen(env.PORT, () => {
       logger.info({ port: env.PORT }, 'server ready');
     });
+    // Caddy (and most proxies) keep upstream connections idle for up to 2
+    // minutes. Node's default 5s keep-alive closed them first, so a request
+    // sent on a socket Node was closing came back as a sporadic 502. Outlive
+    // the proxy instead; headersTimeout must exceed keepAliveTimeout.
+    server.keepAliveTimeout = 125_000;
+    server.headersTimeout = 126_000;
+    // Upper bound for receiving a whole request (slow mobile uploads included).
+    server.requestTimeout = 120_000;
 
     // The webhook queue worker and the reconciliation sweep run in-process by
     // default. Set RUN_WORKERS=false to run them separately (npm run worker).
     const timers = env.RUN_WORKERS ? [startWebhookWorker(), startReconciliationJob(), startKycReminderJob()] : [];
 
-    const shutdown = async () => {
-      logger.info('shutting down');
-      timers.forEach(clearInterval);
-      server.close();
-      await db.$disconnect();
-      process.exit(0);
-    };
-
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
+    installShutdownHandlers({ server, timers });
 
     // A stray rejected promise would otherwise kill the whole API (Node's
     // default); log it and keep serving. A thrown exception leaves the process

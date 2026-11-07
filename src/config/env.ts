@@ -56,6 +56,9 @@ const envSchema = z.object({
   CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
   // Run the webhook/job worker and reconciliation inside the API process.
   // Turn off when they run as a separate process (npm run worker).
+  // Webhook events handled at once per process. Each holds a DB connection
+  // while it writes, so keep it well under the Prisma pool size.
+  WEBHOOK_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(4),
   RUN_WORKERS: z
     .string()
     .transform((v) => v !== 'false')

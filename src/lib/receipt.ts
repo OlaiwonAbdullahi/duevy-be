@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import PDFDocument from 'pdfkit';
 import { formatNaira } from './money';
@@ -114,10 +115,34 @@ function formatPaidAt(date: Date) {
   }).format(date);
 }
 
+/**
+ * Asset bytes, read from disk once per process. Passing paths made pdfkit
+ * re-read ~1.25 MB of fonts (twice: scratch + real document) and the header
+ * images synchronously on every receipt, on the event loop.
+ */
+const assetCache = new Map<string, Buffer>();
+function asset(file: string): Buffer {
+  let buf = assetCache.get(file);
+  if (!buf) {
+    buf = fs.readFileSync(file);
+    assetCache.set(file, buf);
+  }
+  return buf;
+}
+
 function registerFonts(doc: PDFKit.PDFDocument) {
-  doc.registerFont('regular', FONT.regular);
-  doc.registerFont('semibold', FONT.semibold);
-  doc.registerFont('bold', FONT.bold);
+  doc.registerFont('regular', asset(FONT.regular));
+  doc.registerFont('semibold', asset(FONT.semibold));
+  doc.registerFont('bold', asset(FONT.bold));
+}
+
+/** A bundled image's bytes, or its path if it can't be read (tryImage then skips it). */
+function bundledImage(file: string): Buffer | string {
+  try {
+    return asset(file);
+  } catch {
+    return file;
+  }
 }
 
 /** Draw an image if it's there; a missing asset must never break a receipt. */
@@ -388,7 +413,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
       doc.save();
       doc.rect(0, 0, PAGE_W, headerH).clip();
       if (design.accent) doc.opacity(0.35);
-      tryImage(doc, IMAGE.doodle, 0, 0, { cover: [PAGE_W, headerH], align: 'center', valign: 'center' });
+      tryImage(doc, bundledImage(IMAGE.doodle), 0, 0, { cover: [PAGE_W, headerH], align: 'center', valign: 'center' });
       doc.restore();
     }
 
@@ -397,7 +422,7 @@ export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
     if (logo && design.logo) {
       tryImage(doc, design.logo, CARD_X + 6, 16, { width: logo.w, height: logo.h });
     } else {
-      tryImage(doc, IMAGE.logoWhite, CARD_X + 6, 22, { height: 22 });
+      tryImage(doc, bundledImage(IMAGE.logoWhite), CARD_X + 6, 22, { height: 22 });
     }
     // The title takes whatever width the logo leaves.
     const titleX = CARD_X + 6 + (logo ? logo.w : 90) + 16;

@@ -3,6 +3,7 @@ import { logger } from './lib/logger';
 import { startReconciliationJob } from './jobs/reconciliation';
 import { startWebhookWorker } from './jobs/webhookWorker';
 import { startKycReminderJob } from './jobs/kycReminders';
+import { installShutdownHandlers } from './lib/lifecycle';
 
 /**
  * Standalone worker: the webhook queue, the reconciliation sweep and the KYC
@@ -16,13 +17,7 @@ async function main() {
   const timers = [startWebhookWorker(), startReconciliationJob(), startKycReminderJob()];
   logger.info('worker started');
 
-  const shutdown = async () => {
-    timers.forEach(clearInterval);
-    await db.$disconnect();
-    process.exit(0);
-  };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  installShutdownHandlers({ timers });
 }
 
 main().catch((err) => {

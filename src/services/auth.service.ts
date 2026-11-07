@@ -1,4 +1,3 @@
-import bcrypt from 'bcryptjs';
 import { db } from '../config/db';
 import { env } from '../config/env';
 import { signAccessToken, signRefreshToken } from '../lib/jwt';

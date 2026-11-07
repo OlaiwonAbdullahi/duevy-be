@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from 'express';
-import bcrypt from 'bcryptjs';
+import { verifyPassword } from '../lib/password';
 import { z } from 'zod';
 import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
@@ -365,7 +365,7 @@ circleRouter.post('/transfer-lead', requireSpaceRep(true), validate(transferSche
     db.spaceRep.findUnique({ where: { userId_spaceId: { userId: callerId, spaceId: sid } } }),
     db.user.findUnique({ where: { id: targetId }, select: { name: true } }),
   ]);
-  if (!caller?.passwordHash || !(await bcrypt.compare(password, caller.passwordHash))) {
+  if (!caller?.passwordHash || !(await verifyPassword(password, caller.passwordHash))) {
     fail(res, 400, 'INVALID_CREDENTIALS', 'Password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
     return;
   }
@@ -416,7 +416,7 @@ circleRouter.post('/archive', requireSpaceRep(true), validate(archiveSchema), as
   const { password, reason } = req.body as z.infer<typeof archiveSchema>;
 
   const caller = await db.user.findUnique({ where: { id: callerId } });
-  if (!caller?.passwordHash || !(await bcrypt.compare(password, caller.passwordHash))) {
+  if (!caller?.passwordHash || !(await verifyPassword(password, caller.passwordHash))) {
     fail(res, 400, 'INVALID_CREDENTIALS', 'Password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
     return;
   }

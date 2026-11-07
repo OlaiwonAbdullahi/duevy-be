@@ -7,7 +7,7 @@ import { ok, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeTransaction } from '../lib/serializers';
 import { renderReceiptPdf } from '../lib/receipt';
-import { getCheckoutForUser } from '../services/checkout.service';
+import { serializeCheckout } from '../services/checkout.service';
 import { getReceiptByNumber, listReceipts, renderCheckoutReceipt, renderReceiptByNumber } from '../services/receipt.service';
 import { reconcileCheckout } from '../jobs/reconciliation';
 import { logger } from '../lib/logger';
@@ -144,38 +144,57 @@ export const paymentsRouter = Router();
 paymentsRouter.use(authenticate);
 
 const PROVIDER_CHECK_INTERVAL_MS = 10_000;
-const lastProviderCheck = new Map<string, number>();
 
-export async function syncPendingCheckout(reference: string): Promise<void> {
+/**
+ * Ask the provider about a pending checkout, at most once per interval per
+ * checkout. The slot is claimed with a conditional UPDATE on the row, so the
+ * throttle holds across every API instance (an in-process map multiplied the
+ * provider calls by the instance count). A poll that loses the claim costs one
+ * indexed UPDATE that matches no row. Returns true if the provider was asked.
+ */
+export async function syncPendingCheckout(reference: string): Promise<boolean> {
+  const now = new Date();
+  const claimed = await db.checkout.updateMany({
+    where: {
+      reference,
+      status: 'pending',
+      providerCheckoutId: { not: null },
+      OR: [{ lastProviderCheckAt: null }, { lastProviderCheckAt: { lt: new Date(now.getTime() - PROVIDER_CHECK_INTERVAL_MS) } }],
+    },
+    data: { lastProviderCheckAt: now },
+  });
+  if (claimed.count === 0) return false;
   const c = await db.checkout.findUnique({ where: { reference } });
-  if (!c || c.status !== 'pending' || !c.providerCheckoutId) return;
-  const now = Date.now();
-  if (now - (lastProviderCheck.get(reference) ?? 0) < PROVIDER_CHECK_INTERVAL_MS) return;
-  lastProviderCheck.set(reference, now);
-  if (lastProviderCheck.size > 5_000) lastProviderCheck.clear(); // bounded; a miss only costs one extra GET
+  if (!c || c.status !== 'pending') return false;
   await reconcileCheckout(c, { expireIfPastDue: false, source: 'status check' }).catch((err) =>
     logger.warn({ ref: reference, err: (err as Error).message }, 'status check with provider failed'),
   );
+  return true;
 }
+
+const statusInclude = { items: { include: { due: { select: { title: true } } } }, receipt: { select: { number: true } } } as const;
 
 async function paymentStatus(req: Request, res: Response): Promise<void> {
   const id = uid(req);
   const reference = req.params.reference as string;
 
-  const checkout = await db.checkout.findUnique({ where: { reference }, select: { userId: true } });
+  // One read for the common poll (pending, throttled); re-read only when the
+  // provider was actually asked, since that may have moved the checkout.
+  let checkout = await db.checkout.findUnique({ where: { reference }, include: statusInclude });
   if (checkout) {
     if (checkout.userId !== id) {
       errors.notFound(res, 'Payment not found');
       return;
     }
-    await syncPendingCheckout(reference);
-    const view = await getCheckoutForUser(reference, id);
-    const txn = await db.transaction.findUnique({ where: { reference } });
-    const receipt = view.status === 'paid' ? await db.receipt.findFirst({ where: { checkout: { reference } }, select: { number: true } }) : null;
+    if (checkout.status === 'pending' && (await syncPendingCheckout(reference))) {
+      checkout = (await db.checkout.findUnique({ where: { reference }, include: statusInclude }))!;
+    }
+    const view = serializeCheckout(checkout);
+    const txn = view.status === 'paid' ? await db.transaction.findUnique({ where: { reference } }) : null;
     ok(res, {
       ...view,
-      receiptNumber: receipt?.number ?? null,
-      ...(txn && view.status === 'paid' ? { transaction: serializeTransaction(txn) } : {}),
+      receiptNumber: view.status === 'paid' ? (checkout.receipt?.number ?? null) : null,
+      ...(txn ? { transaction: serializeTransaction(txn) } : {}),
     });
     return;
   }

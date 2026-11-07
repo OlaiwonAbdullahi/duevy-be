@@ -78,20 +78,28 @@ export async function sendKycRemindersOnce(now = new Date()): Promise<number> {
   return sent;
 }
 
-let running = false;
+let running: Promise<void> | null = null;
+let stopped = false;
 
 /** Start the hourly reminder sweep. Returns a handle for shutdown. */
 export function startKycReminderJob(intervalMs = HOUR): NodeJS.Timeout {
+  stopped = false;
   const run = () => {
-    if (running) return;
-    running = true;
-    sendKycRemindersOnce()
+    if (running || stopped) return;
+    running = sendKycRemindersOnce()
+      .then(() => undefined)
       .catch((err) => logger.error({ err: (err as Error).message }, 'kyc reminder run failed'))
       .finally(() => {
-        running = false;
+        running = null;
       });
   };
   // First pass shortly after boot, then hourly.
   setTimeout(run, 30 * 1000).unref();
   return setInterval(run, intervalMs);
+}
+
+/** Shutdown: start no new run (the boot-time one included) and wait for the one in flight. */
+export async function stopKycReminderJob(): Promise<void> {
+  stopped = true;
+  await running;
 }

@@ -12,7 +12,7 @@
  *
  * Run with: npm run db:seed
  */
-import bcrypt from 'bcryptjs';
+import { hashPassword } from '../src/lib/password';
 import { db } from '../src/config/db';
 import { env } from '../src/config/env';
 import { encrypt, maskAccountNumber } from '../src/lib/encryption';
@@ -25,7 +25,7 @@ const JOIN_CODE = 'CSC-LAU1';
 async function main() {
   if (env.NODE_ENV === 'production') throw new Error('Refusing to seed a production database');
   const fake = env.PAYMENT_PROVIDER === 'fake';
-  const passwordHash = await bcrypt.hash(PASSWORD, env.BCRYPT_ROUNDS);
+  const passwordHash = await hashPassword(PASSWORD, env.BCRYPT_ROUNDS);
   const now = new Date();
 
   // --- Super admin -----------------------------------------------------------

@@ -31,5 +31,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
   CMD curl -fsS http://localhost:3000/health || exit 1
 
 # Apply any pending migrations, then start. `migrate deploy` is a no-op when
-# the database is already up to date.
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+# the database is already up to date. `exec` makes node PID 1's replacement,
+# so `docker stop`'s SIGTERM reaches it and it can shut down gracefully
+# (src/lib/lifecycle.ts) instead of being SIGKILLed after the grace period.
+CMD ["sh", "-c", "npx prisma migrate deploy && exec node dist/server.js"]

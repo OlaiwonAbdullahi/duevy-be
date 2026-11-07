@@ -1,5 +1,5 @@
 import { Prisma, type Payout, type RepRole, type Space } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import { hashPassword, verifyPassword } from '../lib/password';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
@@ -121,7 +121,7 @@ async function checkPin(space: Space, pin: string): Promise<void> {
   if (space.withdrawalPinLockedUntil && space.withdrawalPinLockedUntil > new Date()) {
     throw new AppError(423, 'WITHDRAWAL_PIN_LOCKED', 'Too many wrong security codes. Try again in 30 minutes, or reset your code.');
   }
-  if (await bcrypt.compare(pin, space.withdrawalPinHash)) {
+  if (await verifyPassword(pin, space.withdrawalPinHash)) {
     if (space.withdrawalPinFailedAttempts > 0) {
       await db.space.update({ where: { id: space.id }, data: { withdrawalPinFailedAttempts: 0, withdrawalPinLockedUntil: null } });
     }
@@ -219,7 +219,7 @@ export async function setWithdrawalPinByRep(input: {
   await db.space.update({
     where: { id: space.id },
     data: {
-      withdrawalPinHash: await bcrypt.hash(input.pin, 10),
+      withdrawalPinHash: await hashPassword(input.pin, 10),
       withdrawalPinSetAt: new Date(),
       withdrawalPinFailedAttempts: 0,
       withdrawalPinLockedUntil: null,

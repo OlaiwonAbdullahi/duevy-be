@@ -22,7 +22,11 @@
     "worker": "node dist/worker.js",
     "dev:worker": "tsx watch src/worker.ts",
     "webhook:test": "tsx scripts/send-test-webhook.ts",
-    "db:deploy": "prisma migrate deploy"
+    "db:deploy": "prisma migrate deploy",
+    "loadtest:server": "tsx scripts/loadtest/server.ts",
+    "loadtest": "k6 run load-tests/duevy.js",
+    "loadtest:stress": "k6 run -e PROFILE=stress load-tests/duevy.js",
+    "loadtest:audit": "tsx scripts/loadtest/audit.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
@@ -30,7 +34,6 @@
   "dependencies": {
     "@imagekit/nodejs": "^7.12.1",
     "@prisma/client": "^5.22.0",
-    "@types/bcryptjs": "^2.4.6",
     "@types/compression": "^1.8.1",
     "@types/cookie-parser": "^1.4.8",
     "@types/cors": "^2.8.17",
@@ -38,6 +41,7 @@
     "@types/multer": "^1.4.12",
     "@types/node": "^22.10.7",
     "@types/pdfkit": "^0.17.6",
+    "bcrypt": "^6.0.0",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.34.5",
     "compression": "^1.8.2",
@@ -59,6 +63,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@typescript-eslint/eslint-plugin": "^8.20.0",
     "@typescript-eslint/parser": "^8.20.0",
     "embedded-postgres": "^17.5.0-beta.15",

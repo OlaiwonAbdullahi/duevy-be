@@ -90,14 +90,18 @@ export async function computePublicMetrics(now = new Date()): Promise<PublicMetr
 // the endpoint is public, so it keeps its own short cache too.
 const CACHE_TTL_MS = 10 * 60 * 1000;
 let cache: { metrics: PublicMetrics; at: number } | null = null;
+// The refresh in flight. When the cache expires under traffic, every request
+// waits on this one computation instead of each running the seven
+// platform-wide aggregates at once (a stampede on the biggest tables).
+let refreshing: Promise<PublicMetrics> | null = null;
 
 /** Reset between tests. */
 export function clearPublicMetricsCache() {
   cache = null;
+  refreshing = null;
 }
 
-async function publicMetricsCached(): Promise<PublicMetrics> {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.metrics;
+async function refresh(): Promise<PublicMetrics> {
   try {
     const metrics = await computePublicMetrics();
     cache = { metrics, at: Date.now() };
@@ -109,6 +113,14 @@ async function publicMetricsCached(): Promise<PublicMetrics> {
     }
     throw err;
   }
+}
+
+async function publicMetricsCached(): Promise<PublicMetrics> {
+  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.metrics;
+  refreshing ??= refresh().finally(() => {
+    refreshing = null;
+  });
+  return refreshing;
 }
 
 // ---------------------------------------------------------------------------

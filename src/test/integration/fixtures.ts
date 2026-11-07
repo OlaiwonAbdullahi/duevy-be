@@ -1,7 +1,7 @@
 import { type AddressInfo } from 'net';
 import { type Server } from 'http';
 import { randomUUID } from 'crypto';
-import bcrypt from 'bcryptjs';
+import { hashPasswordSync } from '../../lib/password';
 import { db } from '../../config/db';
 import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
@@ -13,7 +13,7 @@ import { appendLedgerEntry } from '../../services/ledger.service';
 
 /** Withdrawal security code every fixture space is given (see makeSpace). */
 export const TEST_PIN = '2580';
-const TEST_PIN_HASH = bcrypt.hashSync(TEST_PIN, 4);
+const TEST_PIN_HASH = hashPasswordSync(TEST_PIN, 4);
 
 export const WEBHOOK_SECRET = process.env.NINEJAPAY_SECRET_KEY ?? 'whsec_test_secret';
 

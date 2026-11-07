@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import bcrypt from 'bcryptjs';
+import { hashPasswordSync } from '../../lib/password';
 import { db } from '../../config/db';
 import { type FakeProvider } from '../../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance } from '../../services/ledger.service';
@@ -18,7 +18,7 @@ vi.mock('../../lib/email', async (importOriginal) => ({
 }));
 
 const PASSWORD = 'Secret123!';
-const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
+const PASSWORD_HASH = hashPasswordSync(PASSWORD, 4);
 
 let fake: FakeProvider;
 beforeAll(async () => {

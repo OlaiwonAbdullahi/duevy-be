@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import bcrypt from "bcryptjs";
+import { hashPassword, hashPasswordSync, verifyPassword } from '../lib/password';
 import { z } from "zod";
 import { createHash } from "crypto";
 import { type User, type SpaceMembership, type SpaceRep } from "@prisma/client";
@@ -67,7 +67,8 @@ function toSessionUser<T extends Partial<User>>(user: T) {
 
 // Compared against when the email is unknown, so a login takes the same time
 // whether or not the account exists (no user enumeration by timing).
-const DUMMY_HASH = bcrypt.hashSync("duevy-timing-equaliser", 10);
+// Same cost as real hashes, or an unknown email answers measurably faster.
+const DUMMY_HASH = hashPasswordSync("duevy-timing-equaliser", env.BCRYPT_ROUNDS);
 
 // Shared by /auth/register and /auth/google — the department-setup fields
 // collected when the signer picks the `rep` role (§2.1/§2.3).
@@ -128,7 +129,7 @@ authRouter.post(
       return;
     }
 
-    const passwordHash = await bcrypt.hash(data.password, env.BCRYPT_ROUNDS);
+    const passwordHash = await hashPassword(data.password, env.BCRYPT_ROUNDS);
 
     // Begin transaction to create user and potentially rep application
     const user = await db.$transaction(async (tx) => {
@@ -359,7 +360,7 @@ authRouter.post(
       include: { spaceMemberships: true, spaceReps: true },
     });
 
-    const passwordOk = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+    const passwordOk = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
     if (!user || !user.passwordHash || !passwordOk) {
       errors.unauthorized(res, "Invalid email or password");
       return;
@@ -641,7 +642,7 @@ authRouter.post(
       return;
     }
 
-    const passwordHash = await bcrypt.hash(password, env.BCRYPT_ROUNDS);
+    const passwordHash = await hashPassword(password, env.BCRYPT_ROUNDS);
 
     await db.$transaction([
       // Any other outstanding reset links die with this one.

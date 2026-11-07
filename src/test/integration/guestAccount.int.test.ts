@@ -58,11 +58,19 @@ async function pay(reference: string, amountKobo: number, eventId = `txn_acct_${
   await drainWebhookQueue();
 }
 
-/** afterPaid runs after the webhook commits; wait for its invite to settle. */
+/**
+ * afterPaid runs after the webhook commits; wait for its invite to settle.
+ * accountInviteSentAt is the claim, written BEFORE the token and the email,
+ * so wait for the email itself too — otherwise a poll landing between the
+ * claim and the send sees no email yet, and the late call leaks into the
+ * next test's assertions.
+ */
 async function waitForInvite(reference: string) {
+  const { user } = await db.checkout.findUniqueOrThrow({ where: { reference }, select: { user: { select: { email: true } } } });
   await vi.waitFor(async () => {
     const c = await db.checkout.findUniqueOrThrow({ where: { reference } });
     expect(c.accountInviteSentAt).not.toBeNull();
+    expect(activationEmail.mock.calls.some(([to]) => to === user.email)).toBe(true);
   });
 }
 

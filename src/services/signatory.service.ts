@@ -1,5 +1,5 @@
 import { type Prisma, type WithdrawalAuthMode } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import { verifyPassword } from '../lib/password';
 import { db } from '../config/db';
 import { AppError, notFound } from '../lib/errors';
 import { writeAudit } from '../lib/audit';
@@ -47,7 +47,7 @@ export async function assertPassword(userId: string, password: string): Promise<
   if (!user.passwordHash) {
     throw new AppError(409, 'PASSWORD_REQUIRED', 'Your account has no password yet. Sign out and use "Forgot password" to create one, then try again.');
   }
-  if (!(await bcrypt.compare(password, user.passwordHash))) {
+  if (!(await verifyPassword(password, user.passwordHash))) {
     throw new AppError(403, 'INVALID_PASSWORD', 'Your password is incorrect', [{ field: 'password', issue: 'incorrect' }]);
   }
   return { id: user.id, name: user.name, email: user.email };

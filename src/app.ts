@@ -12,6 +12,8 @@ import { errorHandler } from './middleware/errorHandler';
 import { standardLimiter } from './middleware/rateLimiter';
 import { ok, fail } from './lib/response';
 import { logger } from './lib/logger';
+import { db } from './config/db';
+import { isShuttingDown } from './lib/lifecycle';
 
 export const app = express();
 
@@ -76,6 +78,8 @@ if (env.NODE_ENV !== 'test') {
         res.setHeader('x-request-id', id);
         return id;
       },
+      // Health probes every few seconds would drown the request log.
+      autoLogging: { ignore: (req) => req.url === '/health' || req.url === '/health/ready' },
       customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
       serializers: {
         req: (req: { id: string; method: string; url: string }) => ({ id: req.id, method: req.method, url: req.url }),
@@ -93,9 +97,36 @@ app.use('/v1/webhooks', webhooksRouter);
 // Global rate limit
 app.use('/v1', standardLimiter);
 
-// Health check
+// Liveness: the process is up and serving. Deliberately touches nothing
+// else, so a database blip never gets a healthy container restarted.
 app.get('/health', (req, res) => {
   ok(res, { status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Readiness, for a load balancer: can this instance take traffic right now?
+// 503 while shutting down (so it is drained before it exits) or when the
+// database doesn't answer within 2s.
+app.get('/health/ready', async (_req, res) => {
+  if (isShuttingDown()) {
+    fail(res, 503, 'SHUTTING_DOWN', 'This instance is shutting down');
+    return;
+  }
+  const started = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      db.$queryRaw`SELECT 1`,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('database ping timed out')), 2_000);
+      }),
+    ]);
+    ok(res, { status: 'ready', dbLatencyMs: Date.now() - started });
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'readiness check failed');
+    fail(res, 503, 'NOT_READY', 'Database unavailable');
+  } finally {
+    clearTimeout(timer);
+  }
 });
 
 // API Routes

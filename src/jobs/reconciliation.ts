@@ -156,6 +156,49 @@ export async function purgeExpiredIdempotencyKeys(): Promise<void> {
   await db.idempotencyKey.deleteMany({ where: { expiresAt: { lt: new Date() } } });
 }
 
+const PURGE_BATCH = 5_000;
+const PURGE_MAX_BATCHES = 20;
+// Expired refresh tokens are refused by their own JWT expiry, so a row past
+// it is dead weight; the margin only keeps recent ones around for support.
+const REFRESH_TOKEN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const AUTH_PURGE_INTERVAL_MS = 60 * 60 * 1000;
+let lastAuthPurgeAt = 0;
+
+/**
+ * Housekeeping: delete expired refresh tokens, email verifications and
+ * password resets, which otherwise grow with every sign-in forever. In
+ * bounded batches (id lookup, then delete by id) so a first run over a large
+ * backlog never becomes one long-running DELETE. Hourly, not every pass.
+ */
+export async function purgeExpiredAuthTokens(now = Date.now()): Promise<number> {
+  if (now - lastAuthPurgeAt < AUTH_PURGE_INTERVAL_MS) return 0;
+  lastAuthPurgeAt = now;
+  let purged = 0;
+  const tables = [
+    { find: (take: number) => db.refreshToken.findMany({ where: { expiresAt: { lt: new Date(now - REFRESH_TOKEN_RETENTION_MS) } }, select: { id: true }, take }),
+      del: (ids: string[]) => db.refreshToken.deleteMany({ where: { id: { in: ids } } }) },
+    { find: (take: number) => db.emailVerification.findMany({ where: { expiresAt: { lt: new Date(now) } }, select: { id: true }, take }),
+      del: (ids: string[]) => db.emailVerification.deleteMany({ where: { id: { in: ids } } }) },
+    { find: (take: number) => db.passwordReset.findMany({ where: { expiresAt: { lt: new Date(now) } }, select: { id: true }, take }),
+      del: (ids: string[]) => db.passwordReset.deleteMany({ where: { id: { in: ids } } }) },
+  ];
+  for (const t of tables) {
+    for (let i = 0; i < PURGE_MAX_BATCHES; i++) {
+      const ids = (await t.find(PURGE_BATCH)).map((r) => r.id);
+      if (ids.length === 0) break;
+      purged += (await t.del(ids)).count;
+      if (ids.length < PURGE_BATCH) break;
+    }
+  }
+  if (purged) logger.info({ purged }, 'expired auth tokens purged');
+  return purged;
+}
+
+/** Reset the hourly gate (tests). */
+export function resetAuthPurgeClock(): void {
+  lastAuthPurgeAt = 0;
+}
+
 /**
  * No cross-instance lock on purpose: a session advisory lock is unreliable
  * behind a transaction pooler (Supabase), and every action here is idempotent
@@ -168,19 +211,24 @@ export async function runReconciliationOnce(): Promise<void> {
   await runDailySweeps().catch((err) => logger.error({ err: (err as Error).message }, 'daily sweep run failed'));
   await retryGuestAccountInvites().catch((err) => logger.error({ err: (err as Error).message }, 'guest account invite sweep failed'));
   await purgeExpiredIdempotencyKeys().catch(() => {});
+  await purgeExpiredAuthTokens().catch((err) => logger.warn({ err: (err as Error).message }, 'auth token purge failed'));
 }
 
-let running = false;
+let running: Promise<void> | null = null;
 
 /** Start the periodic sweep. Returns a handle for shutdown. */
 export function startReconciliationJob(intervalMs = 60 * 1000): NodeJS.Timeout {
   return setInterval(() => {
     if (running) return; // never overlap within one process
-    running = true;
-    runReconciliationOnce()
+    running = runReconciliationOnce()
       .catch((err) => logger.error({ err: (err as Error).message }, 'reconciliation failed'))
       .finally(() => {
-        running = false;
+        running = null;
       });
   }, intervalMs);
+}
+
+/** Shutdown: resolves once the pass in flight (if any) has finished. */
+export async function reconciliationIdle(): Promise<void> {
+  await running;
 }
