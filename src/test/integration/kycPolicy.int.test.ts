@@ -10,12 +10,15 @@ import {
 import {
   api,
   apiMultipart,
+  creditSpace,
   installFakeProvider,
   installFakeVerifier,
   makeSpace,
+  newKey,
   PNG_BYTES,
   startHttp,
   stopHttp,
+  TEST_PIN,
   tokenFor,
 } from "./fixtures";
 
@@ -376,5 +379,55 @@ describe("admin KYC settings", () => {
         body: { livenessRequired: true },
       });
     }
+  });
+});
+
+describe('a rep verified without a NIN (the default policy) can do everything a verified rep can', () => {
+  it('withdraws (regression: the withdrawal check read the NIN status, so it refused every such rep)', async () => {
+    const { rep, space, beneficiary } = await makeSpace();
+    // Verified by student ID + face capture only; the NIN was never checked.
+    await db.user.update({ where: { id: rep.id }, data: { kycStatus: 'unverified', ninCheckOutcome: null } });
+    await creditSpace(space.id, 1_000_000);
+    const token = await tokenFor(rep);
+    const withdraw = () =>
+      api('POST', `/v1/spaces/${space.id}/payout/request`, { token, idempotencyKey: newKey(), body: { amount: 300_000, beneficiaryId: beneficiary!.id, pin: TEST_PIN } });
+
+    const ok = await withdraw();
+    expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+
+    // With NIN required, the same rep is refused until they pass it.
+    const adm = await admin();
+    await api('PUT', '/v1/admin/settings/kyc', { token: adm, body: { ninRequired: true } });
+    try {
+      const refused = await withdraw();
+      expect(refused.status).toBe(403);
+      expect(refused.body.error.code).toBe('KYC_NOT_VERIFIED');
+    } finally {
+      await api('PUT', '/v1/admin/settings/kyc', { token: adm, body: { ninRequired: false } });
+    }
+  });
+
+  it('gets their rep application approved (regression: approval demanded a verified NIN)', async () => {
+    const email = `applicant_${Date.now()}_${Math.random()}@test.duevy`;
+    await api('POST', '/v1/auth/register', {
+      body: { role: 'rep', name: 'Ada Rep', matricNo: '190401001', email, password: 'correct-horse', acceptedTerms: true, space: { name: 'Physics', short: 'PHY', kind: 'department', school: 'LAUTECH' } },
+    });
+    const user = await db.user.findUniqueOrThrow({ where: { email } });
+    const adm = await admin();
+    const approve = () => api('POST', `/v1/admin/reps/${user.id}/verify`, { token: adm, body: {} });
+
+    // Student ID on file but no face capture yet: not approvable.
+    await db.user.update({ where: { id: user.id }, data: { studentIdStatus: 'pending' } });
+    const early = await approve();
+    expect(early.status).toBe(409);
+    expect(early.body.error.code).toBe('KYC_INCOMPLETE');
+
+    // Both on file, no NIN: approving approves the student ID and face capture the admin reviewed.
+    await db.user.update({ where: { id: user.id }, data: { livenessStatus: 'pending' } });
+    const res = await approve();
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const after = await db.user.findUniqueOrThrow({ where: { id: user.id } });
+    expect(after).toMatchObject({ isRep: true, kycStatus: 'unverified', studentIdStatus: 'approved', livenessStatus: 'approved' });
+    expect((await api('GET', '/v1/me/kyc-status', { token: await tokenFor(after) })).body.data.canCollect).toBe(true);
   });
 });

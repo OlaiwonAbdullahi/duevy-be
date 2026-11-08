@@ -872,14 +872,21 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
     return;
   }
-  // Final approval comes after KYC: the NIN must be verified, and the
-  // student ID card must be on file (approving the application approves it).
-  if (user.kycStatus !== 'verified') {
+  // Final approval comes after KYC, per the current policy: the student ID
+  // card must be on file; while required, the face capture must be on file
+  // and the NIN verified. Approving the application approves the pending
+  // student ID and face capture the admin just reviewed on this page.
+  const kycPolicy = await getKycPolicy();
+  if (kycPolicy.ninRequired && user.kycStatus !== 'verified') {
     errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
     return;
   }
   if (user.studentIdStatus !== 'pending' && user.studentIdStatus !== 'approved') {
     errors.conflict(res, 'KYC_INCOMPLETE', "The applicant hasn't uploaded an acceptable student ID yet");
+    return;
+  }
+  if (kycPolicy.livenessRequired && user.livenessStatus !== 'pending' && user.livenessStatus !== 'approved') {
+    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant hasn't sent an acceptable face capture yet");
     return;
   }
 
@@ -924,6 +931,14 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
                 studentIdReviewedAt: new Date(),
                 studentIdReviewedById: (req as AuthenticatedRequest).user.sub as string,
                 studentIdReviewNote: note ?? null,
+              }
+            : {}),
+          ...(user.livenessStatus === 'pending'
+            ? {
+                livenessStatus: 'approved',
+                livenessReviewedAt: new Date(),
+                livenessReviewedById: (req as AuthenticatedRequest).user.sub as string,
+                livenessReviewNote: note ?? null,
               }
             : {}),
         },

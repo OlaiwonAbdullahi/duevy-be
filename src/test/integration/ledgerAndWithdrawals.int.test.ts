@@ -335,7 +335,8 @@ describe('beneficiaries', () => {
     const req = () => requestWithdrawal({ spaceId: space.id, userId: next.id, beneficiaryId: beneficiary!.id, amountKobo: 200_000, pin: TEST_PIN });
     await expect(req()).rejects.toMatchObject({ code: 'KYC_NOT_VERIFIED' });
 
-    await db.user.update({ where: { id: next.id }, data: { kycStatus: 'verified' } });
+    // The new lead passes KYC (the default policy: student ID + face capture approved).
+    await db.user.update({ where: { id: next.id }, data: { kycStatus: 'verified', studentIdStatus: 'approved', livenessStatus: 'approved' } });
     const p = await req();
     expect(p.status).toBe('processing');
     expect(fake.calls.find((c) => c.op === 'initiateTransfer')?.args).toMatchObject({ from: { accountNumber: space.walletAccountNumber } });

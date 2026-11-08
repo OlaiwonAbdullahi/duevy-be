@@ -10,6 +10,8 @@ import { writeAudit } from '../lib/audit';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } from './ledger.service';
 import { oneOffDestination } from './beneficiary.service';
+import { canWithdraw } from './kyc.service';
+import { getKycPolicy } from './kycPolicy.service';
 import {
   createSweep,
   dailyLimitError,
@@ -285,11 +287,12 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   }
   const breakdown = computeWithdrawal(amountKobo);
 
-  const [space, user, rep, lead] = await Promise.all([
+  const [space, user, rep, lead, kycPolicy] = await Promise.all([
     db.space.findUnique({ where: { id: spaceId } }),
     db.user.findUnique({ where: { id: userId } }),
     db.spaceRep.findUnique({ where: { userId_spaceId: { userId, spaceId } } }),
     db.spaceRep.findFirst({ where: { spaceId, role: 'lead' }, include: { user: true } }),
+    getKycPolicy(),
   ]);
   if (!space || !user) throw notFound('Space not found');
   if (!rep) throw forbidden('You are not a rep of this space');
@@ -299,9 +302,10 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   const due = await authoriseScope(req, rep.role);
   if (space.payoutsFrozen) throw new AppError(423, 'PAYOUTS_FROZEN', 'Withdrawals for this space are frozen');
   await verifyAuthorisation(space, req.pin);
-  // The money is the space's; the rep acting on it must have a verified
-  // identity. The student ID review gates collecting (canCollect), not this.
-  if (user.kycStatus !== 'verified') {
+  // The money is the space's; the rep acting on it must have passed every
+  // check the current KYC policy requires (the same bar as collecting).
+  // kycStatus alone is only the NIN check's status, which may not be required.
+  if (!canWithdraw(user, kycPolicy)) {
     throw forbidden('Complete identity verification before withdrawing', 'KYC_NOT_VERIFIED');
   }
   if (!lead) throw forbidden('This space has no lead rep', 'NO_LEAD_REP');

@@ -35,7 +35,7 @@ let seq = 0;
 /** A verified member of the space (not yet a rep). */
 async function member(spaceId: string, name: string) {
   const u = await db.user.create({
-    data: { name, email: `${name.toLowerCase()}_${spaceId}_${++seq}@test.duevy`, passwordHash: PASSWORD_HASH, kycStatus: 'verified' },
+    data: { name, email: `${name.toLowerCase()}_${spaceId}_${++seq}@test.duevy`, passwordHash: PASSWORD_HASH, kycStatus: 'verified', studentIdStatus: 'approved', livenessStatus: 'approved' },
   });
   await db.spaceMembership.create({ data: { userId: u.id, spaceId } });
   return u;

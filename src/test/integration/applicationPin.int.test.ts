@@ -41,7 +41,7 @@ describe('withdrawal code chosen during rep onboarding', () => {
     // Re-saving while pending replaces it.
     await api('PUT', '/v1/me/withdrawal-pin', { token, body: { pin: '3691', password: PASSWORD } });
 
-    await db.user.update({ where: { id: user.id }, data: { kycStatus: 'verified', studentIdStatus: 'pending' } });
+    await db.user.update({ where: { id: user.id }, data: { kycStatus: 'verified', studentIdStatus: 'pending', livenessStatus: 'pending' } });
     expect((await api('POST', `/v1/admin/reps/${user.id}/verify`, { token: await adminToken(), body: {} })).status).toBe(200);
 
     const { spaceId } = await db.repApplication.findUniqueOrThrow({ where: { userId: user.id } });
