@@ -11,7 +11,7 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { computeCharge } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { createCheckout } from '../services/checkout.service';
-import { renderCheckoutReceipt } from '../services/receipt.service';
+import { renderDueReceipt } from '../services/receipt.service';
 import { type Due, type DuePayment } from '@prisma/client';
 
 export const duesRouter = Router();
@@ -176,7 +176,8 @@ duesRouter.post(
 );
 
 // ---------------------------------------------------------------------------
-// GET /dues/{dueId}/receipt — the PDF receipt of the payment that settled it
+// GET /dues/{dueId}/receipt — the PDF receipt for this due: just its line when
+// it was paid together with other dues (the full receipt is /receipts/:number)
 // ---------------------------------------------------------------------------
 duesRouter.get('/:dueId/receipt', async (req: Request, res: Response): Promise<void> => {
   const id = uid(req);
@@ -188,7 +189,7 @@ duesRouter.get('/:dueId/receipt', async (req: Request, res: Response): Promise<v
     errors.notFound(res, 'No receipt — this due has not been paid through Duevy checkout');
     return;
   }
-  const { filename, pdf } = await renderCheckoutReceipt(payment.checkoutId, id);
+  const { filename, pdf } = await renderDueReceipt(payment.checkoutId, req.params.dueId as string, id);
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
   res.status(200).send(pdf);

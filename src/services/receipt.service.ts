@@ -87,6 +87,40 @@ async function renderPdf(r: LoadedReceipt) {
   return { filename: `receipt-${r.number}.pdf`, pdf };
 }
 
+/**
+ * The receipt for one due of a checkout. A checkout that paid several dues
+ * has one receipt; this renders just this due's line and its share of the
+ * fee, numbered `<receipt>-<n>` (n = the line's position) so it traces back to
+ * the full one. A single-due checkout renders exactly like its full receipt.
+ */
+export async function renderDueReceipt(checkoutId: string, dueId: string, userId: string) {
+  const r = await loadOwnedReceipt({ checkoutId }, userId);
+  const c = r.checkout;
+  if (c.items.length <= 1) return renderPdf(r);
+  const items = [...c.items].sort((a, b) => a.id.localeCompare(b.id));
+  const index = items.findIndex((i) => i.dueId === dueId);
+  if (index < 0) throw notFound('Receipt not found');
+  const item = items[index]!;
+  const number = `${r.number}-${index + 1}`;
+  const pdf = await renderReceiptPdf({
+    receiptNumber: number,
+    reference: c.reference,
+    title: item.due.title,
+    lines: [{ title: item.due.title, amountKobo: item.faceKobo }],
+    spaceName: r.space.name,
+    payerName: r.user.name,
+    amountPaid: item.faceKobo + item.feeKobo,
+    processingFee: 0,
+    duevyFee: item.feeKobo,
+    netToSpace: item.faceKobo,
+    paidAt: c.paidAt ?? r.issuedAt,
+    method: 'Bank transfer',
+    design: await getReceiptDesign(r.spaceId),
+    answers: readGuestAnswers(c.guestAnswers),
+  });
+  return { filename: `receipt-${number}.pdf`, pdf };
+}
+
 export async function renderCheckoutReceipt(checkoutId: string, userId: string) {
   return renderPdf(await loadOwnedReceipt({ checkoutId }, userId));
 }
