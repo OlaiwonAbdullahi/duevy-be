@@ -1,3 +1,4 @@
+import { transferNarration } from '../lib/narration';
 import { Prisma, type Space, type Sweep, type SweepTrigger } from '@prisma/client';
 import { randomInt } from 'crypto';
 import { db } from '../config/db';
@@ -276,7 +277,8 @@ export async function dispatchSweep(sweepId: string): Promise<void> {
       accountName: space.walletAccountName,
       amountKobo: sweep.amountKobo,
       reference: sweep.reference,
-      narration: `Duevy collections for ${space.name}`,
+      // "Duevy/<code> sent you ₦<amount>"; the reference travels as the payment reference.
+      narration: transferNarration({ spaceCode: space.short, amountKobo: sweep.amountKobo }),
     });
     await db.sweep.updateMany({
       where: { id: sweep.id, status: 'pending' },

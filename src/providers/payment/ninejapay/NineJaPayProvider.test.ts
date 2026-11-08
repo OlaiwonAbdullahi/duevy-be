@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { NineJaPayProvider } from './NineJaPayProvider';
+import { fitNarration, NARRATION_MAX, NineJaPayProvider } from './NineJaPayProvider';
 import { ProviderError } from '../types';
 
 const provider = new NineJaPayProvider(
@@ -288,5 +288,45 @@ describe('credits on a space account', () => {
       ['r1', 'reversal', 5000],
     ]);
     expect(credits[1]).toMatchObject({ senderName: 'Test Account', senderAccountNumber: '11906', at: new Date('2026-11-07T13:43:16.655Z') });
+  });
+});
+
+describe('transfer narration (9jaPay: "Narration cannot be above 50 characters")', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('fits any narration to 50 plain characters, keeping the start (the reference)', () => {
+    expect(fitNarration('Duevy WD-2026-ES87KY Computer Science Department')).toBe('Duevy WD-2026-ES87KY Computer Science Department');
+    const long = fitNarration('Duevy WD-2026-ES87KY Faculty of Engineering and Technology Students Association');
+    expect(long.length).toBeLessThanOrEqual(NARRATION_MAX);
+    expect(long.startsWith('Duevy WD-2026-ES87KY ')).toBe(true);
+    expect(fitNarration('Duevy SWP2026ABC Ọ̀mọ́ Yorùbá  Club 🎉')).toBe('Duevy SWP2026ABC Omo Yoruba Club');
+    // The naira sign is kept: it's what Duevy's narrations use ("Duevy/CSC sent you ₦3000").
+    expect(fitNarration('Duevy/CSC sent you ₦3000')).toBe('Duevy/CSC sent you ₦3000');
+  });
+
+  it('sends the fitted narration to 9jaPay, never over the limit', async () => {
+    let sent = '';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const body = JSON.parse((init?.body as string) ?? '{}');
+        if (String(url).endsWith('/name-enquiry')) {
+          return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { accountName: 'X', accountNumber: body.accountNumber, bankCode: '058', nameEnquiryReference: 'ne' } }), { status: 200 });
+        }
+        sent = body.narration;
+        return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { paymentReference: 'WDN', status: 'Successful' } }), { status: 200 });
+      }),
+    );
+    await provider.initiateTransfer({
+      from: { accountNumber: '9000143203', accountName: 'DUEVY/Space' },
+      bankCode: '058',
+      accountNumber: '0123456789',
+      accountName: 'x',
+      amountKobo: 100_000,
+      reference: 'WD-2026-ES87KY',
+      narration: 'Duevy WD-2026-ES87KY Department of Computer Science and Information Technology',
+    });
+    expect(sent.length).toBeLessThanOrEqual(NARRATION_MAX);
+    expect(sent.startsWith('Duevy WD-2026-ES87KY')).toBe(true);
   });
 });

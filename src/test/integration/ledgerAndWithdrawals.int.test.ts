@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { hashPasswordSync } from '../../lib/password';
 import { db } from '../../config/db';
+import { transferNarration } from '../../lib/narration';
 import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
 import { completePayout, failPayoutByReference, requestWithdrawal } from '../../services/withdrawal.service';
@@ -339,6 +340,10 @@ describe('beneficiaries', () => {
     await db.user.update({ where: { id: next.id }, data: { kycStatus: 'verified', studentIdStatus: 'approved', livenessStatus: 'approved' } });
     const p = await req();
     expect(p.status).toBe('processing');
-    expect(fake.calls.find((c) => c.op === 'initiateTransfer')?.args).toMatchObject({ from: { accountNumber: space.walletAccountNumber } });
+    const sent = fake.calls.find((c) => c.op === 'initiateTransfer')!.args as { from: { accountNumber: string }; narration: string };
+    expect(sent.from.accountNumber).toBe(space.walletAccountNumber);
+    // What the recipient's statement shows: "Duevy/<code> sent you ₦<amount>", no reference.
+    expect(sent.narration).toBe(`Duevy/TST sent you ₦${p.netKobo / 100}`);
+    expect(sent.narration).toBe(transferNarration({ spaceCode: 'TST', amountKobo: p.netKobo }));
   });
 });

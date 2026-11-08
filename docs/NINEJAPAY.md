@@ -120,6 +120,7 @@ Tested against `https://developer.test.9japay.com` with Duevy's test keys:
 | Transaction dates | `transactionDate` is Lagos time with **no offset** (`2026-11-07T08:35:38`), unlike `expiresAt` (UTC, `Z`). Read as UTC+1. |
 | Sweep ₦1,000, collection → space account | `00` SUCCESS at once (no webhook needed); TSQ `Success`. The space account received the full ₦1,000: **a sweep is not charged as an incoming payment**. The collection account was debited ₦1,002: a ₦2 sandbox transfer fee, charged to the sender. |
 | Withdrawal ₦500, space account → bank | `00` SUCCESS at once; TSQ `Success`. The space account went down by exactly ₦500. No fee showed on either account in the sandbox. |
+| Narration over 50 characters (2026-11-08) | Refused: "Narration cannot be above 50 characters" (no money moves; the withdrawal fails and its debit is reversed). Narrations are now `Duevy/<space code> sent you ₦<amount>` (e.g. `Duevy/CSC sent you ₦3000`), built by `transferNarration` (src/lib/narration.ts); at most ~30 characters. **Unverified: whether 9jaPay/NIBSS accept and display "₦"** (the only non-ASCII character); confirm on the first sandbox transfer, and switch to "NGN" if it's refused or shows as "?". Our reference is not in the narration; it travels as the transfer's `paymentReference`. `fitNarration` in the provider is the safety net. |
 
 The API key is a GUID; 9jaPay refuses anything else with "{Api Key} must be valid GUID."
 

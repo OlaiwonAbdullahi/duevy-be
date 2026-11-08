@@ -1,3 +1,4 @@
+import { plainText, TRANSFER_NARRATION_MAX } from '../../../lib/narration';
 import { logger } from '../../../lib/logger';
 import {
   InvalidSignatureError,
@@ -390,7 +391,7 @@ export class NineJaPayProvider implements PaymentProvider {
           recipientBankCode: input.bankCode,
           amount: String(input.amountKobo),
           nameEnquiryReference: enquiry.nameEnquiryReference,
-          narration: input.narration.slice(0, 100),
+          narration: fitNarration(input.narration),
         },
       });
       const state = createdTransferState(res);
@@ -452,4 +453,18 @@ export class NineJaPayProvider implements PaymentProvider {
     }
     return normaliseNineJaPayEvent(body, { businessAccountNumber: this.config.businessAccountNumber });
   }
+}
+
+/** 9jaPay refuses a transfer whose narration is over 50 characters ("Narration cannot be above 50 characters"). */
+export const NARRATION_MAX = TRANSFER_NARRATION_MAX;
+
+/**
+ * Safety net for whatever narration reaches the provider: plain text (ASCII
+ * plus the naira sign), single-spaced, at most 50 characters. Duevy's own
+ * narrations are built to fit (src/lib/narration.ts), so normally this
+ * changes nothing.
+ */
+export function fitNarration(text: string): string {
+  const plain = plainText(text);
+  return plain.length <= NARRATION_MAX ? plain : plain.slice(0, NARRATION_MAX).trimEnd();
 }

@@ -11,6 +11,7 @@ import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } from './ledger.service';
 import { oneOffDestination } from './beneficiary.service';
 import { canWithdraw } from './kyc.service';
+import { transferNarration } from '../lib/narration';
 import { getKycPolicy } from './kycPolicy.service';
 import {
   createSweep,
@@ -500,7 +501,8 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
       accountName: payout.accountName ?? '',
       amountKobo: payout.netKobo,
       reference: payout.reference,
-      narration: `${space.name} withdrawal ${payout.reference}`,
+      // "Duevy/<code> sent you ₦<amount>"; the reference travels as the payment reference.
+      narration: transferNarration({ spaceCode: space.short, amountKobo: payout.netKobo }),
     });
     await db.$transaction(async (tx) => {
       const p = await lockPayout(tx, payout.id);

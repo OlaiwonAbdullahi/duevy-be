@@ -105,6 +105,11 @@ export interface InitiateTransferInput {
   amountKobo: number;
   /** Ours. Also the provider's payment reference, so a retry can never pay twice. */
   reference: string;
+  /**
+   * Shown on the recipient's statement; build it with transferNarration()
+   * (src/lib/narration.ts), which fits 9jaPay's 50-character limit. (Our
+   * sweeps are recognised by their sending account, not this text.)
+   */
   narration: string;
 }
 
