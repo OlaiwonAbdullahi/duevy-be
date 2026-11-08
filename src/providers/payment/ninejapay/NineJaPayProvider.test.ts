@@ -300,8 +300,8 @@ describe('transfer narration (9jaPay: "Narration cannot be above 50 characters")
     expect(long.length).toBeLessThanOrEqual(NARRATION_MAX);
     expect(long.startsWith('Duevy WD-2026-ES87KY ')).toBe(true);
     expect(fitNarration('Duevy SWP2026ABC Ọ̀mọ́ Yorùbá  Club 🎉')).toBe('Duevy SWP2026ABC Omo Yoruba Club');
-    // The naira sign is kept: it's what Duevy's narrations use ("Duevy/CSC sent you ₦3000").
-    expect(fitNarration('Duevy/CSC sent you ₦3000')).toBe('Duevy/CSC sent you ₦3000');
+    // Duevy's own narrations pass through unchanged.
+    expect(fitNarration('Duevy/CSC sent you NGN3000')).toBe('Duevy/CSC sent you NGN3000');
   });
 
   it('sends the fitted narration to 9jaPay, never over the limit', async () => {

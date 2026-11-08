@@ -11,7 +11,7 @@ import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, getDueAvailability, getSpaceBalance, lockSpace } from './ledger.service';
 import { oneOffDestination } from './beneficiary.service';
 import { canWithdraw } from './kyc.service';
-import { transferNarration } from '../lib/narration';
+import { payoutLedgerDescription, payoutSummary, transferNarration } from '../lib/narration';
 import { getKycPolicy } from './kycPolicy.service';
 import {
   createSweep,
@@ -451,7 +451,7 @@ async function debit(tx: Tx, p: Payout): Promise<void> {
     feeKobo: p.feeKobo,
     netKobo: p.netKobo,
     reference: p.reference,
-    description: `Withdrawal to ${p.accountMasked}`,
+    description: payoutLedgerDescription(p),
   });
   // Ledger entries must be positive; skip a zero fee.
   if (p.feeKobo === 0) return;
@@ -501,7 +501,7 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
       accountName: payout.accountName ?? '',
       amountKobo: payout.netKobo,
       reference: payout.reference,
-      // "Duevy/<code> sent you ₦<amount>"; the reference travels as the payment reference.
+      // The recipient's statement: "Duevy/<code> sent you NGN<amount>"; the reference travels as the payment reference.
       narration: transferNarration({ spaceCode: space.short, amountKobo: payout.netKobo }),
     });
     await db.$transaction(async (tx) => {
@@ -652,16 +652,21 @@ export async function refreshPayout(payoutId: string): Promise<void> {
 
 async function notifyReps(p: Payout, outcome: 'success' | 'failed' | 'cancelled'): Promise<void> {
   const reps = await db.spaceRep.findMany({ where: { spaceId: p.spaceId }, select: { userId: true } });
+  if (outcome === 'success') {
+    // "You sent NGN3000 to Abdullahi Olaiwon" to whoever made it; the other reps aren't "you".
+    const done = { ...p, status: 'success' };
+    const requester = reps.filter((r) => r.userId === p.requestedById).map((r) => r.userId);
+    const others = reps.filter((r) => r.userId !== p.requestedById).map((r) => r.userId);
+    const base = { kind: 'payout_completed' as const, title: 'Withdrawal completed', href: '/dashboard/payout' };
+    await Promise.all([
+      notifyMany(requester, { ...base, detail: `${payoutSummary(done)}.` }),
+      notifyMany(others, { ...base, detail: `${payoutSummary(done, { viewerIsRequester: false })}.` }),
+    ]).catch(() => {});
+    return;
+  }
   await notifyMany(
     reps.map((r) => r.userId),
-    outcome === 'success'
-      ? {
-          kind: 'payout_completed',
-          title: 'Withdrawal completed',
-          detail: `₦${(p.netKobo / 100).toLocaleString('en-NG')} was sent to ${p.accountName ? `${p.accountName}, ` : ''}${p.accountMasked}.`,
-          href: '/dashboard/payout',
-        }
-      : outcome === 'cancelled'
+    outcome === 'cancelled'
         ? {
             kind: 'system',
             tone: 'rose',

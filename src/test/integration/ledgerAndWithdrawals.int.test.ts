@@ -4,7 +4,7 @@ import { db } from '../../config/db';
 import { transferNarration } from '../../lib/narration';
 import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
-import { completePayout, failPayoutByReference, requestWithdrawal } from '../../services/withdrawal.service';
+import { completePayout, failPayoutByReference, refreshPayout, requestWithdrawal } from '../../services/withdrawal.service';
 import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { decrypt } from '../../lib/encryption';
 import { api, creditSpace, installFakeProvider, makeSpace, newKey, TEST_PIN, sendWebhook, startHttp, stopHttp, tokenFor, transferEvent } from './fixtures';
@@ -342,8 +342,23 @@ describe('beneficiaries', () => {
     expect(p.status).toBe('processing');
     const sent = fake.calls.find((c) => c.op === 'initiateTransfer')!.args as { from: { accountNumber: string }; narration: string };
     expect(sent.from.accountNumber).toBe(space.walletAccountNumber);
-    // What the recipient's statement shows: "Duevy/<code> sent you ₦<amount>", no reference.
-    expect(sent.narration).toBe(`Duevy/TST sent you ₦${p.netKobo / 100}`);
+    // What the recipient's statement shows: "Duevy/<code> sent you NGN<amount>", no reference.
+    expect(sent.narration).toBe(`Duevy/TST sent you NGN${p.netKobo / 100}`);
     expect(sent.narration).toBe(transferNarration({ spaceCode: 'TST', amountKobo: p.netKobo }));
+
+    // The sender's side reads "You sent NGN… to <name>": the ledger line now, and once it arrives,
+    // the withdrawal's summary and the notification ("you" only for whoever made it).
+    const amount = `NGN${p.netKobo / 100}`;
+    const who = 'Ada Obi';
+    expect((await db.ledgerEntry.findFirstOrThrow({ where: { payoutId: p.id, type: 'payout' } })).description).toBe(`Sent ${amount} to ${who}`);
+    fake.settleTransfer(p.reference, 'succeeded');
+    await refreshPayout(p.id);
+    const nextToken = await tokenFor(next);
+    const listed = await api('GET', `/v1/spaces/${space.id}/payouts`, { token: nextToken });
+    expect(listed.body.data.find((x: { reference: string }) => x.reference === p.reference).summary).toBe(`You sent ${amount} to ${who}`);
+    const mine = await db.notification.findFirstOrThrow({ where: { userId: next.id, kind: 'payout_completed' } });
+    expect(mine.detail).toBe(`You sent ${amount} to ${who}.`);
+    const theirs = await db.notification.findFirstOrThrow({ where: { userId: rep.id, kind: 'payout_completed' } });
+    expect(theirs.detail).toBe(`${amount} was sent to ${who}.`);
   });
 });

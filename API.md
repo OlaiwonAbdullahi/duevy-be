@@ -333,7 +333,9 @@ The fee is 9jaPay's transfer charge, passed on: ₦10 under ₦5,000, ₦15 unde
 - Or send to a one-off account without saving it: `{ "amount": 500000, "bankCode": "058", "accountNumber": "0123456789" }`. It is name-checked the same way, but not added to the beneficiaries. Send exactly one of `beneficiaryId`, or `bankCode` + `accountNumber` (else `400 VALIDATION_ERROR`).
 - `201`: `Payout`. If part of the amount is still awaiting the daily sweep, it is swept first and the withdrawal stays `pending` until that lands (usually moments). In `multisig` mode it is `awaiting_approval` and carries `approval` (below), including `otpSentToRequester: true` when the requester is a signatory and has been emailed their code.
 
-`Payout = { id, amount, fee, net, reference, status, account, accountName, beneficiaryId, dueId, note, requestedById, requestedAt, approvalExpiresAt, processingAt, settledAt, failedAt, reversedAt, cancelledAt, failureReason }`
+`Payout = { id, amount, fee, net, reference, status, account, accountName, summary, beneficiaryId, dueId, note, requestedById, requestedAt, approvalExpiresAt, processingAt, settledAt, failedAt, reversedAt, cancelledAt, failureReason }`
+
+`summary` is the line to show the rep, true to the status: `"You sent NGN3000 to Abdullahi Olaiwon"` once it has arrived, `"Sending NGN3000 to …"` while on its way, `"NGN3000 to …, awaiting approval"`, or `"Couldn't send NGN3000 to …"`. The recipient's bank statement reads `"Duevy/CSC sent you NGN3000"` (the space's code and the amount that lands).
 
 Withdrawal status moves `[awaiting_approval →] pending → processing → success | failed | reversed`. `awaiting_approval → cancelled` when a signatory rejects it, its requester withdraws it, it isn't approved within 24 hours, or the lead rep changes. On `failed`, `reversed` or `cancelled`, the full amount goes back to the balance (and to its due).
 

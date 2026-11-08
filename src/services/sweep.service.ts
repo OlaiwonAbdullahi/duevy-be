@@ -277,7 +277,7 @@ export async function dispatchSweep(sweepId: string): Promise<void> {
       accountName: space.walletAccountName,
       amountKobo: sweep.amountKobo,
       reference: sweep.reference,
-      // "Duevy/<code> sent you ₦<amount>"; the reference travels as the payment reference.
+      // "Duevy/<code> sent you NGN<amount>"; the reference travels as the payment reference.
       narration: transferNarration({ spaceCode: space.short, amountKobo: sweep.amountKobo }),
     });
     await db.sweep.updateMany({

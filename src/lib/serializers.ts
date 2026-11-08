@@ -1,3 +1,4 @@
+import { payoutSummary } from './narration';
 import {
   type Space,
   type Due,
@@ -59,6 +60,8 @@ export function serializePayout(p: Payout) {
     status: p.status,
     account: p.accountMasked,
     accountName: p.accountName,
+    // The sender's line, true to the status: "You sent NGN3000 to Abdullahi Olaiwon" once it arrived.
+    summary: payoutSummary(p),
     beneficiaryId: p.beneficiaryId,
     dueId: p.dueId,
     note: p.note,

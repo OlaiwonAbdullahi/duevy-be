@@ -1,4 +1,4 @@
-import { plainText, TRANSFER_NARRATION_MAX } from '../../../lib/narration';
+import { plainAscii, TRANSFER_NARRATION_MAX } from '../../../lib/narration';
 import { logger } from '../../../lib/logger';
 import {
   InvalidSignatureError,
@@ -459,12 +459,11 @@ export class NineJaPayProvider implements PaymentProvider {
 export const NARRATION_MAX = TRANSFER_NARRATION_MAX;
 
 /**
- * Safety net for whatever narration reaches the provider: plain text (ASCII
- * plus the naira sign), single-spaced, at most 50 characters. Duevy's own
- * narrations are built to fit (src/lib/narration.ts), so normally this
- * changes nothing.
+ * Safety net for whatever narration reaches the provider: plain ASCII,
+ * single-spaced, at most 50 characters. Duevy's own narrations are built to
+ * fit (src/lib/narration.ts), so normally this changes nothing.
  */
 export function fitNarration(text: string): string {
-  const plain = plainText(text);
+  const plain = plainAscii(text);
   return plain.length <= NARRATION_MAX ? plain : plain.slice(0, NARRATION_MAX).trimEnd();
 }
