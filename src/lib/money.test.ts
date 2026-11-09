@@ -43,20 +43,20 @@ describe('checkoutFee — 1.5%, on top', () => {
   });
 });
 
-describe('withdrawalFee — 9jaPay’s transfer charge: ₦10 / ₦15 / ₦20', () => {
+describe('withdrawalFee — 9jaPay’s transfer charge + 7.5% VAT: ₦10.75 / ₦16.13 / ₦21.50', () => {
   it('bands by amount', () => {
-    expect(transferFee(1 * NAIRA)).toBe(1_000);
-    expect(transferFee(4_999_99)).toBe(1_000); // ₦4,999.99
-    expect(transferFee(5_000 * NAIRA)).toBe(1_500);
-    expect(transferFee(99_999_99)).toBe(1_500);
-    expect(transferFee(100_000 * NAIRA)).toBe(2_000);
-    expect(transferFee(10_000_000 * NAIRA)).toBe(2_000);
-    expect(withdrawalFee(20_000 * NAIRA)).toBe(1_500);
+    expect(transferFee(1 * NAIRA)).toBe(1_075);
+    expect(transferFee(4_999_99)).toBe(1_075); // ₦4,999.99
+    expect(transferFee(5_000 * NAIRA)).toBe(1_613);
+    expect(transferFee(99_999_99)).toBe(1_613);
+    expect(transferFee(100_000 * NAIRA)).toBe(2_150);
+    expect(transferFee(10_000_000 * NAIRA)).toBe(2_150);
+    expect(withdrawalFee(20_000 * NAIRA)).toBe(1_613);
   });
 
   it('deducts the fee from the withdrawal', () => {
-    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 1_500, net: 1_998_500 });
-    expect(computeWithdrawal(150_000 * NAIRA)).toEqual({ gross: 15_000_000, fee: 2_000, net: 14_998_000 });
+    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 1_613, net: 1_998_387 });
+    expect(computeWithdrawal(150_000 * NAIRA)).toEqual({ gross: 15_000_000, fee: 2_150, net: 14_997_850 });
   });
 
 });

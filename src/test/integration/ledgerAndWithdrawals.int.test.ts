@@ -24,23 +24,23 @@ describe('ledger balance', () => {
     await creditSpace(space.id, 2_500_000); // ₦25,000
     expect(await getSpaceBalance(space.id)).toBe(5_500_000);
 
-    // ₦20,000 withdrawal: 9jaPay's ₦15 transfer fee, ₦19,985 sent, ₦20,000 debited.
+    // ₦20,000 withdrawal: 9jaPay's ₦15 transfer fee + VAT (₦16.13), ₦19,983.87 sent, ₦20,000 debited.
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
-    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 1_500, net: 1_998_500 });
+    expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 1_613, net: 1_998_387 });
     expect(await getSpaceBalance(space.id)).toBe(3_500_000);
     // Paid out of the space's own account, not Duevy's.
     expect(fake.calls.find((c) => c.op === 'initiateTransfer')?.args).toMatchObject({
       from: { accountNumber: space.walletAccountNumber },
       bankCode: '058',
       accountNumber: '0123456789',
-      amountKobo: 1_998_500,
+      amountKobo: 1_998_387,
       reference: p.reference,
     });
 
     await completePayout(p.reference);
     const summary = await getSpaceLedgerSummary(space.id);
-    expect(summary).toMatchObject({ balance: 3_500_000, collected: 5_500_000, withdrawn: 1_998_500, withdrawalFees: 1_500, inFlight: 0 });
+    expect(summary).toMatchObject({ balance: 3_500_000, collected: 5_500_000, withdrawn: 1_998_387, withdrawalFees: 1_613, inFlight: 0 });
 
     // A bank reversal after success restores the full ₦20,000.
     await failPayoutByReference(p.reference, 'returned by the bank');

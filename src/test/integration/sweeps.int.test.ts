@@ -112,7 +112,7 @@ describe('withdrawals and the sweep', () => {
     expect(fake.calls.filter((c) => c.op === 'initiateTransfer').at(-1)?.args).toMatchObject({
       from: { accountNumber: s.space.walletAccountNumber },
       reference: p.reference,
-      amountKobo: 300_000 - 1_000,
+      amountKobo: 300_000 - 1_075, // ₦10 fee + ₦0.75 VAT
     });
     expect(await getUnsweptKobo(s.space.id)).toBe(200_000);
   });
