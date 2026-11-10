@@ -3,7 +3,7 @@ import { hashPassword, verifyPassword } from '../lib/password';
 import { db } from '../config/db';
 import { AppError, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
-import { computeWithdrawal, generatePayoutReference, MAX_PAYOUT_KOBO, MIN_PAYOUT_KOBO } from '../lib/money';
+import { computeWithdrawal, generatePayoutReference, MAX_PAYOUT_KOBO, MAX_TRANSFER_KOBO, MIN_PAYOUT_KOBO } from '../lib/money';
 import { assertPayoutTransition, canTransitionPayout } from '../lib/stateMachine';
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
@@ -67,6 +67,7 @@ import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signato
  */
 
 type Tx = Prisma.TransactionClient;
+
 
 export class WithdrawalInProgressError extends AppError {
   constructor(reference?: string) {
@@ -323,6 +324,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
 
   const reference = await uniquePayoutReference();
   let sweepId: string | null = null;
+  const sweepIds: string[] = [];
 
   let payout: Payout;
   try {
@@ -354,13 +356,14 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
         const withdrawable = await getWithdrawalAllowanceKobo(spaceId, tx);
         if (amountKobo > withdrawable) throw dailyLimitError(withdrawable);
         const unswept = await getUnsweptKobo(spaceId, tx);
-        const sweepNeeded = Math.max(0, amountKobo - Math.max(0, balance - unswept));
+        // What the space's account is missing for this withdrawal.
+        const shortfall = Math.max(0, amountKobo - Math.max(0, balance - unswept));
         const accountAllowance = await getDailyAllowanceKobo(spaceId, tx);
-        if (amountKobo + sweepNeeded > accountAllowance) throw dailyLimitError(Math.min(withdrawable, Math.max(0, accountAllowance - sweepNeeded)));
-        if (sweepNeeded > 0) {
+        if (amountKobo + shortfall > accountAllowance) throw dailyLimitError(Math.min(withdrawable, Math.max(0, accountAllowance - shortfall)));
+        if (unswept > 0) {
           await lockBusinessSweeps(tx);
           const business = await getBusinessSweepAllowanceKobo(tx);
-          if (sweepNeeded > business) {
+          if (shortfall > business) {
             // Only what is already in the space's account can go today.
             const inAccount = Math.min(withdrawable, Math.max(0, balance - unswept) + business);
             throw new AppError(
@@ -370,7 +373,20 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
               [{ field: 'amount', issue: `withdrawable today is ${inAccount} kobo` }],
             );
           }
-          sweepId = (await createSweep(tx, spaceId, sweepNeeded, 'withdrawal')).id;
+          // A withdrawal moves ALL the space's unswept money into its account,
+          // as far as today's limits allow, in transfers of at most
+          // MAX_TRANSFER_KOBO. The first covers the shortfall (a withdrawal is
+          // at most MAX_PAYOUT_KOBO), and only it holds the withdrawal back;
+          // with no shortfall the withdrawal waits for none. Moving more than
+          // needed also absorbs a few kobo the account may hold short of the
+          // ledger (a 9jaPay charge Duevy didn't record).
+          let left = Math.min(unswept, accountAllowance - amountKobo, business);
+          while (left > 0) {
+            const sweep = await createSweep(tx, spaceId, Math.min(left, MAX_TRANSFER_KOBO), 'withdrawal');
+            sweepIds.push(sweep.id);
+            if (shortfall > 0 && !sweepId) sweepId = sweep.id;
+            left -= sweep.amountKobo;
+          }
         }
 
         const created = await tx.payout.create({
@@ -415,9 +431,9 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
   }
 
   logger.info({ ref: reference, spaceId, gross: breakdown.gross, fee: breakdown.fee, status: payout.status, sweepId }, 'withdrawal created');
-  // The sweep goes now even while signatories approve: moving the space's own
+  // The sweeps go now even while signatories approve: moving the space's own
   // money into its own account is harmless if the withdrawal is cancelled.
-  if (sweepId) await dispatchSweep(sweepId);
+  for (const id of sweepIds) await dispatchSweep(id);
   if (payout.status === 'pending') await dispatchPayout(payout.id);
   return db.payout.findUniqueOrThrow({ where: { id: payout.id } });
 }
