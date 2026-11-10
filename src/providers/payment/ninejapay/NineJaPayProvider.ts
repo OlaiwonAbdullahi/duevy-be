@@ -251,7 +251,34 @@ export class NineJaPayProvider implements PaymentProvider {
     }
     credits.sort((a, b) => a.at.getTime() - b.at.getTime());
     if (credits.length === 0) return { state: 'open', receivedKobo: null, credits };
-    return { state: 'paid', receivedKobo: credits.reduce((sum, c) => sum + c.amountKobo, 0), credits };
+    const receivedKobo = credits.reduce((sum, c) => sum + c.amountKobo, 0);
+    this.noteInflowCharges(accountNumber, rows, receivedKobo, window);
+    return { state: 'paid', receivedKobo, credits };
+  }
+
+  /**
+   * Watching for an inflow charge. On live (2026-11-09) a ₦2,030 payment
+   * moved to the business account in full, so 9jaPay took nothing from it,
+   * but its pricing says 0.5% (capped at ₦750) + ₦50 stamp duty from ₦10,000.
+   * Warn when the closure transfer moves less than arrived, or anything else
+   * is debited (a charge, VAT, stamp duty), so the 1.5% can be checked
+   * against what is actually taken. See scripts/ninejapayInflowCharges.ts.
+   */
+  private noteInflowCharges(accountNumber: string, rows: Transaction[], receivedKobo: number, window: { from: Date; to: Date }): void {
+    let movedKobo = 0;
+    const otherDebits: { narration: string | null; amountKobo: number }[] = [];
+    for (const t of rows) {
+      if ((t.transactionType ?? '').toLowerCase() !== 'debit' || (t.accountNumber ?? accountNumber) !== accountNumber) continue;
+      const at = parseNineJaPayDate(t.transactionDate);
+      if (at === null || at < window.from) continue;
+      if (/VIRTUAL ACCOUNT CLOSURE/i.test(t.narration ?? '')) movedKobo += Number(t.amount ?? 0);
+      else otherDebits.push({ narration: t.narration ?? null, amountKobo: Number(t.amount ?? 0) });
+    }
+    // The closure transfer can trail the credit; nothing to compare yet.
+    if (movedKobo === 0 && otherDebits.length === 0) return;
+    if (movedKobo < receivedKobo || otherDebits.length > 0) {
+      logger.warn({ accountNumber, receivedKobo, movedKobo, keptKobo: receivedKobo - movedKobo, otherDebits }, '9japay inflow charge seen');
+    }
   }
 
   /**
