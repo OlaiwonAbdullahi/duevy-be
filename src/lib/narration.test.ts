@@ -4,7 +4,10 @@ import { displayName, ngn, payoutLedgerDescription, payoutSummary, TRANSFER_NARR
 describe('the recipient\'s statement: "Duevy/<space code> sent you NGN<amount>"', () => {
   it('reads as asked: code and amount, no reference or space name', () => {
     expect(transferNarration({ spaceCode: 'CSC', amountKobo: 300_000 })).toBe('Duevy/CSC sent you NGN3000');
-    expect(transferNarration({ spaceCode: 'CSC', amountKobo: 300_050 })).toBe('Duevy/CSC sent you NGN3000.50');
+    // 9jaPay strips "." from narrations, so kobo are spelled out.
+    expect(transferNarration({ spaceCode: 'CSC', amountKobo: 300_050 })).toBe('Duevy/CSC sent you NGN3000 and 50 kobo');
+    expect(transferNarration({ spaceCode: 'CSC', amountKobo: 98_925 })).toBe('Duevy/CSC sent you NGN989 and 25 kobo');
+    expect(transferNarration({ spaceCode: 'FETSAX', amountKobo: 49_999_999 })).toBe('Duevy/FETSAX sent you NGN499999 and 99 kobo');
   });
 
   it('is plain ASCII and far within 9jaPay\'s 50 characters, whatever the code', () => {

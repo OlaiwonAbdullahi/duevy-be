@@ -704,26 +704,6 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       href: rosterHref,
     },
   );
-  // And by email, unless the rep turned payment emails off, or paid it themselves
-  // (their own receipt follows). Best effort: one failed email never blocks the rest.
-  const emailReps = reps.filter((r) => r.userId !== checkout.userId && !r.user.isDeactivated && wantsPaymentEmails(r.user.notificationPrefs));
-  const sent = await Promise.allSettled(
-    emailReps.map((r) =>
-      sendRepPaymentReceivedEmail(r.user.email, r.user.name, {
-        spaceName: space?.name ?? '',
-        payerName: payer?.name ?? 'A member',
-        payerIsGuest: !!payer?.isGuest,
-        reference: checkout.reference,
-        items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
-        faceKobo: checkout.faceKobo,
-        paidAt: checkout.paidAt ?? new Date(),
-        link: `${env.FRONTEND_URL}${rosterHref}`,
-      }),
-    ),
-  );
-  for (const [i, r] of sent.entries()) {
-    if (r.status === 'rejected') logger.warn({ err: (r.reason as Error)?.message, ref: checkout.reference, repId: emailReps[i]!.userId }, 'rep payment email failed');
-  }
   // Guests have no dashboard to see an in-app notice — the email is theirs.
   if (!payer?.isGuest) await notifyMany([checkout.userId], {
     kind: 'payment_received',
@@ -760,6 +740,26 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       paidAt: checkout.paidAt ?? new Date(),
       receiptUrl: payer.isGuest && items[0] ? guestReceiptUrl(items[0].dueId, checkout.reference) : undefined,
     }, pdf);
+  }
+  // Last, so the payer's own invite and receipt never wait on them: the reps
+  // by email, unless they turned payment emails off or paid it themselves. Best effort: one failed email never blocks the rest.
+  const emailReps = reps.filter((r) => r.userId !== checkout.userId && !r.user.isDeactivated && wantsPaymentEmails(r.user.notificationPrefs));
+  const sent = await Promise.allSettled(
+    emailReps.map((r) =>
+      sendRepPaymentReceivedEmail(r.user.email, r.user.name, {
+        spaceName: space?.name ?? '',
+        payerName: payer?.name ?? 'A member',
+        payerIsGuest: !!payer?.isGuest,
+        reference: checkout.reference,
+        items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
+        faceKobo: checkout.faceKobo,
+        paidAt: checkout.paidAt ?? new Date(),
+        link: `${env.FRONTEND_URL}${rosterHref}`,
+      }),
+    ),
+  );
+  for (const [i, r] of sent.entries()) {
+    if (r.status === 'rejected') logger.warn({ err: (r.reason as Error)?.message, ref: checkout.reference, repId: emailReps[i]!.userId }, 'rep payment email failed');
   }
 }
 

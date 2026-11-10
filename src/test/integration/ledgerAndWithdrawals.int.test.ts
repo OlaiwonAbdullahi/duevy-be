@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { hashPasswordSync } from '../../lib/password';
 import { db } from '../../config/db';
-import { transferNarration } from '../../lib/narration';
+import { narrationAmount, transferNarration } from '../../lib/narration';
 import { ProviderError, type FakeProvider } from '../../providers/payment';
 import { getSpaceBalance, getSpaceLedgerSummary } from '../../services/ledger.service';
 import { completePayout, failPayoutByReference, refreshPayout, requestWithdrawal } from '../../services/withdrawal.service';
@@ -343,7 +343,8 @@ describe('beneficiaries', () => {
     const sent = fake.calls.find((c) => c.op === 'initiateTransfer')!.args as { from: { accountNumber: string }; narration: string };
     expect(sent.from.accountNumber).toBe(space.walletAccountNumber);
     // What the recipient's statement shows: "Duevy/<code> sent you NGN<amount>", no reference.
-    expect(sent.narration).toBe(`Duevy/TST sent you NGN${p.netKobo / 100}`);
+    expect(sent.narration).toBe(`Duevy/TST sent you ${narrationAmount(p.netKobo)}`);
+    expect(sent.narration).not.toContain('.'); // 9jaPay strips dots
     expect(sent.narration).toBe(transferNarration({ spaceCode: 'TST', amountKobo: p.netKobo }));
 
     // The sender's side reads "You sent NGN… to <name>": the ledger line now, and once it arrives,

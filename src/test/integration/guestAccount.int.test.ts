@@ -20,6 +20,7 @@ vi.mock('../../lib/email', async (importOriginal) => ({
   sendEmail: vi.fn(async () => {}),
   sendAccountActivationEmail: vi.fn(async () => {}),
   sendDuePaymentReceiptEmail: vi.fn(async () => {}),
+  sendRepPaymentReceivedEmail: vi.fn(async () => {}),
 }));
 const activationEmail = vi.mocked(sendAccountActivationEmail);
 const receiptEmail = vi.mocked(sendDuePaymentReceiptEmail);

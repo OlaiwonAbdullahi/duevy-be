@@ -102,7 +102,8 @@ describe('withdrawals and the sweep', () => {
     const p = await requestWithdrawal({ spaceId: s.space.id, userId: s.rep.id, beneficiaryId: s.beneficiary!.id, amountKobo: 300_000, pin: TEST_PIN });
     expect(p.status).toBe('pending');
     const sweep = await db.sweep.findUniqueOrThrow({ where: { id: p.sweepId! } });
-    expect(sweep).toMatchObject({ amountKobo: 300_000, trigger: 'withdrawal', status: 'processing' });
+    // All of the space's unswept money moves, not just the ₦3,000 it needs.
+    expect(sweep).toMatchObject({ amountKobo: 500_000, trigger: 'withdrawal', status: 'processing' });
     expect(fake.calls.filter((c) => c.op === 'initiateTransfer')).toHaveLength(1); // the sweep only
 
     fake.settleTransfer(sweep.reference, 'succeeded');
@@ -114,7 +115,29 @@ describe('withdrawals and the sweep', () => {
       reference: p.reference,
       amountKobo: 300_000 - 1_075, // ₦10 fee + ₦0.75 VAT
     });
-    expect(await getUnsweptKobo(s.space.id)).toBe(200_000);
+    expect(await getUnsweptKobo(s.space.id)).toBe(0);
+  });
+
+  it('moves everything even when the account already holds enough, without holding the withdrawal back', async () => {
+    const s = await makeSpace();
+    await creditSpace(s.space.id, 300_000); // ₦3,000 already in the space's account
+    await collect(s); // ₦5,000 unswept
+    const p = await requestWithdrawal({ spaceId: s.space.id, userId: s.rep.id, beneficiaryId: s.beneficiary!.id, amountKobo: 200_000, pin: TEST_PIN });
+    expect(p.sweepId).toBeNull();
+    expect(p.status).toBe('processing'); // sent at once
+    const sweeps = await db.sweep.findMany({ where: { spaceId: s.space.id } });
+    expect(sweeps.map((w) => [w.amountKobo, w.trigger])).toEqual([[500_000, 'withdrawal']]);
+    expect(await getUnsweptKobo(s.space.id)).toBe(0);
+  });
+
+  it('splits a large unswept amount into transfers of at most ₦1M; the withdrawal waits for the first', async () => {
+    const s = await makeSpace({ dues: [150_000_000] }); // a ₦1.5M due
+    await collect(s);
+    const p = await requestWithdrawal({ spaceId: s.space.id, userId: s.rep.id, beneficiaryId: s.beneficiary!.id, amountKobo: 100_000, pin: TEST_PIN });
+    const sweeps = await db.sweep.findMany({ where: { spaceId: s.space.id }, orderBy: { amountKobo: 'desc' } });
+    expect(sweeps.map((w) => w.amountKobo)).toEqual([MAX_TRANSFER_KOBO, 50_000_000]);
+    expect(p.sweepId).toBe(sweeps[0]!.id);
+    expect(await getUnsweptKobo(s.space.id)).toBe(0);
   });
 
   it('a withdrawal whose sweep fails fails too, and the balance is restored', async () => {

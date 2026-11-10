@@ -16,9 +16,9 @@ Under Bachs every rep held their own provider account, so every rep had to clear
 |---|---|---|
 | 1. Checkout | A one-time (transient) account for exactly face + 1.5%, single payment, expires with the checkout. `requestReference` = the checkout reference without punctuation. | `checkout.service` → `createCollectionAccount` |
 | 2. Payment | Settles straight into Duevy's business account. `new_transaction` arrives; Duevy reads the account's transactions back (`GET /v1/api/transactions?account-number=`) and credits the space's ledger with the face amount. | `webhookProcessor` → `confirmReceivedPayment` |
-| 3. Sweep | Once a Lagos day from 02:00, and whenever a withdrawal needs it, the space's collections move from the business account to the space's own account (`POST /v1/api/transfers`). The ledger doesn't change. | `sweep.service` |
+| 3. Sweep | Once a Lagos day from 02:00, and on every withdrawal, all of the space's unswept collections move from the business account to the space's own account (`POST /v1/api/transfers`). The ledger doesn't change. | `sweep.service` |
 | Direct deposit | Someone sends money straight to the space's own account number, not through a checkout. It is already in the space's account, so it's credited to the space as it is (ledger `direct_deposit`, no due attached) and never swept. Found from the credit webhook, or by reconciliation reading each space account every 6 hours. | `directDeposit.service` |
-| 4. Withdrawal | From the space's account to a beneficiary saved on the space (`POST /v1/api/transfers/virtual-account`). If the space's account doesn't hold enough yet, a sweep goes first and the withdrawal waits `pending`. | `withdrawal.service` |
+| 4. Withdrawal | From the space's account to a beneficiary saved on the space (`POST /v1/api/transfers/virtual-account`). Every withdrawal also sweeps all the space's unswept money (as far as the day's limits allow, in transfers of at most ₦1M). If the account doesn't hold enough yet, the withdrawal waits `pending` for the first of those sweeps, which covers it; otherwise it goes at once. | `withdrawal.service` |
 
 Where a space's money is:
 
