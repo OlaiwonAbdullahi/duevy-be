@@ -257,6 +257,9 @@ export async function quoteWithdrawal(spaceId: string, amountKobo: number) {
   return {
     amount: b.gross,
     fee: b.fee,
+    // `fee` split: 9jaPay's transfer charge and the 7.5% VAT on it.
+    feeCharge: b.charge,
+    feeVat: b.vat,
     net: b.net,
     minPayout: MIN_PAYOUT_KOBO,
     maxPayout: MAX_PAYOUT_KOBO,

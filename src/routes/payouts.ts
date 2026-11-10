@@ -14,7 +14,7 @@ import {
   MAX_PAYOUT_KOBO,
   MIN_PAYOUT_KOBO,
   TRANSFER_FEE_BANDS,
-  TRANSFER_FEE_TOP_KOBO,
+  TRANSFER_FEE_TOP,
 } from '../lib/money';
 import { canCollect, getKycState, getSpaceKycState } from '../services/kyc.service';
 import { getKycPolicy } from '../services/kycPolicy.service';
@@ -105,17 +105,22 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     minPayout: MIN_PAYOUT_KOBO,
     maxPayout: MAX_PAYOUT_KOBO,
     // 9jaPay's transfer charge by withdrawal amount. `toKobo` is exclusive; null = no upper bound.
+    // `feeKobo` = `chargeKobo` + `vatKobo` (7.5% VAT on the charge).
     fees: {
       bands: [
         ...TRANSFER_FEE_BANDS.map((b, i) => ({
           fromKobo: i === 0 ? 0 : TRANSFER_FEE_BANDS[i - 1]!.belowKobo,
           toKobo: b.belowKobo as number | null,
+          chargeKobo: b.chargeKobo,
+          vatKobo: b.vatKobo,
           feeKobo: b.feeKobo,
         })),
         {
           fromKobo: TRANSFER_FEE_BANDS[TRANSFER_FEE_BANDS.length - 1]!.belowKobo,
           toKobo: null,
-          feeKobo: TRANSFER_FEE_TOP_KOBO,
+          chargeKobo: TRANSFER_FEE_TOP.chargeKobo,
+          vatKobo: TRANSFER_FEE_TOP.vatKobo,
+          feeKobo: TRANSFER_FEE_TOP.feeKobo,
         },
       ],
     },

@@ -6,6 +6,7 @@ import {
   computeWithdrawal,
   decimalToKobo,
   koboToDecimal,
+  splitWithdrawalFee,
   transferFee,
   withdrawalFee,
 } from './money';
@@ -55,8 +56,15 @@ describe('withdrawalFee — 9jaPay’s transfer charge + 7.5% VAT: ₦10.75 / �
   });
 
   it('deducts the fee from the withdrawal', () => {
-    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 1_613, net: 1_998_387 });
-    expect(computeWithdrawal(150_000 * NAIRA)).toEqual({ gross: 15_000_000, fee: 2_150, net: 14_997_850 });
+    expect(computeWithdrawal(1_900 * NAIRA)).toEqual({ gross: 190_000, fee: 1_075, charge: 1_000, vat: 75, net: 188_925 });
+    expect(computeWithdrawal(20_000 * NAIRA)).toEqual({ gross: 2_000_000, fee: 1_613, charge: 1_500, vat: 113, net: 1_998_387 });
+    expect(computeWithdrawal(150_000 * NAIRA)).toEqual({ gross: 15_000_000, fee: 2_150, charge: 2_000, vat: 150, net: 14_997_850 });
+  });
+
+  it('splits a stored fee into charge and VAT; a pre-VAT fee is all charge', () => {
+    expect(splitWithdrawalFee(1_075)).toEqual({ chargeKobo: 1_000, vatKobo: 75 });
+    expect(splitWithdrawalFee(2_150)).toEqual({ chargeKobo: 2_000, vatKobo: 150 });
+    expect(splitWithdrawalFee(1_000)).toEqual({ chargeKobo: 1_000, vatKobo: 0 });
   });
 
 });

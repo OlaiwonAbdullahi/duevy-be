@@ -83,18 +83,38 @@ export const COLLECTION_FEE_BPS = 150;
  * separate line (live, 2026-11-09: a ₦1,900 transfer cost ₦10 + ₦0.75 VAT).
  * Rounded up so the ledger never debits less than the account loses.
  */
-const withVat = (chargeKobo: number) => chargeKobo + Math.ceil((chargeKobo * 75) / 1000);
+export const vatOnCharge = (chargeKobo: number) => Math.ceil((chargeKobo * 75) / 1000);
+
+/** 9jaPay's transfer charge before VAT: ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000. */
+const TRANSFER_CHARGE_BANDS = [
+  { belowKobo: 500_000, chargeKobo: 1_000 },
+  { belowKobo: 10_000_000, chargeKobo: 1_500 },
+];
+const TRANSFER_CHARGE_TOP_KOBO = 2_000;
 
 /**
  * Withdrawal fee: 9jaPay's transfer charge plus VAT, passed on and deducted
  * from the withdrawal. ₦10.75 under ₦5,000, ₦16.13 under ₦100,000, ₦21.50
  * from ₦100,000.
  */
-export const TRANSFER_FEE_BANDS: { belowKobo: number; feeKobo: number }[] = [
-  { belowKobo: 500_000, feeKobo: withVat(1_000) }, // < ₦5,000 → ₦10 + VAT
-  { belowKobo: 10_000_000, feeKobo: withVat(1_500) }, // < ₦100,000 → ₦15 + VAT
-];
-export const TRANSFER_FEE_TOP_KOBO = withVat(2_000); // ₦20 + VAT
+export const TRANSFER_FEE_BANDS: { belowKobo: number; chargeKobo: number; vatKobo: number; feeKobo: number }[] =
+  TRANSFER_CHARGE_BANDS.map((b) => ({ ...b, vatKobo: vatOnCharge(b.chargeKobo), feeKobo: b.chargeKobo + vatOnCharge(b.chargeKobo) }));
+export const TRANSFER_FEE_TOP = {
+  chargeKobo: TRANSFER_CHARGE_TOP_KOBO,
+  vatKobo: vatOnCharge(TRANSFER_CHARGE_TOP_KOBO),
+  feeKobo: TRANSFER_CHARGE_TOP_KOBO + vatOnCharge(TRANSFER_CHARGE_TOP_KOBO),
+};
+export const TRANSFER_FEE_TOP_KOBO = TRANSFER_FEE_TOP.feeKobo;
+
+/**
+ * A stored withdrawal fee split into 9jaPay's charge and the VAT on it.
+ * Withdrawals from before VAT was passed on (2026-11-09) hold the bare
+ * charge, so a fee matching no band is all charge.
+ */
+export function splitWithdrawalFee(feeKobo: number): { chargeKobo: number; vatKobo: number } {
+  const band = [...TRANSFER_FEE_BANDS, TRANSFER_FEE_TOP].find((b) => b.feeKobo === feeKobo);
+  return band ? { chargeKobo: band.chargeKobo, vatKobo: band.vatKobo } : { chargeKobo: feeKobo, vatKobo: 0 };
+}
 
 /** No withdrawal below ₦1,000. */
 export const MIN_PAYOUT_KOBO = 100_000;
@@ -167,15 +187,20 @@ export function withdrawalFee(grossKobo: number): number {
 export interface WithdrawalBreakdown {
   /** Debited from the space's ledger. */
   gross: number;
-  /** The transfer fee, deducted from the gross. */
+  /** The transfer fee (charge + VAT), deducted from the gross. */
   fee: number;
+  /** 9jaPay's transfer charge, part of `fee`. */
+  charge: number;
+  /** 7.5% VAT on the charge, part of `fee`. */
+  vat: number;
   /** What lands in the rep's bank account. */
   net: number;
 }
 
 export function computeWithdrawal(grossKobo: number): WithdrawalBreakdown {
   const fee = withdrawalFee(grossKobo);
-  return { gross: grossKobo, fee, net: grossKobo - fee };
+  const { chargeKobo, vatKobo } = splitWithdrawalFee(fee);
+  return { gross: grossKobo, fee, charge: chargeKobo, vat: vatKobo, net: grossKobo - fee };
 }
 
 // ---------------------------------------------------------------------------
