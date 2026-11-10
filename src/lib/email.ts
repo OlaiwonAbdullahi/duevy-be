@@ -103,7 +103,7 @@ export function emailDetails(rows: [string, string][]): string {
  * The shared email shell: a doodle-artwork header with the Duevy mark, the
  * content on a white card, and a quiet footer. `tone` colours the accent strip
  * and buttons (green by default; amber for resets, rose for warnings).
- * `preheader` is the inbox preview line.
+ * `preheader` is the inbox preview line, plain text (escaped here).
  */
 export function renderEmail(content: string, tone = BRAND, opts: { preheader?: string } = {}): string {
   const year = new Date().getFullYear();
@@ -127,7 +127,7 @@ export function renderEmail(content: string, tone = BRAND, opts: { preheader?: s
   </style>
 </head>
 <body style="margin:0;padding:0;background:${PAPER};">
-  ${opts.preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${opts.preheader}</div>` : ''}
+  ${opts.preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escapeHtml(opts.preheader)}</div>` : ''}
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAPER};">
     <tr>
       <td class="outer-pad" align="center" style="padding:32px 16px;">
@@ -381,6 +381,57 @@ export async function sendDuePaymentReceiptEmail(
     ...buildDuePaymentReceiptEmail(name, input),
     ...(pdf ? { attachments: [{ filename: pdf.filename, content: pdf.pdf }] } : {}),
   });
+}
+
+export type RepPaymentReceived = {
+  spaceName: string;
+  payerName: string;
+  payerIsGuest: boolean;
+  reference: string;
+  /** Every due settled by this payment, at its face amount. */
+  items: { title: string; amountKobo: number }[];
+  /** What the space receives: the dues' face amount, without the student's processing fee. */
+  faceKobo: number;
+  paidAt: Date;
+  /** The due's collections roster, or the dues list for a basket. */
+  link: string;
+};
+
+/** Subject, HTML and text telling a rep a member paid into their space. */
+export function buildRepPaymentReceivedEmail(repName: string, input: RepPaymentReceived) {
+  const amount = nairaExact(input.faceKobo);
+  const paidAt = input.paidAt.toLocaleString('en-NG', {
+    day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Africa/Lagos',
+  });
+  const single = input.items.length === 1;
+  const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
+  const payer = `${input.payerName}${input.payerIsGuest ? ' (guest)' : ''}`;
+  const html = renderEmail(
+    `
+    <h1>Payment received</h1>
+    <p>Hi ${escapeHtml(repName)}, <strong>${escapeHtml(payer)}</strong> just paid for <strong>${escapeHtml(summary)}</strong> in ${escapeHtml(input.spaceName)}.</p>
+    ${emailHero('Received', amount, paidAt)}
+    ${emailDetails([
+      ...input.items.map((i) => [escapeHtml(i.title), nairaExact(i.amountKobo)] as [string, string]),
+      ['Paid by', escapeHtml(payer)],
+      ['Reference', escapeHtml(input.reference)],
+    ])}
+    <a href="${input.link}" class="btn">View collections</a>
+    <p class="muted">The full ${amount} is in ${escapeHtml(input.spaceName)}'s balance; the student paid the processing fee separately. You can turn these off under Settings → Notifications → Payment emails.</p>
+  `,
+    undefined,
+    { preheader: `${payer} paid ${amount} for ${summary}.` },
+  );
+  const lines = input.items.map((i) => `- ${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
+  const text =
+    `Hi ${repName},\n\n${payer} just paid ${amount} for ${summary} in ${input.spaceName}.\n\n${lines}\n\n` +
+    `Reference: ${input.reference}\nDate: ${paidAt}\n\nView collections: ${input.link}\n\n` +
+    `You can turn these off under Settings → Notifications → Payment emails.`;
+  return { subject: `${payer} paid ${amount} — ${summary}`, html, text };
+}
+
+export async function sendRepPaymentReceivedEmail(to: string, repName: string, input: RepPaymentReceived): Promise<void> {
+  await sendEmail({ to, ...buildRepPaymentReceivedEmail(repName, input) });
 }
 
 export async function sendRepApplicationReceivedEmail(

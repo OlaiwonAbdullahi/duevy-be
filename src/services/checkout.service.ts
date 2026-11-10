@@ -7,7 +7,7 @@ import { logger } from '../lib/logger';
 import { allocate, checkoutFee, generateReceiptNumber, generateReference } from '../lib/money';
 import { assertCheckoutTransition, canTransitionCheckout } from '../lib/stateMachine';
 import { notifyMany } from '../lib/notifications';
-import { sendDuePaymentReceiptEmail } from '../lib/email';
+import { sendDuePaymentReceiptEmail, sendRepPaymentReceivedEmail } from '../lib/email';
 import { generateId } from '../lib/id';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { appendLedgerEntry, lockSpace } from './ledger.service';
@@ -685,21 +685,45 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     db.user.findUnique({ where: { id: checkout.userId }, select: { name: true, email: true, isGuest: true } }),
     db.checkoutItem.findMany({ where: { checkoutId: checkout.id }, include: { due: { select: { title: true } } } }),
     db.space.findUnique({ where: { id: checkout.spaceId }, select: { name: true } }),
-    db.spaceRep.findMany({ where: { spaceId: checkout.spaceId }, select: { userId: true } }),
+    db.spaceRep.findMany({
+      where: { spaceId: checkout.spaceId },
+      select: { userId: true, user: { select: { name: true, email: true, notificationPrefs: true, isDeactivated: true } } },
+    }),
     // Issued in the same transaction that marked the checkout paid.
     db.receipt.findFirst({ where: { checkoutId: checkout.id }, select: { number: true } }),
   ]);
   const what = listTitles(items.map((i) => i.due.title));
+  // One due opens its collections roster; a basket goes to the dues list.
+  const rosterHref = items.length === 1 ? `/dashboard/create-dues?due=${items[0]!.dueId}` : '/dashboard/create-dues';
   await notifyMany(
     reps.map((r) => r.userId),
     {
       kind: 'payment_received',
       title: 'Payment received',
       detail: `${payer?.name ?? 'A member'}${payer?.isGuest ? ' (guest)' : ''} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
-      // One due opens its collections roster; a basket goes to the dues list.
-      href: items.length === 1 ? `/dashboard/create-dues?due=${items[0]!.dueId}` : '/dashboard/create-dues',
+      href: rosterHref,
     },
   );
+  // And by email, unless the rep turned payment emails off, or paid it themselves
+  // (their own receipt follows). Best effort: one failed email never blocks the rest.
+  const emailReps = reps.filter((r) => r.userId !== checkout.userId && !r.user.isDeactivated && wantsPaymentEmails(r.user.notificationPrefs));
+  const sent = await Promise.allSettled(
+    emailReps.map((r) =>
+      sendRepPaymentReceivedEmail(r.user.email, r.user.name, {
+        spaceName: space?.name ?? '',
+        payerName: payer?.name ?? 'A member',
+        payerIsGuest: !!payer?.isGuest,
+        reference: checkout.reference,
+        items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
+        faceKobo: checkout.faceKobo,
+        paidAt: checkout.paidAt ?? new Date(),
+        link: `${env.FRONTEND_URL}${rosterHref}`,
+      }),
+    ),
+  );
+  for (const [i, r] of sent.entries()) {
+    if (r.status === 'rejected') logger.warn({ err: (r.reason as Error)?.message, ref: checkout.reference, repId: emailReps[i]!.userId }, 'rep payment email failed');
+  }
   // Guests have no dashboard to see an in-app notice — the email is theirs.
   if (!payer?.isGuest) await notifyMany([checkout.userId], {
     kind: 'payment_received',
@@ -737,6 +761,12 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       receiptUrl: payer.isGuest && items[0] ? guestReceiptUrl(items[0].dueId, checkout.reference) : undefined,
     }, pdf);
   }
+}
+
+/** `email.paymentReceipts` in /me/notification-preferences; on unless turned off. */
+function wantsPaymentEmails(prefs: Prisma.JsonValue | null): boolean {
+  const email = (prefs as { email?: { paymentReceipts?: unknown } } | null)?.email;
+  return email?.paymentReceipts !== false;
 }
 
 /** A guest's pay-link page for this checkout: status, receipt and its download, unlocked by the token. */
