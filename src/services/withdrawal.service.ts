@@ -26,6 +26,8 @@ import {
 } from './sweep.service';
 import { decrypt, encrypt } from '../lib/encryption';
 import { assertPassword, getSignatoryIds, REQUIRED_SIGNATORIES } from './signatory.service';
+import { env } from '../config/env';
+import { sendWithdrawalUpdateEmail, type WithdrawalUpdate } from '../lib/email';
 
 /**
  * Withdrawals: a space's lead rep moves the space's balance to one of its
@@ -669,8 +671,47 @@ export async function refreshPayout(payoutId: string): Promise<void> {
   else if (result.state === 'failed') await failPayout(p.id, result.failureReason ?? 'The bank could not complete the transfer');
 }
 
+/** Email every active rep of the space how a withdrawal ended; one failed email never blocks the rest. */
+async function emailReps(p: Payout, outcome: WithdrawalUpdate['outcome']): Promise<void> {
+  const [space, reps, requester, due] = await Promise.all([
+    db.space.findUnique({ where: { id: p.spaceId }, select: { name: true } }),
+    db.spaceRep.findMany({
+      where: { spaceId: p.spaceId, user: { isDeactivated: false } },
+      select: { userId: true, user: { select: { name: true, email: true } } },
+    }),
+    p.requestedById ? db.user.findUnique({ where: { id: p.requestedById }, select: { name: true } }) : null,
+    p.dueId ? db.due.findUnique({ where: { id: p.dueId }, select: { title: true } }) : null,
+  ]);
+  const base = {
+    outcome,
+    spaceName: space?.name ?? 'your space',
+    netKobo: p.netKobo,
+    feeKobo: p.feeKobo,
+    grossKobo: p.amount,
+    destination: p.accountName ? `${p.accountName} · ${p.accountMasked}` : p.accountMasked,
+    dueTitle: due?.title ?? null,
+    requestedBy: requester?.name ?? 'A rep',
+    reference: p.reference,
+    reason: p.failureReason,
+    at: p.settledAt ?? p.reversedAt ?? p.failedAt ?? p.cancelledAt ?? new Date(),
+    link: `${env.FRONTEND_URL}/dashboard/payout`,
+  };
+  const sent = await Promise.allSettled(
+    reps.map((r) => sendWithdrawalUpdateEmail(r.user.email, r.user.name, { ...base, viewerIsRequester: r.userId === p.requestedById })),
+  );
+  for (const [i, r] of sent.entries()) {
+    if (r.status === 'rejected') logger.warn({ ref: p.reference, repId: reps[i]!.userId, err: (r.reason as Error)?.message }, 'withdrawal email failed');
+  }
+}
+
 async function notifyReps(p: Payout, outcome: 'success' | 'failed' | 'cancelled'): Promise<void> {
   const reps = await db.spaceRep.findMany({ where: { spaceId: p.spaceId }, select: { userId: true } });
+  // Every outcome is emailed to every rep too: money leaving the space is
+  // something each of them should be able to spot. Best effort, never awaited
+  // by the caller's result.
+  await emailReps(p, outcome === 'failed' && p.status === 'reversed' ? 'reversed' : outcome).catch((err) =>
+    logger.warn({ ref: p.reference, err: (err as Error).message }, 'withdrawal emails not sent'),
+  );
   if (outcome === 'success') {
     // "You sent NGN3000 to Abdullahi Olaiwon" to whoever made it; the other reps aren't "you".
     const done = { ...p, status: 'success' };

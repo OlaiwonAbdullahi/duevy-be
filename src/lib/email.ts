@@ -596,6 +596,112 @@ export async function sendRepRejectedEmail(
   });
 }
 
+export type WithdrawalUpdate = {
+  outcome: 'success' | 'failed' | 'reversed' | 'cancelled';
+  spaceName: string;
+  /** What reached (or would have reached) the recipient. */
+  netKobo: number;
+  /** Duevy's withdrawal fee. */
+  feeKobo: number;
+  /** What came off the space balance: net + fee. Restored in full unless it succeeded. */
+  grossKobo: number;
+  /** "ADA OBI · GTBank •••• 4021". */
+  destination: string;
+  dueTitle: string | null;
+  requestedBy: string;
+  /** Whether this rep made the withdrawal: "You sent…" vs "Ada sent…". */
+  viewerIsRequester: boolean;
+  reference: string;
+  /** Why it failed or was cancelled. */
+  reason: string | null;
+  at: Date;
+  link: string;
+};
+
+/**
+ * Subject, HTML and text telling a rep how a withdrawal from their space
+ * ended. Every rep gets it, whatever their notification settings: money
+ * leaving the space is something each of them should be able to spot.
+ */
+export function buildWithdrawalUpdateEmail(name: string, w: WithdrawalUpdate) {
+  const net = nairaExact(w.netKobo);
+  const gross = nairaExact(w.grossKobo);
+  const at = w.at.toLocaleString('en-NG', {
+    day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Africa/Lagos',
+  });
+  const firstName = name.split(' ')[0] || name;
+  const who = w.viewerIsRequester ? 'You' : w.requestedBy;
+  const whoHtml = escapeHtml(who);
+  const copy = {
+    success: {
+      heading: 'Withdrawal completed',
+      lead: `${whoHtml} sent <strong>${net}</strong> from ${escapeHtml(w.spaceName)} to <strong>${escapeHtml(w.destination)}</strong>.`,
+      leadText: `${who} sent ${net} from ${w.spaceName} to ${w.destination}.`,
+      hero: 'Sent',
+      subject: `${w.viewerIsRequester ? 'You sent' : `${w.requestedBy} sent`} ${net} from ${w.spaceName}`,
+      after: `${gross} (including the ${nairaExact(w.feeKobo)} fee) came off the space balance.`,
+    },
+    failed: {
+      heading: "Withdrawal didn't go through",
+      lead: `The ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)} failed.`,
+      leadText: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} failed.`,
+      hero: 'Not sent',
+      subject: `Withdrawal failed — ${net} from ${w.spaceName}`,
+      after: `The full ${gross}, fee included, is back in the space balance. You can try again from the Payout page.`,
+    },
+    reversed: {
+      heading: 'Withdrawal reversed',
+      lead: `The bank sent back the ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)}.`,
+      leadText: `The bank sent back the ${net} withdrawal from ${w.spaceName} to ${w.destination}.`,
+      hero: 'Returned',
+      subject: `Withdrawal reversed — ${net} from ${w.spaceName}`,
+      after: `The full ${gross}, fee included, is back in the space balance.`,
+    },
+    cancelled: {
+      heading: 'Withdrawal cancelled',
+      lead: `The ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)} was cancelled before it was sent.`,
+      leadText: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} was cancelled before it was sent.`,
+      hero: 'Cancelled',
+      subject: `Withdrawal cancelled — ${net} from ${w.spaceName}`,
+      after: `The full ${gross}, fee included, is back in the space balance.`,
+    },
+  }[w.outcome];
+
+  // Plain values; escaped for the HTML below.
+  const rows: [string, string][] = [
+    ['Space', w.spaceName],
+    ['To', w.destination],
+    ['Amount sent', net],
+    ['Fee', nairaExact(w.feeKobo)],
+    ['Total from balance', gross],
+    ...(w.dueTitle ? [['From due', w.dueTitle] as [string, string]] : []),
+    ['Requested by', w.viewerIsRequester ? `You (${w.requestedBy})` : w.requestedBy],
+    ...(w.reason && w.outcome !== 'success' ? [['Reason', w.reason] as [string, string]] : []),
+    ['Reference', w.reference],
+  ];
+  const html = renderEmail(
+    `
+    <h1>${copy.heading}</h1>
+    <p>Hi ${escapeHtml(firstName)}, ${copy.lead}</p>
+    ${emailHero(copy.hero, net, at)}
+    ${emailDetails(rows.map(([k, v]) => [k, escapeHtml(v)] as [string, string]))}
+    <a href="${w.link}" class="btn">View withdrawals</a>
+    <p class="muted">${escapeHtml(copy.after)} If you don't recognise this withdrawal, contact support@duevy.app straight away.</p>
+  `,
+    BRAND,
+    { preheader: copy.leadText },
+  );
+  const text =
+    `Hi ${firstName},\n\n${copy.leadText}\n\n` +
+    rows.map(([k, v]) => `${k}: ${v}`).join('\n') +
+    `\nDate: ${at}\n\n${copy.after}\n\nView withdrawals: ${w.link}\n\nIf you don't recognise this withdrawal, contact support@duevy.app straight away.`;
+  return { subject: headerSafe(copy.subject), html, text };
+}
+
+export async function sendWithdrawalUpdateEmail(to: string, name: string, w: WithdrawalUpdate): Promise<void> {
+  await sendEmail({ to, ...buildWithdrawalUpdateEmail(name, w) });
+}
+
 export type WithdrawalOtp = {
   code: string;
   spaceName: string;
