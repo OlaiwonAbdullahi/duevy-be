@@ -233,3 +233,42 @@ export const guestAccountLimiter = limiter("guestAccount", {
     fail(res, 429, "RATE_LIMITED", "We've sent this a few times already — check your inbox, or try again in a few minutes.");
   },
 });
+
+// Public receipt verification (a rep scanning a QR code at a desk): generous
+// for a queue of payers, too slow to sweep the receipt-number space.
+export const receiptVerifyLimiter = limiter("receiptVerify", {
+  windowMs: 60 * 1000,
+  max: 30,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many checks from your network — wait a minute and try again.");
+  },
+});
+
+// "Email me my receipts": a few per address and per network, so it can't be
+// used to flood someone's inbox.
+export const receiptLookupLimiter = limiter("receiptLookup", {
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req: Request) =>
+    `${req.ip ?? "anon"}:${String((req.body as { email?: unknown } | undefined)?.email ?? "").trim().toLowerCase()}`,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "We've already sent a few links — check your inbox (and spam), or try again in 15 minutes.");
+  },
+});
+
+export const receiptLookupNetworkLimiter = limiter("receiptLookupNetwork", {
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many requests from your network, please try again later.");
+  },
+});
+
+// Viewing / downloading with an emailed link.
+export const receiptAccessLimiter = limiter("receiptAccess", {
+  windowMs: 60 * 1000,
+  max: 60,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many requests, please slow down.");
+  },
+});

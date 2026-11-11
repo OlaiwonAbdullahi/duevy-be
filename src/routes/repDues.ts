@@ -162,7 +162,7 @@ const createDueSchema = z.object({
   // Lead only: the co-rep who can withdraw this due's collections. Defaults to the creator.
   assignedRepId: z.string().min(1).optional(),
   // Opens the due's public pay link to people outside the space (no account).
-  allowGuests: z.boolean().default(false),
+  allowGuests: z.boolean().default(true),
   // Extra questions on the guest pay link. Omitted = DEFAULT_GUEST_FIELDS; null = the original form.
   guestFields: guestFieldsSchema.optional(),
 });

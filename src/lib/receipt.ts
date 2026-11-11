@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import PDFDocument from 'pdfkit';
+import QRCode from 'qrcode';
 import { formatNaira } from './money';
 import { resolveReceiptDesign, type ResolvedReceiptDesign } from '../services/receiptDesign.service';
 
@@ -27,6 +28,13 @@ interface ReceiptData {
   design?: ResolvedReceiptDesign;
   /** A guest's answers to the due's questions, printed when the design allows. */
   answers?: { label: string; value: string }[];
+  /**
+   * The public page that confirms this receipt is genuine. Printed as a QR
+   * code (plus the receipt number to type in) so a rep can scan it.
+   */
+  verifyUrl?: string;
+  /** Filled in by renderReceiptPdf from `verifyUrl`. */
+  qrPng?: Buffer;
 }
 
 type Colors = typeof COLOR;
@@ -369,7 +377,41 @@ function drawCardContent(
     });
     y = bottom + 4;
   }
+
+  // ── Verification: a QR code a rep scans to confirm the receipt is real ─
+  if (d.qrPng) {
+    y += 14;
+    const size = 64;
+    const boxH = size + 16;
+    doc.roundedRect(pad, y, contentW, boxH, 10).fill(COLOR.paper);
+    doc.image(d.qrPng, pad + 8, y + 8, { width: size, height: size });
+    const tx = pad + size + 22;
+    const tw = contentW - size - 32;
+    doc.font('semibold').fontSize(9.5).fillColor(COLOR.ink).text('Scan to verify this receipt', tx, y + 16, { width: tw });
+    doc
+      .font('regular')
+      .fontSize(8)
+      .fillColor(COLOR.muted)
+      .text(
+        `Point a phone camera at the code, or open ${verifyHost(d.verifyUrl)} and enter ${d.receiptNumber ?? 'the receipt number'}.`,
+        tx,
+        doc.y + 3,
+        { width: tw },
+      );
+    y += boxH;
+  }
   return y + 12;
+}
+
+/** "duevy.app/verify" from the full verify URL, for the line under the QR. */
+function verifyHost(url?: string): string {
+  if (!url) return 'duevy.app/verify';
+  try {
+    const u = new URL(url);
+    return `${u.host}/verify`;
+  } catch {
+    return 'duevy.app/verify';
+  }
 }
 
 /**
@@ -377,7 +419,10 @@ function drawCardContent(
  * One layout for one due or many: the dues are always itemised, and the page
  * grows past A5 rather than splitting a long basket across pages.
  */
-export function renderReceiptPdf(d: ReceiptData): Promise<Buffer> {
+export async function renderReceiptPdf(input: ReceiptData): Promise<Buffer> {
+  const d: ReceiptData = input.verifyUrl
+    ? { ...input, qrPng: await QRCode.toBuffer(input.verifyUrl, { type: 'png', margin: 0, width: 256, errorCorrectionLevel: 'M' }) }
+    : input;
   const lines: Line[] = d.lines && d.lines.length > 0 ? d.lines : [{ title: d.title, amountKobo: d.netToSpace }];
   const design = d.design ?? resolveReceiptDesign(null);
   const C = colorsFor(design);
