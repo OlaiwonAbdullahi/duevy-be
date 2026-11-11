@@ -237,7 +237,8 @@ describe('space accounts', () => {
     await vi.waitFor(async () => {
       const space = await db.space.findUniqueOrThrow({ where: { id: res.body.data.id } });
       expect(space.walletAccountNumber).toMatch(/^91\d{8}$/);
-      expect(space).toMatchObject({ walletAccountName: 'Physics Students Association', walletBankCode: '090629' });
+      // As the bank shows it: "DUEVY/<space name>-<3 letters>".
+      expect(space).toMatchObject({ walletAccountName: expect.stringMatching(/^DUEVY\/Physics Students Association-[A-Z]{3}$/), walletBankCode: '090629' });
     });
   });
 

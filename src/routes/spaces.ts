@@ -13,7 +13,7 @@ import { circleRouter } from './circle';
 import { repDuesRouter } from './repDues';
 import { payoutsRouter } from './payouts';
 import { pollsRepRouter } from './polls';
-import { openSpaceAccountInBackground } from '../services/sweep.service';
+import { openSpaceAccountInBackground, renameSpaceAccountInBackground } from '../services/sweep.service';
 import { receiptDesignRouter } from './receiptDesign';
 
 export const spacesRouter = Router();
@@ -309,6 +309,7 @@ spacesRouter.patch(
     }
 
     const actor = await db.user.findUnique({ where: { id: uid }, select: { name: true } });
+    const before = data.name === undefined ? null : await db.space.findUnique({ where: { id: spaceId }, select: { name: true } });
 
     const [space] = await db.$transaction([
       db.space.update({
@@ -326,6 +327,8 @@ spacesRouter.patch(
         },
       }),
     ]);
+    // The bank account carries the space's name.
+    if (before && before.name !== space.name) renameSpaceAccountInBackground(spaceId);
 
     ok(res, serializeSpace(space, { memberCount: space._count.memberships }));
   },

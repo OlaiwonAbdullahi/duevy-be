@@ -475,6 +475,7 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 |---|---|---|
 | `GET /admin/reps/applications?status=pending` | userManagement | Reps waiting for approval. Each row: `{ userId, applicant, status, requestedSpace, submittedAt, … }`. |
 | `POST /admin/reps/:repId/verify` | userManagement | Approves the rep: sets `isRep` and creates the space from the application. Body: `{ note? }`. |
+| `POST /admin/reps/:repId/approve-as-co-rep` | userManagement | Approves a pending applicant as a **co-rep of an existing space** instead of creating a new one (their department is already on Duevy). Same KYC checks as `/verify`. Body: `{ spaceId, note? }`. Notifies the applicant (in-app and email) and the space's lead. Returns the rep plus `space: { id, name, role: 'co' }`. 409 `NOT_PENDING` / `KYC_INCOMPLETE` / `USER_INACTIVE`; 404 if the space is missing or archived. `GET /admin/reps/:repId/application` now includes `matchingSpaces` (up to 5 unarchived spaces at the same school whose name contains the requested name) to pick from. |
 | `POST /admin/reps/:repId/reject` | userManagement | Body: `{ reason }`. |
 | `GET /admin/reps` | userManagement | Reps with their collections. |
 | `GET /admin/kyc/student-ids?status=pending` | userManagement | Student ID cards to review: `[{ userId, name, email, matricNo, institution, kycStatus, studentId: { status, mimeType, uploadedAt, reviewedAt, reviewNote, viewUrl, viewUrlExpiresInSeconds } }]`. `viewUrl` is a signed ImageKit link that expires after 10 minutes. |

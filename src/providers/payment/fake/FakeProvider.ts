@@ -114,10 +114,16 @@ export class FakeProvider implements PaymentProvider {
     return {
       accountId: `va_fake_${randomUUID()}`,
       accountNumber: `91${randomInt(10_000_000, 99_999_999)}`,
-      accountName: input.accountName,
+      // What 9jaPay shows: the business name in front.
+      accountName: `DUEVY/${input.accountName}`,
       bankName: '9jaPay',
       bankCode: '090629',
     };
+  }
+
+  async renameSpaceAccount(accountNumber: string, accountName: string): Promise<{ accountName: string }> {
+    this.record('renameSpaceAccount', { accountNumber, accountName });
+    return { accountName: `DUEVY/${accountName}` };
   }
 
   async listBanks(): Promise<Bank[]> {

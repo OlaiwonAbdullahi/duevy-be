@@ -219,6 +219,11 @@ export interface PaymentProvider {
 
   /** Open a space's own permanent account. Money stays in it until paid out. */
   createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount>;
+  /**
+   * Change the name on a space's permanent account. Returns the name the bank
+   * now shows (9jaPay prefixes the business name), which transfers must use.
+   */
+  renameSpaceAccount(accountNumber: string, accountName: string): Promise<{ accountName: string }>;
 
   /** The credits that landed in a permanent account within `window`, oldest first. */
   listAccountCredits(accountNumber: string, window: { from: Date; to: Date }): Promise<AccountCredit[]>;
