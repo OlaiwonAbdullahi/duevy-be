@@ -6,6 +6,7 @@ import { env } from '../config/env';
 import { AppError } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { DAILY_PAYOUT_LIMIT_KOBO, MAX_TRANSFER_KOBO } from '../lib/money';
+import { isCurrentSpaceAccountName, randomSuffix, spaceAccountName } from '../lib/spaceAccountName';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { lockSpace } from './ledger.service';
 // Circular with withdrawal.service, which is fine: each only calls the other
@@ -74,8 +75,8 @@ export async function ensureSpaceAccount(spaceId: string): Promise<Space> {
   const space = await db.space.findUniqueOrThrow({ where: { id: spaceId } });
   if (space.walletAccountNumber) return space;
 
-  // 9jaPay puts the business name in front itself: "DUEVY/<space name>".
-  const accountName = space.name.slice(0, 50);
+  // 9jaPay puts the business name in front itself: "DUEVY/<space name>-<suffix>".
+  const accountName = await uniqueSpaceAccountName(space);
   const account = await getPaymentProvider().createSpaceAccount({ reference: space.id, accountName });
   // Only fill it in if nobody else did meanwhile; the loser's account is
   // unused and logged for cleanup.
@@ -93,6 +94,48 @@ export async function ensureSpaceAccount(spaceId: string): Promise<Space> {
   if (count === 0) logger.warn({ spaceId, accountNumber: account.accountNumber }, 'space account opened twice — the second is unused');
   else logger.info({ spaceId, accountNumber: account.accountNumber }, 'space account opened');
   return db.space.findUniqueOrThrow({ where: { id: spaceId } });
+}
+
+/**
+ * "<space name>-<3 letters>", with letters no other space's account name
+ * uses with the same base. Checked against the names the bank shows, which
+ * end in exactly what we sent.
+ */
+async function uniqueSpaceAccountName(space: Pick<Space, 'id' | 'name'>): Promise<string> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const name = spaceAccountName(space.name, randomSuffix());
+    const taken = await db.space.count({
+      where: { id: { not: space.id }, walletAccountName: { endsWith: `/${name}`, mode: 'insensitive' } },
+    });
+    if (!taken) return name;
+  }
+  throw new AppError(409, 'ACCOUNT_NAME_EXHAUSTED', 'Could not find a free account name for this space');
+}
+
+/**
+ * Give the space's account the current naming ("<space name>-<suffix>"),
+ * e.g. after the space is renamed or for accounts opened before the suffix.
+ * A no-op when the bank already shows a name in that form for the space's
+ * current name, unless `force`. Returns the name the bank now shows.
+ */
+export async function renameSpaceAccount(spaceId: string, opts: { force?: boolean } = {}): Promise<{ renamed: boolean; accountName: string | null }> {
+  const space = await db.space.findUniqueOrThrow({ where: { id: spaceId } });
+  if (!space.walletAccountNumber) return { renamed: false, accountName: null };
+  if (!opts.force && isCurrentSpaceAccountName(space.walletAccountName, space.name)) {
+    return { renamed: false, accountName: space.walletAccountName };
+  }
+  const accountName = await uniqueSpaceAccountName(space);
+  const shown = await getPaymentProvider().renameSpaceAccount(space.walletAccountNumber, accountName);
+  await db.space.update({ where: { id: space.id }, data: { walletAccountName: shown.accountName } });
+  logger.info({ spaceId, accountNumber: space.walletAccountNumber, from: space.walletAccountName, to: shown.accountName }, 'space account renamed');
+  return { renamed: true, accountName: shown.accountName };
+}
+
+/** Best effort, after a space is renamed; scripts/renameSpaceAccounts catches any miss. */
+export function renameSpaceAccountInBackground(spaceId: string): void {
+  void renameSpaceAccount(spaceId).catch((err) =>
+    logger.warn({ spaceId, err: (err as Error).message }, 'space account not renamed after the space was — run the rename script'),
+  );
 }
 
 /** Best effort, after a space is created: a failure is retried by the daily sweep. */

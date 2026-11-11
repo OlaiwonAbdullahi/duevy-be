@@ -46,6 +46,8 @@ const TRANSACTION_PAGE_SIZE = 50;
 const TRANSACTION_PAGE_LIMIT = 20;
 /** Fresh references tried when opening a space account keeps hitting a duplicate. */
 const SPACE_ACCOUNT_ATTEMPTS = 5;
+/** How long a sending account's bank name is trusted before it's looked up again (accounts can be renamed). */
+const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
 
 export interface NineJaPayConfig {
   baseUrl: string;
@@ -132,8 +134,8 @@ function createdTransferState(res: { status?: string; statusCode?: string; data?
 export class NineJaPayProvider implements PaymentProvider {
   readonly name = 'ninejapay';
   private readonly client: NineJaPayClient;
-  /** Sending accounts' names as the bank holds them, looked up once per process. */
-  private readonly senderNames = new Map<string, Promise<string>>();
+  /** Sending accounts' names as the bank holds them, looked up at most every SENDER_NAME_TTL_MS. */
+  private readonly senderNames = new Map<string, { name: Promise<string>; at: number }>();
 
   constructor(
     private readonly config: NineJaPayConfig,
@@ -353,6 +355,29 @@ export class NineJaPayProvider implements PaymentProvider {
     };
   }
 
+  /**
+   * PATCH /v1/api/virtual-accounts/permanent/{accountNumber}. autoPayoutEnabled
+   * is sent as false every time, so an update can never turn on 9jaPay's
+   * auto-payout and send the space's money to the business account.
+   * blockStatus is left out: Duevy doesn't block accounts at the bank.
+   */
+  async renameSpaceAccount(accountNumber: string, accountName: string): Promise<{ accountName: string }> {
+    const res = await this.client.request<AccountDetails & { autoPayoutEnabled?: boolean }>({
+      method: 'PATCH',
+      path: `/v1/api/virtual-accounts/permanent/${encodeURIComponent(accountNumber)}`,
+      op: 'space_account.rename',
+      ref: accountNumber,
+      body: { accountName, autoPayoutEnabled: false },
+    });
+    if (res.data?.autoPayoutEnabled === true) {
+      logger.error({ accountNumber }, '9jaPay reports auto-payout ON for a space account after a rename — check it at 9jaPay');
+    }
+    // The cached sender name is now wrong for withdrawals from this account.
+    this.senderNames.delete(accountNumber);
+    const shown = await this.nameEnquiry(this.config.bankCode, accountNumber, accountNumber).catch(() => null);
+    return { accountName: shown?.accountName ?? res.data?.accountName ?? accountName };
+  }
+
   private async getAccount(accountNumber: string, ref?: string): Promise<AccountDetails | null> {
     const res = await this.client.request<AccountDetails>({
       method: 'GET',
@@ -433,17 +458,20 @@ export class NineJaPayProvider implements PaymentProvider {
   /**
    * The sender name for a transfer, from the business account (a sweep) or a
    * space's account (a withdrawal): whatever name enquiry says, so it always
-   * matches the bank's record ("DUEVY/<space>" for a space). Cached for the
-   * process; a failed lookup isn't cached, so the next transfer retries it.
+   * matches the bank's record ("DUEVY/<space>-<suffix>" for a space). Cached
+   * for SENDER_NAME_TTL_MS, so a rename made by another process (the rename
+   * script, an admin in the API while the worker sends) is picked up; a
+   * failed lookup isn't cached, so the next transfer retries it.
    */
   private getSenderName(accountNumber: string): Promise<string> {
-    let name = this.senderNames.get(accountNumber);
+    const cachedName = this.senderNames.get(accountNumber);
+    let name = cachedName && Date.now() - cachedName.at < SENDER_NAME_TTL_MS ? cachedName.name : undefined;
     if (!name) {
       name = this.nameEnquiry(this.config.bankCode, accountNumber).then((found) => {
         if (!found) throw new ProviderError(`Sending account ${accountNumber} could not be verified with 9jaPay`, null, 'SENDER_UNVERIFIABLE', true);
         return found.accountName;
       });
-      this.senderNames.set(accountNumber, name);
+      this.senderNames.set(accountNumber, { name, at: Date.now() });
     }
     return name.catch((err) => {
       this.senderNames.delete(accountNumber);

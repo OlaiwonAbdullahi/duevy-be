@@ -259,6 +259,36 @@ describe('space accounts', () => {
   });
 });
 
+describe('renaming a space account', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('PATCHes the permanent account, keeps auto-payout off, and returns the name the bank shows', async () => {
+    const calls: { url: string; method?: string; body: Record<string, unknown> }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? '{}');
+      calls.push({ url: String(url), method: init?.method, body });
+      if (String(url).endsWith('/name-enquiry')) {
+        return new Response(JSON.stringify({ status: 'SUCCESS', statusCode: '00', data: { accountName: 'DUEVY/Computer Science-KTP', accountNumber: '9000143203', bankCode: '090629', nameEnquiryReference: 'ne' } }), { status: 200 });
+      }
+      // As documented (docs.9japay.com, Update Permanent Virtual Account).
+      return new Response(JSON.stringify({ status: 'SUCCESS', message: 'Operation successful.', statusCode: '00', data: { accountNumber: '9000143203', accountName: 'Computer Science-KTP', autoPayoutEnabled: false, status: 'Active' } }), { status: 200 });
+    }));
+    const result = await provider.renameSpaceAccount('9000143203', 'Computer Science-KTP');
+    expect(calls[0]).toMatchObject({
+      url: 'https://developer.test.9japay.com/v1/api/virtual-accounts/permanent/9000143203',
+      method: 'PATCH',
+      body: { accountName: 'Computer Science-KTP', autoPayoutEnabled: false },
+    });
+    expect(calls[0]!.body).not.toHaveProperty('blockStatus');
+    expect(result).toEqual({ accountName: 'DUEVY/Computer Science-KTP' });
+  });
+
+  it('a refused rename is an error, not a silent success', async () => {
+    respond(400, { status: 'FAILED', message: 'Account Number must have a length of 10 characters.', statusCode: '09' });
+    await expect(provider.renameSpaceAccount('123', 'X-KTP')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+});
+
 describe('credits on a space account', () => {
   afterEach(() => vi.unstubAllGlobals());
 

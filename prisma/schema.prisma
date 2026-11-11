@@ -163,6 +163,7 @@ enum SweepStatus {
 enum SweepTrigger {
   daily
   withdrawal
+  manual // an admin's "Sweep now"
 }
 
 enum PayoutApprovalDecision {

@@ -15,17 +15,21 @@ import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listLivenessForReview, listNinReviews, listStudentIdsForReview, reviewLiveness, reviewNin, reviewStudentId } from '../services/kyc.service';
 import { getKycPolicy, leadRepsNotMeeting, setKycPolicy } from '../services/kycPolicy.service';
-import { notify } from '../lib/notifications';
+import { notify, notifyMany } from '../lib/notifications';
+import { writeAudit } from '../lib/audit';
 import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
-import { sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
+import { sendCoRepApprovedEmail, sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
 import { renderTablePdf } from '../lib/pdf';
 import { AppError } from '../lib/errors';
-import { openSpaceAccountInBackground } from '../services/sweep.service';
+import { openSpaceAccountInBackground, renameSpaceAccountInBackground } from '../services/sweep.service';
+import { adminPaymentsRouter } from './adminPayments';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
+// 9jaPay money flow: summary, sweeps, direct deposits, webhooks, payout/checkout actions.
+adminRouter.use(adminPaymentsRouter);
 
 const userSpaces = {
   spaceMemberships: { select: { space: { select: { name: true } } } },
@@ -224,7 +228,7 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
     db.checkout.count({ where }),
     db.checkout.findMany({
       where,
-      include: { user: { select: { name: true, email: true } }, space: { select: { name: true } }, _count: { select: { items: true } } },
+      include: { user: { select: { name: true, email: true, isGuest: true } }, space: { select: { name: true } }, _count: { select: { items: true } } },
       orderBy: { createdAt: 'desc' },
       skip,
       take,
@@ -245,6 +249,10 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
       overpaid: c.overpaidKobo,
       needsReview: c.needsReview,
       reviewReason: c.reviewReason,
+      isGuest: c.user.isGuest,
+      // The one-time 9jaPay account the student was told to pay into.
+      account: c.vaAccountNumber ? { number: c.vaAccountNumber, bankName: c.vaBankName, name: c.vaAccountName } : null,
+      providerTransactionId: c.providerTransactionId,
       expiresAt: c.expiresAt.toISOString(),
       paidAt: c.paidAt?.toISOString() ?? null,
       createdAt: c.createdAt.toISOString(),
@@ -276,21 +284,51 @@ adminRouter.post('/checkouts/:reference/resolve', requireAdminPermission('overri
 // GET /admin/payouts — every withdrawal across spaces
 // ---------------------------------------------------------------------------
 adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
-  const { page, perPage, skip, take } = parseListQuery(req);
+  const { page, perPage, skip, take, q } = parseListQuery(req);
   const where: Prisma.PayoutWhereInput = {};
   if (typeof req.query.status === 'string' && ['awaiting_approval', 'pending', 'processing', 'success', 'failed', 'reversed', 'cancelled'].includes(req.query.status)) {
     where.status = req.query.status as never;
   }
-  if (typeof req.query.spaceId === 'string') where.spaceId = req.query.spaceId;
-  const [total, rows] = await Promise.all([
+  // ?status=active: anything in flight to the bank.
+  if (req.query.status === 'active') where.status = { in: ['pending', 'processing'] };
+  // ?stuck=true: pending/processing for over an hour.
+  if (req.query.stuck === 'true') {
+    where.status = { in: ['pending', 'processing'] };
+    where.requestedAt = { lte: new Date(Date.now() - 60 * 60 * 1000) };
+  }
+  if (typeof req.query.spaceId === 'string' && req.query.spaceId) where.spaceId = req.query.spaceId;
+  if (q) {
+    where.OR = [
+      { reference: { contains: q, mode: 'insensitive' } },
+      { accountName: { contains: q, mode: 'insensitive' } },
+      { space: { name: { contains: q, mode: 'insensitive' } } },
+    ];
+  }
+  const [total, sum, rows] = await Promise.all([
     db.payout.count({ where }),
-    db.payout.findMany({ where, include: { space: { select: { name: true } } }, orderBy: { requestedAt: 'desc' }, skip, take }),
+    db.payout.aggregate({ where, _sum: { amount: true, feeKobo: true } }),
+    db.payout.findMany({
+      where,
+      include: { space: { select: { name: true, short: true } }, requestedBy: { select: { id: true, name: true } } },
+      orderBy: { requestedAt: 'desc' },
+      skip,
+      take,
+    }),
   ]);
+  const stuckBefore = Date.now() - 60 * 60 * 1000;
   ok(
     res,
-    rows.map((p) => ({ ...serializePayout(p), spaceId: p.spaceId, spaceName: p.space.name, provider: p.provider })),
+    rows.map((p) => ({
+      ...serializePayout(p),
+      spaceId: p.spaceId,
+      spaceName: p.space.name,
+      spaceShort: p.space.short,
+      provider: p.provider,
+      requestedBy: p.requestedBy,
+      stuck: (p.status === 'pending' || p.status === 'processing') && p.requestedAt.getTime() < stuckBefore,
+    })),
     200,
-    buildMeta(page, perPage, total),
+    { ...buildMeta(page, perPage, total), totalAmount: sum._sum.amount ?? 0, totalFees: sum._sum.feeKobo ?? 0 },
   );
 });
 
@@ -358,7 +396,8 @@ async function computeAdminOverview() {
 
   // One round trip: every figure below is independent (the overdue counts
   // filter by relation, not by a list of due ids read first).
-  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, overdueDues, memberGroups, paidGroups] = await Promise.all([
+  const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, overdueDues, memberGroups, paidGroups, payments] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
@@ -377,6 +416,20 @@ async function computeAdminOverview() {
       _count: { _all: true },
     }),
     db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
+    // 9jaPay plumbing that needs a human.
+    Promise.all([
+      db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: hourAgo } } }),
+      db.checkout.count({ where: { needsReview: true } }),
+      db.webhookEvent.count({ where: { status: 'dead', provider: { not: 'anchor' } } }),
+      db.sweep.count({ where: { status: 'failed', failedAt: { gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } } }),
+      db.space.count({ where: { isArchived: false, walletAccountNumber: null } }),
+    ]).then(([stuckPayouts, reviewCheckouts, deadWebhooks, failedSweeps, spacesWithoutAccount]) => ({
+      stuckPayouts,
+      reviewCheckouts,
+      deadWebhooks,
+      failedSweeps,
+      spacesWithoutAccount,
+    })),
   ]);
   const lowCollectionCount = fin.lowCollectionCount;
   const breachedDisputes = breachedRows[0]?.n ?? 0;
@@ -394,6 +447,62 @@ async function computeAdminOverview() {
   }
 
   const attention: unknown[] = [];
+  const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+  if (payments.stuckPayouts > 0) {
+    attention.push({
+      id: 'stuck-payouts',
+      tone: 'danger',
+      badge: 'Withdrawals',
+      title: `${plural(payments.stuckPayouts, 'withdrawal')} stuck for over an hour`,
+      detail: 'Recheck them with 9jaPay. Reps are waiting on this money.',
+      href: '/admin/withdrawals?view=stuck',
+      linkLabel: 'Open withdrawals',
+    });
+  }
+  if (payments.reviewCheckouts > 0) {
+    attention.push({
+      id: 'checkout-review',
+      tone: 'danger',
+      badge: 'Collections',
+      title: `${plural(payments.reviewCheckouts, 'payment')} flagged for review`,
+      detail: 'Underpaid, overpaid, late or duplicate money that needs a decision.',
+      href: '/admin/collections?view=review',
+      linkLabel: 'Review payments',
+    });
+  }
+  if (payments.deadWebhooks > 0) {
+    attention.push({
+      id: 'dead-webhooks',
+      tone: 'danger',
+      badge: 'Webhooks',
+      title: `${plural(payments.deadWebhooks, '9jaPay event')} failed every retry`,
+      detail: 'Payments or transfers may not be reflected until these are retried.',
+      href: '/admin/webhooks?view=dead',
+      linkLabel: 'Open webhooks',
+    });
+  }
+  if (payments.failedSweeps > 0) {
+    attention.push({
+      id: 'failed-sweeps',
+      tone: 'warning',
+      badge: 'Sweeps',
+      title: `${plural(payments.failedSweeps, 'sweep')} failed in the last 7 days`,
+      detail: 'That money is still in the business account and will be retried by the next sweep.',
+      href: '/admin/settlement?view=failed',
+      linkLabel: 'Open sweeps',
+    });
+  }
+  if (payments.spacesWithoutAccount > 0) {
+    attention.push({
+      id: 'spaces-no-account',
+      tone: 'warning',
+      badge: '9jaPay account',
+      title: `${plural(payments.spacesWithoutAccount, 'space')} without a 9jaPay account`,
+      detail: 'They can collect, but can’t receive sweeps or withdraw until an account is opened.',
+      href: '/admin/spaces?account=missing',
+      linkLabel: 'Open spaces',
+    });
+  }
   if (pendingReps > 0) {
     attention.push({
       id: 'pending-reps',
@@ -847,9 +956,62 @@ adminRouter.get('/reps/:repId/application', requireAdminPermission('userManageme
     errors.notFound(res, 'No application on file for this user');
     return;
   }
-  const user = await db.user.findUnique({ where: { id: userId }, select: applicantSelect });
-  ok(res, serializeRepApplication(app, user ?? undefined));
+  const [user, matchingSpaces] = await Promise.all([
+    db.user.findUnique({ where: { id: userId }, select: applicantSelect }),
+    // Spaces that may already be this department, so the admin can approve the
+    // applicant as a co-rep of one (POST /reps/:repId/approve-as-co-rep).
+    app.status === 'pending'
+      ? db.space.findMany({
+          where: { isArchived: false, school: app.school, name: { contains: app.spaceName.trim(), mode: 'insensitive' } },
+          select: { id: true, name: true, short: true, kind: true, faculty: true, _count: { select: { memberships: true } } },
+          orderBy: { createdAt: 'asc' },
+          take: 5,
+        })
+      : [],
+  ]);
+  ok(res, {
+    ...serializeRepApplication(app, user ?? undefined),
+    matchingSpaces: matchingSpaces.map((s) => ({ id: s.id, name: s.name, short: s.short, kind: s.kind, faculty: s.faculty, memberCount: s._count.memberships })),
+  });
 });
+
+/**
+ * Final approval comes after KYC, per the current policy: the student ID card
+ * must be on file; while required, the face capture must be on file and the
+ * NIN verified. Null when the applicant can be approved.
+ */
+async function applicantKycProblem(user: Pick<User, 'kycStatus' | 'studentIdStatus' | 'livenessStatus'>): Promise<string | null> {
+  const kycPolicy = await getKycPolicy();
+  if (kycPolicy.ninRequired && user.kycStatus !== 'verified') return "The applicant's NIN verification hasn't passed yet";
+  if (user.studentIdStatus !== 'pending' && user.studentIdStatus !== 'approved') return "The applicant hasn't uploaded an acceptable student ID yet";
+  if (kycPolicy.livenessRequired && user.livenessStatus !== 'pending' && user.livenessStatus !== 'approved') {
+    return "The applicant hasn't sent an acceptable face capture yet";
+  }
+  return null;
+}
+
+/** Approving an application approves the pending student ID and face capture the admin just reviewed on that page. */
+function approveReviewedKyc(user: Pick<User, 'studentIdStatus' | 'livenessStatus'>, adminId: string, note: string | undefined) {
+  const at = new Date();
+  return {
+    ...(user.studentIdStatus === 'pending'
+      ? { studentIdStatus: 'approved' as const, studentIdReviewedAt: at, studentIdReviewedById: adminId, studentIdReviewNote: note ?? null }
+      : {}),
+    ...(user.livenessStatus === 'pending'
+      ? { livenessStatus: 'approved' as const, livenessReviewedAt: at, livenessReviewedById: adminId, livenessReviewNote: note ?? null }
+      : {}),
+  };
+}
+
+/** Link the referral code entered at signup, outside any provisioning transaction (best effort). */
+async function linkApplicationReferral(userId: string, referralCode: string | null): Promise<void> {
+  if (!referralCode) return;
+  const referrer = await db.user.findUnique({ where: { referralCode } });
+  if (!referrer || referrer.id === userId) return;
+  await db.referral
+    .upsert({ where: { referredId: userId }, update: { status: 'joined' }, create: { referrerId: referrer.id, referredId: userId, status: 'joined' } })
+    .catch((err) => console.error('[referral link]', err));
+}
 
 // POST /reps/:repId/verify — the rep-approval keystone.
 const verifySchema = z.object({ note: z.string().max(500).optional() });
@@ -872,21 +1034,9 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
     errors.conflict(res, 'NO_APPLICATION', 'No rep application on file');
     return;
   }
-  // Final approval comes after KYC, per the current policy: the student ID
-  // card must be on file; while required, the face capture must be on file
-  // and the NIN verified. Approving the application approves the pending
-  // student ID and face capture the admin just reviewed on this page.
-  const kycPolicy = await getKycPolicy();
-  if (kycPolicy.ninRequired && user.kycStatus !== 'verified') {
-    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant's NIN verification hasn't passed yet");
-    return;
-  }
-  if (user.studentIdStatus !== 'pending' && user.studentIdStatus !== 'approved') {
-    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant hasn't uploaded an acceptable student ID yet");
-    return;
-  }
-  if (kycPolicy.livenessRequired && user.livenessStatus !== 'pending' && user.livenessStatus !== 'approved') {
-    errors.conflict(res, 'KYC_INCOMPLETE', "The applicant hasn't sent an acceptable face capture yet");
+  const kycProblem = await applicantKycProblem(user);
+  if (kycProblem) {
+    errors.conflict(res, 'KYC_INCOMPLETE', kycProblem);
     return;
   }
 
@@ -925,22 +1075,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
           repApplicationStatus: 'approved',
           referralCode,
           // Approving the application approves the student ID the admin just reviewed.
-          ...(user.studentIdStatus === 'pending'
-            ? {
-                studentIdStatus: 'approved',
-                studentIdReviewedAt: new Date(),
-                studentIdReviewedById: (req as AuthenticatedRequest).user.sub as string,
-                studentIdReviewNote: note ?? null,
-              }
-            : {}),
-          ...(user.livenessStatus === 'pending'
-            ? {
-                livenessStatus: 'approved',
-                livenessReviewedAt: new Date(),
-                livenessReviewedById: (req as AuthenticatedRequest).user.sub as string,
-                livenessReviewNote: note ?? null,
-              }
-            : {}),
+          ...approveReviewedKyc(user, (req as AuthenticatedRequest).user.sub as string, note),
         },
       });
       await tx.repApplication.update({ where: { userId }, data: { status: 'approved', spaceId: created.id, reviewedAt: new Date(), reviewNote: note } });
@@ -950,19 +1085,7 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
   );
   openSpaceAccountInBackground(space.id);
 
-  // Link the referral outside the provisioning transaction (best-effort).
-  if (app.referralCode) {
-    const referrer = await db.user.findUnique({ where: { referralCode: app.referralCode } });
-    if (referrer && referrer.id !== userId) {
-      await db.referral
-        .upsert({
-          where: { referredId: userId },
-          update: { status: 'joined' },
-          create: { referrerId: referrer.id, referredId: userId, status: 'joined' },
-        })
-        .catch((err) => console.error('[referral link]', err));
-    }
-  }
+  await linkApplicationReferral(userId, app.referralCode);
 
   await writeAdminAudit(req, 'rep.verify', { target: userId, metadata: { spaceId: space.id } });
   sendRepApprovedEmail(user.email, user.name, space.name).catch(console.error);
@@ -970,6 +1093,102 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
 
   ok(res, await buildAdminRep({ ...user, role: 'rep', isRep: true, repApplicationStatus: 'approved' }));
 });
+
+// POST /reps/:repId/approve-as-co-rep — the applicant's department already
+// has a space: approve them as a co-rep of it instead of opening a second
+// space (and a second bank account) for the same department. Same KYC bar as
+// /verify. A co-rep can't withdraw on their own (only the lead's code or the
+// signatories can), so userManagement is enough, as for rep invites.
+const approveAsCoRepSchema = z.object({ spaceId: z.string().min(1), note: z.string().max(500).optional() });
+
+adminRouter.post(
+  '/reps/:repId/approve-as-co-rep',
+  requireAdminPermission('userManagement'),
+  validate(approveAsCoRepSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.params.repId as string;
+    const adminId = (req as AuthenticatedRequest).user.sub as string;
+    const { spaceId, note } = req.body as z.infer<typeof approveAsCoRepSchema>;
+
+    const [user, app, space] = await Promise.all([
+      db.user.findUnique({ where: { id: userId } }),
+      db.repApplication.findUnique({ where: { userId } }),
+      db.space.findUnique({ where: { id: spaceId }, select: { id: true, name: true, isArchived: true } }),
+    ]);
+    if (!user) {
+      errors.notFound(res, 'User not found');
+      return;
+    }
+    if (user.repApplicationStatus !== 'pending' || app?.status !== 'pending') {
+      errors.conflict(res, 'NOT_PENDING', 'This account has no pending rep application');
+      return;
+    }
+    if (!space || space.isArchived) {
+      errors.notFound(res, 'Space not found');
+      return;
+    }
+    if (user.isSuspended || user.isDeactivated) {
+      errors.conflict(res, 'USER_INACTIVE', 'Suspended or deactivated users cannot be approved as reps');
+      return;
+    }
+    const kycProblem = await applicantKycProblem(user);
+    if (kycProblem) {
+      errors.conflict(res, 'KYC_INCOMPLETE', kycProblem);
+      return;
+    }
+
+    const [adminUser, referralCode] = await Promise.all([
+      db.user.findUnique({ where: { id: adminId }, select: { name: true } }),
+      user.referralCode ?? generateReferralCode(user.name),
+    ]);
+    const added = await db.$transaction(
+      async (tx) => {
+        // Re-checked inside: a second click, or a rep invite racing this, must not double-apply.
+        const claimed = await tx.repApplication.updateMany({
+          where: { userId, status: 'pending' },
+          // spaceId stays null: it's unique, and the space belongs to the application that opened it.
+          data: { status: 'approved', reviewedAt: new Date(), reviewNote: note ?? `Approved as co-rep of ${space.name}` },
+        });
+        if (claimed.count === 0) return false;
+        await tx.spaceRep.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, role: 'co' } });
+        await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId } }, update: {}, create: { userId, spaceId, kind: 'member' } });
+        await tx.user.update({
+          where: { id: userId },
+          data: {
+            role: user.role === 'admin' ? 'admin' : 'rep',
+            isRep: true,
+            repApplicationStatus: 'approved',
+            referralCode,
+            ...approveReviewedKyc(user, adminId, note),
+          },
+        });
+        await writeAudit(spaceId, { id: adminId, name: adminUser?.name ? `${adminUser.name} (Duevy admin)` : 'Duevy admin' }, 'rep_invited', `Added ${user.name} as a co-rep (rep application approved)`, tx);
+        return true;
+      },
+      { timeout: 20_000 },
+    );
+    if (!added) {
+      errors.conflict(res, 'NOT_PENDING', 'This account has no pending rep application');
+      return;
+    }
+
+    await linkApplicationReferral(userId, app.referralCode);
+    await writeAdminAudit(req, 'rep.approve_as_co_rep', { target: userId, severity: 'warning', metadata: { spaceId, requestedSpace: app.spaceName } });
+
+    const leads = await db.spaceRep.findMany({ where: { spaceId, role: 'lead' }, select: { userId: true } });
+    await Promise.all([
+      notify({ userId, kind: 'system', title: 'You are now a co-rep', detail: `Your rep application was approved: you're a co-rep of ${space.name}.`, href: '/dashboard' }),
+      notifyMany(
+        leads.map((l) => l.userId),
+        { kind: 'system', title: 'New co-rep', detail: `Duevy approved ${user.name} as a co-rep of ${space.name}.`, href: '/dashboard/manage' },
+      ),
+    ]).catch((err) => console.error('[co-rep notify]', err));
+    sendCoRepApprovedEmail(user.email, user.name, space.name).catch(console.error);
+    await invalidate(ADMIN_OVERVIEW_CACHE_KEY);
+
+    ok(res, { ...(await buildAdminRep({ ...user, role: 'rep', isRep: true, repApplicationStatus: 'approved' })), space: { id: space.id, name: space.name, role: 'co' } });
+  },
+);
 
 adminRouter.post('/reps/:repId/reject', requireAdminPermission('userManagement'), validate(reasonSchema), async (req: Request, res: Response): Promise<void> => {
   const userId = req.params.repId as string;
@@ -1047,6 +1266,12 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
   if (kind && ['department', 'association', 'faculty', 'club'].includes(kind)) where.kind = kind as never;
   if (school) where.school = { contains: school, mode: 'insensitive' };
   if (q) where.OR = [{ name: { contains: q, mode: 'insensitive' } }, { short: { contains: q, mode: 'insensitive' } }];
+  // ?account=missing|open: whether the space's own 9jaPay account exists.
+  if (req.query.account === 'missing') {
+    where.walletAccountNumber = null;
+    where.isArchived = false;
+  } else if (req.query.account === 'open') where.walletAccountNumber = { not: null };
+  if (req.query.frozen === 'true') where.payoutsFrozen = true;
 
   const [total, spaces] = await Promise.all([
     db.space.count({ where }),
@@ -1073,6 +1298,11 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
       withdrawalPinSetAt: s.withdrawalPinSetAt,
       withdrawalPinLocked: !!s.withdrawalPinLockedUntil && s.withdrawalPinLockedUntil > new Date(),
       withdrawalPinHoldUntil: s.withdrawalPinHoldUntil && s.withdrawalPinHoldUntil > new Date() ? s.withdrawalPinHoldUntil : null,
+      frozenReason: s.frozenReason,
+      // The ledger balance: owed to the space, wherever 9jaPay holds it.
+      balance: Math.max(0, fin?.held ?? 0),
+      // The space's own 9jaPay account (null until opened).
+      account: s.walletAccountNumber ? { number: s.walletAccountNumber, bankName: s.walletBankName, name: s.walletAccountName } : null,
     };
   });
   ok(res, rows, 200, buildMeta(page, perPage, total));
@@ -1153,6 +1383,8 @@ adminRouter.patch('/spaces/:spaceId', requireAdminPermission('userManagement'), 
     return;
   }
   const space = await db.space.update({ where: { id }, data: d });
+  // The bank account carries the space's name.
+  if (d.name !== undefined && d.name !== exists.name) renameSpaceAccountInBackground(id);
   await writeAdminAudit(req, 'space.update', { target: id, metadata: { fields: Object.keys(d) } });
   ok(res, { id: space.id, name: space.name, short: space.short, kind: space.kind, school: space.school, faculty: space.faculty });
 });

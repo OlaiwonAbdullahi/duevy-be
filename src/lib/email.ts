@@ -529,6 +529,27 @@ export async function sendRepApprovedEmail(
   });
 }
 
+/** The applicant's department already had a space, so they joined it as a co-rep. */
+export async function sendCoRepApprovedEmail(
+  to: string,
+  name: string,
+  spaceName: string,
+): Promise<void> {
+  const link = `${env.FRONTEND_URL}/dashboard`;
+  const html = renderEmail(`
+    <h1>You're approved! 🎉</h1>
+    <p>Hi ${escapeHtml(name)}, your rep application has been approved.</p>
+    <p><strong>${escapeHtml(spaceName)}</strong> was already on Duevy, so you've been added to it as a co-rep. You can now help manage its dues alongside the lead rep.</p>
+    <a href="${link}" class="btn">Go to dashboard</a>
+  `);
+
+  await sendEmail({
+    to,
+    subject: 'Your Duevy rep application has been approved',
+    html,
+  });
+}
+
 export async function sendRepRejectedEmail(
   to: string,
   name: string,
