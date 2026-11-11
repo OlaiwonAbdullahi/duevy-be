@@ -208,6 +208,30 @@ export async function sendPasswordResetEmail(
 }
 
 /**
+ * "See my receipts": a link to every receipt issued to this email, from the
+ * public lookup page. The link is the only proof the person owns the inbox.
+ */
+export async function sendReceiptLookupEmail(to: string, link: string, count: number): Promise<void> {
+  const what = count === 1 ? 'your receipt' : `your ${count} receipts`;
+  const html = renderEmail(
+    `
+    <h1>Your Duevy receipts</h1>
+    <p>Someone (hopefully you) asked to see the payments made with this email on Duevy. Open the link below to view and download ${what}.</p>
+    <a href="${link}" class="btn">View my receipts</a>
+    <p class="muted">This link expires in 1 hour and only works for this email address. If you didn't ask for it, you can ignore this email.</p>
+  `,
+    undefined,
+    { preheader: `View and download ${what}.` },
+  );
+  await sendEmail({
+    to,
+    subject: 'Your Duevy receipts',
+    html,
+    text: `View and download ${what}: ${link}\n\nThis link expires in 1 hour. If you didn't ask for it, ignore this email.`,
+  });
+}
+
+/**
  * A guest who ticked "create a free Duevy account" at checkout, sent once their
  * payment is confirmed. The link is a single-use set-password token; no
  * password is ever generated or emailed.

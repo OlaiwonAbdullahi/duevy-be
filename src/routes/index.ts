@@ -15,6 +15,7 @@ import { feedbackRouter } from './feedback';
 import { requireFeature } from '../middleware/requireFeature';
 import { guestPayRouter } from './guestPay';
 import { publicMetricsRouter } from './publicMetrics';
+import { publicReceiptsRouter } from './publicReceipts';
 import { devRouter } from './dev';
 
 export const apiRouter = Router();
@@ -22,6 +23,7 @@ export const apiRouter = Router();
 apiRouter.use('/auth', authRouter);
 apiRouter.use('/public', guestPayRouter);
 apiRouter.use('/public', publicMetricsRouter);
+apiRouter.use('/public', publicReceiptsRouter);
 apiRouter.use('/me', meRouter);
 apiRouter.use('/spaces', spacesRouter);
 apiRouter.use('/wallet', walletRouter);

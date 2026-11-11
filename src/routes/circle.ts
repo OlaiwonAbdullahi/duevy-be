@@ -164,23 +164,46 @@ circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response)
 });
 
 // ---------------------------------------------------------------------------
-// POST /reps — the lead adds a member of the space as a co-rep. A co-rep can
-// manage dues and withdraw from the dues the lead assigns them
+// POST /reps — the lead adds a co-rep: a member of the space (`userId`), or
+// any Duevy account by `email` (dues are paid through pay links now, so most
+// spaces have no members to pick from; the account is added as a member too).
+// A co-rep can manage dues and withdraw from the dues the lead assigns them
 // (POST /dues/{dueId}/reassign); the lead can also nominate them as a
 // withdrawal signatory (PUT /payout/signatories).
 // ---------------------------------------------------------------------------
-const addRepSchema = z.object({ userId: z.string().min(1) }).strict();
+const addRepSchema = z.union([
+  z.object({ userId: z.string().min(1) }).strict(),
+  z.object({ email: z.string().trim().email().max(254).transform((e) => e.toLowerCase()) }).strict(),
+]);
 
 circleRouter.post('/reps', requireSpaceRep(true), validate(addRepSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const { userId: targetId } = req.body as z.infer<typeof addRepSchema>;
+  const input = req.body as z.infer<typeof addRepSchema>;
+
+  let targetId: string;
+  let addMembership = false;
+  if ('email' in input) {
+    // Guests (pay-link payers) have no password, so they can't sign in to be a rep.
+    const account = await db.user.findFirst({
+      where: { email: { equals: input.email, mode: 'insensitive' }, isGuest: false },
+      select: { id: true },
+    });
+    if (!account) {
+      fail(res, 404, 'NO_ACCOUNT', 'No Duevy account uses this email');
+      return;
+    }
+    targetId = account.id;
+    addMembership = true;
+  } else {
+    targetId = input.userId;
+  }
 
   const [membership, existing, target] = await Promise.all([
     db.spaceMembership.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
     db.spaceRep.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
     db.user.findUnique({ where: { id: targetId }, select: { id: true, name: true, email: true, role: true, referralCode: true, isSuspended: true, isDeactivated: true } }),
   ]);
-  if (!target || !membership) {
+  if (!target || (!membership && !addMembership)) {
     errors.notFound(res, 'That user is not a member of this space');
     return;
   }
@@ -196,6 +219,7 @@ circleRouter.post('/reps', requireSpaceRep(true), validate(addRepSchema), async 
   const referralCode = target.referralCode ?? (await generateReferralCode(target.name));
   const me = await actor(req);
   const created = await db.$transaction(async (tx) => {
+    if (!membership) await tx.spaceMembership.create({ data: { userId: targetId, spaceId: sid } });
     const r = await tx.spaceRep.create({ data: { userId: targetId, spaceId: sid, role: 'co' } });
     // Attaching a rep promotes the account, as an admin assignment does.
     await tx.user.update({
@@ -306,15 +330,18 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   const memberCount = space._count.memberships;
 
   const memberPaidByDue = new Map(memberPaid.map((g) => [g.dueId, g._count._all]));
-  const paidByDue = new Map<string, { count: number; sum: number }>(
-    grouped.map((g) => [g.dueId, { count: memberPaidByDue.get(g.dueId) ?? 0, sum: g._sum.netToSpace ?? 0 }]),
+  const paidByDue = new Map<string, { count: number; guests: number; sum: number }>(
+    grouped.map((g) => {
+      const members = memberPaidByDue.get(g.dueId) ?? 0;
+      return [g.dueId, { count: members, guests: g._count._all - members, sum: g._sum.netToSpace ?? 0 }];
+    }),
   );
 
   let collected = 0;
   let expected = 0;
   let unpaidCount = 0;
   const activeDuesOut = activeDues.map((d) => {
-    const agg = paidByDue.get(d.id) ?? { count: 0, sum: 0 };
+    const agg = paidByDue.get(d.id) ?? { count: 0, guests: 0, sum: 0 };
     collected += agg.sum;
     expected += d.amount * memberCount;
     unpaidCount += Math.max(0, memberCount - agg.count);
@@ -327,6 +354,8 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       category: d.category,
       status: d.status,
       paidCount: agg.count,
+      // Paid through the pay link (guests) — every payment now, since dues went link-only.
+      guestPaidCount: agg.guests,
       memberCount,
     };
   });
