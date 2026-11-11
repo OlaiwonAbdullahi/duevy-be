@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { Prisma, KycStatus, TxnStatus, TxnType, DisputeStatus, DisputeType, PollStatus, type RepApplication, type User } from '@prisma/client';
+import { Prisma, type Report, KycStatus, TxnStatus, TxnType, DisputeStatus, DisputeType, PollStatus, type RepApplication, type User } from '@prisma/client';
 import { db } from '../config/db';
 import { cached, invalidate } from '../lib/cache';
 import { validate } from '../middleware/validate';
@@ -21,7 +21,8 @@ import { env } from '../config/env';
 import { generateJoinCode } from '../lib/joincode';
 import { generateReferralCode } from '../lib/referral';
 import { sendCoRepApprovedEmail, sendRepApprovedEmail, sendRepRejectedEmail } from '../lib/email';
-import { renderTablePdf } from '../lib/pdf';
+import { renderReportPdf } from '../lib/pdf';
+import { buildReport, formatCell, lagosDate, lagosDayEnd, lagosDayStart, SCOPE_TITLES, type ReportTable } from '../services/reports.service';
 import { AppError } from '../lib/errors';
 import { openSpaceAccountInBackground, renameSpaceAccountInBackground } from '../services/sweep.service';
 import { adminPaymentsRouter } from './adminPayments';
@@ -2020,7 +2021,8 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
 });
 
 // ===========================================================================
-// §14.9 Reports
+// §14.9 Reports — built by services/reports.service.ts from the 9jaPay-era
+// records (checkouts, space ledgers, payouts, sweeps, direct deposits).
 // ===========================================================================
 /** One CSV cell. Text that a spreadsheet would run as a formula is prefixed with ' first. */
 function csvCell(c: string | number | null): string {
@@ -2030,70 +2032,89 @@ function csvCell(c: string | number | null): string {
   return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
-function csv(rows: (string | number | null)[][]): string {
-  return rows.map((r) => r.map(csvCell).join(',')).join('\n');
+function reportCsv(table: ReportTable): string {
+  const line = (cells: (string | number | null)[]) =>
+    cells.map((c, i) => csvCell(typeof c === 'number' ? formatCell(c, table.columns[i]?.kind) : c)).join(',');
+  return [
+    // A UTF-8 BOM so Excel reads ₦ and accented names correctly.
+    '﻿' + csvCell(`Duevy - ${table.title}`),
+    ...table.subtitle.map((s) => csvCell(s)),
+    '',
+    line(table.columns.map((c) => c.label)),
+    ...table.rows.map(line),
+    ...(table.totals ? [line(table.totals)] : []),
+  ].join('\r\n');
 }
 
-function serializeReport(r: {
-  id: string;
-  scope: string;
-  format: string;
-  status: string;
-  generatedAt: Date | null;
-  fileSize: number | null;
-  downloadUrl: string | null;
-  fromDate: Date;
-  toDate: Date;
-  createdAt: Date;
-}) {
+function serializeReport(r: Report & { space?: { name: string } | null }) {
   return {
     id: r.id,
-    name: `${r.scope} (${r.fromDate.toISOString().slice(0, 10)} – ${r.toDate.toISOString().slice(0, 10)})`,
+    name: `${SCOPE_TITLES[r.scope]} (${lagosDate(r.fromDate)} – ${lagosDate(r.toDate)})`,
     scope: r.scope,
     format: r.format,
-    status: r.status,
+    // Report expiry is checked at download; reflect it here too.
+    status: r.status === 'ready' && r.expiresAt && r.expiresAt < new Date() ? 'expired' : r.status,
+    /** Lagos calendar dates, inclusive. */
+    from: lagosDate(r.fromDate),
+    to: lagosDate(r.toDate),
+    spaceId: r.spaceId,
+    spaceName: r.space?.name ?? null,
     generatedAt: r.generatedAt?.toISOString() ?? null,
+    expiresAt: r.expiresAt?.toISOString() ?? null,
     fileSize: r.fileSize,
     downloadUrl: r.downloadUrl,
     createdAt: r.createdAt.toISOString(),
   };
 }
 
-const MAX_REPORT_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
-const MAX_LEDGER_ROWS = 50_000;
+const MAX_REPORT_DAYS = 366;
+const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date as YYYY-MM-DD');
 
-const createReportSchema = z.object({
-  scope: z.enum(['financial_summary', 'space_collection', 'rep_performance', 'full_ledger']),
-  format: z.enum(['csv', 'pdf']),
-  from: z.coerce.date(),
-  to: z.coerce.date(),
-  spaceId: z.string().optional(),
-}).refine((d) => d.to >= d.from, { message: 'must be on or after from', path: ['to'] })
-  .refine((d) => d.to.getTime() - d.from.getTime() <= MAX_REPORT_RANGE_MS, { message: 'range cannot exceed 366 days', path: ['to'] });
+const createReportSchema = z
+  .object({
+    scope: z.enum(['financial_summary', 'space_collection', 'rep_performance', 'full_ledger']),
+    format: z.enum(['csv', 'pdf']),
+    // Lagos calendar days, both inclusive. A full ISO timestamp is cut to its date.
+    from: z.preprocess((v) => (typeof v === 'string' ? v.slice(0, 10) : v), ymd),
+    to: z.preprocess((v) => (typeof v === 'string' ? v.slice(0, 10) : v), ymd),
+    spaceId: z.preprocess((v) => (v === '' || v === null ? undefined : v), z.string().optional()),
+  })
+  .refine((d) => d.to >= d.from, { message: 'must be on or after from', path: ['to'] })
+  .refine((d) => (lagosDayStart(d.to).getTime() - lagosDayStart(d.from).getTime()) / 86_400_000 < MAX_REPORT_DAYS, {
+    message: `range cannot exceed ${MAX_REPORT_DAYS} days`,
+    path: ['to'],
+  });
 
 adminRouter.post('/reports', requireAdminPermission('userManagement'), validate(createReportSchema), async (req: Request, res: Response): Promise<void> => {
   const d = req.body as z.infer<typeof createReportSchema>;
+  if (d.spaceId && !(await db.space.count({ where: { id: d.spaceId } }))) {
+    errors.validation(res, [{ field: 'spaceId', issue: 'no space with this id' }]);
+    return;
+  }
   const now = new Date();
 
-  // Synchronous generation: the file is rendered on demand at download time.
-  const report = await db.report.create({
+  // Generated on demand at download time, so it's ready at once.
+  const created = await db.report.create({
     data: {
       requestedById: (req as AuthenticatedRequest).user.sub as string,
       scope: d.scope,
       format: d.format,
       status: 'ready',
-      fromDate: d.from,
-      toDate: d.to,
+      fromDate: lagosDayStart(d.from),
+      toDate: lagosDayEnd(d.to),
       spaceId: d.spaceId,
       generatedAt: now,
       expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
     },
   });
-  const downloadUrl = `${env.APP_BASE_URL}/v1/admin/reports/${report.id}/download`;
-  await db.report.update({ where: { id: report.id }, data: { downloadUrl } });
+  const report = await db.report.update({
+    where: { id: created.id },
+    data: { downloadUrl: `${env.APP_BASE_URL}/v1/admin/reports/${created.id}/download` },
+  });
+  const space = d.spaceId ? await db.space.findUnique({ where: { id: d.spaceId }, select: { name: true } }) : null;
 
-  await writeAdminAudit(req, 'report.generate', { target: report.id, metadata: { scope: d.scope, format: d.format } });
-  res.status(202).json({ success: true, data: serializeReport({ ...report, downloadUrl }) });
+  await writeAdminAudit(req, 'report.generate', { target: report.id, metadata: { scope: d.scope, format: d.format, from: d.from, to: d.to, spaceId: d.spaceId ?? null } });
+  res.status(201).json({ success: true, data: serializeReport({ ...report, space }) });
 });
 
 adminRouter.get('/reports', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
@@ -2102,23 +2123,11 @@ adminRouter.get('/reports', requireAdminPermission('userManagement'), async (req
     db.report.count(),
     db.report.findMany({ orderBy: { createdAt: 'desc' }, skip, take }),
   ]);
-  ok(res, reports.map(serializeReport), 200, buildMeta(page, perPage, total));
+  const spaceIds = [...new Set(reports.map((r) => r.spaceId).filter((id): id is string => !!id))];
+  const spaces = spaceIds.length ? await db.space.findMany({ where: { id: { in: spaceIds } }, select: { id: true, name: true } }) : [];
+  const names = new Map(spaces.map((s) => [s.id, s]));
+  ok(res, reports.map((r) => serializeReport({ ...r, space: r.spaceId ? names.get(r.spaceId) ?? null : null })), 200, buildMeta(page, perPage, total));
 });
-
-/** Net collected and fees per space for payments in [from, to], in one GROUP BY. */
-async function collectedBySpace(from: Date, to: Date, spaceId?: string | null): Promise<Map<string, { net: number; fees: number }>> {
-  const rows = await db.$queryRaw<{ spaceId: string; net: bigint | null; fees: bigint | null }[]>`
-    SELECT d."spaceId" AS "spaceId",
-           SUM(dp."netToSpace") AS net,
-           SUM(dp."processingFee" + dp."duevyFee") AS fees
-    FROM "due_payments" dp
-    JOIN "dues" d ON d."id" = dp."dueId"
-    WHERE dp."paidAt" >= ${from} AND dp."paidAt" <= ${to}
-    ${spaceId ? Prisma.sql`AND d."spaceId" = ${spaceId}` : Prisma.empty}
-    GROUP BY d."spaceId"
-  `;
-  return new Map(rows.map((r) => [r.spaceId, { net: Number(r.net ?? 0), fees: Number(r.fees ?? 0) }]));
-}
 
 adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'), async (req: Request, res: Response): Promise<void> => {
   const report = await db.report.findUnique({ where: { id: req.params.id as string } });
@@ -2128,75 +2137,26 @@ adminRouter.get('/reports/:id/download', requireAdminPermission('userManagement'
   }
   if (report.expiresAt && report.expiresAt < new Date()) {
     await db.report.update({ where: { id: report.id }, data: { status: 'expired' } }).catch(() => {});
-    errors.conflict(res, 'REPORT_EXPIRED', 'This report link has expired');
+    errors.conflict(res, 'REPORT_EXPIRED', 'This report has expired. Generate it again.');
     return;
   }
 
-  const range = { gte: report.fromDate, lte: report.toDate };
-  let rows: (string | number | null)[][];
-
-  if (report.scope === 'full_ledger') {
-    const txns = await db.transaction.findMany({
-      where: { createdAt: range },
-      select: { reference: true, type: true, title: true, amount: true, method: true, status: true, createdAt: true, user: { select: { name: true, email: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: MAX_LEDGER_ROWS,
-    });
-    rows = [
-      ['Reference', 'Type', 'Title', 'Amount (kobo)', 'Method', 'Status', 'User', 'Email', 'Date'],
-      ...txns.map((t) => [t.reference, t.type, t.title, t.amount, t.method, t.status, t.user.name, t.user.email, t.createdAt.toISOString()]),
-    ];
-  } else if (report.scope === 'financial_summary') {
-    const [collected, fees, topups, refunds, payouts] = await Promise.all([
-      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { netToSpace: true } }),
-      db.duePayment.aggregate({ where: { paidAt: range }, _sum: { processingFee: true, duevyFee: true } }),
-      db.transaction.aggregate({ where: { type: 'topup', status: 'completed', createdAt: range }, _sum: { amount: true } }),
-      db.transaction.aggregate({ where: { type: 'refund', createdAt: range }, _sum: { amount: true } }),
-      db.payout.aggregate({ where: { requestedAt: range }, _sum: { amount: true } }),
-    ]);
-    rows = [
-      ['Metric', 'Amount (kobo)'],
-      ['Net collected (to spaces)', collected._sum.netToSpace ?? 0],
-      ['Processing fees', fees._sum.processingFee ?? 0],
-      ['Duevy revenue (fees)', fees._sum.duevyFee ?? 0],
-      ['Wallet top-ups', topups._sum.amount ?? 0],
-      ['Refunds issued', refunds._sum.amount ?? 0],
-      ['Payouts requested', payouts._sum.amount ?? 0],
-    ];
-  } else if (report.scope === 'space_collection') {
-    const where = report.spaceId ? { id: report.spaceId } : {};
-    const [spaces, bySpace] = await Promise.all([
-      db.space.findMany({ where, select: { id: true, name: true } }),
-      collectedBySpace(report.fromDate, report.toDate, report.spaceId),
-    ]);
-    rows = [['Space', 'Net collected (kobo)', 'Fees (kobo)']];
-    for (const s of spaces) {
-      const agg = bySpace.get(s.id);
-      rows.push([s.name, agg?.net ?? 0, agg?.fees ?? 0]);
-    }
-  } else {
-    // rep_performance
-    const [leads, bySpace] = await Promise.all([
-      db.spaceRep.findMany({ where: { role: 'lead' }, select: { spaceId: true, user: { select: { name: true } }, space: { select: { name: true } } } }),
-      collectedBySpace(report.fromDate, report.toDate),
-    ]);
-    rows = [['Rep', 'Space', 'Net collected (kobo)']];
-    for (const l of leads) rows.push([l.user.name, l.space.name, bySpace.get(l.spaceId)?.net ?? 0]);
-  }
+  const table = await buildReport(report);
+  const filename = `duevy-${report.scope.replace(/_/g, '-')}-${lagosDate(report.fromDate)}-to-${lagosDate(report.toDate)}`;
 
   if (report.format === 'pdf') {
-    const pdf = await renderTablePdf(`${report.scope} report`, rows);
+    const pdf = await renderReportPdf(table);
     await db.report.update({ where: { id: report.id }, data: { fileSize: pdf.byteLength } }).catch(() => {});
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${report.scope}-${report.id}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}.pdf"`);
     res.status(200).send(pdf);
     return;
   }
 
-  const body = csv(rows);
+  const body = reportCsv(table);
   await db.report.update({ where: { id: report.id }, data: { fileSize: Buffer.byteLength(body) } }).catch(() => {});
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${report.scope}-${report.id}.csv"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
   res.status(200).send(body);
 });
 
