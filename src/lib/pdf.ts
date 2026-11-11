@@ -8,7 +8,7 @@ import { formatCell, lagosDate, type Cell, type ReportTable } from '../services/
  * Admin report PDFs (§14.9, `format: "pdf"`) on Duevy's letterhead.
  *
  * pdfkit lays the table out inside the letterhead's writing area; pdf-lib then
- * stamps the letterhead onto every page. The logo, address and footer text are
+ * stamps the letterhead onto every page. The logo, email/domain and footer text are
  * cut straight from assets/letterhead.pdf (vector, exact), and the full-width
  * rule and footer band are redrawn in its colours, so the same letterhead fits
  * portrait (short reports) and landscape (wide tables).
@@ -24,7 +24,8 @@ const BRAND_GOLD = rgb(250 / 255, 190 / 255, 76 / 255); // #FABE4C
 /** Pieces cut from the letterhead: [left, bottom, right, top]. */
 const PIECES = {
   logo: { left: 48, bottom: 749, right: 202, top: 796 },
-  address: { left: 420, bottom: 748, right: 548, top: 800 },
+  /** Just the email and domain lines; the street address above them is left out. */
+  contact: { left: 420, bottom: 748, right: 548, top: 774 },
   footerLeft: { left: 40, bottom: 12, right: 330, top: 40 },
   footerRight: { left: 430, bottom: 12, right: 552, top: 40 },
 } as const;
@@ -148,10 +149,13 @@ function renderTable(table: ReportTable, layout: 'portrait' | 'landscape'): Prom
 async function stampLetterhead(body: Buffer): Promise<Buffer> {
   const out = await PdfLibDocument.load(body);
   const source = (await PdfLibDocument.load(letterhead())).getPage(0);
-  const [logo, address, footerLeft, footerRight] = await out.embedPages(
+  const [logo, contact, footerLeft, footerRight] = await out.embedPages(
     [source, source, source, source],
-    [PIECES.logo, PIECES.address, PIECES.footerLeft, PIECES.footerRight],
+    [PIECES.logo, PIECES.contact, PIECES.footerLeft, PIECES.footerRight],
   );
+  // Centre the email and domain on the logo, now the address no longer sits above them.
+  const centre = (b: { bottom: number; top: number }) => (b.bottom + b.top) / 2;
+  const contactLift = centre(PIECES.logo) - centre(PIECES.contact);
 
   for (const page of out.getPages()) {
     const { width: W, height: H } = page.getSize();
@@ -160,9 +164,9 @@ async function stampLetterhead(body: Buffer): Promise<Buffer> {
     const at = (p: PDFPage, piece: typeof logo, box: { left: number; bottom: number }, x: number, y: number) =>
       p.drawPage(piece!, { x: box.left + x, y: box.bottom + y, width: piece!.width, height: piece!.height });
 
-    // Header: logo left, address right, then the green rule ending in gold.
+    // Header: logo left, email and domain right, then the green rule ending in gold.
     at(page, logo, PIECES.logo, 0, dy);
-    at(page, address, PIECES.address, dx, dy);
+    at(page, contact, PIECES.contact, dx, dy + contactLift);
     const ruleRight = W - LH.margin;
     page.drawRectangle({ x: LH.margin, y: RULE.y + dy, width: ruleRight - RULE.goldWidth - LH.margin, height: RULE.height, color: BRAND_GREEN });
     page.drawRectangle({ x: ruleRight - RULE.goldWidth, y: RULE.y + dy, width: RULE.goldWidth, height: RULE.height, color: BRAND_GOLD });
