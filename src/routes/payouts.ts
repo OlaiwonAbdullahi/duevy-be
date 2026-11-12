@@ -27,8 +27,7 @@ import { getDueAvailability, getSpaceLedgerEntry, getSpaceLedgerSummary, listSpa
 import { notifyMany } from '../lib/notifications';
 import { writeAudit } from '../lib/audit';
 import { quoteWithdrawal, requestWithdrawal, setWithdrawalPinByRep, type PinChange } from '../services/withdrawal.service';
-import { sendEmail, renderEmail } from '../lib/email';
-import { escapeHtml } from '../lib/html';
+import { buildWithdrawalPinResetEmail, sendEmail } from '../lib/email';
 import { addBeneficiary, listBeneficiaries, removeBeneficiary, resolveBankDetails } from '../services/beneficiary.service';
 import { listSignatories, REQUIRED_SIGNATORIES, setSignatories, setWithdrawalAuthMode } from '../services/signatory.service';
 import { getSpaceFunds } from '../services/sweep.service';
@@ -476,16 +475,7 @@ async function afterPinChange(req: Request, change: PinChange, holdUntil: Date |
     },
   ).catch(() => {});
   if (change === 'reset') {
-    sendEmail({
-      to: actor.email,
-      subject: 'Your Duevy withdrawal code was reset',
-      html: renderEmail(`
-        <h1>Your withdrawal code was reset</h1>
-        <p>Hi ${escapeHtml(actor.name)}, the withdrawal security code for <strong>${escapeHtml(space.name)}</strong> was just reset.
-        Withdrawals reopen at ${escapeHtml(holdUntil?.toUTCString() ?? '')}.</p>
-        <p>If you didn't do this, change your password and contact support@duevy.app immediately.</p>
-      `),
-    }).catch(() => {});
+    sendEmail({ to: actor.email, ...buildWithdrawalPinResetEmail(actor.name, space.name, holdUntil ?? null) }).catch(() => {});
   }
 }
 

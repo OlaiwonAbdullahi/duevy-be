@@ -89,10 +89,10 @@ describe('payments milestone emails', () => {
       at: new Date('2026-11-12T00:00:00Z'), link: 'https://duevy.app/admin/overview',
     };
     const email = buildTransactionMilestoneEmail('Ada Admin', m);
-    expect(email.subject).toBe('🎉 Hurray! Duevy has processed 1k payments — ₦5,000,000.00 net');
-    expect(email.text).toContain('Hurray! Duevy has just processed its 1,000th payment.');
+    expect(email.subject).toBe('Hurray, Duevy has processed 1k payments (₦5,000,000.00 net)');
+    expect(email.text).toContain('Duevy just processed its 1,000th payment, 500 of them in the 23 days since we passed 500.');
     expect(email.text).toContain('Net to spaces: ₦5,000,000.00');
     expect(email.text).toContain('Paid out to departments: ₦3,800,000.00 (42 withdrawals)');
-    expect(email.text).toContain('500 payments in 23 days since we hit 500.');
+    expect(email.html).not.toMatch(/—|🎉/);
   });
 });

@@ -37,76 +37,56 @@ export async function sendEmail(options: SendEmailOptions): Promise<void> {
 // Email templates
 // ---------------------------------------------------------------------------
 
-/** Public assets for emails — must be absolute and reachable from any inbox. */
-const ASSET_BASE = 'https://www.duevy.app';
+const SITE = 'https://www.duevy.app';
 const BRAND = '#0b6e4f';
-const BRAND_DEEP = '#08583f';
-const INK = '#1b2520';
-const INK_SOFT = '#7a847f';
-const PAPER = '#f4f2ec';
-const LINE = '#e6f2ec';
-const BRAND_SOFT = '#eef6f2';
-const FONT = "'Manrope', 'Helvetica Neue', Helvetica, Arial, sans-serif";
+const INK = '#1f2421';
+const INK_SOFT = '#6b716e';
+const LINE = '#e8e8e6';
+const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
 /**
  * Callers write plain `<h1>`, `<p>`, `<p class="muted">`, `class="btn"` and
  * `class="callout"`. Some clients (Gmail with non-Google accounts, Outlook)
- * drop `<style>` blocks, so stamp the same styles inline as well.
+ * drop `<style>` blocks, so the styles are stamped inline.
  */
-function inlineStyles(content: string, tone: string): string {
+function inlineStyles(content: string): string {
   return content
-    .replace(/<h1>/g, `<h1 style="margin:0 0 12px;font-family:${FONT};font-size:22px;line-height:1.3;font-weight:700;letter-spacing:-0.01em;color:${INK};">`)
-    .replace(/<p class="muted">/g, `<p class="muted" style="margin:0 0 16px;font-family:${FONT};font-size:13px;line-height:1.6;color:${INK_SOFT};">`)
-    .replace(/<p>/g, `<p style="margin:0 0 16px;font-family:${FONT};font-size:15px;line-height:1.65;color:${INK};">`)
-    .replace(/class="btn"/g, `class="btn" style="display:inline-block;background:${tone};color:#ffffff;border-radius:9999px;padding:14px 32px;font-family:${FONT};font-size:14px;font-weight:600;text-decoration:none;margin:4px 0 20px;"`)
-    .replace(/class="callout"/g, `class="callout" style="background:${PAPER};border-radius:16px;padding:16px 18px;margin:0 0 20px;font-family:${FONT};font-size:14px;line-height:1.6;color:${INK};"`);
+    .replace(/<h1>/g, `<h1 style="margin:0 0 16px;font-family:${FONT};font-size:20px;line-height:1.35;font-weight:600;color:${INK};">`)
+    .replace(/<p class="muted">/g, `<p class="muted" style="margin:0 0 14px;font-family:${FONT};font-size:13px;line-height:1.6;color:${INK_SOFT};">`)
+    .replace(/<p>/g, `<p style="margin:0 0 16px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};">`)
+    .replace(/class="btn"/g, `class="btn" style="display:inline-block;background:${BRAND};color:#ffffff;border-radius:6px;padding:10px 18px;font-family:${FONT};font-size:14px;font-weight:600;text-decoration:none;margin:4px 0 24px;"`)
+    .replace(/class="callout"/g, `class="callout" style="border-left:3px solid ${LINE};padding:2px 0 2px 12px;margin:0 0 16px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};"`);
 }
 
-/**
- * A big-figure hero card (amount, code…) on the doodle artwork — e.g. the
- * amount on a receipt. Falls back to solid brand green where background images
- * aren't shown (Outlook).
- */
-export function emailHero(label: string, value: string, caption?: string): string {
+/** The one figure the email is about (an amount, a code), large and centred. */
+export function emailHero(value: string): string {
   return `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;">
-      <tr>
-        <td style="background:${BRAND_DEEP} url('${ASSET_BASE}/doodle-card.jpg') center / cover no-repeat;background-color:${BRAND_DEEP};border-radius:20px;padding:22px 24px;">
-          <div style="font-family:${FONT};font-size:12px;color:rgba(255,255,255,0.78);">${label}</div>
-          <div style="font-family:${FONT};font-size:32px;line-height:1.15;font-weight:700;letter-spacing:-0.02em;color:#ffffff;margin-top:6px;">${value}</div>
-          ${caption ? `<div style="font-family:${FONT};font-size:12px;color:rgba(255,255,255,0.78);margin-top:8px;">${caption}</div>` : ''}
-        </td>
-      </tr>
-    </table>`;
+    <div style="margin:8px 0 24px;font-family:${FONT};text-align:center;font-size:28px;line-height:1.3;font-weight:600;color:${INK};">${value}</div>`;
 }
 
-/** Label/value rows in a soft panel — receipt details, account info. */
+/** Label/value rows separated by thin lines. */
 export function emailDetails(rows: [string, string][]): string {
   const body = rows
     .map(
-      ([label, value], i) => `
+      ([label, value]) => `
       <tr>
-        <td style="padding:12px 0;${i ? 'border-top:1px solid #e4e0d6;' : ''}font-family:${FONT};font-size:13px;color:${INK_SOFT};">${label}</td>
-        <td align="right" style="padding:12px 0;${i ? 'border-top:1px solid #e4e0d6;' : ''}font-family:${FONT};font-size:13px;font-weight:600;color:${INK};word-break:break-all;">${value}</td>
+        <td style="padding:9px 12px 9px 0;border-top:1px solid ${LINE};font-family:${FONT};font-size:14px;color:${INK_SOFT};vertical-align:top;">${label}</td>
+        <td align="right" style="padding:9px 0;border-top:1px solid ${LINE};font-family:${FONT};font-size:14px;color:${INK};word-break:break-word;">${value}</td>
       </tr>`,
     )
     .join('');
   return `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAPER};border-radius:16px;margin:0 0 20px;">
-      <tr><td style="padding:4px 18px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${body}</table>
-      </td></tr>
-    </table>`;
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;border-bottom:1px solid ${LINE};">${body}</table>`;
 }
 
 /**
- * The shared email shell: a doodle-artwork header with the Duevy mark, the
- * content on a white card, and a quiet footer. `tone` colours the accent strip
- * and buttons (green by default; amber for resets, rose for warnings).
- * `preheader` is the inbox preview line, plain text (escaped here).
+ * The shared email shell: the Duevy logo (public/logos/duevy-logo-green.png
+ * on the web app; "Duevy" in text where images are off), the content, and a
+ * one-line footer on a plain white page. `tone` is kept for existing callers
+ * and doesn't change the look. `preheader` is the inbox preview line, plain
+ * text (escaped here).
  */
-export function renderEmail(content: string, tone = BRAND, opts: { preheader?: string } = {}): string {
-  const year = new Date().getFullYear();
+export function renderEmail(content: string, _tone = BRAND, opts: { preheader?: string } = {}): string {
   return `
 <!DOCTYPE html>
 <html lang="en">
@@ -116,42 +96,26 @@ export function renderEmail(content: string, tone = BRAND, opts: { preheader?: s
   <meta name="color-scheme" content="light" />
   <meta name="supported-color-schemes" content="light" />
   <title>Duevy</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
-    body { margin: 0; padding: 0; background: ${PAPER}; -webkit-font-smoothing: antialiased; }
-    a.btn:hover { opacity: 0.92; }
-    @media (max-width: 600px) {
-      .card-pad { padding-left: 22px !important; padding-right: 22px !important; }
-      .outer-pad { padding: 16px 10px !important; }
-    }
-  </style>
 </head>
-<body style="margin:0;padding:0;background:${PAPER};">
+<body style="margin:0;padding:0;background:#ffffff;">
   ${opts.preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escapeHtml(opts.preheader)}</div>` : ''}
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAPER};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;">
     <tr>
-      <td class="outer-pad" align="center" style="padding:32px 16px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:24px;border:1px solid ${LINE};overflow:hidden;">
-          <!-- Header: Duevy mark on the doodle artwork -->
+      <td align="center" style="padding:32px 20px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;">
           <tr>
-            <td style="background:${BRAND_DEEP} url('${ASSET_BASE}/doodle-card.jpg') center / cover no-repeat;background-color:${BRAND_DEEP};padding:26px 32px;">
-              <img src="${ASSET_BASE}/logos/duevy-logo-white.png" width="111" height="32" alt="Duevy" style="display:block;width:111px;height:32px;border:0;font-family:${FONT};font-size:20px;font-weight:600;color:#ffffff;" />
+            <td style="padding:0 0 28px;">
+              <a href="${SITE}" style="text-decoration:none;"><img src="${SITE}/logos/duevy-logo-green.png" width="104" height="30" alt="Duevy" style="display:block;width:104px;height:30px;border:0;font-family:${FONT};font-size:17px;font-weight:700;color:${BRAND};" /></a>
             </td>
           </tr>
-          <!-- Accent strip in the email's tone -->
-          <tr><td style="height:4px;line-height:4px;font-size:0;background:${tone};">&nbsp;</td></tr>
-          <!-- Body -->
           <tr>
-            <td class="card-pad" style="padding:32px 36px 16px;font-family:${FONT};color:${INK};">
-              ${inlineStyles(content, tone)}
+            <td style="font-family:${FONT};color:${INK};">
+              ${inlineStyles(content)}
             </td>
           </tr>
-          <!-- Footer -->
           <tr>
-            <td class="card-pad" style="padding:20px 36px 28px;border-top:1px solid ${LINE};text-align:center;font-family:${FONT};font-size:12px;line-height:1.7;color:${INK_SOFT};">
-              Need help? <a href="mailto:support@duevy.app" style="color:${BRAND};text-decoration:none;font-weight:600;">support@duevy.app</a><br />
-              You're receiving this because it relates to your Duevy account.<br />
-              © ${year} Duevy · <a href="${ASSET_BASE}" style="color:${INK_SOFT};text-decoration:underline;">duevy.app</a>
+            <td style="padding:20px 0 0;border-top:1px solid ${LINE};font-family:${FONT};font-size:12px;line-height:1.6;color:${INK_SOFT};">
+              Duevy · <a href="${SITE}" style="color:${INK_SOFT};">duevy.app</a> · <a href="mailto:support@duevy.app" style="color:${INK_SOFT};">support@duevy.app</a>
             </td>
           </tr>
         </table>
@@ -162,6 +126,18 @@ export function renderEmail(content: string, tone = BRAND, opts: { preheader?: s
 </html>`.trim();
 }
 
+/** "Ada" from "Ada Obi": every greeting uses the first name. */
+function firstName(name: string): string {
+  return name.trim().split(/\s+/)[0] || name;
+}
+
+/** "12 Nov 2026, 4:39 pm", in Lagos time. */
+function lagosTime(at: Date): string {
+  return at.toLocaleString('en-NG', {
+    day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Africa/Lagos',
+  });
+}
+
 export async function sendVerificationEmail(
   to: string,
   name: string,
@@ -170,16 +146,16 @@ export async function sendVerificationEmail(
   const link = `${env.FRONTEND_URL}/verify-email?token=${token}`;
   const html = renderEmail(`
     <h1>Verify your email</h1>
-    <p>Hi ${escapeHtml(name)}, thanks for joining Duevy! Click the button below to verify your email address.</p>
+    <p>Hi ${escapeHtml(firstName(name))}, confirm this address to finish setting up your Duevy account.</p>
     <a href="${link}" class="btn">Verify email</a>
-    <p class="muted">This link expires in 24 hours. If you didn't create an account, you can safely ignore this email.</p>
+    <p class="muted">The link expires in 24 hours. If you didn't sign up for Duevy, ignore this email.</p>
   `);
 
   await sendEmail({
     to,
-    subject: 'Verify your Duevy email address',
+    subject: 'Verify your email for Duevy',
     html,
-    text: `Hi ${name},\n\nVerify your email: ${link}\n\nThis link expires in 24 hours.`,
+    text: `Hi ${firstName(name)},\n\nConfirm this address to finish setting up your Duevy account:\n${link}\n\nThe link expires in 24 hours. If you didn't sign up for Duevy, ignore this email.`,
   });
 }
 
@@ -192,18 +168,17 @@ export async function sendPasswordResetEmail(
   const html = renderEmail(
     `
     <h1>Reset your password</h1>
-    <p>Hi ${escapeHtml(name)}, we received a request to reset your Duevy password.</p>
-    <a href="${link}" class="btn">Reset password</a>
-    <p class="muted">This link expires in 1 hour. If you didn't request this, you can safely ignore this email — your password won't change.</p>
+    <p>Hi ${escapeHtml(firstName(name))}, someone asked to reset the password on your Duevy account. If that was you, choose a new one here:</p>
+    <a href="${link}" class="btn">Choose a new password</a>
+    <p class="muted">The link expires in 1 hour. If you didn't ask for this, ignore this email and your password stays the same.</p>
   `,
-    '#e8a33d',
   );
 
   await sendEmail({
     to,
     subject: 'Reset your Duevy password',
     html,
-    text: `Hi ${name},\n\nReset your password: ${link}\n\nThis link expires in 1 hour.`,
+    text: `Hi ${firstName(name)},\n\nSomeone asked to reset the password on your Duevy account. If that was you, choose a new one here:\n${link}\n\nThe link expires in 1 hour. If you didn't ask for this, ignore this email and your password stays the same.`,
   });
 }
 
@@ -215,19 +190,19 @@ export async function sendReceiptLookupEmail(to: string, link: string, count: nu
   const what = count === 1 ? 'your receipt' : `your ${count} receipts`;
   const html = renderEmail(
     `
-    <h1>Your Duevy receipts</h1>
-    <p>Someone (hopefully you) asked to see the payments made with this email on Duevy. Open the link below to view and download ${what}.</p>
-    <a href="${link}" class="btn">View my receipts</a>
-    <p class="muted">This link expires in 1 hour and only works for this email address. If you didn't ask for it, you can ignore this email.</p>
+    <h1>Your receipts</h1>
+    <p>Someone (hopefully you) asked to see the payments made with this email address. This link opens ${what}, ready to download.</p>
+    <a href="${link}" class="btn">View receipts</a>
+    <p class="muted">It expires in 1 hour and only works for this address. If you didn't ask for it, ignore this email.</p>
   `,
     undefined,
-    { preheader: `View and download ${what}.` },
+    { preheader: `The link to ${what} on Duevy.` },
   );
   await sendEmail({
     to,
     subject: 'Your Duevy receipts',
     html,
-    text: `View and download ${what}: ${link}\n\nThis link expires in 1 hour. If you didn't ask for it, ignore this email.`,
+    text: `Someone (hopefully you) asked to see the payments made with this email address. This link opens ${what}:\n${link}\n\nIt expires in 1 hour. If you didn't ask for it, ignore this email.`,
   });
 }
 
@@ -245,21 +220,20 @@ export async function sendAccountActivationEmail(
   const link = `${env.FRONTEND_URL}/reset-password?token=${token}&activate=1`;
   const html = renderEmail(
     `
-    <h1>Activate your Duevy account</h1>
-    <p>Hi ${escapeHtml(name)}, your payment to ${escapeHtml(opts.spaceName)} is confirmed. As you asked, we've set up a free Duevy account for this email, so you can track payments, find your receipts and pay future dues in one place.</p>
-    <p>Set a password to finish:</p>
-    <a href="${link}" class="btn">Set my password</a>
-    <p class="muted">This link works once and expires in ${opts.expiresInHours} hours. Didn't ask for an account? Ignore this email and nothing changes.</p>
+    <h1>Set a password for your account</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, you asked for a Duevy account when you paid ${escapeHtml(opts.spaceName)}, so we made one for this email address. Once you set a password you can sign in to see your receipts and pay future dues.</p>
+    <a href="${link}" class="btn">Set password</a>
+    <p class="muted">The link works once and expires in ${opts.expiresInHours} hours. If you didn't ask for an account, ignore this email.</p>
   `,
     BRAND,
-    { preheader: 'Set a password to see your receipts and payments on Duevy.' },
+    { preheader: 'Set a password to sign in and see your receipts.' },
   );
 
   await sendEmail({
     to,
-    subject: 'Activate your Duevy account',
+    subject: 'Set a password for your Duevy account',
     html,
-    text: `Hi ${name},\n\nYour payment to ${opts.spaceName} is confirmed. Set a password to activate your Duevy account: ${link}\n\nThis link works once and expires in ${opts.expiresInHours} hours.`,
+    text: `Hi ${firstName(name)},\n\nYou asked for a Duevy account when you paid ${opts.spaceName}, so we made one for this email address. Set a password to sign in:\n${link}\n\nThe link works once and expires in ${opts.expiresInHours} hours.`,
   });
 }
 
@@ -285,112 +259,65 @@ export type DuePaymentReceipt = {
 const nairaExact = (kobo: number) =>
   `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-/** One receipt card: the dues paid, then dues total, fee and the total paid. */
-function emailReceiptCard(input: DuePaymentReceipt, amountPaid: string): string {
-  const single = input.items.length === 1;
-  const cell = `font-family:${FONT};font-size:14px;line-height:1.45;color:${INK};`;
-  const items = input.items
-    .map(
-      (item, i) => `
+/** The breakdown under the total: each due, the dues total (for several) and the fee. */
+function emailReceiptTable(input: DuePaymentReceipt): string {
+  const row = (label: string, value: string, opts: { soft?: boolean } = {}) => `
       <tr>
-        <td style="${cell}padding:12px 0;${i ? `border-top:1px solid ${LINE};` : ''}">${escapeHtml(item.title)}</td>
-        <td align="right" style="${cell}padding:12px 0 12px 16px;${i ? `border-top:1px solid ${LINE};` : ''}font-weight:600;white-space:nowrap;vertical-align:top;">${nairaExact(item.amountKobo)}</td>
-      </tr>`,
-    )
-    .join('');
-  const total = (label: string, value: string) => `
-      <tr>
-        <td style="padding:4px 0;font-family:${FONT};font-size:13px;color:${INK_SOFT};">${label}</td>
-        <td align="right" style="padding:4px 0;font-family:${FONT};font-size:13px;font-weight:600;color:${INK};white-space:nowrap;">${value}</td>
+        <td style="padding:9px 12px 9px 0;border-top:1px solid ${LINE};font-family:${FONT};font-size:14px;color:${opts.soft ? INK_SOFT : INK};">${label}</td>
+        <td align="right" style="padding:9px 0;border-top:1px solid ${LINE};font-family:${FONT};font-size:14px;color:${INK};white-space:nowrap;vertical-align:top;">${value}</td>
       </tr>`;
+  const items = input.items.map((item) => row(escapeHtml(item.title), nairaExact(item.amountKobo))).join('');
+  const subtotal = input.items.length > 1 ? row('Dues total', nairaExact(input.faceKobo), { soft: true }) : '';
   return `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${LINE};border-radius:16px;margin:0 0 20px;border-collapse:separate;">
-      <tr>
-        <td style="padding:14px 18px;background:${PAPER};border-radius:16px 16px 0 0;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-            <tr>
-              <td style="font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:${INK_SOFT};">${single ? 'Due paid' : `Dues paid (${input.items.length})`}</td>
-              <td align="right" style="font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:${INK_SOFT};">Amount</td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:2px 18px 6px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${items}</table>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:12px 18px 6px;border-top:1px solid ${LINE};">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-            ${total(single ? 'Due amount' : 'Dues total', nairaExact(input.faceKobo))}
-            ${total('Processing fee', nairaExact(input.feeKobo))}
-          </table>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:6px 10px 10px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND_SOFT};border-radius:12px;">
-            <tr>
-              <td style="padding:12px 8px 12px 12px;font-family:${FONT};font-size:14px;font-weight:700;color:${INK};">Total paid</td>
-              <td align="right" style="padding:12px 12px 12px 8px;font-family:${FONT};font-size:17px;font-weight:700;color:${BRAND};white-space:nowrap;">${amountPaid}</td>
-            </tr>
-          </table>
-        </td>
-      </tr>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;border-bottom:1px solid ${LINE};">
+      ${items}
+      ${subtotal}
+      ${row('Processing fee', nairaExact(input.feeKobo), { soft: true })}
     </table>`;
 }
 
-/** Subject, HTML and text for a dues payment receipt — one due or a basket of many. */
+/** Subject, HTML and text for a dues payment receipt: one due or a basket of many. */
 export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentReceipt) {
   const amount = nairaExact(input.amountPaidKobo);
   // The app's payment page shows the full receipt and its PDF download (behind sign-in).
   const receiptLink = input.receiptUrl ?? `${env.FRONTEND_URL}/dashboard/pay/${encodeURIComponent(input.reference)}`;
-  const paidAt = input.paidAt.toLocaleString('en-NG', {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZone: 'Africa/Lagos',
-  });
+  const paidAt = lagosTime(input.paidAt);
   const single = input.items.length === 1;
   const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
-  const spaceName = escapeHtml(input.spaceName);
-  const intro = single
-    ? `your payment for <strong>${escapeHtml(summary)}</strong>${spaceName ? ` to ${spaceName}` : ''} went through.`
-    : `your payment for <strong>${input.items.length} dues</strong>${spaceName ? ` to ${spaceName}` : ''} went through — every one of them is now marked paid.`;
+  const to = input.spaceName ? ` to ${input.spaceName}` : '';
+  const lead = single
+    ? `Hi ${firstName(name)}, thanks for paying ${summary}${to}.`
+    : `Hi ${firstName(name)}, thanks for paying ${input.items.length} dues${to}. All of them are now marked as paid.`;
+  const details: [string, string][] = [
+    ...(input.receiptNumber ? ([['Receipt no.', input.receiptNumber]] as [string, string][]) : []),
+    ['Date', paidAt],
+    ['Method', 'Bank transfer'],
+    ['Reference', input.reference],
+  ];
+  const note = `${input.spaceName || 'Your department'} gets the full ${nairaExact(input.faceKobo)}. The 1.5% processing fee is charged on top. You can use this email as proof of payment.`;
 
   const html = renderEmail(
     `
-    <h1>Payment confirmed</h1>
-    <p>Hi ${escapeHtml(name)}, ${intro} Here's your receipt.</p>
-    ${emailHero('Total paid', amount, `<span style="display:inline-block;background:#ffffff;color:${BRAND};border-radius:9999px;padding:2px 10px;font-size:11px;font-weight:700;letter-spacing:0.06em;margin-right:8px;">PAID</span>${paidAt}`)}
-    ${emailReceiptCard(input, amount)}
-    ${emailDetails([
-      ...(input.receiptNumber ? ([['Receipt no.', escapeHtml(input.receiptNumber)]] as [string, string][]) : []),
-      ...(spaceName ? ([['Paid to', spaceName]] as [string, string][]) : []),
-      ['Paid by', escapeHtml(name)],
-      ['Method', 'Bank transfer'],
-      ['Reference', escapeHtml(input.reference)],
-    ])}
+    <h1>Your receipt</h1>
+    <p>${escapeHtml(lead)}</p>
+    ${emailHero(amount)}
+    ${emailReceiptTable(input)}
+    ${emailDetails(details.map(([k, v]) => [k, escapeHtml(v)] as [string, string]))}
     <a href="${receiptLink}" class="btn">View receipt</a>
-    <p class="muted">Keep this email as proof of payment. ${spaceName || 'Your department'} receives the full ${nairaExact(input.faceKobo)}; the processing fee is 1.5% of the dues. Questions? Reply here or reach us at support@duevy.app</p>
+    <p class="muted">${escapeHtml(note)}</p>
   `,
     undefined,
-    { preheader: `${amount} paid for ${summary} — your receipt is inside.` },
+    { preheader: `Your receipt for ${summary}.` },
   );
 
-  const lines = input.items.map((i) => `- ${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
+  const lines = input.items.map((i) => `${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
   const text =
-    `Hi ${name},\n\nYour payment of ${amount}${input.spaceName ? ` to ${input.spaceName}` : ''} is confirmed.\n\n` +
-    `${single ? 'Due paid' : `Dues paid (${input.items.length})`}:\n${lines}\n\n` +
-    `${single ? 'Due amount' : 'Dues total'}: ${nairaExact(input.faceKobo)}\nProcessing fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
-    `${input.receiptNumber ? `Receipt no.: ${input.receiptNumber}\n` : ''}Reference: ${input.reference}\nMethod: Bank transfer\nDate: ${paidAt}\n\n` +
-    `View your receipt: ${receiptLink}`;
+    `${lead}\n\n${lines}\n` +
+    `${single ? '' : `Dues total: ${nairaExact(input.faceKobo)}\n`}Processing fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
+    details.map(([k, v]) => `${k}: ${v}`).join('\n') +
+    `\n\n${note}\n\nView receipt: ${receiptLink}`;
 
-  return { subject: `Payment confirmed — ${summary}`, html, text };
+  return { subject: `Your receipt for ${summary}`, html, text };
 }
 
 /** `pdf`, when given, is attached — the same receipt PDF the app downloads. */
@@ -410,7 +337,6 @@ export async function sendDuePaymentReceiptEmail(
 export type RepPaymentReceived = {
   spaceName: string;
   payerName: string;
-  payerIsGuest: boolean;
   reference: string;
   /** Every due settled by this payment, at its face amount. */
   items: { title: string; amountKobo: number }[];
@@ -424,34 +350,33 @@ export type RepPaymentReceived = {
 /** Subject, HTML and text telling a rep a member paid into their space. */
 export function buildRepPaymentReceivedEmail(repName: string, input: RepPaymentReceived) {
   const amount = nairaExact(input.faceKobo);
-  const paidAt = input.paidAt.toLocaleString('en-NG', {
-    day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Africa/Lagos',
-  });
   const single = input.items.length === 1;
   const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
-  const payer = `${input.payerName}${input.payerIsGuest ? ' (guest)' : ''}`;
+  const payer = input.payerName;
+  const lead = `Hi ${firstName(repName)}, ${payer} just paid ${amount} for ${summary} in ${input.spaceName}. It's already in the space balance.`;
+  const rows: [string, string][] = [
+    ...(single ? [] : input.items.map((i) => [i.title, nairaExact(i.amountKobo)] as [string, string])),
+    ['Date', lagosTime(input.paidAt)],
+    ['Reference', input.reference],
+  ];
+  const optOut = 'To stop these emails, go to Settings, then Notifications, and turn off Payment emails.';
   const html = renderEmail(
     `
-    <h1>Payment received</h1>
-    <p>Hi ${escapeHtml(repName)}, <strong>${escapeHtml(payer)}</strong> just paid for <strong>${escapeHtml(summary)}</strong> in ${escapeHtml(input.spaceName)}.</p>
-    ${emailHero('Received', amount, paidAt)}
-    ${emailDetails([
-      ...input.items.map((i) => [escapeHtml(i.title), nairaExact(i.amountKobo)] as [string, string]),
-      ['Paid by', escapeHtml(payer)],
-      ['Reference', escapeHtml(input.reference)],
-    ])}
+    <h1>${escapeHtml(payer)} paid</h1>
+    ${emailHero(amount)}
+    <p>${escapeHtml(`Hi ${firstName(repName)}, that's for ${summary} in ${input.spaceName}, and it's already in the space balance.`)}</p>
+    ${emailDetails(rows.map(([k, v]) => [escapeHtml(k), escapeHtml(v)] as [string, string]))}
     <a href="${input.link}" class="btn">View collections</a>
-    <p class="muted">The full ${amount} is in ${escapeHtml(input.spaceName)}'s balance; the student paid the processing fee separately. You can turn these off under Settings → Notifications → Payment emails.</p>
+    <p class="muted">The student pays the processing fee on top, so the space gets the full amount. ${optOut}</p>
   `,
     undefined,
     { preheader: `${payer} paid ${amount} for ${summary}.` },
   );
-  const lines = input.items.map((i) => `- ${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
   const text =
-    `Hi ${repName},\n\n${payer} just paid ${amount} for ${summary} in ${input.spaceName}.\n\n${lines}\n\n` +
-    `Reference: ${input.reference}\nDate: ${paidAt}\n\nView collections: ${input.link}\n\n` +
-    `You can turn these off under Settings → Notifications → Payment emails.`;
-  return { subject: `${payer} paid ${amount} — ${summary}`, html, text };
+    `${lead}\n\n` +
+    rows.map(([k, v]) => `${k}: ${v}`).join('\n') +
+    `\n\nView collections: ${input.link}\n\n${optOut}`;
+  return { subject: `${payer} paid ${amount} for ${summary}`, html, text };
 }
 
 export async function sendRepPaymentReceivedEmail(to: string, repName: string, input: RepPaymentReceived): Promise<void> {
@@ -464,16 +389,15 @@ export async function sendRepApplicationReceivedEmail(
   spaceName: string,
 ): Promise<void> {
   const html = renderEmail(`
-    <h1>Application received</h1>
-    <p>Hi ${escapeHtml(name)}, your rep application for <strong>${escapeHtml(spaceName)}</strong> is under review.</p>
-    <p>Our team will verify your application within 1–2 business days. You'll get an email once a decision is made.</p>
-    <p class="muted">Questions? Reply to this email or reach us at support@duevy.app</p>
+    <h1>We got your application</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, thanks for applying to be a rep for ${escapeHtml(spaceName)}. We'll review it within one or two business days and email you with our decision.</p>
   `);
 
   await sendEmail({
     to,
-    subject: 'Your Duevy rep application is under review',
+    subject: 'We got your Duevy rep application',
     html,
+    text: `Hi ${firstName(name)},\n\nThanks for applying to be a rep for ${spaceName}. We'll review it within one or two business days and email you with our decision.`,
   });
 }
 
@@ -500,37 +424,37 @@ export async function sendKycReminderEmail(
   requirements: { nin: boolean; liveness: boolean } = { nin: false, liveness: true },
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/onboarding`;
-  const first = escapeHtml(name.split(' ')[0]);
+  const first = firstName(name);
   const copy = {
     1: {
-      subject: 'Finish setting up your Duevy rep account',
-      heading: 'You\'re almost there',
-      body: `Hi ${first}, thanks for signing up as a rep on Duevy. One step is left: verify your identity so your department can start collecting dues. It takes about two minutes.`,
+      subject: 'One step left on your Duevy rep account',
+      heading: 'One step left',
+      body: `Hi ${first}, you signed up as a rep on Duevy but haven't verified your identity yet. It takes about two minutes, and your department can collect dues as soon as it's done.`,
     },
     2: {
-      subject: 'Your department is waiting — finish your Duevy verification',
-      heading: 'Your department can\'t collect dues yet',
-      body: `Hi ${first}, your rep account still needs verification. Until it's done, your department can't collect dues on Duevy. You'll need ${kycNeeds(requirements)}.`,
+      subject: "Your department can't collect dues on Duevy yet",
+      heading: "Your verification isn't finished",
+      body: `Hi ${first}, your department can't collect dues until you verify your rep account. You'll need ${kycNeeds(requirements)}.`,
     },
     3: {
-      subject: 'Last reminder: complete your Duevy rep verification',
+      subject: 'Last reminder to verify your Duevy rep account',
       heading: 'Last reminder',
-      body: `Hi ${first}, it's been a week since you signed up as a rep and your verification still isn't complete. Finish it now to get your department collecting dues — or reply to this email if something's in the way and we'll help.`,
+      body: `Hi ${first}, you signed up as a rep a week ago and still haven't finished verifying. If something is stopping you, reply to this email and we'll help.`,
     },
   }[stage];
 
   const html = renderEmail(
     `
     <h1>${copy.heading}</h1>
-    <p>${copy.body}</p>
-    <a href="${link}" class="btn">Complete verification</a>
-    <p class="muted">Already done? You can ignore this email.</p>
+    <p>${escapeHtml(copy.body)}</p>
+    <a href="${link}" class="btn">Finish verification</a>
+    <p class="muted">Already done? Ignore this email.</p>
   `,
     BRAND,
     { preheader: requirements.nin ? 'Verify your NIN and student ID in a few minutes.' : 'Verify your student ID in a few minutes.' },
   );
 
-  await sendEmail({ to, subject: copy.subject, html });
+  await sendEmail({ to, subject: copy.subject, html, text: `${copy.body}\n\nFinish verification: ${link}` });
 }
 
 export async function sendRepApprovedEmail(
@@ -540,16 +464,16 @@ export async function sendRepApprovedEmail(
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/dashboard`;
   const html = renderEmail(`
-    <h1>You're approved! 🎉</h1>
-    <p>Hi ${escapeHtml(name)}, your rep application for <strong>${escapeHtml(spaceName)}</strong> has been approved.</p>
-    <p>You can now access your rep dashboard and start managing dues.</p>
-    <a href="${link}" class="btn">Go to dashboard</a>
+    <h1>You're approved</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, you're now the rep for ${escapeHtml(spaceName)} on Duevy. You can set up dues from your dashboard.</p>
+    <a href="${link}" class="btn">Open dashboard</a>
   `);
 
   await sendEmail({
     to,
-    subject: 'Your Duevy rep application has been approved',
+    subject: `You're the rep for ${spaceName} on Duevy`,
     html,
+    text: `Hi ${firstName(name)},\n\nYou're now the rep for ${spaceName} on Duevy. You can set up dues from your dashboard: ${link}`,
   });
 }
 
@@ -561,16 +485,16 @@ export async function sendCoRepApprovedEmail(
 ): Promise<void> {
   const link = `${env.FRONTEND_URL}/dashboard`;
   const html = renderEmail(`
-    <h1>You're approved! 🎉</h1>
-    <p>Hi ${escapeHtml(name)}, your rep application has been approved.</p>
-    <p><strong>${escapeHtml(spaceName)}</strong> was already on Duevy, so you've been added to it as a co-rep. You can now help manage its dues alongside the lead rep.</p>
-    <a href="${link}" class="btn">Go to dashboard</a>
+    <h1>You're approved</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, ${escapeHtml(spaceName)} was already on Duevy, so we've added you to it as a co-rep. You'll run its dues with the lead rep.</p>
+    <a href="${link}" class="btn">Open dashboard</a>
   `);
 
   await sendEmail({
     to,
-    subject: 'Your Duevy rep application has been approved',
+    subject: `You're now a co-rep of ${spaceName} on Duevy`,
     html,
+    text: `Hi ${firstName(name)},\n\n${spaceName} was already on Duevy, so we've added you to it as a co-rep. You'll run its dues with the lead rep: ${link}`,
   });
 }
 
@@ -581,18 +505,18 @@ export async function sendRepRejectedEmail(
 ): Promise<void> {
   const html = renderEmail(
     `
-    <h1>Application update</h1>
-    <p>Hi ${escapeHtml(name)}, we reviewed your rep application and unfortunately couldn't approve it at this time.</p>
-    <div class="callout"><strong>Reason:</strong> ${escapeHtml(reason)}</div>
-    <p>Your account has been set up as a student account. If you believe this is a mistake, please contact us at support@duevy.app</p>
+    <h1>About your rep application</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, we couldn't approve your application to be a rep. The reviewer's note:</p>
+    <div class="callout">${escapeHtml(reason)}</div>
+    <p>You can still use Duevy as a student. If you think we got this wrong, email support@duevy.app.</p>
   `,
-    '#b01e4e',
   );
 
   await sendEmail({
     to,
-    subject: 'Update on your Duevy rep application',
+    subject: 'About your Duevy rep application',
     html,
+    text: `Hi ${firstName(name)},\n\nWe couldn't approve your application to be a rep. The reviewer's note:\n\n${reason}\n\nYou can still use Duevy as a student. If you think we got this wrong, email support@duevy.app.`,
   });
 }
 
@@ -626,75 +550,64 @@ export type WithdrawalUpdate = {
 export function buildWithdrawalUpdateEmail(name: string, w: WithdrawalUpdate) {
   const net = nairaExact(w.netKobo);
   const gross = nairaExact(w.grossKobo);
-  const at = w.at.toLocaleString('en-NG', {
-    day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Africa/Lagos',
-  });
-  const firstName = name.split(' ')[0] || name;
+  const first = firstName(name);
   const who = w.viewerIsRequester ? 'You' : w.requestedBy;
-  const whoHtml = escapeHtml(who);
+  const restored = `The full ${gross} is back in the space balance.`;
   const copy = {
     success: {
-      heading: 'Withdrawal completed',
-      lead: `${whoHtml} sent <strong>${net}</strong> from ${escapeHtml(w.spaceName)} to <strong>${escapeHtml(w.destination)}</strong>.`,
-      leadText: `${who} sent ${net} from ${w.spaceName} to ${w.destination}.`,
-      hero: 'Sent',
-      subject: `${w.viewerIsRequester ? 'You sent' : `${w.requestedBy} sent`} ${net} from ${w.spaceName}`,
-      after: `${gross} (including the ${nairaExact(w.feeKobo)} fee) came off the space balance.`,
+      heading: 'Withdrawal sent',
+      lead: `${who} sent ${net} from ${w.spaceName} to ${w.destination}.`,
+      subject: `${who} sent ${net} from ${w.spaceName}`,
     },
     failed: {
-      heading: "Withdrawal didn't go through",
-      lead: `The ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)} failed.`,
-      leadText: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} failed.`,
-      hero: 'Not sent',
-      subject: `Withdrawal failed — ${net} from ${w.spaceName}`,
-      after: `The full ${gross}, fee included, is back in the space balance. You can try again from the Payout page.`,
+      heading: 'Withdrawal failed',
+      lead: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} didn't go through. ${restored} You can try again from the Payout page.`,
+      subject: `Your ${net} withdrawal from ${w.spaceName} failed`,
     },
     reversed: {
       heading: 'Withdrawal reversed',
-      lead: `The bank sent back the ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)}.`,
-      leadText: `The bank sent back the ${net} withdrawal from ${w.spaceName} to ${w.destination}.`,
-      hero: 'Returned',
-      subject: `Withdrawal reversed — ${net} from ${w.spaceName}`,
-      after: `The full ${gross}, fee included, is back in the space balance.`,
+      lead: `The bank returned the ${net} withdrawal from ${w.spaceName} to ${w.destination}. ${restored}`,
+      subject: `The bank returned a ${net} withdrawal from ${w.spaceName}`,
     },
     cancelled: {
       heading: 'Withdrawal cancelled',
-      lead: `The ${net} withdrawal from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)} was cancelled before it was sent.`,
-      leadText: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} was cancelled before it was sent.`,
-      hero: 'Cancelled',
-      subject: `Withdrawal cancelled — ${net} from ${w.spaceName}`,
-      after: `The full ${gross}, fee included, is back in the space balance.`,
+      lead: `The ${net} withdrawal from ${w.spaceName} to ${w.destination} was cancelled before it was sent. ${restored}`,
+      subject: `A ${net} withdrawal from ${w.spaceName} was cancelled`,
     },
   }[w.outcome];
 
-  // Plain values; escaped for the HTML below.
+  // Only what the sentence above doesn't already say. Plain values; escaped for the HTML.
   const rows: [string, string][] = [
-    ['Space', w.spaceName],
-    ['To', w.destination],
-    ['Amount sent', net],
-    ['Fee', nairaExact(w.feeKobo)],
-    ['Total from balance', gross],
-    ...(w.dueTitle ? [['From due', w.dueTitle] as [string, string]] : []),
-    ['Requested by', w.viewerIsRequester ? `You (${w.requestedBy})` : w.requestedBy],
+    ...(w.outcome === 'success'
+      ? ([['Fee', nairaExact(w.feeKobo)], ['Taken from balance', gross]] as [string, string][])
+      : ([['Requested by', w.viewerIsRequester ? `You (${w.requestedBy})` : w.requestedBy]] as [string, string][])),
     ...(w.reason && w.outcome !== 'success' ? [['Reason', w.reason] as [string, string]] : []),
+    ...(w.dueTitle ? [['Due', w.dueTitle] as [string, string]] : []),
+    ['Date', lagosTime(w.at)],
     ['Reference', w.reference],
   ];
+  // A completed withdrawal leads with the amount; the others with what happened.
+  const body =
+    w.outcome === 'success'
+      ? `${emailHero(net)}
+    <p>Hi ${escapeHtml(first)}, ${escapeHtml(w.viewerIsRequester ? 'you' : w.requestedBy)} sent this from ${escapeHtml(w.spaceName)} to ${escapeHtml(w.destination)}.</p>`
+      : `<p>Hi ${escapeHtml(first)}, ${escapeHtml(copy.lead)}</p>`;
+  const warning = "Don't recognise this withdrawal? Email support@duevy.app right away.";
   const html = renderEmail(
     `
     <h1>${copy.heading}</h1>
-    <p>Hi ${escapeHtml(firstName)}, ${copy.lead}</p>
-    ${emailHero(copy.hero, net, at)}
+    ${body}
     ${emailDetails(rows.map(([k, v]) => [k, escapeHtml(v)] as [string, string]))}
     <a href="${w.link}" class="btn">View withdrawals</a>
-    <p class="muted">${escapeHtml(copy.after)} If you don't recognise this withdrawal, contact support@duevy.app straight away.</p>
+    <p class="muted">${escapeHtml(warning)}</p>
   `,
     BRAND,
-    { preheader: copy.leadText },
+    { preheader: copy.lead },
   );
   const text =
-    `Hi ${firstName},\n\n${copy.leadText}\n\n` +
+    `Hi ${first},\n\n${copy.lead}\n\n` +
     rows.map(([k, v]) => `${k}: ${v}`).join('\n') +
-    `\nDate: ${at}\n\n${copy.after}\n\nView withdrawals: ${w.link}\n\nIf you don't recognise this withdrawal, contact support@duevy.app straight away.`;
+    `\n\nView withdrawals: ${w.link}\n\n${warning}`;
   return { subject: headerSafe(copy.subject), html, text };
 }
 
@@ -728,19 +641,19 @@ export async function sendWithdrawalOtpEmail(to: string, name: string, w: Withdr
   const html = renderEmail(
     `
     <h1>Approve a withdrawal</h1>
-    <p>Hi ${escapeHtml(name.split(' ')[0] ?? name)}, enter this code on Duevy to approve the withdrawal below.</p>
-    ${emailHero('Your approval code', w.code, `Expires in ${w.expiresInMinutes} minutes`)}
+    <p>Hi ${escapeHtml(firstName(name))}, enter this code on Duevy to approve the withdrawal below. It expires in ${w.expiresInMinutes} minutes.</p>
+    ${emailHero(`<span style="letter-spacing:0.12em;">${escapeHtml(w.code)}</span>`)}
     ${emailDetails(rows)}
-    <p class="muted">Never share this code — Duevy will never ask you for it. If you don't recognise this withdrawal, reject it on the Payout page and contact support@duevy.app.</p>
+    <p class="muted">Don't share this code with anyone. Duevy will never ask you for it. If you don't recognise this withdrawal, reject it on the Payout page and email support@duevy.app.</p>
   `,
     BRAND,
-    { preheader: `Approval code for a ${amount} withdrawal from ${w.spaceName}` },
+    { preheader: `Your code to approve ${amount} from ${w.spaceName}.` },
   );
   await sendEmail({
     to,
-    subject: headerSafe(`${w.code} is your Duevy withdrawal approval code`),
+    subject: headerSafe(`${w.code} is your Duevy approval code`),
     html,
-    text: `Hi ${name},\n\nYour code to approve the ${amount} withdrawal from ${w.spaceName} to ${w.destination} (${w.reference}) is ${w.code}. It expires in ${w.expiresInMinutes} minutes.\n\nNever share this code. If you don't recognise this withdrawal, reject it on Duevy and contact support@duevy.app.`,
+    text: `Hi ${firstName(name)},\n\nYour code to approve the ${amount} withdrawal from ${w.spaceName} to ${w.destination} (${w.reference}) is ${w.code}. It expires in ${w.expiresInMinutes} minutes.\n\nDon't share this code with anyone. If you don't recognise this withdrawal, reject it on Duevy and email support@duevy.app.`,
   });
 }
 
@@ -780,17 +693,26 @@ const days = (from: Date, to: Date) => Math.max(1, Math.round((to.getTime() - fr
 const plural = (n: number, word: string) => `${compactCount(n)} ${word}${n === 1 ? '' : 's'}`;
 
 /** Subject, HTML and text celebrating a platform-wide payments milestone, for Duevy's team. */
+/** 1st, 2nd, 3rd, 4th … 11th, 12th, 13th … 1,000th, 1,002nd. */
+function ordinal(n: number): string {
+  const tens = n % 100;
+  const suffix = tens >= 11 && tens <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] ?? 'th';
+  return `${compactCount(n)}${suffix}`;
+}
+
 export function buildTransactionMilestoneEmail(name: string, m: TransactionMilestone) {
   const label = milestoneLabel(m.milestone);
+  const net = nairaExact(m.netKobo);
   const pace = m.previous
-    ? `${compactCount(m.milestone - m.previous.milestone)} payments in ${plural(days(m.previous.at, m.at), 'day')} since we hit ${milestoneLabel(m.previous.milestone)}.`
+    ? `, ${compactCount(m.milestone - m.previous.milestone)} of them in the ${plural(days(m.previous.at, m.at), 'day')} since we passed ${milestoneLabel(m.previous.milestone)}`
     : m.firstPaymentAt
-      ? `${plural(days(m.firstPaymentAt, m.at), 'day')} since the very first payment.`
-      : null;
+      ? `, ${plural(days(m.firstPaymentAt, m.at), 'day')} after the first one`
+      : '';
+  const lead = `Duevy just processed its ${ordinal(m.milestone)} payment${pace}.`;
   const rows: [string, string][] = [
-    ['Payments processed', compactCount(m.payments)],
+    ['Payments so far', compactCount(m.payments)],
+    ['Net to spaces', net],
     ['Total volume', nairaExact(m.volumeKobo)],
-    ['Net to spaces', nairaExact(m.netKobo)],
     ['Processing fees', nairaExact(m.feesKobo)],
     ['Paid out to departments', `${nairaExact(m.paidOutKobo)} (${plural(m.payouts, 'withdrawal')})`],
     ['Spaces', compactCount(m.spaces)],
@@ -798,27 +720,59 @@ export function buildTransactionMilestoneEmail(name: string, m: TransactionMiles
     ['Students', compactCount(m.students)],
     ['Campuses', compactCount(m.campuses)],
   ];
-  const firstName = name.split(' ')[0] || name;
+  const first = firstName(name);
   const html = renderEmail(
     `
-    <h1>Hurray! 🎉 ${label} payments</h1>
-    <p>Hi ${escapeHtml(firstName)}, Duevy has just processed its <strong>${compactCount(m.milestone)}th payment</strong>. Here's where we stand.</p>
-    ${emailHero('Net to spaces', nairaExact(m.netKobo), `${nairaExact(m.volumeKobo)} total volume`)}
+    <h1>Hurray, ${label} payments</h1>
+    <p>Hi ${escapeHtml(first)}, ${escapeHtml(lead)}</p>
     ${emailDetails(rows)}
-    ${pace ? `<p>${escapeHtml(pace)}</p>` : ''}
-    <a href="${m.link}" class="btn">Open the dashboard</a>
-    <p class="muted">Sent to Duevy admins each time payments pass a milestone.</p>
+    <a href="${m.link}" class="btn">Open dashboard</a>
+    <p class="muted">Duevy admins get this email each time payments pass a milestone.</p>
   `,
     BRAND,
-    { preheader: `${compactCount(m.payments)} payments, ${nairaExact(m.netKobo)} net to spaces.` },
+    { preheader: `${compactCount(m.payments)} payments, ${net} to spaces.` },
   );
-  const text =
-    `Hi ${firstName},\n\nHurray! Duevy has just processed its ${compactCount(m.milestone)}th payment.\n\n` +
-    rows.map(([k, v]) => `${k}: ${v}`).join('\n') +
-    `${pace ? `\n\n${pace}` : ''}\n\nOpen the dashboard: ${m.link}`;
-  return { subject: headerSafe(`🎉 Hurray! Duevy has processed ${label} payments — ${nairaExact(m.netKobo)} net`), html, text };
+  const text = `Hi ${first},\n\n${lead}\n\n` + rows.map(([k, v]) => `${k}: ${v}`).join('\n') + `\n\nOpen dashboard: ${m.link}`;
+  return { subject: headerSafe(`Hurray, Duevy has processed ${label} payments (${net} net)`), html, text };
 }
 
 export async function sendTransactionMilestoneEmail(to: string, name: string, m: TransactionMilestone): Promise<void> {
   await sendEmail({ to, ...buildTransactionMilestoneEmail(name, m) });
+}
+
+/** A rep inviting someone to sign up as a rep, with their referral link and code. */
+export function buildReferralInviteEmail(inviterName: string, link: string, code: string) {
+  const pitch = `Duevy lets department reps collect dues by bank transfer and see who has paid. ${inviterName} thinks you'd be a good rep for yours.`;
+  const html = renderEmail(`
+    <h1>${escapeHtml(inviterName)} invited you to Duevy</h1>
+    <p>${escapeHtml(pitch)}</p>
+    <a href="${link}" class="btn">Sign up as a rep</a>
+    <p class="muted">Your referral code is ${escapeHtml(code)}.</p>
+  `);
+  return { subject: headerSafe(`${inviterName} invited you to be a rep on Duevy`), html, text: `${pitch}\n\nSign up: ${link}\nReferral code: ${code}` };
+}
+
+/** To the rep who reset their space's withdrawal code; withdrawals pause until `holdUntil`. */
+export function buildWithdrawalPinResetEmail(name: string, spaceName: string, holdUntil: Date | null) {
+  const pause = holdUntil ? ` Withdrawals are paused until ${lagosTime(holdUntil)}.` : '';
+  const lead = `Hi ${firstName(name)}, the withdrawal code for ${spaceName} was just reset.${pause}`;
+  const warning = "If you didn't do this, change your password and email support@duevy.app right away.";
+  const html = renderEmail(`
+    <h1>Your withdrawal code was reset</h1>
+    <p>${escapeHtml(lead)}</p>
+    <p>${escapeHtml(warning)}</p>
+  `);
+  return { subject: 'Your Duevy withdrawal code was reset', html, text: `${lead}\n\n${warning}` };
+}
+
+/** To every rep when a payout account is added to their space. */
+export function buildNewBeneficiaryEmail(name: string, actorName: string, account: string) {
+  const lead = `Hi ${firstName(name)}, ${actorName} added ${account} as a payout account for your space, so withdrawals can now be sent there.`;
+  const warning = "If you didn't expect this, email support@duevy.app right away.";
+  const html = renderEmail(`
+    <h1>New payout account</h1>
+    <p>${escapeHtml(lead)}</p>
+    <p class="muted">${escapeHtml(warning)}</p>
+  `);
+  return { subject: 'A new payout account was added on Duevy', html, text: `${lead}\n\n${warning}` };
 }

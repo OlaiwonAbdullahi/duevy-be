@@ -53,7 +53,6 @@ describe('reps are emailed when a member pays', () => {
     expect(input).toMatchObject({
       spaceName: space.name,
       payerName: 'Ada Guest',
-      payerIsGuest: true,
       reference,
       faceKobo: due.amount,
       items: [{ title: due.title, amountKobo: due.amount }],
@@ -78,20 +77,20 @@ describe('reps are emailed when a member pays', () => {
 });
 
 describe('buildRepPaymentReceivedEmail', () => {
-  it('names the guest payer and escapes what members typed', () => {
+  it('names the student who paid, with no guest label, and escapes what they typed', () => {
     const { subject, html, text } = buildRepPaymentReceivedEmail('Rep <b>', {
       spaceName: 'Food Science',
       payerName: 'Ada <script>',
-      payerIsGuest: true,
       reference: 'DVY-ABC',
       items: [{ title: 'Dept dues', amountKobo: 200_000 }],
       faceKobo: 200_000,
       paidAt: new Date('2026-11-10T10:00:00Z'),
       link: 'https://duevy.app/dashboard/create-dues?due=1',
     });
-    expect(subject).toBe('Ada <script> (guest) paid ₦2,000.00 — Dept dues');
+    expect(subject).toBe('Ada <script> paid ₦2,000.00 for Dept dues');
     expect(html).not.toContain('<script>');
-    expect(html).toContain('Ada &lt;script&gt; (guest)');
-    expect(text).toContain('Ada <script> (guest) just paid ₦2,000.00 for Dept dues in Food Science.');
+    expect(html).toContain('Ada &lt;script&gt; paid');
+    expect(`${subject}${html}${text}`).not.toMatch(/guest/i);
+    expect(text).toContain('Ada <script> just paid ₦2,000.00 for Dept dues in Food Science.');
   });
 });

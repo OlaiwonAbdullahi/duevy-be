@@ -43,6 +43,24 @@ meRouter.post('/kyc/student-id', ...resubmitStudentIdHandlers);
 meRouter.post('/kyc/liveness', ...submitLivenessHandlers);
 
 // ---------------------------------------------------------------------------
+// GET /me/rep-application — the caller's own rep application, for the
+// pending-rep dashboard: what they applied to run and where it stands.
+// ---------------------------------------------------------------------------
+meRouter.get('/rep-application', async (req: Request, res: Response): Promise<void> => {
+  const app = await db.repApplication.findUnique({ where: { userId: userId(req) } });
+  if (!app) {
+    errors.notFound(res, 'No rep application');
+    return;
+  }
+  ok(res, {
+    status: app.status,
+    requestedSpace: { name: app.spaceName, short: app.spaceShort, kind: app.spaceKind, school: app.school, faculty: app.faculty },
+    submittedAt: app.createdAt.toISOString(),
+    reviewedAt: app.reviewedAt?.toISOString() ?? null,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET / PUT /me/withdrawal-pin — a rep applicant's withdrawal code, chosen
 // during onboarding and applied to the space on approval. Once the space
 // exists it's managed with /spaces/:spaceId/payout/pin instead.

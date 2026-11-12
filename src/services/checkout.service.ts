@@ -700,7 +700,7 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     {
       kind: 'payment_received',
       title: 'Payment received',
-      detail: `${payer?.name ?? 'A member'}${payer?.isGuest ? ' (guest)' : ''} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
+      detail: `${payer?.name ?? 'A student'} paid ₦${(checkout.faceKobo / 100).toLocaleString('en-NG')} for ${what}.`,
       href: rosterHref,
     },
   );
@@ -749,7 +749,6 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       sendRepPaymentReceivedEmail(r.user.email, r.user.name, {
         spaceName: space?.name ?? '',
         payerName: payer?.name ?? 'A member',
-        payerIsGuest: !!payer?.isGuest,
         reference: checkout.reference,
         items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
         faceKobo: checkout.faceKobo,

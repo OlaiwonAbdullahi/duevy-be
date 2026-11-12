@@ -4,10 +4,9 @@ import { AppError, conflict, notFound } from '../lib/errors';
 import { encrypt, decrypt, maskAccountNumber } from '../lib/encryption';
 import { logger } from '../lib/logger';
 import { writeAudit } from '../lib/audit';
-import { sendEmail, renderEmail } from '../lib/email';
+import { buildNewBeneficiaryEmail, sendEmail } from '../lib/email';
 import { getPaymentProvider } from '../providers/payment';
 import { listBanksCached } from '../routes/banks';
-import { escapeHtml } from '../lib/html';
 import { lockSpace } from './ledger.service';
 
 /**
@@ -131,15 +130,6 @@ export async function oneOffDestination(bankCode: string, accountNumber: string)
 async function notifyRepsOfNewBeneficiary(spaceId: string, actorName: string, who: string): Promise<void> {
   const reps = await db.spaceRep.findMany({ where: { spaceId }, include: { user: { select: { email: true, name: true } } } });
   for (const r of reps) {
-    sendEmail({
-      to: r.user.email,
-      subject: 'New Duevy payout beneficiary',
-      html: renderEmail(
-        `<h1>New payout beneficiary</h1>
-         <p>Hi ${escapeHtml(r.user.name)}, ${escapeHtml(actorName)} added <strong>${escapeHtml(who)}</strong> as a beneficiary for your space. Withdrawals can now be sent to this account.</p>
-         <p class="muted">If this wasn't expected, contact support immediately at support@duevy.app</p>`,
-        '#b01e4e',
-      ),
-    }).catch(() => {});
+    sendEmail({ to: r.user.email, ...buildNewBeneficiaryEmail(r.user.name, actorName, who) }).catch(() => {});
   }
 }

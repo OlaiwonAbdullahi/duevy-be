@@ -598,7 +598,7 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
     ),
     ...guests.map((g) => {
       const answers = questionIds.map((id) => g.answers.find((a) => a.fieldId === id)?.value ?? null);
-      return [g.name, g.matricNo, null, g.email, 'paid (guest)', g.paidAt, g.reference, ...answers].map(csvCell).join(',');
+      return [g.name, g.matricNo, null, g.email, 'paid', g.paidAt, g.reference, ...answers].map(csvCell).join(',');
     }),
   ];
   const csv = [header.join(','), ...rows].join('\n');

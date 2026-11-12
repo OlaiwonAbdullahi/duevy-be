@@ -82,13 +82,13 @@ describe('withdrawal emails', () => {
     const mine = buildWithdrawalUpdateEmail('Ada Obi', { ...base, outcome: 'success', viewerIsRequester: true });
     expect(mine.subject).toBe('You sent ₦19,983.87 from Computer <Science>');
     expect(mine.text).toContain('You sent ₦19,983.87 from Computer <Science> to ADA OBI · GTBank •••• 6789.');
-    expect(mine.text).toContain('Total from balance: ₦20,000.00');
+    expect(mine.text).toContain('Taken from balance: ₦20,000.00');
     expect(mine.html).not.toContain('<Science>');
     const theirs = buildWithdrawalUpdateEmail('Tunde Co', { ...base, outcome: 'success', viewerIsRequester: false });
     expect(theirs.html).not.toContain('<b>Obi</b>');
     expect(theirs.html).toContain('Ada &lt;b&gt;Obi&lt;/b&gt; sent');
     const failed = buildWithdrawalUpdateEmail('Ada Obi', { ...base, outcome: 'failed', viewerIsRequester: true, reason: 'Dormant account' });
-    expect(failed.subject).toBe('Withdrawal failed — ₦19,983.87 from Computer <Science>');
+    expect(failed.subject).toBe('Your ₦19,983.87 withdrawal from Computer <Science> failed');
     expect(failed.text).toContain('Reason: Dormant account');
     expect(failed.text).toContain('is back in the space balance');
   });

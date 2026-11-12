@@ -7,8 +7,7 @@ import { authenticate, type AuthenticatedRequest } from '../middleware/auth';
 import { inviteLimiter } from '../middleware/rateLimiter';
 import { ok, errors } from '../lib/response';
 import { generateReferralCode, REFERRAL_REWARD_KOBO } from '../lib/referral';
-import { sendEmail, renderEmail } from '../lib/email';
-import { escapeHtml } from '../lib/html';
+import { buildReferralInviteEmail, sendEmail } from '../lib/email';
 
 export const referralsRouter = Router();
 referralsRouter.use(authenticate);
@@ -95,18 +94,9 @@ referralsRouter.post('/invites', inviteLimiter, validate(invitesSchema), async (
   // Dedupe (case-insensitively) so one request can't mail the same inbox repeatedly.
   const emails = [...new Set((req.body as z.infer<typeof invitesSchema>).emails.map((e) => e.trim().toLowerCase()))];
 
-  const html = renderEmail(`
-    <h1>You're invited to Duevy</h1>
-    <p>${escapeHtml(user.name)} thinks you'd make a great department rep on Duevy.</p>
-    <a href="${link}" class="btn">Sign up to get started</a>
-    <div class="callout">Referral code: <strong>${escapeHtml(code)}</strong></div>
-  `);
+  const invite = buildReferralInviteEmail(user.name, link, code);
   for (const to of emails) {
-    sendEmail({
-      to,
-      subject: `${user.name} invited you to become a rep on Duevy`,
-      html,
-    }).catch(console.error);
+    sendEmail({ to, ...invite }).catch(console.error);
   }
 
   ok(res, { sent: emails.length });

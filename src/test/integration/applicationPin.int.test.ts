@@ -69,3 +69,20 @@ describe('withdrawal code chosen during rep onboarding', () => {
     expect((await api('GET', '/v1/me/withdrawal-pin', { token: await tokenFor(student) })).status).toBe(404);
   });
 });
+
+describe('GET /me/rep-application', () => {
+  it("shows the applicant what they applied to run, and 404s for someone who never applied", async () => {
+    const { token } = await applicant();
+    const res = await api('GET', '/v1/me/rep-application', { token });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({
+      status: 'pending',
+      requestedSpace: { name: 'Computer Science', short: 'CSC', kind: 'department', school: 'University of Lagos' },
+      reviewedAt: null,
+    });
+    expect(Date.parse(res.body.data.submittedAt)).not.toBeNaN();
+
+    const student = await db.user.create({ data: { name: 'Student', email: `stu_${Date.now()}_${Math.random()}@test.duevy` } });
+    expect((await api('GET', '/v1/me/rep-application', { token: await tokenFor(student) })).status).toBe(404);
+  });
+});
