@@ -743,3 +743,82 @@ export async function sendWithdrawalOtpEmail(to: string, name: string, w: Withdr
     text: `Hi ${name},\n\nYour code to approve the ${amount} withdrawal from ${w.spaceName} to ${w.destination} (${w.reference}) is ${w.code}. It expires in ${w.expiresInMinutes} minutes.\n\nNever share this code. If you don't recognise this withdrawal, reject it on Duevy and contact support@duevy.app.`,
   });
 }
+
+export type TransactionMilestone = {
+  /** The milestone crossed, e.g. 1000. */
+  milestone: number;
+  /** Paid student payments so far (at least `milestone`). */
+  payments: number;
+  /** Everything students sent, fees included. */
+  volumeKobo: number;
+  /** What reached the spaces: the dues' face value. */
+  netKobo: number;
+  /** Duevy's processing fees on those payments. */
+  feesKobo: number;
+  /** Completed withdrawals and what they sent to departments' banks. */
+  payouts: number;
+  paidOutKobo: number;
+  spaces: number;
+  reps: number;
+  students: number;
+  campuses: number;
+  /** When the first payment landed, and when the last milestone was crossed (null for the first). */
+  firstPaymentAt: Date | null;
+  previous: { milestone: number; at: Date } | null;
+  at: Date;
+  link: string;
+};
+
+const compactCount = (n: number) => n.toLocaleString('en-NG');
+/** "1k", "2.5k", "10k", "1m". */
+export function milestoneLabel(n: number): string {
+  if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(1)}m`;
+  if (n >= 1_000) return `${+(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+const days = (from: Date, to: Date) => Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000));
+const plural = (n: number, word: string) => `${compactCount(n)} ${word}${n === 1 ? '' : 's'}`;
+
+/** Subject, HTML and text celebrating a platform-wide payments milestone, for Duevy's team. */
+export function buildTransactionMilestoneEmail(name: string, m: TransactionMilestone) {
+  const label = milestoneLabel(m.milestone);
+  const pace = m.previous
+    ? `${compactCount(m.milestone - m.previous.milestone)} payments in ${plural(days(m.previous.at, m.at), 'day')} since we hit ${milestoneLabel(m.previous.milestone)}.`
+    : m.firstPaymentAt
+      ? `${plural(days(m.firstPaymentAt, m.at), 'day')} since the very first payment.`
+      : null;
+  const rows: [string, string][] = [
+    ['Payments processed', compactCount(m.payments)],
+    ['Total volume', nairaExact(m.volumeKobo)],
+    ['Net to spaces', nairaExact(m.netKobo)],
+    ['Processing fees', nairaExact(m.feesKobo)],
+    ['Paid out to departments', `${nairaExact(m.paidOutKobo)} (${plural(m.payouts, 'withdrawal')})`],
+    ['Spaces', compactCount(m.spaces)],
+    ['Reps', compactCount(m.reps)],
+    ['Students', compactCount(m.students)],
+    ['Campuses', compactCount(m.campuses)],
+  ];
+  const firstName = name.split(' ')[0] || name;
+  const html = renderEmail(
+    `
+    <h1>Hurray! 🎉 ${label} payments</h1>
+    <p>Hi ${escapeHtml(firstName)}, Duevy has just processed its <strong>${compactCount(m.milestone)}th payment</strong>. Here's where we stand.</p>
+    ${emailHero('Net to spaces', nairaExact(m.netKobo), `${nairaExact(m.volumeKobo)} total volume`)}
+    ${emailDetails(rows)}
+    ${pace ? `<p>${escapeHtml(pace)}</p>` : ''}
+    <a href="${m.link}" class="btn">Open the dashboard</a>
+    <p class="muted">Sent to Duevy admins each time payments pass a milestone.</p>
+  `,
+    BRAND,
+    { preheader: `${compactCount(m.payments)} payments, ${nairaExact(m.netKobo)} net to spaces.` },
+  );
+  const text =
+    `Hi ${firstName},\n\nHurray! Duevy has just processed its ${compactCount(m.milestone)}th payment.\n\n` +
+    rows.map(([k, v]) => `${k}: ${v}`).join('\n') +
+    `${pace ? `\n\n${pace}` : ''}\n\nOpen the dashboard: ${m.link}`;
+  return { subject: headerSafe(`🎉 Hurray! Duevy has processed ${label} payments — ${nairaExact(m.netKobo)} net`), html, text };
+}
+
+export async function sendTransactionMilestoneEmail(to: string, name: string, m: TransactionMilestone): Promise<void> {
+  await sendEmail({ to, ...buildTransactionMilestoneEmail(name, m) });
+}
