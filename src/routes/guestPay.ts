@@ -210,14 +210,17 @@ guestPayRouter.post(
 );
 
 // ---------------------------------------------------------------------------
-// GET /public/pay/callback?ref= — the Interswitch IPG site_redirect_url.
+// GET/POST /public/pay/callback?ref= — the Interswitch IPG site_redirect_url.
 //
-// After the card popup completes, Interswitch returns the payer here. The
-// server requeries the transaction (gettransaction.json — never trusting the
-// browser) and then redirects the payer to the frontend status page, which
-// polls until the checkout shows "paid". Safe to hit more than once.
+// Interswitch returns the payer here after payment. With Web Redirect it comes
+// back as a browser-side form **POST** (x-www-form-urlencoded with txnref/amount/
+// resp/…); the inline popup uses a GET. We register both. We trust none of the
+// returned fields — only `ref` (preserved in the query of site_redirect_url) is
+// used to requery the transaction server-side (gettransaction.json) before the
+// frontend status poll. Then we redirect the payer to the frontend status page.
+// Safe to hit more than once.
 // ---------------------------------------------------------------------------
-guestPayRouter.get('/pay/callback', guestCheckoutStatusLimiter, async (req: Request, res: Response): Promise<void> => {
+async function handlePayCallback(req: Request, res: Response): Promise<void> {
   const reference = typeof req.query.ref === 'string' ? req.query.ref : '';
   let dueId: string | null = null;
   if (reference) {
@@ -237,7 +240,9 @@ guestPayRouter.get('/pay/callback', guestCheckoutStatusLimiter, async (req: Requ
     target.searchParams.set('t', guestCheckoutToken(reference));
   }
   res.redirect(302, target.toString());
-});
+}
+guestPayRouter.get('/pay/callback', guestCheckoutStatusLimiter, handlePayCallback);
+guestPayRouter.post('/pay/callback', guestCheckoutStatusLimiter, handlePayCallback);
 
 // ---------------------------------------------------------------------------
 // GET /public/checkouts/{reference}?t= — guest checkout status
