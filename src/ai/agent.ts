@@ -1,6 +1,7 @@
 import type OpenAI from 'openai';
 import { getNim, AI_MODEL } from './nim';
 import { toolSpecs, findTool, type ToolContext } from './tools';
+import { todayContext } from './dates';
 import { loadRepContext, mintToken, type RepContext } from './identity';
 import { logger } from '../lib/logger';
 
@@ -42,7 +43,7 @@ export function resetSession(userId: string): void {
   sessions.delete(userId);
 }
 
-function systemPrompt(rep: RepContext): string {
+function systemPrompt(rep: RepContext, todayLagos: string, weekday: string): string {
   const spaceList = rep.spaces.length
     ? rep.spaces.map((s) => `- ${s.name} (${s.short}), you are ${s.repRole} rep, id: ${s.id}`).join('\n')
     : '(none yet)';
@@ -53,8 +54,11 @@ function systemPrompt(rep: RepContext): string {
     'The spaces they rep:',
     spaceList,
     '',
+    `Today is ${weekday}, ${todayLagos} (Africa/Lagos time).`,
+    '',
     'Rules:',
     '- Use the tools for every fact and action. NEVER invent balances, counts, names or statuses — read them from a tool.',
+    `- DATES: understand everyday/relative dates yourself and pass them to tools as YYYY-MM-DD. NEVER ask the rep to type a date in YYYY-MM-DD. Relative to today (${todayLagos}): "today"=${todayLagos}, "tomorrow"=+1 day, "next week"/"same day next week"/"in a week"=+7 days, "in N days"=+N days, "this Friday"/"next Friday"=the next upcoming Friday, "end of the month"=the last day of this month, "end of the week"=the coming Sunday. If a date is truly ambiguous, pick the most sensible one and say which date you used — do not refuse or keep asking.`,
     '- MONEY UNITS: numeric money fields returned by tools are in KOBO (minor units); 100 kobo = ₦1. Divide by 100 to show naira. Examples: a tool value of 500000 is ₦5,000.00; 150000 is ₦1,500.00; 507500 is ₦5,075.00. Values ALREADY written with a ₦ sign (e.g. from create_due or quotes) are naira — show them as-is, do not convert again.',
     '- Amounts the rep types are in naira.',
     '- If they rep more than one space and none is active, ask which space, then call set_active_space.',
@@ -82,7 +86,11 @@ export async function handleMessage(userId: string, text: string): Promise<strin
     },
   };
 
-  const messages: Msg[] = [{ role: 'system', content: systemPrompt(rep) }, ...session.history, { role: 'user', content: text }];
+  // Civil date in the rep's timezone (Africa/Lagos), so "today" in the prompt and
+  // the deterministic resolver in dates.ts always agree.
+  const { iso: todayLagos, weekday } = todayContext();
+
+  const messages: Msg[] = [{ role: 'system', content: systemPrompt(rep, todayLagos, weekday) }, ...session.history, { role: 'user', content: text }];
   const nim = getNim();
 
   let finalText = '';

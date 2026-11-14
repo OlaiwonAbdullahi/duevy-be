@@ -1,0 +1,18 @@
+# Training dependencies (install on the GPU node / inside the NeMo container).
+# Pin to the versions your NeMo AutoModel release requires; these are indicative.
+#
+# Easiest path: use NVIDIA's NeMo container (nvcr.io/nvidia/nemo:<tag>), which
+# already carries CUDA, PyTorch, Transformer Engine and flash-attn, then:
+#   pip install -r requirements.txt
+nemo-automodel>=0.1          # NVIDIA NeMo AutoModel (fine-tuning recipes)
+torch>=2.4
+transformers>=4.46
+accelerate>=1.0
+peft>=0.13
+datasets>=3.0
+flash-attn>=2.6              # attn_implementation: flash_attention_2
+bitsandbytes>=0.44          # only needed for the QLoRA (4-bit) variant
+pyyaml>=6.0
+
+# Evaluation (../evaluation/eval_model.py) only needs an OpenAI-compatible client:
+openai>=1.40

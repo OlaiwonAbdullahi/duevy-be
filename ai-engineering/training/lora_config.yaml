@@ -1,0 +1,82 @@
+# LoRA fine-tuning config for the Duevy agent.
+#
+# Base model: NVIDIA Nemotron 3.5 Super VL 120B-A12B (open weights, OpenMDW).
+# Framework: NeMo AutoModel (NVIDIA's official recipes list a single-node,
+#            8× 80GB GPU LoRA run for this model — see
+#            docs.nvidia.com/nemo/automodel/.../NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16).
+#
+# This file is RUNNABLE on that hardware; it is NOT run in the Duevy dev env
+# (no GPUs). Values below are sensible defaults — align the exact ones with the
+# official recipe you pull (recipes/llm/nemotron... ) before a real run.
+#
+# We fine-tune on the TEXT tool-calling behaviour only (the VL model's vision
+# tower is untouched): intent → correct tool + args, Nigerian/informal phrasing,
+# confirm-first, pass-through relative dates. Dates/money stay deterministic in
+# code — we do NOT teach calendar arithmetic.
+
+model:
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+  trust_remote_code: true
+  attn_implementation: flash_attention_2
+
+peft:
+  method: lora                 # LoRA (QLoRA optional — see note at bottom)
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  # MoE attention/proj targets; confirm module names against the loaded model.
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+data:
+  chat_template: default        # examples are already OpenAI/NeMo chat format
+  # Duevy-only. To also teach Nigerian Pidgin comprehension, run
+  #   HF_TOKEN=... python ../datasets/mix_pidgin.py --in out --ratio 0.3
+  # then switch these to the *.mixed.jsonl files (Pidgin capped ≤30%, Duevy
+  # tool-calling stays the dominant signal). Attribution: naijaPidgin
+  # (ahmadabdulnasir/naijaPidgin) — see ../docs/dataset-inventory.md.
+  train_path: ../datasets/out/train.jsonl        # or out/train.mixed.jsonl
+  validation_path: ../datasets/out/val.jsonl     # or out/val.mixed.jsonl
+  max_seq_length: 4096          # our conversations are short; 1M ctx not needed
+  pad_to_max_length: false
+  packed_sequences: true        # pack short samples for throughput
+
+training:
+  seed: 7
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_epochs: 3
+  lr: 1.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  optimizer: adamw
+  precision: bf16
+  gradient_checkpointing: true
+
+distributed:
+  # Single node, 8× 80GB GPUs (per the official LoRA recipe for this model).
+  num_nodes: 1
+  devices: 8
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  expert_parallel_size: 4        # MoE: shard experts across GPUs
+
+checkpoint:
+  save_dir: ./checkpoints
+  save_top_k: 3
+  monitor: val_loss
+  mode: min
+  every_n_epochs: 1
+  # Export a mergeable LoRA adapter dir for NIM serving (NIM_PEFT_SOURCE).
+  export_adapter_dir: ./checkpoints/duevy-lora-adapter
+
+evaluation:
+  # After training, run ../evaluation/eval_model.py against the fine-tuned
+  # endpoint and compare to the base-model baseline (same script, different
+  # --model/--base-url). Do not claim improvement without this delta.
+  holdout: ../datasets/out/test.jsonl
+
+# --- QLoRA note ---------------------------------------------------------------
+# To cut VRAM (e.g. fewer/smaller GPUs), switch to QLoRA: load the base in 4-bit
+# (bitsandbytes nf4) and keep the LoRA adapters in bf16. Quality trade-off for
+# this task is "to be measured" — run eval_model.py both ways and compare.

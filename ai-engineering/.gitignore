@@ -1,0 +1,7 @@
+# Training artifacts (regenerate on the GPU node)
+training/checkpoints/
+# Eval reports (regenerate by running eval_model.py against an endpoint)
+evaluation/reports/
+# Python
+__pycache__/
+*.pyc

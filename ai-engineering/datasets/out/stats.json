@@ -1,0 +1,52 @@
+{
+  "total": 2280,
+  "by_split": {
+    "train": 1834,
+    "val": 223,
+    "test": 223
+  },
+  "by_category": {
+    "datetime": 400,
+    "tool_calling": 480,
+    "nlu": 400,
+    "nigerian_lang": 320,
+    "parameters": 480,
+    "intent": 56,
+    "out_of_scope": 8,
+    "error_handling": 26,
+    "multiturn": 48,
+    "security": 7,
+    "clarification": 37,
+    "financial_ops": 18
+  },
+  "shortfalls": {
+    "intent": {
+      "wanted": 480,
+      "got": 56
+    },
+    "multiturn": {
+      "wanted": 400,
+      "got": 48
+    },
+    "financial_ops": {
+      "wanted": 320,
+      "got": 18
+    },
+    "error_handling": {
+      "wanted": 240,
+      "got": 26
+    },
+    "clarification": {
+      "wanted": 200,
+      "got": 37
+    },
+    "security": {
+      "wanted": 160,
+      "got": 7
+    },
+    "out_of_scope": {
+      "wanted": 120,
+      "got": 8
+    }
+  }
+}

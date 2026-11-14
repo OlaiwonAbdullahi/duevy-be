@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { nairaToKobo, formatNaira, checkoutFee } from '../lib/money';
 import { apiCall } from './api';
+import { resolveDueDate } from './dates';
 import type { RepContext } from './identity';
 
 /**
@@ -110,7 +111,7 @@ export const tools: AgentTool[] = [
       properties: {
         title: { type: 'string' },
         amount_naira: { type: 'number', description: 'The due amount in naira (e.g. 2000 for ₦2,000).' },
-        due_date: { type: 'string', description: 'Deadline, YYYY-MM-DD, today or later.' },
+        due_date: { type: 'string', description: 'Deadline as YYYY-MM-DD (today or later). You may also pass an everyday phrase like "next week", "tomorrow", "in 3 days", "Friday" or "end of the month" and it will be resolved.' },
         category: { type: 'string', enum: [...DUE_TYPES] },
         note: { type: 'string' },
         allow_guests: { type: 'boolean', description: 'Let non-members pay via the public link. Default true.' },
@@ -124,9 +125,10 @@ export const tools: AgentTool[] = [
       if ('error' in s) return s;
       const title = str(args.title);
       const amountNaira = numArg(args.amount_naira);
-      const dueDate = str(args.due_date);
+      const dueDate = resolveDueDate(str(args.due_date));
       const category = str(args.category);
-      if (!title || amountNaira === undefined || !dueDate || !category) return { error: 'title, amount_naira, due_date and category are all required.' };
+      if (!title || amountNaira === undefined || !category) return { error: 'title, amount_naira and category are required.' };
+      if (!dueDate) return { error: `I couldn't read "${str(args.due_date) ?? ''}" as a date. Give a specific day (e.g. "next Friday", "in 2 weeks", or a date).` };
       const faceKobo = nairaToKobo(amountNaira);
       const feeKobo = checkoutFee(faceKobo);
       const summary = {
