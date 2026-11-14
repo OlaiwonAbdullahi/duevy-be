@@ -22,10 +22,12 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Payment rail. 'ninejapay' is the only live provider; 'fake' is an
+  // Payment rail. 'interswitch' is the hackathon rail (Interswitch IPG Web
+  // Checkout for students + Virtual Accounts & Payouts for spaces);
+  // 'ninejapay' is the previous live provider, kept selectable; 'fake' is an
   // in-memory stand-in for local development, the seed and the test suite.
-  // See src/providers/payment/ and docs/NINEJAPAY.md.
-  PAYMENT_PROVIDER: z.enum(['ninejapay', 'fake']).default('ninejapay'),
+  // See src/providers/payment/ and docs/INTERSWITCH.md / docs/NINEJAPAY.md.
+  PAYMENT_PROVIDER: z.enum(['interswitch', 'ninejapay', 'fake']).default('ninejapay'),
 
   // 9jaPay (docs.9japay.com) — virtual accounts under Duevy's own business.
   // The live base URL comes from 9jaPay at onboarding.
@@ -48,6 +50,65 @@ const envSchema = z.object({
   // Lagos day share it. Withdrawals leave from each space's own account and
   // don't count here.
   NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO: z.coerce.number().int().positive().default(1_000_000_000),
+
+  // ---------------------------------------------------------------------------
+  // Interswitch — the hackathon payment rail (docs.interswitchgroup.com).
+  //   * Students pay via IPG Web Checkout (card popup). The "one-time account"
+  //     is the per-attempt txn_ref (= our checkout reference), created and
+  //     stored server-side before the popup, then requeried on gettransaction.json.
+  //   * Spaces get a permanent Interswitch Virtual Account; withdrawals go out
+  //     through the Payouts API. See docs/INTERSWITCH.md.
+  // Required only when PAYMENT_PROVIDER=interswitch (superRefine below).
+  // ---------------------------------------------------------------------------
+  INTERSWITCH_ENV: z.enum(['test', 'live']).default('test'),
+  // Passport OAuth2 client credentials (Quickteller Business → Developer Tools).
+  INTERSWITCH_CLIENT_ID: z.string().optional(),
+  INTERSWITCH_CLIENT_SECRET: z.string().optional(),
+  // Web Checkout merchant + pay item. TEST: MX6072 / 9405967.
+  // LIVE: MX153376 + the team's own Pay Item ID from the Resources sheet.
+  INTERSWITCH_MERCHANT_CODE: z.string().optional(),
+  INTERSWITCH_PAY_ITEM_ID: z.string().optional(),
+  // ISO-4217 numeric currency. 566 = NGN.
+  INTERSWITCH_CURRENCY: z.string().default('566'),
+  // Secret used to verify webhook signatures from the Quickteller dashboard.
+  INTERSWITCH_WEBHOOK_SECRET: z.string().optional(),
+  // Base URLs. Defaults are the test hosts; the live hosts are set per-env.
+  // Passport (OAuth2 token):
+  INTERSWITCH_PASSPORT_URL: z.string().url().default('https://sandbox.interswitchng.com/passport/oauth/token'),
+  // Transaction query (gettransaction.json) + collections base:
+  INTERSWITCH_COLLECTIONS_URL: z.string().url().default('https://sandbox.interswitchng.com'),
+  // Payouts API base:
+  INTERSWITCH_PAYOUTS_URL: z.string().url().default('https://payouts-sandbox.interswitchng.com/api/v1/payouts'),
+  // Virtual Accounts API base (confirm the exact host in the portal):
+  INTERSWITCH_VA_URL: z.string().url().default('https://sandbox.interswitchng.com'),
+  // Host that serves inline-checkout.js for the frontend. TEST:
+  // newwebpay.qa.interswitchng.com ; LIVE: newwebpay.interswitchng.com.
+  INTERSWITCH_INLINE_CHECKOUT_URL: z
+    .string()
+    .url()
+    .default('https://newwebpay.qa.interswitchng.com/inline-checkout.js'),
+
+  // ---------------------------------------------------------------------------
+  // AI assistant — NVIDIA NIM (OpenAI-compatible). Drives the chat + WhatsApp
+  // bot; every rep action runs as a tool over the existing REST API. See docs/AI.md.
+  // ---------------------------------------------------------------------------
+  AI_ENABLED: z.string().transform((v) => v === 'true').default('false'),
+  NVIDIA_API_KEY: z.string().optional(),
+  NVIDIA_BASE_URL: z.string().url().default('https://integrate.api.nvidia.com/v1'),
+  // meta/llama-3.3-70b-instruct was retired by NVIDIA (2026-08-26); this is a
+  // current tool-calling model on build.nvidia.com. Override with AI_MODEL.
+  AI_MODEL: z.string().default('nvidia/nemotron-3.5-super-vl-120b-a12b'),
+  // Where the agent's tools call the Duevy REST API from (server-side, with a
+  // short-lived JWT minted for the linked rep). Defaults to this process.
+  INTERNAL_API_BASE_URL: z.string().url().optional(),
+
+  // ---------------------------------------------------------------------------
+  // WhatsApp bot — Baileys (unofficial WhatsApp Web client). See docs/WHATSAPP.md.
+  // ---------------------------------------------------------------------------
+  WHATSAPP_ENABLED: z.string().transform((v) => v === 'true').default('false'),
+  // Directory for Baileys multi-file auth state (the linked session). Keep it
+  // off version control and persistent across restarts.
+  WHATSAPP_AUTH_DIR: z.string().default('./.whatsapp-auth'),
 
   // Didit (docs.didit.me) — rep NIN + date of birth checks against NIMC.
   // Required with the live rail. Under PAYMENT_PROVIDER=fake, leaving the key
@@ -123,6 +184,19 @@ const envSchema = z.object({
     ] as const) {
       if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=ninejapay' });
     }
+  }
+  if (val.PAYMENT_PROVIDER === 'interswitch') {
+    for (const key of [
+      'INTERSWITCH_CLIENT_ID',
+      'INTERSWITCH_CLIENT_SECRET',
+      'INTERSWITCH_MERCHANT_CODE',
+      'INTERSWITCH_PAY_ITEM_ID',
+    ] as const) {
+      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=interswitch' });
+    }
+  }
+  if (val.AI_ENABLED && !val.NVIDIA_API_KEY) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['NVIDIA_API_KEY'], message: 'required when AI_ENABLED=true' });
   }
   if (val.PAYMENT_PROVIDER !== 'fake' && !val.DIDIT_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['DIDIT_API_KEY'], message: 'required for rep NIN checks' });

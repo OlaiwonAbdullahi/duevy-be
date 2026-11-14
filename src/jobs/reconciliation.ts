@@ -98,7 +98,24 @@ export async function reconcileCheckout(
   opts: { expireIfPastDue: boolean; source: string },
 ): Promise<void> {
   if (c.status !== 'pending') return;
+  const provider = getPaymentProvider();
   const pastExpiry = c.expiresAt.getTime() + EXPIRY_GRACE_MS < Date.now();
+
+  // Gateway rail (Interswitch IPG): requery the transaction and accept only an
+  // approved, amount-matching payment (by whatever method the student used —
+  // card, transfer, USSD, QR). No one-time bank account is involved.
+  if (provider.collectsByGateway && provider.verifyGatewayCheckout) {
+    const status = await provider.verifyGatewayCheckout(c.reference, c.totalKobo);
+    if (status.state === 'paid' && status.receivedKobo !== null) {
+      await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source, null, status.transactionId);
+    } else if (status.state === 'underpaid') {
+      await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
+    } else if (opts.expireIfPastDue && pastExpiry) {
+      await expireCheckout(c.id);
+    }
+    return;
+  }
+
   if (!c.vaAccountNumber) {
     // The account was never opened; nothing can be paid into it.
     if (opts.expireIfPastDue && pastExpiry) await expireCheckout(c.id, 'no collection account was opened');
@@ -126,7 +143,18 @@ export async function reconcileCheckout(
  * a paid checkout is a no-op there.
  */
 export async function confirmReceivedPayment(c: ReconcilableCheckout, source: string): Promise<void> {
-  if (c.status === 'paid' || !c.vaAccountNumber) return;
+  if (c.status === 'paid') return;
+  const provider = getPaymentProvider();
+  if (provider.collectsByGateway && provider.verifyGatewayCheckout) {
+    const status = await provider.verifyGatewayCheckout(c.reference, c.totalKobo);
+    if (status.state === 'paid' && status.receivedKobo !== null) {
+      await fulfilCheckout(c.id, status.receivedKobo, 0, source, null, status.transactionId);
+    } else {
+      logger.warn({ ref: c.reference, source, state: status.state }, 'gateway payment event without an approved transaction; nothing applied');
+    }
+    return;
+  }
+  if (!c.vaAccountNumber) return;
   const status = await collectionFor({ ...c, vaAccountNumber: c.vaAccountNumber });
   if (status.state !== 'paid' || status.receivedKobo === null) {
     logger.warn({ ref: c.reference, source, state: status.state }, 'payment event without a matching credit at the provider; nothing applied');

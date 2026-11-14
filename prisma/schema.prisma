@@ -347,6 +347,10 @@ model User {
   emailVerified                  Boolean               @default(false)
   passwordHash                   String?
   phone                          String?
+  // WhatsApp bot link: the E.164 number (digits only) this account is bound to,
+  // set when the user links their number from the dashboard. Unique so one
+  // number drives one account. See src/channels/whatsapp/ and docs/WHATSAPP.md.
+  whatsappNumber                 String?               @unique
   // From the rep's KYC submission ("male" | "female"); shown to admins.
   gender                         String?
   avatarUrl                      String?

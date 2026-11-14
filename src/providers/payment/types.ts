@@ -53,6 +53,60 @@ export interface CollectionStatus {
   credits?: CollectionCredit[];
 }
 
+// ---------------------------------------------------------------------------
+// Payment-gateway checkout (Interswitch IPG Web Checkout)
+//
+// Some rails collect from students with a hosted/inline gateway popup instead
+// of a one-time bank account. The popup offers EVERY payment method enabled for
+// the merchant — card, bank transfer, USSD, QR, Visa QR, etc. — not just card;
+// which methods appear is controlled in the provider's dashboard, not here.
+// There the "one-time account" is the per-attempt transaction reference (= our
+// checkout reference), created and stored on the server BEFORE the popup opens,
+// and the outcome is read back by requerying the provider (never trusted from
+// the client). Providers that work this way set `collectsByGateway` and
+// implement createGatewayCheckout + verifyGatewayCheckout.
+// ---------------------------------------------------------------------------
+
+export interface CreateGatewayCheckoutInput {
+  /** Our checkout reference; sent as the provider's txn_ref so it echoes back. */
+  reference: string;
+  /** What the student must pay: face + fee, in kobo (sent as minor units). */
+  totalKobo: number;
+  /** Where the provider returns the payer after the popup completes. */
+  redirectUrl: string;
+  customerName?: string;
+  customerEmail?: string;
+}
+
+/** Everything the frontend needs to open the provider's inline gateway popup (all enabled methods). */
+export interface GatewayCheckoutParams {
+  provider: string;
+  /** The inline-checkout.js host to load for this environment. */
+  scriptUrl: string;
+  merchantCode: string;
+  payItemId: string;
+  /** The server-created txn_ref (= our reference), stored before the popup opens. */
+  txnRef: string;
+  /** Minor units (kobo). */
+  amountKobo: number;
+  /** ISO-4217 numeric (566 = NGN). */
+  currency: string;
+  mode: 'TEST' | 'LIVE';
+  /** A real site_redirect_url (never the literal "location.href"). */
+  redirectUrl: string;
+}
+
+/** A gateway checkout's outcome, read back from the provider (e.g. gettransaction.json). */
+export interface GatewayCheckoutStatus {
+  state: CollectionState;
+  /** Minor units the provider confirms received, when known. */
+  receivedKobo: number | null;
+  /** The provider's id for the paid charge — the dedupe key; null until paid. */
+  transactionId: string | null;
+  /** The provider's raw response code ('00' = approved/successful). */
+  responseCode: string | null;
+}
+
 /** A credit on one of our permanent accounts, read from the provider's records. */
 export interface AccountCredit {
   /** The provider's id for the credit; unique, so a deposit is recorded once. */
@@ -195,6 +249,28 @@ export interface PaymentProvider {
    * events can be matched even when that call timed out.
    */
   wireReference(reference: string): string;
+
+  /**
+   * True when students pay via a hosted gateway popup (createGatewayCheckout) —
+   * offering all enabled methods (card, transfer, USSD, QR) — rather than a
+   * one-time bank account. The checkout service branches on this.
+   */
+  readonly collectsByGateway?: boolean;
+
+  /**
+   * Build the params the frontend needs to open the gateway popup (Interswitch
+   * IPG). Pure/synchronous — the caller stores our reference before using
+   * these, so the txn_ref exists on the server before the popup opens.
+   * Present only when collectsByGateway is true.
+   */
+  createGatewayCheckout?(input: CreateGatewayCheckoutInput): GatewayCheckoutParams;
+
+  /**
+   * Requery the provider for a gateway checkout's outcome. Paid only when the
+   * provider's response code is success AND the amount matches. Present only
+   * when collectsByGateway is true.
+   */
+  verifyGatewayCheckout?(reference: string, amountKobo: number): Promise<GatewayCheckoutStatus>;
 
   /**
    * Open a one-time bank account for one checkout. Returns as soon as the

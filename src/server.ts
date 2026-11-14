@@ -7,6 +7,7 @@ import { startWebhookWorker } from './jobs/webhookWorker';
 import { startKycReminderJob } from './jobs/kycReminders';
 import { startMilestoneJob } from './jobs/milestones';
 import { getPaymentProvider } from './providers/payment';
+import { startWhatsappBot } from './channels/whatsapp/baileys';
 import { installShutdownHandlers } from './lib/lifecycle';
 
 async function startServer() {
@@ -42,6 +43,12 @@ async function startServer() {
     const timers = env.RUN_WORKERS ? [startWebhookWorker(), startReconciliationJob(), startKycReminderJob(), startMilestoneJob()] : [];
 
     installShutdownHandlers({ server, timers });
+
+    // The WhatsApp bot (Baileys) runs in-process alongside the workers. No-op
+    // unless WHATSAPP_ENABLED; prints a QR to the logs on first link.
+    if (env.RUN_WORKERS) {
+      void startWhatsappBot().catch((err) => logger.error({ err: (err as Error).message }, 'whatsapp bot failed to start'));
+    }
 
     // A stray rejected promise would otherwise kill the whole API (Node's
     // default); log it and keep serving. A thrown exception leaves the process

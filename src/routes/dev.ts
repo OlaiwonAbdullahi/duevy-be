@@ -7,6 +7,7 @@ import { ok, fail, errors } from '../lib/response';
 import { logger } from '../lib/logger';
 import { getPaymentProvider, ProviderError } from '../providers/payment';
 import { reconcileCheckout } from '../jobs/reconciliation';
+import { fulfilCheckout } from '../services/checkout.service';
 
 /**
  * Sandbox-only helpers for wiring and testing the frontend. Never live:
@@ -22,8 +23,12 @@ export const devRouter = Router();
 const SANDBOX_HOST = 'developer.test.9japay.com';
 
 export function devToolsEnabled(): boolean {
+  if (env.NODE_ENV === 'production') return false;
+  // Interswitch: the gateway popup can't be driven from the server, so we offer
+  // a simulate-payment shortcut instead of simulate-deposit — test env only.
+  if (env.PAYMENT_PROVIDER === 'interswitch') return env.INTERSWITCH_ENV === 'test';
   if (!getPaymentProvider().simulateDeposit) return false;
-  if (env.PAYMENT_PROVIDER === 'fake') return env.NODE_ENV !== 'production';
+  if (env.PAYMENT_PROVIDER === 'fake') return true;
   return new URL(env.NINEJAPAY_BASE_URL).host === SANDBOX_HOST && !!env.NINEJAPAY_SANDBOX_AUTH_KEY;
 }
 
@@ -52,6 +57,11 @@ const CONFIRM_GAP_MS = 1_500;
 // next status poll either way).
 // ---------------------------------------------------------------------------
 devRouter.post('/simulate-deposit', validate(simulateSchema), async (req: Request, res: Response): Promise<void> => {
+  if (!getPaymentProvider().simulateDeposit) {
+    // Gateway rails (Interswitch) have no bank account to deposit into — use /dev/simulate-payment.
+    fail(res, 400, 'NOT_SUPPORTED', 'This provider collects via a payment gateway; use POST /dev/simulate-payment with { reference }.');
+    return;
+  }
   const { accountNumber, amount } = req.body as z.infer<typeof simulateSchema>;
   const checkout = await db.checkout.findFirst({
     where: { vaAccountNumber: accountNumber, status: 'pending' },
@@ -96,4 +106,32 @@ devRouter.post('/simulate-deposit', validate(simulateSchema), async (req: Reques
     // reconciliation job (or the pay page's next poll) will pick it up shortly.
     checkout: checkout ? { reference: checkout.reference, status } : null,
   });
+});
+
+// ---------------------------------------------------------------------------
+// POST /dev/simulate-payment — mark a pending gateway checkout (Interswitch)
+// paid, without going through the real popup. Test environment only
+// (devToolsEnabled). Fulfils it through the same idempotent path a real
+// gettransaction.json "00" would, regardless of which method the student would
+// have used (card, transfer, USSD, QR).
+// ---------------------------------------------------------------------------
+const simulatePaymentSchema = z.object({
+  reference: z.string().trim().min(3).max(64),
+});
+
+devRouter.post('/simulate-payment', validate(simulatePaymentSchema), async (req: Request, res: Response): Promise<void> => {
+  if (!getPaymentProvider().collectsByGateway) {
+    fail(res, 400, 'NOT_SUPPORTED', 'This provider does not use a payment gateway; use POST /dev/simulate-deposit.');
+    return;
+  }
+  const { reference } = req.body as z.infer<typeof simulatePaymentSchema>;
+  const checkout = await db.checkout.findFirst({ where: { reference, status: 'pending' } });
+  if (!checkout) {
+    fail(res, 404, 'NOT_FOUND', `No pending checkout with reference ${reference}.`);
+    return;
+  }
+  await fulfilCheckout(checkout.id, checkout.totalKobo, 0, 'sandbox payment', null, `DEVSIM-${checkout.reference}`);
+  const status = (await db.checkout.findUniqueOrThrow({ where: { id: checkout.id }, select: { status: true } })).status;
+  logger.info({ reference, status }, 'sandbox gateway payment simulated');
+  ok(res, { reference, status });
 });

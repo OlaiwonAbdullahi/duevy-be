@@ -21,7 +21,7 @@ export const webhooksRouter = Router();
  * stored as `dead` for a human and acknowledged — retrying it would never
  * succeed.
  */
-webhooksRouter.post('/9japay', async (req: Request, res: Response): Promise<void> => {
+async function handleProviderWebhook(req: Request, res: Response): Promise<void> {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
   const provider = getPaymentProvider();
 
@@ -56,7 +56,18 @@ webhooksRouter.post('/9japay', async (req: Request, res: Response): Promise<void
 
   res.status(200).json({ success: true });
   if (env.RUN_WORKERS && env.NODE_ENV !== 'test') kickWebhookWorker();
-});
+}
+
+/**
+ * Provider webhooks. Both paths run the same handler, which verifies and
+ * normalises the event through whichever provider is configured
+ * (PAYMENT_PROVIDER). Register the matching URL in that provider's dashboard.
+ *
+ *   POST /webhooks/9japay       — 9jaPay
+ *   POST /webhooks/interswitch  — Interswitch (Quickteller Business → webhooks)
+ */
+webhooksRouter.post('/9japay', handleProviderWebhook);
+webhooksRouter.post('/interswitch', handleProviderWebhook);
 
 /**
  * POST /webhooks/bachs — retired. Acknowledged and dropped so Bachs stops

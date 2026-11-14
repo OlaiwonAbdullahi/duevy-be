@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { db } from '../config/db';
+import { env } from '../config/env';
 import { validate } from '../middleware/validate';
 import {
   guestAccountLimiter,
@@ -207,6 +208,36 @@ guestPayRouter.post(
     ok(res, { ...checkout, reused, token: guestCheckoutToken(checkout.reference) }, reused ? 200 : 201);
   },
 );
+
+// ---------------------------------------------------------------------------
+// GET /public/pay/callback?ref= — the Interswitch IPG site_redirect_url.
+//
+// After the card popup completes, Interswitch returns the payer here. The
+// server requeries the transaction (gettransaction.json — never trusting the
+// browser) and then redirects the payer to the frontend status page, which
+// polls until the checkout shows "paid". Safe to hit more than once.
+// ---------------------------------------------------------------------------
+guestPayRouter.get('/pay/callback', guestCheckoutStatusLimiter, async (req: Request, res: Response): Promise<void> => {
+  const reference = typeof req.query.ref === 'string' ? req.query.ref : '';
+  let dueId: string | null = null;
+  if (reference) {
+    const checkout = await db.checkout.findUnique({
+      where: { reference },
+      include: { items: { select: { dueId: true }, take: 1 } },
+    });
+    if (checkout) {
+      dueId = checkout.items[0]?.dueId ?? null;
+      // Server-side verification; failures are left for the status poll / reconciliation.
+      await syncPendingCheckout(reference).catch(() => {});
+    }
+  }
+  const target = new URL(`${env.FRONTEND_URL}/pay/${dueId ? `${encodeURIComponent(dueId)}` : 'status'}`);
+  if (reference) {
+    target.searchParams.set('ref', reference);
+    target.searchParams.set('t', guestCheckoutToken(reference));
+  }
+  res.redirect(302, target.toString());
+});
 
 // ---------------------------------------------------------------------------
 // GET /public/checkouts/{reference}?t= — guest checkout status

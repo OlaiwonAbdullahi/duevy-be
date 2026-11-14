@@ -49,9 +49,22 @@ const OPENING_GRACE_MS = 30_000;
 // Serialisation
 // ---------------------------------------------------------------------------
 
+/** The public callback (site_redirect_url) the payment gateway returns the payer to. */
+export function gatewayRedirectUrl(reference: string): string {
+  return `${env.APP_BASE_URL}/v1/public/pay/callback?ref=${encodeURIComponent(reference)}`;
+}
+
 export function serializeCheckout(c: CheckoutWithItems) {
+  const provider = getPaymentProvider();
   const open = c.status === 'pending' && !!c.vaAccountNumber;
   const hosted = c.status === 'pending' && !!c.checkoutUrl;
+  // Gateway rails (Interswitch IPG): the frontend opens the inline popup with
+  // these. The popup shows every payment method enabled for the merchant —
+  // card, bank transfer, USSD, QR, etc. — not just card.
+  const gateway =
+    c.status === 'pending' && provider.collectsByGateway && provider.createGatewayCheckout
+      ? provider.createGatewayCheckout({ reference: c.reference, totalKobo: c.totalKobo, redirectUrl: gatewayRedirectUrl(c.reference) })
+      : null;
   return {
     reference: c.reference,
     status: c.status,
@@ -61,6 +74,9 @@ export function serializeCheckout(c: CheckoutWithItems) {
     items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo, fee: i.feeKobo })),
     // Set on a hosted checkout: redirect the student here to pay.
     checkoutUrl: hosted ? c.checkoutUrl : null,
+    // Set on a gateway checkout: the inline-popup params (merchant, pay item,
+    // txn_ref, amount in kobo, currency, redirect). All enabled methods show.
+    gateway,
     bankTransfer: open
       ? {
           accountNumber: c.vaAccountNumber,
@@ -295,12 +311,29 @@ export async function createCheckout(
     }
   }
 
-  const checkout = outcome.checkout.vaAccountNumber
-    ? outcome.checkout
-    : await openCollectionAccount(outcome.checkout, outcome.reused);
+  const provider = getPaymentProvider();
+  const checkout = provider.collectsByGateway
+    ? await openGatewayCheckout(outcome.checkout)
+    : outcome.checkout.vaAccountNumber
+      ? outcome.checkout
+      : await openCollectionAccount(outcome.checkout, outcome.reused);
 
   logger.info({ ref: checkout.reference, userId, spaceId: checkout.spaceId, total: checkout.totalKobo, reused: outcome.reused }, 'checkout ready');
   return { checkout: serializeCheckout(checkout), reused: outcome.reused };
+}
+
+/**
+ * Gateway rail (Interswitch IPG): there is no one-time bank account to open. The
+ * txn_ref is our reference, so all we do is store its wire form as the provider
+ * checkout id, so a webhook or callback that echoes it maps back here. The
+ * student then picks any enabled method in the popup. Idempotent: a reused
+ * checkout already has it.
+ */
+async function openGatewayCheckout(checkout: CheckoutWithItems): Promise<CheckoutWithItems> {
+  const wire = getPaymentProvider().wireReference(checkout.reference);
+  if (checkout.providerCheckoutId === wire) return checkout;
+  const updated = await db.checkout.update({ where: { id: checkout.id }, data: { providerCheckoutId: wire } });
+  return { ...updated, items: checkout.items };
 }
 
 /**
