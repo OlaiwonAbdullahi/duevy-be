@@ -177,5 +177,14 @@ describe('guest pay', () => {
     const [header, ...rows] = (await csv.text()).split('\n');
     expect(header).toBe('Name,Matric No,Level,Email,Status,Paid At,Reference,Size');
     expect(rows.find((r) => r.includes(email))).toMatch(/,M$/);
+
+    // PDF export: the same roster rendered as a letterhead report download.
+    const pdfRes = await fetch(`${await startHttp()}${path}/collections/export?format=pdf`, { headers: { Authorization: `Bearer ${repToken}` } });
+    expect(pdfRes.status).toBe(200);
+    expect(pdfRes.headers.get('content-type')).toContain('application/pdf');
+    expect(pdfRes.headers.get('content-disposition')).toContain(`collections-${dues[0]!.id}.pdf`);
+    const pdfBuf = Buffer.from(await pdfRes.arrayBuffer());
+    expect(pdfBuf.subarray(0, 5).toString()).toBe('%PDF-');
+    expect(pdfBuf.length).toBeGreaterThan(1000);
   });
 });

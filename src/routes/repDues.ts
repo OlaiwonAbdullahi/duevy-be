@@ -9,8 +9,10 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
-import { computeCharge } from '../lib/money';
+import { computeCharge, formatNaira } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
+import { renderReportPdf } from '../lib/pdf';
+import { lagosDate, type ReportTable } from '../services/reports.service';
 import { DEFAULT_GUEST_FIELDS, guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
 import { getSpaceKycState } from '../services/kyc.service';
 import { writeAudit } from '../lib/audit';
@@ -562,12 +564,16 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
 });
 
 // ---------------------------------------------------------------------------
-// GET /dues/{dueId}/collections/export — CSV roster (§7.8)
+// GET /dues/{dueId}/collections/export — roster download (§7.8)
+//   ?format=csv (default) — full data export, one column per guest question
+//   ?format=pdf           — a clean roster report on Duevy letterhead
 // ---------------------------------------------------------------------------
 function csvCell(value: string | null): string {
   const v = value ?? '';
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
+
+const exportQuery = collectionsQuery.extend({ format: z.enum(['csv', 'pdf']).default('csv') });
 
 repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
@@ -577,13 +583,52 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
     return;
   }
 
-  const parsed = collectionsQuery.safeParse(req.query);
+  const parsed = exportQuery.safeParse(req.query);
   const statusFilter = parsed.success ? parsed.data.status : 'all';
+  const format = parsed.success ? parsed.data.format : 'csv';
   const [{ students }, guests] = await Promise.all([
     buildRoster(sid, due.id, statusFilter),
     statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(sid, due.id),
   ]);
 
+  // --- PDF: a formatted roster report with a totals summary line ----------
+  if (format === 'pdf') {
+    const [memberCount, paidCount, agg] = await Promise.all([
+      db.spaceMembership.count({ where: { spaceId: sid } }),
+      db.duePayment.count({ where: { dueId: due.id, ...paidByMember(sid) } }),
+      db.duePayment.aggregate({ where: { dueId: due.id }, _sum: { amountPaid: true } }),
+    ]);
+    const collected = agg._sum.amountPaid ?? 0;
+    const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    const table: ReportTable = {
+      title: `Collections — ${due.title}`,
+      subtitle: [
+        `Category: ${due.category} · Amount: ${formatNaira(due.amount)}`,
+        `Status filter: ${statusFilter}`,
+        `Paid: ${paidCount} of ${memberCount} members · Collected: ${formatNaira(collected)} · Guest payers: ${guests.length}`,
+      ],
+      columns: [
+        { label: 'Name' }, { label: 'Matric No' }, { label: 'Level' }, { label: 'Email' },
+        { label: 'Status' }, { label: 'Paid At' }, { label: 'Reference' },
+      ],
+      rows: [
+        ...students.map((s) => [
+          s.name, s.matricNo, s.level, s.email, cap(s.status),
+          s.paidAt ? lagosDate(new Date(s.paidAt)) : null, s.reference,
+        ]),
+        ...guests.map((g) => [
+          g.name, g.matricNo, null, g.email, 'Paid (guest)', lagosDate(new Date(g.paidAt)), g.reference,
+        ]),
+      ],
+    };
+    const pdf = await renderReportPdf(table);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="collections-${due.id}.pdf"`);
+    res.status(200).send(pdf);
+    return;
+  }
+
+  // --- CSV: full data export, one column per guest question ----------------
   // A column per guest question: the due's current fields, then any that were
   // answered before being removed. Members leave them blank.
   const questions = new Map((readGuestFields(due.guestFields) ?? []).map((f) => [f.id, f.label]));

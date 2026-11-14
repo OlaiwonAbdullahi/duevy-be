@@ -59,6 +59,50 @@ const boolArg = (v: unknown): boolean => v === true || v === 'true';
 
 const payLink = (dueId: string) => `${env.FRONTEND_URL}/pay/${dueId}`;
 
+const GUEST_FIELD_TYPES = ['text', 'textarea', 'number', 'email', 'phone', 'select'] as const;
+type GuestFieldOut = { id: string; label: string; type: (typeof GUEST_FIELD_TYPES)[number]; required: boolean; options?: string[] };
+
+/** A URL/id-safe slug for a form field, derived from its label. */
+function slugify(label: string): string {
+  return (
+    label
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40) || 'field'
+  );
+}
+
+/**
+ * Turn the model's `fields` argument into the due's guest-form fields (the form
+ * builder: `dues.guestFields`). This is how "ask for their level and age"
+ * becomes real questions on the public pay form — NOT a note. Ids are derived
+ * from labels (unique, matric is reserved as a core field). A `select` without
+ * ≥2 options falls back to text. Returns null when there's nothing usable.
+ */
+function buildGuestFields(raw: unknown): GuestFieldOut[] | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: GuestFieldOut[] = [];
+  const used = new Set<string>(['matric']);
+  for (const item of raw.slice(0, 10)) {
+    const f = (item ?? {}) as Record<string, unknown>;
+    const label = str(f.label);
+    if (!label) continue;
+    const base = slugify(label);
+    let id = base;
+    for (let n = 1; used.has(id); n++) id = `${base}_${n}`.slice(0, 40);
+    used.add(id);
+    const typeRaw = str(f.type)?.toLowerCase();
+    let type: GuestFieldOut['type'] = (GUEST_FIELD_TYPES as readonly string[]).includes(typeRaw ?? '') ? (typeRaw as GuestFieldOut['type']) : 'text';
+    const options = Array.isArray(f.options)
+      ? f.options.map((o) => str(o)).filter((o): o is string => !!o).slice(0, 20)
+      : undefined;
+    if (type === 'select' && (!options || options.length < 2)) type = 'text';
+    out.push({ id, label, type, required: boolArg(f.required), ...(type === 'select' ? { options } : {}) });
+  }
+  return out.length ? out : null;
+}
+
 // --- tools ----------------------------------------------------------------
 
 export const tools: AgentTool[] = [
@@ -105,7 +149,7 @@ export const tools: AgentTool[] = [
   {
     name: 'create_due',
     description:
-      'Create a due for the space. Amount is in NAIRA. Call first WITHOUT confirmed to get the summary (face, 1.5% student fee, total, pay link) to read back to the rep; only call again with confirmed:true once they approve. Set publish:true to open it for payment immediately (needs the space to have passed KYC).',
+      'Create a due for the space. Amount is in NAIRA. Call first WITHOUT confirmed to get the summary (face, 1.5% student fee, total, extra questions, pay link) to read back to the rep; only call again with confirmed:true once they approve. Set publish:true to open it for payment immediately (needs the space to have passed KYC). When the rep wants to COLLECT extra info from payers ("ask for / collect / require X"), put those in `fields` (the form builder) — NOT in `note`.',
     parameters: {
       type: 'object',
       properties: {
@@ -113,7 +157,22 @@ export const tools: AgentTool[] = [
         amount_naira: { type: 'number', description: 'The due amount in naira (e.g. 2000 for ₦2,000).' },
         due_date: { type: 'string', description: 'Deadline as YYYY-MM-DD (today or later). You may also pass an everyday phrase like "next week", "tomorrow", "in 3 days", "Friday" or "end of the month" and it will be resolved.' },
         category: { type: 'string', enum: [...DUE_TYPES] },
-        note: { type: 'string' },
+        note: { type: 'string', description: 'A short optional message shown to payers. NOT for questions — use `fields` to collect answers.' },
+        fields: {
+          type: 'array',
+          description:
+            'The form builder: extra questions each payer answers on the public pay form. Use this whenever the rep says "ask for / collect / require" something (e.g. level, age, hostel, phone). Use type "number" for age/quantity, "select" (with options) for a fixed list like level/department, "email"/"phone" for those, else "text". Name, email and matric number are always collected already — do not add them.',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'What the payer sees, e.g. "Level" or "Age".' },
+              type: { type: 'string', enum: [...GUEST_FIELD_TYPES] },
+              required: { type: 'boolean', description: 'Must the payer answer? Default false.' },
+              options: { type: 'array', items: { type: 'string' }, description: 'Only for type "select" (≥2 options), e.g. ["100","200","300","400","500"].' },
+            },
+            required: ['label'],
+          },
+        },
         allow_guests: { type: 'boolean', description: 'Let non-members pay via the public link. Default true.' },
         publish: { type: 'boolean', description: 'Publish immediately. Default false (saved as draft).' },
         confirmed: { type: 'boolean', description: 'Only true after the rep has approved the summary.' },
@@ -131,6 +190,7 @@ export const tools: AgentTool[] = [
       if (!dueDate) return { error: `I couldn't read "${str(args.due_date) ?? ''}" as a date. Give a specific day (e.g. "next Friday", "in 2 weeks", or a date).` };
       const faceKobo = nairaToKobo(amountNaira);
       const feeKobo = checkoutFee(faceKobo);
+      const guestFields = buildGuestFields(args.fields);
       const summary = {
         title,
         amount: formatNaira(faceKobo),
@@ -138,11 +198,16 @@ export const tools: AgentTool[] = [
         studentPays: formatNaira(faceKobo + feeKobo),
         dueDate,
         category,
+        // The extra questions payers will answer on the form (the form builder).
+        formQuestions: guestFields
+          ? guestFields.map((f) => ({ label: f.label, type: f.type, required: f.required, ...(f.options ? { options: f.options } : {}) }))
+          : [],
+        note: str(args.note) ?? null,
         allowGuests: args.allow_guests === undefined ? true : boolArg(args.allow_guests),
         willPublish: boolArg(args.publish),
       };
       if (!boolArg(args.confirmed)) {
-        return { needsConfirmation: true, summary, instruction: 'Read this summary to the rep and ask them to confirm before saving.' };
+        return { needsConfirmation: true, summary, instruction: 'Read this summary to the rep (including the extra questions the form will ask) and ask them to confirm before saving.' };
       }
       const res = await apiCall({
         method: 'POST',
@@ -154,6 +219,7 @@ export const tools: AgentTool[] = [
           dueDate,
           category,
           note: str(args.note),
+          ...(guestFields ? { guestFields } : {}),
           allowGuests: summary.allowGuests,
           publish: summary.willPublish,
         },

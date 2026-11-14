@@ -63,6 +63,8 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string): str
     '- Amounts the rep types are in naira.',
     '- If they rep more than one space and none is active, ask which space, then call set_active_space.',
     '- Before creating a due, moving money, or anything destructive, call the tool WITHOUT confirmed to get a summary, read it back, and only proceed with confirmed:true once they clearly say yes.',
+    '- NEVER invent a due\'s title. If the rep did not clearly name the due, ASK them what to call it (one short question) before calling create_due. Do not guess a title like "Departmental Due".',
+    '- FORM BUILDER: when the rep says "ask for / collect / require" something from payers (e.g. "ask for their level and age"), pass those as create_due `fields` — one field per item (label + a sensible type: number for age, select with options for level, etc.). Do NOT put requested questions in the `note`; the note is only a short message. Mention the questions in the summary you read back.',
     '- Withdrawals: always show the quote and destination and get a clear yes; if the space uses a PIN, ask for the 4-digit PIN and pass it.',
     '- When you create or publish a due, give them the public pay link to share.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables.',
@@ -101,6 +103,11 @@ export async function handleMessage(userId: string, text: string): Promise<strin
       tools: toolSpecs(),
       tool_choice: 'auto',
       temperature: 0.2,
+      // Bound the output, but keep it high enough that a REASONING model (e.g. the
+      // nemotron "super"/"lightning" tiers spend tokens on hidden reasoning) still
+      // has room to produce its actual answer. A low cap truncates them to empty.
+      // The fast default (bolt, non-reasoning) uses far fewer tokens anyway.
+      max_tokens: 2048,
     });
     const msg = resp.choices[0]?.message;
     if (!msg) break;
