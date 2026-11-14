@@ -70,7 +70,6 @@ async function main() {
     JWT_REFRESH_SECRET: 'dash-refresh-secret-0123456789abcdef012345678',
     RESEND_API_KEY: 're_dash',
     PAYMENT_PROVIDER: 'fake',
-    NINEJAPAY_SECRET_KEY: 'whsec_dash',
     FILE_STORAGE: 'memory',
     RUN_WORKERS: 'false',
   });
@@ -102,7 +101,7 @@ async function main() {
   const rep = await db.user.create({ data: { name: 'Rep', email: 'rep@dash.duevy', role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved', emailVerified: true } });
   const admin = await db.user.create({ data: { name: 'Admin', email: 'admin@dash.duevy', role: 'admin', adminSubRole: 'super_admin', emailVerified: true } });
   await db.adminPermission.create({ data: { userId: admin.id, userManagement: true, payouts: true, disputes: true, overrides: true } });
-  const space = await db.space.create({ data: { name: 'CSC 300L', short: 'CSC', kind: 'department', school: 'LAUTECH', joinCode: 'CSC-DASH', walletAccountId: 'va_dash', walletAccountNumber: '9100000001', walletAccountName: 'DUEVY/CSC', walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() } });
+  const space = await db.space.create({ data: { name: 'CSC 300L', short: 'CSC', kind: 'department', school: 'LAUTECH', joinCode: 'CSC-DASH', walletAccountId: 'va_dash', walletAccountNumber: '9100000001', walletAccountName: 'DUEVY/CSC', walletBankName: 'Duevy Test', walletBankCode: '090629', walletCreatedAt: new Date() } });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
   const dues = [];
   for (let d = 0; d < 8; d++) {

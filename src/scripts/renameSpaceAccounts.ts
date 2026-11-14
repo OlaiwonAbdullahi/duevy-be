@@ -1,7 +1,7 @@
 /**
  * One-off: give every existing space account the unique name
  * "DUEVY/<space name>-<3 letters>" (accounts opened before the suffix show
- * just "DUEVY/<space name>"). Uses 9jaPay's Update Permanent Virtual Account.
+ * just "DUEVY/<space name>"). Uses the provider's Update Permanent Virtual Account.
  *
  * Run where the API's production env is loaded (the API container), ideally
  * when withdrawals are quiet: the API and worker re-read a sending account's

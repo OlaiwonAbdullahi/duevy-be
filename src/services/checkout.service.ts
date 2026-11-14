@@ -23,10 +23,10 @@ import { renderReceiptByNumber } from './receipt.service';
  *
  *   face  = Σ due amounts          → credited to the space in full
  *   fee   = 1.5% of face           → the processing fee, paid by the student
- *                                    on top (covers 9jaPay's charges)
+ *                                    on top (covers the provider's charges)
  *   total = face + fee             → what the student transfers
  *
- * The money settles into Duevy's 9jaPay business account; the space's share
+ * The money settles into Duevy's the provider business account; the space's share
  * is credited to its ledger here and swept into its own account later
  * (sweep.service).
  *
@@ -61,8 +61,10 @@ export function serializeCheckout(c: CheckoutWithItems) {
   // Gateway rails (Interswitch IPG): the frontend opens the inline popup with
   // these. The popup shows every payment method enabled for the merchant —
   // card, bank transfer, USSD, QR, etc. — not just card.
+  // Always open the gateway popup when the provider supports it (Interswitch IPG);
+  // the gateway is the only collection path now.
   const gateway =
-    c.status === 'pending' && provider.collectsByGateway && provider.createGatewayCheckout
+    c.status === 'pending' && provider.createGatewayCheckout
       ? provider.createGatewayCheckout({ reference: c.reference, totalKobo: c.totalKobo, redirectUrl: gatewayRedirectUrl(c.reference) })
       : null;
   return {
@@ -381,7 +383,7 @@ async function openCollectionAccount(checkout: CheckoutWithItems, reused: boolea
 
 /**
  * After the student already has the account on screen: replace the estimated
- * name and expiry with 9jaPay's own. Fire-and-forget, one retry (9jaPay tends
+ * name and expiry with the provider's own. Fire-and-forget, one retry (the provider tends
  * to answer the first look-up straight after creation with a 500).
  */
 function refineCollectionAccount(checkoutId: string, accountNumber: string): void {
@@ -490,7 +492,7 @@ export async function fulfilCheckout(
   /** The provider charge the money arrived on, when the event names one. */
   providerChargeId: string | null = null,
   /**
-   * The provider credit that paid it (9jaPay transactionId). Unique across
+   * The provider credit that paid it (the provider transactionId). Unique across
    * checkouts: a second checkout claiming the same credit fails to commit.
    */
   providerTransactionId: string | null = null,

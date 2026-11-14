@@ -15,7 +15,7 @@ beforeAll(async () => {
 afterAll(stopHttp);
 
 /**
- * A student's transfer lands in the checkout's one-time account: 9jaPay's
+ * A student's transfer lands in the checkout's one-time account: the provider's
  * records show it (what the handler reads back), and the webhook says so.
  */
 async function pay(checkout: { reference: string }, receivedKobo: number, eventId: string) {
@@ -31,7 +31,7 @@ describe('webhook idempotency', () => {
     const { space, students, dues } = await makeSpace({ dues: [500_000, 150_000] });
     const { checkout } = await createCheckout(students[0]!.id, dues.map((d) => d.id));
     expect(checkout.breakdown).toEqual({ face: 650_000, fee: 9_750, total: 659_750 });
-    expect(checkout.bankTransfer).toMatchObject({ bankName: '9jaPay', amountKobo: 659_750 });
+    expect(checkout.bankTransfer).toMatchObject({ bankName: 'Duevy Test', amountKobo: 659_750 });
 
     // Same event id, five times — three of them concurrently.
     expect(await pay(checkout, checkout.amount, 'txn_dup_1')).toBe(200);
@@ -56,11 +56,11 @@ describe('webhook idempotency', () => {
     expect((await db.transaction.findUniqueOrThrow({ where: { reference: c.reference } })).status).toBe('completed');
   });
 
-  it('never trusts the event body: a credit 9jaPay has no record of changes nothing', async () => {
+  it('never trusts the event body: a credit the provider has no record of changes nothing', async () => {
     const { space, students, dues } = await makeSpace();
     const { checkout } = await createCheckout(students[0]!.id, [dues[0]!.id]);
     const c = await db.checkout.findUniqueOrThrow({ where: { reference: checkout.reference } });
-    // Correctly signed, but 9jaPay's transaction list shows nothing arrived.
+    // Correctly signed, but the provider's transaction list shows nothing arrived.
     await sendWebhook(creditEvent({ accountNumber: c.vaAccountNumber!, accountRequestReference: c.providerCheckoutId!, amountKobo: c.totalKobo }));
     await drainWebhookQueue();
     expect((await db.checkout.findUniqueOrThrow({ where: { id: c.id } })).status).toBe('pending');
@@ -69,7 +69,7 @@ describe('webhook idempotency', () => {
 
   it('rejects an unsigned or wrongly signed delivery with 401 and stores nothing', async () => {
     const before = await db.webhookEvent.count();
-    const res = await fetch(`${await startHttp()}/v1/webhooks/9japay`, {
+    const res = await fetch(`${await startHttp()}/v1/webhooks/interswitch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Signature: 'bm90IGEgcmVhbCBzaWduYXR1cmU=' },
       body: JSON.stringify({ eventType: 'new_transaction', data: { id: 'forged', transactionType: 'Credit' } }),

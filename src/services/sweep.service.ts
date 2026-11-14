@@ -16,13 +16,13 @@ import { dispatchPayout } from './withdrawal.service';
 /**
  * Space accounts and sweeps.
  *
- * Every space owns a permanent 9jaPay account. Students pay into one-time
+ * Every space owns a permanent the provider account. Students pay into one-time
  * accounts that settle into Duevy's business account; the sweep then moves
  * each space's share into the space's own account, once a day or straight
  * away when a withdrawal needs it. Withdrawals are paid out of the space's
  * account.
  *
- *   unswept  = the space's 9jaPay collections (ledger due_payment credits)
+ *   unswept  = the space's the provider collections (ledger due_payment credits)
  *              − its sweeps that haven't failed
  *   in space account = ledger balance − unswept
  *
@@ -30,10 +30,10 @@ import { dispatchPayout } from './withdrawal.service';
  * credited to the ledger but never counted as unswept: it is already there.
  *
  * A sweep doesn't touch the ledger: the money is the space's either way, and
- * 9jaPay bills the transfer to Duevy (covered by the checkout processing
+ * the provider bills the transfer to Duevy (covered by the checkout processing
  * fee). Each space account may move at most DAILY_LIMIT_KOBO a day, counting
  * sweeps and direct deposits in and withdrawals out (Africa/Lagos days), and a space may
- * withdraw at most DAILY_PAYOUT_LIMIT_KOBO of that. 9jaPay refuses a single
+ * withdraw at most DAILY_PAYOUT_LIMIT_KOBO of that. the provider refuses a single
  * transfer over MAX_TRANSFER_KOBO, so a large sweep goes as several.
  *
  * Status: pending → processing → succeeded | failed. A failed sweep simply
@@ -75,7 +75,7 @@ export async function ensureSpaceAccount(spaceId: string): Promise<Space> {
   const space = await db.space.findUniqueOrThrow({ where: { id: spaceId } });
   if (space.walletAccountNumber) return space;
 
-  // 9jaPay puts the business name in front itself: "DUEVY/<space name>-<suffix>".
+  // the provider puts the business name in front itself: "DUEVY/<space name>-<suffix>".
   const accountName = await uniqueSpaceAccountName(space);
   const account = await getPaymentProvider().createSpaceAccount({ reference: space.id, accountName });
   // Only fill it in if nobody else did meanwhile; the loser's account is
@@ -176,8 +176,8 @@ export async function getDailyWithdrawnKobo(spaceId: string, tx: Tx | typeof db 
 }
 
 /**
- * Every sweep leaves from Duevy's business account, which 9jaPay lets send
- * NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO a Lagos day across all spaces. Callers
+ * Every sweep leaves from Duevy's business account, which the provider lets send
+ * BUSINESS_DAILY_LIMIT_KOBO a Lagos day across all spaces. Callers
  * take this lock (after the space's) before reading the allowance and
  * recording a sweep, so two spaces can't both spend the last of it.
  */
@@ -190,7 +190,7 @@ export async function getBusinessSweepAllowanceKobo(tx: Tx | typeof db = db): Pr
   const rows = await tx.$queryRaw<{ swept: bigint | null }[]>`
     SELECT COALESCE(SUM("amountKobo"), 0)::bigint AS swept FROM "sweeps"
      WHERE "status" <> 'failed' AND "createdAt" >= ${startOfLagosDay()}`;
-  return Math.max(0, env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO - Number(rows[0]?.swept ?? 0));
+  return Math.max(0, env.BUSINESS_DAILY_LIMIT_KOBO - Number(rows[0]?.swept ?? 0));
 }
 
 /** What has been swept into the space's account today. */
@@ -303,7 +303,7 @@ export async function startSweep(spaceId: string, trigger: SweepTrigger, maxKobo
   return sweeps;
 }
 
-/** Send a pending sweep. Safe to repeat: 9jaPay refuses a second transfer under the same reference. */
+/** Send a pending sweep. Safe to repeat: the provider refuses a second transfer under the same reference. */
 export async function dispatchSweep(sweepId: string): Promise<void> {
   const sweep = await db.sweep.findUnique({ where: { id: sweepId }, include: { space: true } });
   if (!sweep || sweep.status !== 'pending') return;
@@ -369,7 +369,7 @@ async function releaseWaitingPayouts(sweepId: string): Promise<void> {
   }
 }
 
-/** Ask 9jaPay about a sweep and apply the answer. */
+/** Ask the provider about a sweep and apply the answer. */
 export async function refreshSweep(sweepId: string): Promise<void> {
   const sweep = await db.sweep.findUnique({ where: { id: sweepId } });
   if (!sweep || (sweep.status !== 'processing' && sweep.status !== 'pending')) return;
@@ -377,7 +377,7 @@ export async function refreshSweep(sweepId: string): Promise<void> {
   try {
     result = await getPaymentProvider().getTransfer(sweep.reference);
   } catch (err) {
-    // Never reached 9jaPay: send it (again). The reference stops a double send.
+    // Never reached the provider: send it (again). The reference stops a double send.
     if (err instanceof ProviderError && err.code === 'NOT_FOUND') {
       if (sweep.status === 'processing') await db.sweep.update({ where: { id: sweep.id }, data: { status: 'pending' } });
       await dispatchSweep(sweep.id);

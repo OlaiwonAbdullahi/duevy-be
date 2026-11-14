@@ -1,8 +1,8 @@
 # Interswitch integration
 
 The hackathon payment rail (Interswitch Discovery Series). Set
-`PAYMENT_PROVIDER=interswitch` to use it. It implements the same
-`PaymentProvider` interface as 9jaPay (`src/providers/payment/types.ts`), so the
+`PAYMENT_PROVIDER=interswitch` to use it. It implements the shared
+`PaymentProvider` interface (`src/providers/payment/types.ts`), so the
 ledger, checkout, sweep, withdrawal and reconciliation machinery is unchanged —
 the ledger stays the single source of truth and every amount stays in **kobo**.
 

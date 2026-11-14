@@ -18,7 +18,7 @@ async function main() {
     data: { name: 'Rehearsal Rep', email: `rep_${run}@rehearsal.duevy`, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved' },
   });
   const space = await db.space.create({
-    data: { name: `Rehearsal ${run}`, short: 'RHS', kind: 'department', school: 'LAUTECH', joinCode: `RH-${run}`.slice(0, 24), walletAccountId: `va_rh_${run}`, walletAccountNumber: `92${String(run).slice(-8)}`, walletAccountName: 'DUEVY/RHS', walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() },
+    data: { name: `Rehearsal ${run}`, short: 'RHS', kind: 'department', school: 'LAUTECH', joinCode: `RH-${run}`.slice(0, 24), walletAccountId: `va_rh_${run}`, walletAccountNumber: `92${String(run).slice(-8)}`, walletAccountName: 'DUEVY/RHS', walletBankName: 'Duevy Test', walletBankCode: '090629', walletCreatedAt: new Date() },
   });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
   const due = await db.due.create({ data: { spaceId: space.id, title: 'Rehearsal due', amount: 250_000, dueDate: new Date(Date.now() + 30 * 86_400_000), category: 'departmental_due', status: 'active' } });

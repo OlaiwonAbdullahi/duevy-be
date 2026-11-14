@@ -6,7 +6,7 @@ import { lagosDate, lagosDayEnd, lagosDayStart } from '../../services/reports.se
 import { installFakeProvider, makeSpace, startHttp, stopHttp, tokenFor } from './fixtures';
 
 /**
- * Admin reports are built from the 9jaPay-era records — checkouts, space
+ * Admin reports are built from the the provider-era records — checkouts, space
  * ledgers, payouts, sweeps and direct deposits — in naira, over whole Lagos days.
  */
 
@@ -95,7 +95,7 @@ describe('POST /admin/reports', () => {
 });
 
 describe('report contents', () => {
-  it('financial summary: 9jaPay money in naira, for one space, including today', async () => {
+  it('financial summary: the provider money in naira, for one space, including today', async () => {
     const s = await seeded();
     const created = await post({ scope: 'financial_summary', format: 'csv', from: today(), to: today(), spaceId: s.space.id });
     const file = await download(created.body.data.id);
@@ -111,7 +111,7 @@ describe('report contents', () => {
     expect(find(rows, 'Withdrawals paid out (gross from space balances)')?.slice(1)).toEqual(['1', '1000.00']);
     expect(find(rows, '  sent to reps’ banks')?.[2]).toBe('946.25');
     expect(find(rows, 'Sweeps into space accounts')?.slice(1)).toEqual(['1', '5000.00']);
-    expect(find(rows, '9jaPay sweep charges (Duevy cost)')?.[2]).toBe('50.00');
+    expect(find(rows, 'Sweep charges (Duevy cost)')?.[2]).toBe('50.00');
     // 5,000 + 2,500 − 1,000
     expect(find(rows, 'Owed to this space at end of period')?.[2]).toBe('6500.00');
   });

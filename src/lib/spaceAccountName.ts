@@ -1,7 +1,7 @@
 import { randomInt } from 'crypto';
 
 /**
- * The name on a space's 9jaPay account: "<space name>-<3 letters>", which the
+ * The name on a space's the provider account: "<space name>-<3 letters>", which the
  * bank shows as "DUEVY/<space name>-<3 letters>". The letters make the name
  * unique, so two spaces called "Computer Science Department" (at different
  * schools, or a space recreated after archiving) can't be mistaken for each
@@ -11,7 +11,7 @@ import { randomInt } from 'crypto';
  * I/O, the letters most often misread as digits.
  */
 
-/** What we send; 9jaPay adds its own "DUEVY/" in front. */
+/** What we send; the provider adds its own "DUEVY/" in front. */
 export const SPACE_ACCOUNT_NAME_MAX = 50;
 export const SUFFIX_LENGTH = 3;
 const SUFFIX_LETTERS = 'BCDFGHJKLMNPQRSTVWXZ';

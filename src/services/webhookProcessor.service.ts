@@ -20,8 +20,8 @@ import { confirmReceivedPayment } from '../jobs/reconciliation';
  * keys) for the same OUTCOME arriving under different event ids, e.g. a
  * webhook racing the reconciliation poll.
  *
- * 9jaPay events carry no timestamp, so a captured one could be replayed. No
- * handler acts on an event's contents: each asks 9jaPay (the account's
+ * the provider events carry no timestamp, so a captured one could be replayed. No
+ * handler acts on an event's contents: each asks the provider (the account's
  * transactions, the transfer status query) and applies that answer.
  */
 
@@ -93,7 +93,7 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
       return;
     }
     case 'account.credited':
-      // A sweep landing, or money sent straight to the space account: 9jaPay's
+      // A sweep landing, or money sent straight to the space account: the provider's
       // records say which.
       await refreshSweepsForAccount(event.accountNumber);
       await syncDirectDepositsForAccount(event.accountNumber);

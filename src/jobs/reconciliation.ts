@@ -30,7 +30,7 @@ const CHECK_PROCESSING_AFTER_MS = 15 * 60 * 1000;
  * When a payment into a checkout's one-time account can have landed: from
  * when the checkout was created (less a little slack for clock skew: the
  * account itself opens after that) to when it expired. No slack after
- * expiry: expiresAt is 9jaPay's own, it refuses money after it, and the
+ * expiry: expiresAt is the provider's own, it refuses money after it, and the
  * number can be handed to the next checkout straight away. Kept tight both
  * ends, since a reused number's previous payment can sit just before.
  */

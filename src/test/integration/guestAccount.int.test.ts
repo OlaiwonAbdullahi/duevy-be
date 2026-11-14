@@ -328,7 +328,7 @@ describe('a payment event', () => {
     const c = await open(due.id, { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail() });
     const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } });
 
-    // A signed credit event, but 9jaPay's records don't show the money yet: nothing changes.
+    // A signed credit event, but the provider's records don't show the money yet: nothing changes.
     const { creditEvent, sendWebhook } = await import('./fixtures');
     await sendWebhook(
       creditEvent({ id: `txn_early_${c.reference}`, accountNumber: checkout.vaAccountNumber!, accountRequestReference: checkout.providerCheckoutId!, amountKobo: c.amount }),

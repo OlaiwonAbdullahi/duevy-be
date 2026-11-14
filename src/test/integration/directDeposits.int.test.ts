@@ -31,7 +31,7 @@ function credit(source: AccountCredit['source'], amountKobo: number): AccountCre
   };
 }
 
-/** 9jaPay tells us a space account was credited. */
+/** the provider tells us a space account was credited. */
 async function notify(space: { id: string; walletAccountNumber: string | null }, id: string) {
   await sendWebhook(creditEvent({ id, accountNumber: space.walletAccountNumber!, accountRequestReference: Fake.spaceAccountReference(space.id), amountKobo: 1 }));
   await drainWebhookQueue();

@@ -83,7 +83,7 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     inFlight: ledger.inFlight,
     // Kept for older clients: lifetime amount withdrawn.
     lifetime: ledger.withdrawn,
-    // The space's own 9jaPay account (null while it's being opened), and where
+    // The space's own the provider account (null while it's being opened), and where
     // its balance sits: swept into that account, or still awaiting the daily
     // sweep in Duevy's account. Withdrawals sweep what they need first.
     account: account?.walletAccountNumber
@@ -103,7 +103,7 @@ payoutsRouter.get('/payout/summary', async (req: Request, res: Response): Promis
     awaitingApprovalPayoutId: awaitingApproval?.id ?? null,
     minPayout: MIN_PAYOUT_KOBO,
     maxPayout: MAX_PAYOUT_KOBO,
-    // 9jaPay's transfer charge by withdrawal amount. `toKobo` is exclusive; null = no upper bound.
+    // the provider's transfer charge by withdrawal amount. `toKobo` is exclusive; null = no upper bound.
     // `feeKobo` = `chargeKobo` + `vatKobo` (7.5% VAT on the charge).
     fees: {
       bands: [

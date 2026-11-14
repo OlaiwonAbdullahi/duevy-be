@@ -7,7 +7,7 @@ import { app } from '../../app';
 import { signAccessToken } from '../../lib/jwt';
 import { encrypt, maskAccountNumber } from '../../lib/encryption';
 import { FakeProvider, setPaymentProvider } from '../../providers/payment';
-import { computeNineJaPaySignature } from '../../providers/payment/ninejapay/signature';
+import { computeFakeSignature } from '../../providers/payment/fake/wire';
 import { FakeVerifier, setIdentityVerifier } from '../../providers/identity';
 import { appendLedgerEntry } from '../../services/ledger.service';
 
@@ -15,7 +15,7 @@ import { appendLedgerEntry } from '../../services/ledger.service';
 export const TEST_PIN = '2580';
 const TEST_PIN_HASH = hashPasswordSync(TEST_PIN, 4);
 
-export const WEBHOOK_SECRET = process.env.NINEJAPAY_SECRET_KEY ?? 'whsec_test_secret';
+export const WEBHOOK_SECRET = 'whsec_test_secret';
 
 export function installFakeProvider(): FakeProvider {
   const fake = new FakeProvider([WEBHOOK_SECRET]);
@@ -33,7 +33,7 @@ let seq = 0;
 let accountSeq = Math.floor(Math.random() * 1_000_000);
 const uniq = () => `${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-/** A KYC-verified lead rep with a space (and its own 9jaPay account), a beneficiary, and N members. */
+/** A KYC-verified lead rep with a space (and its own account), a beneficiary, and N members. */
 export async function makeSpace(opts: { members?: number; dues?: number[]; verified?: boolean } = {}) {
   const u = uniq();
   const verified = opts.verified ?? true;
@@ -55,7 +55,7 @@ export async function makeSpace(opts: { members?: number; dues?: number[]; verif
       name: `Space ${u}`, short: 'TST', kind: 'department', school: 'LAUTECH', joinCode: `TST-${u}`.slice(0, 24),
       withdrawalPinHash: TEST_PIN_HASH, withdrawalPinSetAt: new Date(),
       walletAccountId: `va_${u}`, walletAccountNumber: `91${String(++accountSeq).padStart(8, '0')}`,
-      walletAccountName: `DUEVY/Space ${u}`, walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date(),
+      walletAccountName: `DUEVY/Space ${u}`, walletBankName: 'Duevy Test', walletBankCode: '090629', walletCreatedAt: new Date(),
     },
   });
   await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
@@ -149,18 +149,18 @@ export async function api(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** POST a signed 9jaPay-format event to the webhook route. */
+/** POST a signed fake-rail event to the webhook route. */
 export async function sendWebhook(event: Record<string, unknown>) {
   const raw = JSON.stringify(event);
-  const res = await fetch(`${base}/v1/webhooks/9japay`, {
+  const res = await fetch(`${base}/v1/webhooks/interswitch`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Signature: computeNineJaPaySignature(WEBHOOK_SECRET, raw) },
+    headers: { 'Content-Type': 'application/json', Signature: computeFakeSignature(WEBHOOK_SECRET, raw) },
     body: raw,
   });
   return res.status;
 }
 
-/** A 9jaPay credit into an account, as `new_transaction` sends it. */
+/** A credit into an account, as `new_transaction` sends it. */
 export function creditEvent(opts: { accountNumber: string; accountRequestReference: string; amountKobo: number; id?: string }) {
   return {
     eventType: 'new_transaction',
@@ -181,7 +181,7 @@ export function creditEvent(opts: { accountNumber: string; accountRequestReferen
 }
 
 /**
- * A student's transfer lands in a checkout's one-time account: 9jaPay's
+ * A student's transfer lands in a checkout's one-time account: the provider's
  * records show it (what the handler reads back) and the webhook says so.
  * Pass `receivedKobo` for an under- or overpayment. Drain the queue after.
  */
@@ -194,7 +194,7 @@ export async function payCheckout(fake: FakeProvider, reference: string, opts: {
   );
 }
 
-/** 9jaPay's report that a transfer we started has a final status. */
+/** the provider's report that a transfer we started has a final status. */
 export function transferEvent(providerReference: string, status: 'Success' | 'Failed', eventId = randomUUID()) {
   return { eventId, eventType: 'transfer_response', data: { requestReference: providerReference, sessionId: '999', status } };
 }

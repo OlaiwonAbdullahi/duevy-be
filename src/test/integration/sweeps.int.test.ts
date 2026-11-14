@@ -155,7 +155,7 @@ describe('withdrawals and the sweep', () => {
 
   it('needs no sweep when the space account already holds enough', async () => {
     const s = await makeSpace();
-    await creditSpace(s.space.id, 1_000_000); // not a 9jaPay collection: nothing to sweep
+    await creditSpace(s.space.id, 1_000_000); // not a the provider collection: nothing to sweep
     const p = await requestWithdrawal({ spaceId: s.space.id, userId: s.rep.id, beneficiaryId: s.beneficiary!.id, amountKobo: 300_000, pin: TEST_PIN });
     expect(p.sweepId).toBeNull();
     expect(p.status).toBe('processing');
@@ -196,7 +196,7 @@ describe('withdrawal limits: ₦500k at once, ₦5M a day per space', () => {
     expect(await getWithdrawalAllowanceKobo(s.space.id)).toBe(50_000_000);
   });
 
-  it('splits a sweep into transfers of at most ₦1,000,000 (9jaPay’s single-transfer limit)', async () => {
+  it('splits a sweep into transfers of at most ₦1,000,000 (the provider’s single-transfer limit)', async () => {
     const s = await makeSpace({ dues: [250_000_000] }); // a ₦2.5M due
     await collect(s);
     await runDailySweeps(afterSweepHour());
@@ -258,11 +258,11 @@ describe('space accounts', () => {
 describe("the business account's daily limit (shared by every space's sweeps)", () => {
   /** Leave exactly `leftKobo` of today's business allowance, whatever earlier tests swept. */
   function capBusinessAt(leftKobo: number) {
-    const original = env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO;
+    const original = env.BUSINESS_DAILY_LIMIT_KOBO;
     return getBusinessSweepAllowanceKobo().then((allowance) => {
-      env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO = original - allowance + leftKobo;
+      env.BUSINESS_DAILY_LIMIT_KOBO = original - allowance + leftKobo;
       return () => {
-        env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO = original;
+        env.BUSINESS_DAILY_LIMIT_KOBO = original;
       };
     });
   }

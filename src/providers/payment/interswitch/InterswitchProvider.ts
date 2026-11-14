@@ -22,7 +22,7 @@ import {
 } from '../types';
 import { InterswitchClient, type InterswitchConfig } from './client';
 import { normaliseInterswitchEvent } from './events';
-import { MalformedEventError } from '../ninejapay/events';
+import { MalformedEventError } from '../types';
 import { verifyInterswitchSignature } from './signature';
 
 /**

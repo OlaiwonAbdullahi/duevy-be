@@ -24,7 +24,7 @@ describe('ledger balance', () => {
     await creditSpace(space.id, 2_500_000); // ₦25,000
     expect(await getSpaceBalance(space.id)).toBe(5_500_000);
 
-    // ₦20,000 withdrawal: 9jaPay's ₦15 transfer fee + VAT (₦16.13), ₦19,983.87 sent, ₦20,000 debited.
+    // ₦20,000 withdrawal: the provider's ₦15 transfer fee + VAT (₦16.13), ₦19,983.87 sent, ₦20,000 debited.
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 2_000_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
     expect({ fee: p.feeKobo, net: p.netKobo }).toEqual({ fee: 1_613, net: 1_998_387 });
@@ -122,8 +122,8 @@ describe('withdrawals', () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 2_000_000);
     const a = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 1_000_000, pin: TEST_PIN });
-    expect(a.providerPayoutId).toBe(a.reference.replace(/-/g, '')); // 9jaPay takes letters and digits only
-    // The event only prompts a status query; 9jaPay's answer is what counts.
+    expect(a.providerPayoutId).toBe(a.reference.replace(/-/g, '')); // the provider takes letters and digits only
+    // The event only prompts a status query; the provider's answer is what counts.
     await sendWebhook(transferEvent(a.providerPayoutId!, 'Success', `evt_pp_${a.reference}`));
     await drainWebhookQueue();
     expect((await db.payout.findUniqueOrThrow({ where: { id: a.id } })).status).toBe('processing');
@@ -344,7 +344,7 @@ describe('beneficiaries', () => {
     expect(sent.from.accountNumber).toBe(space.walletAccountNumber);
     // What the recipient's statement shows: "Duevy/<code> sent you NGN<amount>", no reference.
     expect(sent.narration).toBe(`Duevy/TST sent you ${narrationAmount(p.netKobo)}`);
-    expect(sent.narration).not.toContain('.'); // 9jaPay strips dots
+    expect(sent.narration).not.toContain('.'); // the provider strips dots
     expect(sent.narration).toBe(transferNarration({ spaceCode: 'TST', amountKobo: p.netKobo }));
 
     // The sender's side reads "You sent NGN… to <name>": the ledger line now, and once it arrives,

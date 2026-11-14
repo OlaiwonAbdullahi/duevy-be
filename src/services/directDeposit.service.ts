@@ -9,14 +9,14 @@ import { appendLedgerEntry, lockSpace } from './ledger.service';
  * account, so there is nothing to sweep; it is credited to the space as it is
  * (ledger direct_deposit), with no due attached.
  *
- * Found two ways, both reading 9jaPay's own records (never the event body):
+ * Found two ways, both reading the provider's own records (never the event body):
  *   - the credit webhook on the space account, straight away;
  *   - reconciliation, which reads every space account every few hours in case
  *     a webhook never came.
  *
  * Our own sweeps and payouts the bank sent back are credits on the same
  * account; the provider tells them apart (AccountCredit.source) and only
- * 'external' ones are recorded. Each 9jaPay transaction is recorded once.
+ * 'external' ones are recorded. Each the provider transaction is recorded once.
  */
 
 const HOUR_MS = 60 * 60 * 1000;

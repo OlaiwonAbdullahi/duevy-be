@@ -22,34 +22,18 @@ const envSchema = z.object({
   RESEND_API_KEY: z.string(),
   RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
-  // Payment rail. 'interswitch' is the hackathon rail (Interswitch IPG Web
-  // Checkout for students + Virtual Accounts & Payouts for spaces);
-  // 'ninejapay' is the previous live provider, kept selectable; 'fake' is an
+  // Payment rail. 'interswitch' is the live rail (Interswitch IPG Web Checkout
+  // for students + Virtual Accounts & Payouts for spaces); 'fake' is an
   // in-memory stand-in for local development, the seed and the test suite.
-  // See src/providers/payment/ and docs/INTERSWITCH.md / docs/NINEJAPAY.md.
-  PAYMENT_PROVIDER: z.enum(['interswitch', 'ninejapay', 'fake']).default('ninejapay'),
+  // See src/providers/payment/ and docs/INTERSWITCH.md.
+  PAYMENT_PROVIDER: z.enum(['interswitch', 'fake']).default('interswitch'),
 
-  // 9jaPay (docs.9japay.com) — virtual accounts under Duevy's own business.
-  // The live base URL comes from 9jaPay at onboarding.
-  NINEJAPAY_BASE_URL: z.string().url().default('https://developer.test.9japay.com'),
-  NINEJAPAY_API_KEY: z.string().optional(),
-  // Also the webhook signing key: 9jaPay signs deliveries with it.
-  NINEJAPAY_SECRET_KEY: z.string().optional(),
-  // Duevy's business (collection) account: where collections settle and
-  // sweeps are sent from. Its name is looked up from 9jaPay, not configured.
-  NINEJAPAY_BUSINESS_ACCOUNT_NUMBER: z.string().optional(),
-  // 9jaPay's own bank code, for transfers into a space's account.
-  NINEJAPAY_BANK_CODE: z.string().default('090629'),
-  // Sandbox only: the key 9jaPay issues for its simulate-deposit call. Set, on
-  // the sandbox base URL, it turns on POST /v1/dev/simulate-deposit.
-  NINEJAPAY_SANDBOX_AUTH_KEY: z.string().optional(),
   // A space's unswept collections below this wait for the next day's sweep.
   SWEEP_MIN_KOBO: z.coerce.number().int().positive().default(100_000),
-  // 9jaPay's daily transfer limit on the business account (₦10M for now; it
-  // will be raised). Every sweep leaves from it, so all spaces' sweeps in a
-  // Lagos day share it. Withdrawals leave from each space's own account and
-  // don't count here.
-  NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO: z.coerce.number().int().positive().default(1_000_000_000),
+  // Daily transfer limit on the business (collection) account (₦10M for now).
+  // Every sweep leaves from it, so all spaces' sweeps in a Lagos day share it.
+  // Withdrawals leave from each space's own account and don't count here.
+  BUSINESS_DAILY_LIMIT_KOBO: z.coerce.number().int().positive().default(1_000_000_000),
 
   // ---------------------------------------------------------------------------
   // Interswitch — the hackathon payment rail (docs.interswitchgroup.com).
@@ -177,15 +161,6 @@ const envSchema = z.object({
   FEATURE_POLLS: z.string().transform((v) => v === 'true').default('false'),
   FEATURE_REFERRALS: z.string().transform((v) => v === 'true').default('false'),
 }).superRefine((val, ctx) => {
-  if (val.PAYMENT_PROVIDER === 'ninejapay') {
-    for (const key of [
-      'NINEJAPAY_API_KEY',
-      'NINEJAPAY_SECRET_KEY',
-      'NINEJAPAY_BUSINESS_ACCOUNT_NUMBER',
-    ] as const) {
-      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when PAYMENT_PROVIDER=ninejapay' });
-    }
-  }
   if (val.PAYMENT_PROVIDER === 'interswitch') {
     for (const key of [
       'INTERSWITCH_CLIENT_ID',

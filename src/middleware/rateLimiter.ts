@@ -184,7 +184,7 @@ export const guestLinkLimiter = limiter("guestLink", {
   },
 });
 
-// Starting a guest payment opens a real one-time account at 9jaPay, so one
+// Starting a guest payment opens a real one-time account at the provider, so one
 // person stays at 10 a minute (keyed by account when signed in, else by
 // network + email)…
 export const guestCheckoutPersonLimiter = limiter("guestCheckoutPerson", {

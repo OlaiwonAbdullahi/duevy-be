@@ -8,18 +8,17 @@ import { env } from '../config/env';
 export const webhooksRouter = Router();
 
 /**
- * POST /webhooks/9japay — public; authenticated by signature only. Register
- * this URL in the 9jaPay dashboard (Settings → Developer), test and live.
+ * POST /webhooks/interswitch — public; authenticated by signature only.
+ * Register this URL in the provider's dashboard (test and live).
  *
  * Does the minimum and returns 200 fast:
  *   1. Verify the signature over the exact raw bytes (401 if it fails).
  *   2. Enqueue, deduplicated by the event id (a duplicate is a no-op).
  *   3. 200. The work happens in src/jobs/webhookWorker.ts.
  *
- * A 5xx is returned only if we could not durably store the event, so 9jaPay
- * resends it (up to 10 times). Anything authenticated but unreadable is
- * stored as `dead` for a human and acknowledged — retrying it would never
- * succeed.
+ * A 5xx is returned only if we could not durably store the event, so the
+ * provider resends it. Anything authenticated but unreadable is stored as
+ * `dead` for a human and acknowledged — retrying it would never succeed.
  */
 async function handleProviderWebhook(req: Request, res: Response): Promise<void> {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
@@ -59,14 +58,12 @@ async function handleProviderWebhook(req: Request, res: Response): Promise<void>
 }
 
 /**
- * Provider webhooks. Both paths run the same handler, which verifies and
- * normalises the event through whichever provider is configured
- * (PAYMENT_PROVIDER). Register the matching URL in that provider's dashboard.
+ * Provider webhook. Verifies and normalises the event through whichever
+ * provider is configured (PAYMENT_PROVIDER). Register this URL in the
+ * provider's dashboard.
  *
- *   POST /webhooks/9japay       — 9jaPay
  *   POST /webhooks/interswitch  — Interswitch (Quickteller Business → webhooks)
  */
-webhooksRouter.post('/9japay', handleProviderWebhook);
 webhooksRouter.post('/interswitch', handleProviderWebhook);
 
 /**

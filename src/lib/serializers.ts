@@ -51,7 +51,7 @@ export function serializePayout(p: Payout) {
   const legacy = p.provider === 'anchor';
   const fee = legacy ? p.duevyFeeKobo + p.anchorFeeKobo + p.stampDutyKobo : p.feeKobo;
   const net = legacy ? p.netSentKobo : p.netKobo;
-  // `fee` split into 9jaPay's transfer charge and the 7.5% VAT on it.
+  // `fee` split into the provider's transfer charge and the 7.5% VAT on it.
   const { chargeKobo, vatKobo } = legacy ? { chargeKobo: fee, vatKobo: 0 } : splitWithdrawalFee(fee);
   return {
     id: p.id,

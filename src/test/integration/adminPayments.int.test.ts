@@ -5,9 +5,9 @@ import { createCheckout, findCheckoutId, fulfilCheckout } from '../../services/c
 import { api, creditSpace, installFakeProvider, makeSpace, startHttp, stopHttp, tokenFor } from './fixtures';
 
 /**
- * The admin's 9jaPay console: the money summary, sweeps, withdrawals,
+ * The admin's the provider console: the money summary, sweeps, withdrawals,
  * webhook retries and a space's account. Actions only ever move a record the
- * way 9jaPay's own answer says.
+ * way the provider's own answer says.
  */
 
 let fake: FakeProvider;
@@ -54,7 +54,7 @@ describe('GET /admin/payments/summary', () => {
     const before = (await api('GET', '/v1/admin/payments/summary', { token })).body.data;
     const s = await makeSpace({ dues: [500_000] });
     await collect(s);
-    await creditSpace(s.space.id, 200_000); // not a 9jaPay collection: never counts as unswept
+    await creditSpace(s.space.id, 200_000); // not a the provider collection: never counts as unswept
 
     const res = await api('GET', '/v1/admin/payments/summary', { token });
     expect(res.status).toBe(200);
@@ -79,7 +79,7 @@ describe('GET /admin/payments/summary', () => {
 });
 
 describe('sweeps', () => {
-  it('"Sweep now" moves the collections, lists the sweep, and a recheck applies 9jaPay\'s answer', async () => {
+  it('"Sweep now" moves the collections, lists the sweep, and a recheck applies the provider\'s answer', async () => {
     const s = await makeSpace({ dues: [400_000] });
     await collect(s);
 
@@ -123,7 +123,7 @@ describe('withdrawals', () => {
     expect(res.body.meta.totalAmount).toBe(100_000);
   });
 
-  it('recheck applies a transfer 9jaPay settled', async () => {
+  it('recheck applies a transfer the provider settled', async () => {
     const s = await makeSpace();
     const p = await makePayout(s.space.id, 'processing');
     fake.transfers.set(p.reference, {
@@ -137,7 +137,7 @@ describe('withdrawals', () => {
     expect(res.body.data.status).toBe('success');
   });
 
-  it('stops a pending withdrawal 9jaPay has no record of, restoring the balance', async () => {
+  it('stops a pending withdrawal the provider has no record of, restoring the balance', async () => {
     const s = await makeSpace();
     const p = await makePayout(s.space.id, 'pending');
     const res = await api('POST', `/v1/admin/payouts/${p.id}/cancel`, { token, body: { reason: 'Wrong account' } });
@@ -147,7 +147,7 @@ describe('withdrawals', () => {
     expect(await db.ledgerEntry.count({ where: { payoutId: p.id, type: 'payout_reversal' } })).toBe(1);
   });
 
-  it("won't stop a pending withdrawal 9jaPay already has", async () => {
+  it("won't stop a pending withdrawal the provider already has", async () => {
     const s = await makeSpace();
     const p = await makePayout(s.space.id, 'pending');
     fake.transfers.set(p.reference, {
@@ -198,7 +198,7 @@ describe('webhooks', () => {
   });
 });
 
-describe("a space's 9jaPay account", () => {
+describe("a space's the provider account", () => {
   it('shows the account, its funds and recent activity', async () => {
     const s = await makeSpace({ dues: [300_000] });
     await collect(s);
@@ -226,7 +226,7 @@ describe("a space's 9jaPay account", () => {
 });
 
 describe('checkouts', () => {
-  it('rechecks a checkout with 9jaPay, and 404s an unknown one', async () => {
+  it('rechecks a checkout with the provider, and 404s an unknown one', async () => {
     const s = await makeSpace();
     const { checkout } = await createCheckout(s.students[0]!.id, [s.dues[0]!.id]);
     const res = await api('POST', `/v1/admin/checkouts/${checkout.reference}/recheck`, { token });

@@ -7,7 +7,7 @@ describe('space account names', () => {
     expect(spaceAccountName('Computer Science Department', 'KTP')).toBe('Computer Science Department-KTP');
   });
 
-  it('tidies spaces and always fits 9jaPay with the suffix', () => {
+  it('tidies spaces and always fits the provider with the suffix', () => {
     expect(spaceAccountName('  Computer   Science  ', 'KTP')).toBe('Computer Science-KTP');
     const long = spaceAccountName('Department of Electronic and Electrical Engineering Students', 'KTP');
     expect(long.length).toBeLessThanOrEqual(SPACE_ACCOUNT_NAME_MAX);

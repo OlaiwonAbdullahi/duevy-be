@@ -1,13 +1,13 @@
 # Scaling & performance — audit, changes, and what's left
 
-November 2026. Branch `feat/9japay-didit`. Covers the backend only (this repo).
+November 2026. Branch `feat/interswitch-discovery`. Covers the backend only (this repo).
 
 ## 1. Architecture as found
 
 - **One Express 5 process** (`src/server.ts`) on a single VPS container behind Caddy (`docker-compose.yml`), Postgres on Supabase via its pooler, Prisma 5.
 - **Background work runs in the same process** by default (`RUN_WORKERS=true`): the webhook queue (polls every 2s), reconciliation (every 60s: pending checkouts, payouts, sweeps, daily sweeps, guest invites), and KYC reminder emails (hourly). `src/worker.ts` runs these on their own.
 - **No Redis.** The webhook queue is a Postgres table claimed with `FOR UPDATE SKIP LOCKED`. Rate limits use `express-rate-limit`'s in-memory store. (`bullmq` is in `package.json` but nothing imports it.)
-- **Money paths are already built for concurrency:** checkout creation is serialised per student (advisory lock); every outcome (`fulfilCheckout`, `markUnderpaid`, `expireCheckout`, payouts, sweeps) row-locks and checks a state machine. The ledger is append-only with unique keys per `(type, duePaymentId)` / `(type, payoutId)`, and balances are derived, never stored. Webhooks are deduplicated on `(provider, providerEventId)`, and handlers re-read the truth from 9jaPay instead of trusting the event body. Payouts and sweeps rely on 9jaPay refusing a duplicate reference.
+- **Money paths are already built for concurrency:** checkout creation is serialised per student (advisory lock); every outcome (`fulfilCheckout`, `markUnderpaid`, `expireCheckout`, payouts, sweeps) row-locks and checks a state machine. The ledger is append-only with unique keys per `(type, duePaymentId)` / `(type, payoutId)`, and balances are derived, never stored. Webhooks are deduplicated on `(provider, providerEventId)`, and handlers re-read the truth from the provider instead of trusting the event body. Payouts and sweeps rely on the provider refusing a duplicate reference.
 - **Queries had already had a performance pass:** lists are paginated in the database, aggregates use `groupBy`, and there are no N+1 loops on hot paths.
 
 The design was sound. The bottlenecks were CPU on the event loop, a few per-process assumptions that break with more than one instance, and operational gaps.
@@ -19,8 +19,8 @@ The design was sound. The bottlenecks were CPU on the event loop, a few per-proc
 | 1 | Password hashing (`bcryptjs`, cost 12) ran in pure JS **on the event loop**: 273 ms of CPU per login. | One process handled ~3.6 logins/s **in total**, and every other request (webhooks included) stalled behind it. This was the collapse point under load (see §4). | **Fixed** |
 | 2 | Login timing equaliser hashed at cost 10 while real hashes are cost 12. | An unknown email answered ~4× faster, which lets anyone enumerate registered accounts. | **Fixed** |
 | 3 | `checkouts.vaAccountNumber` (looked up on **every** payment webhook) had no index. | Sequential scan of the checkouts table per payment; grows linearly with history. | **Fixed** |
-| 4 | Pay-page status poll: 4–5 sequential queries per poll, and its "ask 9jaPay at most every 10s" throttle was an in-process `Map`. | With N instances, provider calls multiplied by N; the map was also cleared wholesale at 5,000 entries. | **Fixed** |
-| 5 | Webhook worker processed a claimed batch one event at a time; each event is a 9jaPay round trip (up to 20s). | A collection-day burst queued for minutes before students saw "paid". | **Fixed** |
+| 4 | Pay-page status poll: 4–5 sequential queries per poll, and its "ask the provider at most every 10s" throttle was an in-process `Map`. | With N instances, provider calls multiplied by N; the map was also cleared wholesale at 5,000 entries. | **Fixed** |
+| 5 | Webhook worker processed a claimed batch one event at a time; each event is a the provider round trip (up to 20s). | A collection-day burst queued for minutes before students saw "paid". | **Fixed** |
 | 6 | Shutdown called `process.exit` without draining; the Dockerfile's `sh -c "… && node …"` could keep SIGTERM from reaching Node; Docker's default 10s grace. | Every deploy killed in-flight requests (502s) and in-progress jobs (money stayed safe, since everything is transactional and idempotent, but work was redone via stale-lock reclaim). | **Fixed** |
 | 7 | Node's default 5s keep-alive is shorter than Caddy's 2-minute upstream idle timeout. | Sporadic 502s when Caddy reuses a socket Node is closing. | **Fixed** |
 | 8 | `/health` is liveness only; no readiness check. | A load balancer can't drain an instance or detect a dead DB connection. | **Fixed** (`/health/ready` added; `/health` unchanged) |
@@ -28,7 +28,7 @@ The design was sound. The bottlenecks were CPU on the event loop, a few per-proc
 | 10 | Public metrics cache: on expiry every concurrent request recomputed 7 platform-wide aggregates. | Cache stampede on the biggest tables. | **Fixed** |
 | 11 | Receipt PDF re-read ~1.25 MB of fonts (twice) and images from disk per render, synchronously. | 183 ms on the event loop per receipt. | **Improved** (−22%) |
 | 12 | Four redundant indexes duplicating `@unique` columns. | Write amplification. | **Fixed** |
-| 13 | Rate limits are per process, in memory. | With N instances every limit is N× looser (including the checkout limit that bounds account minting at 9jaPay), and limits reset on every deploy. | **Fixed** (§3.9) |
+| 13 | Rate limits are per process, in memory. | With N instances every limit is N× looser (including the checkout limit that bounds account minting at the provider), and limits reset on every deploy. | **Fixed** (§3.9) |
 | 14 | Uploads (avatars, poll images) are written to the container's local disk. | A second instance can't see the files; this blocks horizontal scaling. | **Fixed** (§3.7); run the one-off migration in production |
 | 15 | Deploy recreates the only container. | Downtime on every deploy. | **Fixed** (§3.10) |
 | 16 | No Prisma pool settings (`connection_limit` / `pool_timeout`). | The pool size depends on the host's CPU count; under saturation requests hang instead of failing fast. | **Documented** (`.env.example`); needs setting in production `.env` |
@@ -51,12 +51,12 @@ Migration `20261107140000_scaling_indexes`: adds `checkouts(vaAccountNumber, sta
 
 ### 3.3 Pay-page status poll (finding 4), `src/routes/transactions.ts`
 - The throttle is now a conditional `UPDATE … WHERE lastProviderCheckAt < now-10s` on the checkout row, so it holds across any number of instances. A poll that loses costs one indexed UPDATE that matches nothing.
-- The common poll (pending, throttled) is **2 queries instead of 4**; it re-reads only when 9jaPay was actually asked. The response shape is unchanged (covered by test).
+- The common poll (pending, throttled) is **2 queries instead of 4**; it re-reads only when the provider was actually asked. The response shape is unchanged (covered by test).
 - **Trade-off:** `checkouts.updatedAt` is bumped at most once per 10s while a checkout is being polled.
 
 ### 3.4 Concurrent webhook processing (finding 5), `src/jobs/webhookWorker.ts`
 - A claimed batch now runs with bounded concurrency (`WEBHOOK_WORKER_CONCURRENCY`, default 4).
-- **Why it's safe:** it is the same situation as several worker processes, which the design already supports. Every handler row-locks or claims conditionally; `providerTransactionId` and the ledger keys are unique; money-out dispatch relies on 9jaPay's duplicate-reference refusal, which maps to a status lookup. A failure to record an outcome no longer aborts the rest of the batch.
+- **Why it's safe:** it is the same situation as several worker processes, which the design already supports. Every handler row-locks or claims conditionally; `providerTransactionId` and the ledger keys are unique; money-out dispatch relies on the provider's duplicate-reference refusal, which maps to a status lookup. A failure to record an outcome no longer aborts the rest of the batch.
 - **Trade-off:** each in-flight event can hold a DB connection while it writes. Keep the setting well under `connection_limit`.
 
 ### 3.5 Graceful shutdown, timeouts, readiness (findings 6–8)
@@ -84,7 +84,7 @@ Guests have no account, so the IP is the only key, and a class shares one campus
 | Guest route | Before | After |
 |---|---|---|
 | `GET /public/dues/:id` (view the link) | 10/min per IP | 600/min per IP |
-| `POST /public/dues/:id/checkout` (opens a 9jaPay account) | 10/min per IP | 10/min per person (account, or IP + email) **and** 60/min per IP for anonymous guests |
+| `POST /public/dues/:id/checkout` (opens a the provider account) | 10/min per IP | 10/min per person (account, or IP + email) **and** 60/min per IP for anonymous guests |
 | `GET /public/checkouts/:ref` + receipt | IP-wide 1,500/15 min only | 60/min per checkout |
 | `POST /public/checkouts/:ref/account` (emails a link) | 10/min per IP | 5 per 10 min per checkout |
 | IP-wide 1,500/15 min | applied | skipped for these paths (they have their own limits) |
@@ -96,7 +96,7 @@ Measured with `load-tests/guest-link.js` (one IP, the page's data request):
 | 300 students | 10 loaded, **290 refused** | 300 loaded, p95 **7.5 ms** |
 | 600 students | — | 600 loaded (cap), p95 7.6 ms |
 
-When the page does load it takes ~6–8 ms server-side, before and after; the network to the student dominates. The remaining throttle is starting payments: 60 a minute per network, so a class of 300 all starting at once is through in about 5 minutes. That bounds how many one-time accounts one address can open at 9jaPay; raise it if real classes need it.
+When the page does load it takes ~6–8 ms server-side, before and after; the network to the student dominates. The remaining throttle is starting payments: 60 a minute per network, so a class of 300 all starting at once is through in about 5 minutes. That bounds how many one-time accounts one address can open at the provider; raise it if real classes need it.
 
 ### 3.9 Shared rate limits in Redis (finding 13)
 - **Change:** `src/lib/redis.ts` (ioredis, `REDIS_URL`) and `rate-limit-redis`. Every limiter is built by one helper in `src/middleware/rateLimiter.ts` with its own key prefix (`rl:<name>:`), so limiters never count each other's requests. `REDIS_URL` unset means per-process limits, as before (tests, local development); production logs a warning if it's missing. The unused `bullmq` dependency is gone.
@@ -170,7 +170,7 @@ Behind Supabase's **transaction** pooler (port 6543, `pgbouncer=true`), Prisma r
 
 A pre-existing race in `guestAccount.int.test.ts` (it waited on the invite *claim*, which is written before the email is sent) surfaced once in 5 runs and is fixed; 8/8 green since.
 
-**Load** (`load-tests/duevy.js`, k6, against `scripts/loadtest/server.ts`): the real app and jobs on embedded Postgres, 20 spaces, 2,000 students, 80k history rows, 9jaPay faked with 250 ms latency, Prisma pool 10, k6 + Postgres + API all on one 8-core laptop. After every run, `scripts/loadtest/audit.ts` checks that each paid checkout has exactly one due payment, ledger credit and receipt; that there are no double payments; that the ledger balance equals the face value collected; and that no webhook is dead or stuck.
+**Load** (`load-tests/duevy.js`, k6, against `scripts/loadtest/server.ts`): the real app and jobs on embedded Postgres, 20 spaces, 2,000 students, 80k history rows, the provider faked with 250 ms latency, Prisma pool 10, k6 + Postgres + API all on one 8-core laptop. After every run, `scripts/loadtest/audit.ts` checks that each paid checkout has exactly one due payment, ledger credit and receipt; that there are no double payments; that the ledger balance equals the face value collected; and that no webhook is dead or stuck.
 
 Mixed "deadline day" profile: 150 browsing users, 5 logins/s, 8 payments/s (checkout → webhook ×2 → pay-page polling), 2.5 min.
 

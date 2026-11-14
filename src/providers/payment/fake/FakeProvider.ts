@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from 'crypto';
 import {
   InvalidSignatureError,
+  MalformedEventError,
   ProviderError,
   type AccountCredit,
   type Bank,
@@ -16,17 +17,16 @@ import {
   type TransferResult,
   type TransferState,
 } from '../types';
-import { MalformedEventError, normaliseNineJaPayEvent, SPACE_ACCOUNT_PREFIX } from '../ninejapay/events';
-import { verifyNineJaPaySignature } from '../ninejapay/signature';
+import { normaliseFakeEvent, SPACE_ACCOUNT_PREFIX, verifyFakeSignature } from './wire';
 
 /**
  * In-memory provider for local development, the seed and the test suite.
  * PAYMENT_PROVIDER=fake. Refused in production by env validation.
  *
- * Its API calls succeed instantly against in-memory state. Its WEBHOOKS use
- * the real 9jaPay wire format and signature scheme, so
- * scripts/send-test-webhook.ts and the tests exercise exactly the parsing
- * path production uses.
+ * Its API calls succeed instantly against in-memory state. Its WEBHOOKS use a
+ * self-contained wire format and signature scheme (see ./wire), so
+ * scripts/send-test-webhook.ts and the tests exercise the same webhook →
+ * ProviderEvent parsing path production uses.
  *
  * Test knobs are plain public fields; `calls` records every operation.
  */
@@ -36,7 +36,7 @@ export class FakeProvider implements PaymentProvider {
   /** Account numbers name enquiry cannot resolve. */
   unresolvable = new Set<string>();
   resolvedName = 'ADA OBI';
-  /** What a new transfer reports: 9jaPay answers SUCCESS, PROCESSING or FAILED up front. */
+  /** What a new transfer reports: the provider answers SUCCESS, PROCESSING or FAILED up front. */
   transferOutcome: TransferState = 'processing';
   /** The next initiateTransfer throws this, once. */
   failNextTransfer: ProviderError | null = null;
@@ -78,7 +78,7 @@ export class FakeProvider implements PaymentProvider {
     return {
       providerCheckoutId: this.wireReference(input.reference),
       accountNumber: `90${randomInt(10_000_000, 99_999_999)}`,
-      bankName: '9jaPay',
+      bankName: 'Duevy Test',
       accountName: 'Duevy Checkout',
       totalKobo: input.totalKobo,
       expiresAt: new Date(Date.now() + input.expiresInMinutes * 60_000),
@@ -94,7 +94,7 @@ export class FakeProvider implements PaymentProvider {
     this.record('getCollectionStatus', { accountNumber, window });
     const status = this.collectionStatus.get(accountNumber) ?? { state: 'open', receivedKobo: null };
     if (!status.credits) return status;
-    // Like 9jaPay's list: only the credits inside the checkout's window.
+    // Like the provider's list: only the credits inside the checkout's window.
     const credits = status.credits.filter((c) => c.at >= window.from && c.at <= window.to);
     return credits.length
       ? { state: 'paid', receivedKobo: credits.reduce((s, c) => s + c.amountKobo, 0), credits }
@@ -114,9 +114,9 @@ export class FakeProvider implements PaymentProvider {
     return {
       accountId: `va_fake_${randomUUID()}`,
       accountNumber: `91${randomInt(10_000_000, 99_999_999)}`,
-      // What 9jaPay shows: the business name in front.
+      // What the provider shows: the business name in front.
       accountName: `DUEVY/${input.accountName}`,
-      bankName: '9jaPay',
+      bankName: 'Duevy Test',
       bankCode: '090629',
     };
   }
@@ -134,7 +134,7 @@ export class FakeProvider implements PaymentProvider {
       { code: '033', name: 'United Bank for Africa' },
       { code: '50515', name: 'Moniepoint MFB' },
       { code: '999992', name: 'OPay' },
-      { code: '090629', name: 'AMEGY MFB (9jaPay)' },
+      { code: '090629', name: 'Duevy Test MFB' },
     ];
   }
 
@@ -152,7 +152,7 @@ export class FakeProvider implements PaymentProvider {
       this.failNextTransfer = null;
       throw err;
     }
-    // Same reference again: like 9jaPay's duplicate check, report the original.
+    // Same reference again: like the provider's duplicate check, report the original.
     const existing = this.transfers.get(input.reference);
     if (existing) return { providerReference: existing.providerReference, state: existing.state, failureReason: existing.failureReason };
     const result: TransferResult = {
@@ -185,7 +185,7 @@ export class FakeProvider implements PaymentProvider {
   }
 
   parseWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): ProviderEvent {
-    const check = verifyNineJaPaySignature(rawBody, headers, this.webhookSecrets);
+    const check = verifyFakeSignature(rawBody, headers, this.webhookSecrets);
     if (!check.ok) throw new InvalidSignatureError(`Webhook signature ${check.reason}`);
     let body: unknown;
     try {
@@ -193,6 +193,6 @@ export class FakeProvider implements PaymentProvider {
     } catch {
       throw new MalformedEventError(null, null, 'webhook body is not JSON');
     }
-    return normaliseNineJaPayEvent(body);
+    return normaliseFakeEvent(body);
   }
 }

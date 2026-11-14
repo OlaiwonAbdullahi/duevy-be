@@ -40,7 +40,7 @@ export function displayName(name: string): string {
 }
 
 /**
- * An amount as a bank narration can carry it. 9jaPay drops "." from
+ * An amount as a bank narration can carry it. the provider drops "." from
  * narrations (live, 2026-11-10: "NGN989.25" arrived as "NGN98925"), so kobo
  * are spelled out: 98925 → "NGN989 and 25 kobo". Whole naira as ngn().
  */
@@ -50,7 +50,7 @@ export function narrationAmount(amountKobo: number): string {
   return kobo === 0 ? `NGN${naira}` : `NGN${naira} and ${kobo} kobo`;
 }
 
-/** The recipient's statement: "Duevy/CSC sent you NGN3000". Always well under 9jaPay's 50 characters. */
+/** The recipient's statement: "Duevy/CSC sent you NGN3000". Always well under the provider's 50 characters. */
 export function transferNarration(input: { spaceCode: string; amountKobo: number }): string {
   // "/" separates the parts, so it can't appear inside the code.
   const code = plainAscii(input.spaceCode).replace(/\//g, '-');

@@ -1,6 +1,6 @@
 /**
- * One-off: open the 9jaPay account for every live space that doesn't have one
- * yet (spaces created before the 9jaPay cutover). The daily sweep does the same
+ * One-off: open the the provider account for every live space that doesn't have one
+ * yet (spaces created before the the provider cutover). The daily sweep does the same
  * 25 at a time from 2am Lagos; this does them all now.
  *
  * Run where the API's production env is loaded (the API container):

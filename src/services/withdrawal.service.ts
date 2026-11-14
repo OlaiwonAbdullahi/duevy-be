@@ -33,12 +33,12 @@ import { sendWithdrawalUpdateEmail, type WithdrawalUpdate } from '../lib/email';
  * Withdrawals: a space's lead rep moves the space's balance to one of its
  * beneficiaries — any bank account the space has added. A co-rep can withdraw
  * a due's collections when the lead has assigned that due to them. Either way
- * the money is the SPACE's and leaves the space's own 9jaPay account; when
+ * the money is the SPACE's and leaves the space's own the provider account; when
  * part of it is still in Duevy's business account, a sweep moves it first and
  * the withdrawal waits `pending` for it (sweep.service).
  *
  *   gross = what the rep asks for, debited from the space's ledger
- *   fee   = 9jaPay's transfer charge (₦10 / ₦15 / ₦20 by amount), deducted
+ *   fee   = the provider's transfer charge (₦10 / ₦15 / ₦20 by amount), deducted
  *           from the gross
  *   net   = gross − fee, sent to the bank
  *
@@ -260,7 +260,7 @@ export async function quoteWithdrawal(spaceId: string, amountKobo: number) {
   return {
     amount: b.gross,
     fee: b.fee,
-    // `fee` split: 9jaPay's transfer charge and the 7.5% VAT on it.
+    // `fee` split: the provider's transfer charge and the 7.5% VAT on it.
     feeCharge: b.charge,
     feeVat: b.vat,
     net: b.net,
@@ -381,7 +381,7 @@ export async function requestWithdrawal(req: WithdrawalRequest): Promise<Payout>
           // at most MAX_PAYOUT_KOBO), and only it holds the withdrawal back;
           // with no shortfall the withdrawal waits for none. Moving more than
           // needed also absorbs a few kobo the account may hold short of the
-          // ledger (a 9jaPay charge Duevy didn't record).
+          // ledger (a the provider charge Duevy didn't record).
           let left = Math.min(unswept, accountAllowance - amountKobo, business);
           while (left > 0) {
             const sweep = await createSweep(tx, spaceId, Math.min(left, MAX_TRANSFER_KOBO), 'withdrawal');
@@ -495,7 +495,7 @@ export async function lockPayout(tx: Tx, payoutId: string): Promise<Payout> {
 
 /**
  * Send a pending withdrawal from the space's account. Safe to call repeatedly
- * (the reconciliation job does, for anything stuck in `pending`): 9jaPay
+ * (the reconciliation job does, for anything stuck in `pending`): the provider
  * refuses a second transfer under the same reference, and the state change
  * is guarded. A withdrawal waiting for a sweep stays pending until it lands.
  */
@@ -544,7 +544,7 @@ export async function dispatchPayout(payoutId: string): Promise<void> {
       return;
     }
     // Timeout / 5xx: the transfer may exist. Leave it pending; reconciliation
-    // resends under the same reference, which 9jaPay refuses as a duplicate.
+    // resends under the same reference, which the provider refuses as a duplicate.
     logger.warn({ ref: payout.reference, err: (err as Error).message }, 'withdrawal dispatch deferred');
   }
 }
@@ -647,7 +647,7 @@ export async function cancelPayout(payoutId: string, reason: string): Promise<Pa
   return done;
 }
 
-/** Reconciliation (and transfer events): resolve a withdrawal from 9jaPay's own record. */
+/** Reconciliation (and transfer events): resolve a withdrawal from the provider's own record. */
 export async function refreshPayout(payoutId: string): Promise<void> {
   const p = await db.payout.findUnique({ where: { id: payoutId } });
   if (!p || p.status !== 'processing') return;
@@ -655,12 +655,12 @@ export async function refreshPayout(payoutId: string): Promise<void> {
   try {
     result = await getPaymentProvider().getTransfer(p.reference);
   } catch (err) {
-    // 9jaPay has no record of it: it never arrived, so send it again. The
+    // the provider has no record of it: it never arrived, so send it again. The
     // reference stops a double send if it turns up after all.
     if (err instanceof ProviderError && err.code === 'NOT_FOUND') {
       const { count } = await db.payout.updateMany({ where: { id: p.id, status: 'processing' }, data: { status: 'pending', processingAt: null } });
       if (count === 1) {
-        logger.warn({ ref: p.reference }, 'withdrawal unknown to 9jaPay — sending it again');
+        logger.warn({ ref: p.reference }, 'withdrawal unknown to the provider — sending it again');
         await dispatchPayout(p.id);
       }
       return;

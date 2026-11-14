@@ -27,15 +27,15 @@ import { syncDirectDeposits } from '../services/directDeposit.service';
 import { confirmReceivedPayment, reconcileCheckout } from '../jobs/reconciliation';
 
 /**
- * The admin's view of the 9jaPay money flow, mounted under /admin (behind
+ * The admin's view of the the provider money flow, mounted under /admin (behind
  * authenticate + requireAdmin):
  *
  *   student ──▶ one-time account (checkout) ──▶ Duevy business account
- *           ──sweep──▶ space's own 9jaPay account ──payout──▶ rep's bank
- *   anyone  ──direct deposit──▶ space's own 9jaPay account
+ *           ──sweep──▶ space's own the provider account ──payout──▶ rep's bank
+ *   anyone  ──direct deposit──▶ space's own the provider account
  *
- * Every read here is from our own books; the actions ask 9jaPay first and
- * only ever move a record the way 9jaPay's answer says (the same functions
+ * Every read here is from our own books; the actions ask the provider first and
+ * only ever move a record the way the provider's answer says (the same functions
  * the reconciliation job uses), so an admin can't push money out of step.
  */
 export const adminPaymentsRouter = Router();
@@ -81,7 +81,7 @@ adminPaymentsRouter.get('/payments/summary', requireAdminPermission('payouts'), 
     accountsOpened,
   ] = await Promise.all([
     db.ledgerEntry.groupBy({ by: ['direction'], _sum: { amountKobo: true } }),
-    // Per space: 9jaPay collections not yet swept (never below zero per space).
+    // Per space: the provider collections not yet swept (never below zero per space).
     db.$queryRaw<{ unswept: bigint | null; spaces: number }[]>`
       WITH collected AS (
         SELECT le."spaceId", SUM(le."amountKobo") AS amt
@@ -158,7 +158,7 @@ adminPaymentsRouter.get('/payments/summary', requireAdminPermission('payouts'), 
   ok(res, {
     provider,
     funds: {
-      // Owed to spaces (the ledger): split by where 9jaPay holds it.
+      // Owed to spaces (the ledger): split by where the provider holds it.
       heldKobo,
       awaitingSweepKobo,
       inSpaceAccountsKobo: Math.max(0, heldKobo - awaitingSweepKobo),
@@ -170,7 +170,7 @@ adminPaymentsRouter.get('/payments/summary', requireAdminPermission('payouts'), 
       checkoutsPaid: paidToday._count._all,
       sweptKobo: sweptToday._sum.amountKobo ?? 0,
       sweeps: sweptToday._count._all,
-      businessSweepLimitKobo: env.NINEJAPAY_BUSINESS_DAILY_LIMIT_KOBO,
+      businessSweepLimitKobo: env.BUSINESS_DAILY_LIMIT_KOBO,
       businessSweepRemainingKobo: businessRemaining,
       withdrawnKobo: withdrawnToday._sum.amount ?? 0,
       withdrawals: withdrawnToday._count._all,
@@ -182,10 +182,10 @@ adminPaymentsRouter.get('/payments/summary', requireAdminPermission('payouts'), 
       checkoutsPaid: fees30._count._all,
       // Duevy's 1.5% processing fee — revenue.
       processingFeesKobo: fees30._sum.feeKobo ?? 0,
-      // What 9jaPay charged Duevy to sweep — a cost, covered by the processing fee.
+      // What the provider charged Duevy to sweep — a cost, covered by the processing fee.
       sweepChargesKobo: sweepFees30._sum.feeKobo ?? 0,
       sweptKobo: sweepFees30._sum.amountKobo ?? 0,
-      // 9jaPay's transfer charge + VAT on withdrawals, passed on to spaces.
+      // the provider's transfer charge + VAT on withdrawals, passed on to spaces.
       withdrawalChargesKobo: withdrawalFees30._sum.feeKobo ?? 0,
       paidOutKobo: withdrawalFees30._sum.netKobo ?? 0,
       withdrawals: withdrawalFees30._count._all,
@@ -201,7 +201,7 @@ adminPaymentsRouter.get('/payments/summary', requireAdminPermission('payouts'), 
 });
 
 // ---------------------------------------------------------------------------
-// Checkouts (collections): ask 9jaPay again about one.
+// Checkouts (collections): ask the provider again about one.
 // ---------------------------------------------------------------------------
 adminPaymentsRouter.post('/checkouts/:reference/recheck', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
   const reference = req.params.reference as string;
@@ -268,8 +268,8 @@ adminPaymentsRouter.get('/payouts/:id', requireAdminPermission('payouts'), async
 });
 
 /**
- * Ask 9jaPay about a withdrawal and apply the answer: processing → its
- * transfer status; pending → its sweep first, then (re)send — 9jaPay refuses a
+ * Ask the provider about a withdrawal and apply the answer: processing → its
+ * transfer status; pending → its sweep first, then (re)send — the provider refuses a
  * second transfer under the same reference, so this never pays twice.
  */
 adminPaymentsRouter.post('/payouts/:id/recheck', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
@@ -296,7 +296,7 @@ const cancelPayoutSchema = z.object({ reason: z.string().trim().min(3).max(300) 
 
 /**
  * Stop a withdrawal that hasn't reached the bank and restore the space's
- * balance. Awaiting approval: cancelled. Pending: only once 9jaPay confirms it
+ * balance. Awaiting approval: cancelled. Pending: only once the provider confirms it
  * has no transfer under this reference (a timed-out send leaves it pending
  * while the transfer may exist). Processing: never — recheck instead.
  */
@@ -323,9 +323,9 @@ adminPaymentsRouter.post('/payouts/:id/cancel', requireAdminPermission('payouts'
       else throw providerUnavailable(err);
     }
     if (exists) {
-      // 9jaPay has it: apply its answer rather than cancelling under it.
+      // the provider has it: apply its answer rather than cancelling under it.
       await refreshPayout(id).catch(() => {});
-      errors.conflict(res, 'TRANSFER_EXISTS', '9jaPay already has this transfer, so it can’t be stopped. Its status has been refreshed.');
+      errors.conflict(res, 'TRANSFER_EXISTS', 'The provider already has this transfer, so it can’t be stopped. Its status has been refreshed.');
       return;
     }
     if (!(await failPayout(id, why, 'ADMIN_CANCELLED'))) {
@@ -336,7 +336,7 @@ adminPaymentsRouter.post('/payouts/:id/cancel', requireAdminPermission('payouts'
     errors.conflict(
       res,
       'PAYOUT_NOT_CANCELLABLE',
-      p.status === 'processing' ? 'This withdrawal is already with the bank. Recheck it with 9jaPay instead.' : `A ${p.status} withdrawal can’t be stopped.`,
+      p.status === 'processing' ? 'This withdrawal is already with the bank. Recheck it with the provider instead.' : `A ${p.status} withdrawal can’t be stopped.`,
     );
     return;
   }
@@ -345,7 +345,7 @@ adminPaymentsRouter.post('/payouts/:id/cancel', requireAdminPermission('payouts'
 });
 
 function providerUnavailable(err: unknown): unknown {
-  if (err instanceof ProviderError) return new AppError(502, 'PROVIDER_UNAVAILABLE', `9jaPay didn’t answer: ${err.message}`);
+  if (err instanceof ProviderError) return new AppError(502, 'PROVIDER_UNAVAILABLE', `The provider didn’t answer: ${err.message}`);
   return err;
 }
 
@@ -464,7 +464,7 @@ adminPaymentsRouter.get('/direct-deposits', requireAdminPermission('payouts'), a
 });
 
 // ---------------------------------------------------------------------------
-// Webhook events from 9jaPay
+// Webhook events from the provider
 // ---------------------------------------------------------------------------
 /** Every column but the (large) raw payload. */
 const WEBHOOK_ROW = { id: true, provider: true, providerEventId: true, type: true, status: true, attempts: true, error: true, nextAttemptAt: true, receivedAt: true, processedAt: true } as const;
@@ -533,7 +533,7 @@ adminPaymentsRouter.post('/webhooks/:id/retry', requireAdminPermission('payouts'
 });
 
 // ---------------------------------------------------------------------------
-// A space's 9jaPay account
+// A space's the provider account
 // ---------------------------------------------------------------------------
 async function spaceMoney(spaceId: string) {
   const space = await db.space.findUnique({
@@ -595,7 +595,7 @@ adminPaymentsRouter.get('/spaces/:spaceId/money', requireAdminPermission('payout
   ok(res, out);
 });
 
-/** Open the space's 9jaPay account if it has none (creation can fail; the daily job also retries). */
+/** Open the space's the provider account if it has none (creation can fail; the daily job also retries). */
 adminPaymentsRouter.post('/spaces/:spaceId/account', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
   const spaceId = req.params.spaceId as string;
   const space = await db.space.findUnique({ where: { id: spaceId }, select: { walletAccountNumber: true, isArchived: true } });
@@ -639,7 +639,7 @@ adminPaymentsRouter.post('/spaces/:spaceId/sweep', requireAdminPermission('payou
   ok(res, { started: sweeps.length, amountKobo: sweeps.reduce((s, x) => s + x.amountKobo, 0), money: await spaceMoney(spaceId) });
 });
 
-/** Read the space's account at 9jaPay now and credit any direct deposit not yet recorded. */
+/** Read the space's account at the provider now and credit any direct deposit not yet recorded. */
 adminPaymentsRouter.post('/spaces/:spaceId/deposits/sync', requireAdminPermission('payouts'), async (req: Request, res: Response): Promise<void> => {
   const spaceId = req.params.spaceId as string;
   const exists = await db.space.count({ where: { id: spaceId } });

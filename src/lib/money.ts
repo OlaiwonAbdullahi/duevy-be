@@ -4,7 +4,7 @@ import { randomInt } from 'crypto';
  * Money helpers. Every amount in this codebase is an integer number of kobo
  * (₦1 = 100 kobo). No floats are ever used for arithmetic; the only place a
  * decimal appears where an amount is shown or parsed as naira ("7000.00") —
- * see koboToDecimal / decimalToKobo. 9jaPay itself works in kobo.
+ * see koboToDecimal / decimalToKobo. the provider itself works in kobo.
  */
 
 /** Convert kobo to naira (display / email templates only — never for arithmetic). */
@@ -72,20 +72,20 @@ function numberToPlainString(n: number): string {
 
 /**
  * Checkout processing fee: 1.5% of the basket, paid by the student on top.
- * Duevy takes no margin; the fee covers 9jaPay's charges on the student's
+ * Duevy takes no margin; the fee covers the provider's charges on the student's
  * transfer (0.5%, capped at ₦750, plus ₦50 stamp duty from ₦10,000) and on
  * the sweep of that money into the space's own account.
  */
 export const COLLECTION_FEE_BPS = 150;
 
 /**
- * 9jaPay adds 7.5% VAT on its transfer charge, debited from the sender as a
+ * the provider adds 7.5% VAT on its transfer charge, debited from the sender as a
  * separate line (live, 2026-11-09: a ₦1,900 transfer cost ₦10 + ₦0.75 VAT).
  * Rounded up so the ledger never debits less than the account loses.
  */
 export const vatOnCharge = (chargeKobo: number) => Math.ceil((chargeKobo * 75) / 1000);
 
-/** 9jaPay's transfer charge before VAT: ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000. */
+/** the provider's transfer charge before VAT: ₦10 under ₦5,000, ₦15 under ₦100,000, ₦20 from ₦100,000. */
 const TRANSFER_CHARGE_BANDS = [
   { belowKobo: 500_000, chargeKobo: 1_000 },
   { belowKobo: 10_000_000, chargeKobo: 1_500 },
@@ -93,7 +93,7 @@ const TRANSFER_CHARGE_BANDS = [
 const TRANSFER_CHARGE_TOP_KOBO = 2_000;
 
 /**
- * Withdrawal fee: 9jaPay's transfer charge plus VAT, passed on and deducted
+ * Withdrawal fee: the provider's transfer charge plus VAT, passed on and deducted
  * from the withdrawal. ₦10.75 under ₦5,000, ₦16.13 under ₦100,000, ₦21.50
  * from ₦100,000.
  */
@@ -107,7 +107,7 @@ export const TRANSFER_FEE_TOP = {
 export const TRANSFER_FEE_TOP_KOBO = TRANSFER_FEE_TOP.feeKobo;
 
 /**
- * A stored withdrawal fee split into 9jaPay's charge and the VAT on it.
+ * A stored withdrawal fee split into the provider's charge and the VAT on it.
  * Withdrawals from before VAT was passed on (2026-11-09) hold the bare
  * charge, so a fee matching no band is all charge.
  */
@@ -122,7 +122,7 @@ export const MIN_PAYOUT_KOBO = 100_000;
 export const MAX_PAYOUT_KOBO = 50_000_000;
 /** A space withdraws at most ₦5,000,000 a day (Africa/Lagos days). */
 export const DAILY_PAYOUT_LIMIT_KOBO = 500_000_000;
-/** 9jaPay refuses any single transfer above ₦1,000,000, so sweeps are split. */
+/** the provider refuses any single transfer above ₦1,000,000, so sweeps are split. */
 export const MAX_TRANSFER_KOBO = 100_000_000;
 
 /** The processing fee for one checkout covering `faceKobo` worth of dues, rounded up to the kobo. */
@@ -174,7 +174,7 @@ export function allocate(total: number, weights: number[]): number[] {
   return parts.map(Number);
 }
 
-/** 9jaPay's charge for one transfer of `amountKobo`. */
+/** the provider's charge for one transfer of `amountKobo`. */
 export function transferFee(amountKobo: number): number {
   assertKobo(amountKobo, 'amountKobo');
   return TRANSFER_FEE_BANDS.find((b) => amountKobo < b.belowKobo)?.feeKobo ?? TRANSFER_FEE_TOP_KOBO;
@@ -189,7 +189,7 @@ export interface WithdrawalBreakdown {
   gross: number;
   /** The transfer fee (charge + VAT), deducted from the gross. */
   fee: number;
-  /** 9jaPay's transfer charge, part of `fee`. */
+  /** the provider's transfer charge, part of `fee`. */
   charge: number;
   /** 7.5% VAT on the charge, part of `fee`. */
   vat: number;

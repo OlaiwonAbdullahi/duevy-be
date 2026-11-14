@@ -127,7 +127,7 @@ spacesRouter.post('/', validate(createSpaceSchema), async (req: Request, res: Re
     return created;
   });
 
-  // The space's own 9jaPay account; retried by the sweep job if this fails.
+  // The space's own the provider account; retried by the sweep job if this fails.
   openSpaceAccountInBackground(space.id);
   ok(res, { ...serializeSpace(space, { memberCount: 1 }), joinCode: space.joinCode }, 201);
 });

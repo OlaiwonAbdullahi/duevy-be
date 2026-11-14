@@ -1,7 +1,6 @@
-import { type ProviderEvent } from '../types';
-// Reuse the one MalformedEventError the webhook route matches with instanceof
-// (re-exported from src/providers/payment/index.ts).
-import { MalformedEventError } from '../ninejapay/events';
+// MalformedEventError lives in ../types (re-exported from index.ts) and is what
+// the webhook route matches with instanceof.
+import { MalformedEventError, type ProviderEvent } from '../types';
 
 /**
  * Interswitch webhook → our ProviderEvent (docs.interswitchgroup.com/docs/webhooks).

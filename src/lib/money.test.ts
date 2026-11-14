@@ -27,7 +27,7 @@ describe('checkoutFee — 1.5%, on top', () => {
     expect(checkoutFee(12_345)).toBe(186); // 185.175 → 186
   });
 
-  it('always covers 9jaPay on the student’s transfer (0.5% capped at ₦750, + ₦50 from ₦10,000)', () => {
+  it('always covers the provider on the student’s transfer (0.5% capped at ₦750, + ₦50 from ₦10,000)', () => {
     for (const face of [10_000 * NAIRA, 9_900 * NAIRA, 150_000 * NAIRA, 500_000 * NAIRA]) {
       const total = face + checkoutFee(face);
       const cost = Math.min(Math.ceil(total * 0.005), 75_000) + (total >= 10_000 * NAIRA ? 5_000 : 0);
@@ -44,7 +44,7 @@ describe('checkoutFee — 1.5%, on top', () => {
   });
 });
 
-describe('withdrawalFee — 9jaPay’s transfer charge + 7.5% VAT: ₦10.75 / ₦16.13 / ₦21.50', () => {
+describe('withdrawalFee — the provider’s transfer charge + 7.5% VAT: ₦10.75 / ₦16.13 / ₦21.50', () => {
   it('bands by amount', () => {
     expect(transferFee(1 * NAIRA)).toBe(1_075);
     expect(transferFee(4_999_99)).toBe(1_075); // ₦4,999.99

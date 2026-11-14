@@ -1,7 +1,7 @@
 /**
  * Load-test target: the real API (src/app.ts, real middleware, real Postgres,
  * real background jobs) on a throwaway embedded Postgres, seeded with a
- * realistic dataset, with 9jaPay replaced by a fake that answers from the
+ * realistic dataset, with the provider replaced by a fake that answers from the
  * database after a realistic network delay. Nothing leaves the machine.
  *
  *   npx tsx scripts/loadtest/server.ts            # then, in another shell:
@@ -9,7 +9,7 @@
  *
  * Tunables (env): LT_PORT (3100), LT_PG_PORT (55433), LT_SPACES (20),
  * LT_STUDENTS (2000), LT_HISTORY (40 transactions per student),
- * LT_PROVIDER_MS (250: simulated 9jaPay round trip), LT_POOL (Prisma
+ * LT_PROVIDER_MS (250: simulated the provider round trip), LT_POOL (Prisma
  * connection_limit, default 10). Writes load-tests/.fixtures.json for k6.
  */
 import { execSync } from 'child_process';
@@ -55,7 +55,6 @@ async function main() {
     JWT_REFRESH_SECRET: 'lt-refresh-secret-0123456789abcdef012345678',
     RESEND_API_KEY: 're_loadtest',
     PAYMENT_PROVIDER: 'fake',
-    NINEJAPAY_SECRET_KEY: LT_WEBHOOK_SECRET,
     FILE_STORAGE: 'memory',
     TRUST_PROXY: '1', // k6 spreads virtual users over X-Forwarded-For addresses
     BCRYPT_ROUNDS: process.env.BCRYPT_ROUNDS ?? '12',
@@ -83,7 +82,7 @@ async function main() {
     return realFetch(input, init);
   }) as typeof fetch;
 
-  /** 9jaPay stand-in: a round trip's latency, and "the student paid in full" for any open checkout account. */
+  /** the provider stand-in: a round trip's latency, and "the student paid in full" for any open checkout account. */
   class LoadProvider extends FakeProvider {
     async createCollectionAccount(input: Parameters<FakeProvider['createCollectionAccount']>[0]) {
       await sleep(PROVIDER_MS);
@@ -112,7 +111,7 @@ async function main() {
       data: { name: `Rep ${s}`, email: `rep${s}@lt.duevy`, passwordHash, emailVerified: true, role: 'rep', isRep: true, repApplicationStatus: 'approved', kycStatus: 'verified', ninCheckOutcome: 'match', studentIdStatus: 'approved', livenessStatus: 'approved' },
     });
     const space = await db.space.create({
-      data: { name: `Load Space ${s}`, short: `LS${s}`, kind: 'department', school: 'LAUTECH', joinCode: `LT-${s}-${Date.now()}`.slice(0, 24), walletAccountId: `va_lt_${s}`, walletAccountNumber: `91${String(s).padStart(8, '0')}`, walletAccountName: `DUEVY/LS${s}`, walletBankName: '9jaPay', walletBankCode: '090629', walletCreatedAt: new Date() },
+      data: { name: `Load Space ${s}`, short: `LS${s}`, kind: 'department', school: 'LAUTECH', joinCode: `LT-${s}-${Date.now()}`.slice(0, 24), walletAccountId: `va_lt_${s}`, walletAccountNumber: `91${String(s).padStart(8, '0')}`, walletAccountName: `DUEVY/LS${s}`, walletBankName: 'the provider', walletBankCode: '090629', walletCreatedAt: new Date() },
     });
     await db.spaceRep.create({ data: { userId: rep.id, spaceId: space.id, role: 'lead' } });
     const dueIds: string[] = [];

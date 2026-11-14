@@ -9,7 +9,7 @@ import { drainWebhookQueue } from '../../jobs/webhookWorker';
 import { creditEvent, creditSpace, installFakeProvider, makeSpace, sendWebhook, startHttp, stopHttp, TEST_PIN } from './fixtures';
 
 /**
- * 9jaPay hands a one-time account number to a later checkout once the earlier
+ * the provider hands a one-time account number to a later checkout once the earlier
  * one closes. One credit must pay exactly one checkout, and a webhook that
  * still names the earlier checkout must reach the one now holding the number.
  */
@@ -94,7 +94,7 @@ describe('reused one-time account numbers', () => {
 
   it('a webhook still naming the earlier (closed) checkout pays the checkout now holding the number', async () => {
     const { a, b, number } = await twoCheckoutsOnOneNumber();
-    // a expired before b's student paid; 9jaPay then gave its number to b.
+    // a expired before b's student paid; the provider then gave its number to b.
     const aExpiry = new Date(Date.now() - 60_000);
     await db.checkout.update({ where: { id: a.id }, data: { status: 'expired', expiredAt: aExpiry, expiresAt: aExpiry } });
     fake.collectionStatus.set(number, {
@@ -114,14 +114,14 @@ describe('reused one-time account numbers', () => {
   });
 });
 
-describe('a withdrawal 9jaPay has no record of', () => {
+describe('a withdrawal the provider has no record of', () => {
   it('is sent again instead of staying stuck in processing', async () => {
     const { rep, space, beneficiary } = await makeSpace();
     await creditSpace(space.id, 3_000_000);
     const p = await requestWithdrawal({ spaceId: space.id, userId: rep.id, beneficiaryId: beneficiary!.id, amountKobo: 1_000_000, pin: TEST_PIN });
     expect(p.status).toBe('processing');
 
-    // 9jaPay lost it: TSQ answers "25".
+    // the provider lost it: TSQ answers "25".
     fake.transfers.clear();
     const sentBefore = fake.calls.filter((c) => c.op === 'initiateTransfer').length;
     await refreshPayout(p.id);

@@ -161,7 +161,7 @@ export interface InitiateTransferInput {
   reference: string;
   /**
    * Shown on the recipient's statement; build it with transferNarration()
-   * (src/lib/narration.ts), which fits 9jaPay's 50-character limit. (Our
+   * (src/lib/narration.ts), which fits the provider's 50-character limit. (Our
    * sweeps are recognised by their sending account, not this text.)
    */
   narration: string;
@@ -219,6 +219,18 @@ export class InvalidSignatureError extends Error {
   constructor(message = 'Webhook signature verification failed') {
     super(message);
     this.name = 'InvalidSignatureError';
+  }
+}
+
+/** A webhook body that can't be parsed into a known event. Matched by the webhook route with instanceof. */
+export class MalformedEventError extends Error {
+  constructor(
+    public readonly eventId: string | null,
+    public readonly eventType: string | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'MalformedEventError';
   }
 }
 
@@ -288,7 +300,7 @@ export interface PaymentProvider {
   /**
    * What has arrived in a checkout's one-time account, read from the
    * provider's own records. Only money that landed within `window` counts:
-   * 9jaPay reuses one-time account numbers, so the same number carries other
+   * the provider reuses one-time account numbers, so the same number carries other
    * checkouts' payments from before and after this one.
    */
   getCollectionStatus(accountNumber: string, window: { from: Date; to: Date }): Promise<CollectionStatus>;
@@ -297,7 +309,7 @@ export interface PaymentProvider {
   createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount>;
   /**
    * Change the name on a space's permanent account. Returns the name the bank
-   * now shows (9jaPay prefixes the business name), which transfers must use.
+   * now shows (the provider prefixes the business name), which transfers must use.
    */
   renameSpaceAccount(accountNumber: string, accountName: string): Promise<{ accountName: string }>;
 

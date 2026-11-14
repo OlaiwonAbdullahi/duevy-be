@@ -14,7 +14,6 @@ const defaults: Record<string, string> = {
   JWT_REFRESH_SECRET: 'test-refresh-secret-that-is-at-least-32-chars',
   RESEND_API_KEY: 're_test',
   PAYMENT_PROVIDER: 'fake',
-  NINEJAPAY_SECRET_KEY: 'whsec_test_secret',
   RUN_WORKERS: 'false',
   FILE_STORAGE: 'memory',
 };

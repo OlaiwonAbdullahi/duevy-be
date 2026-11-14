@@ -3,17 +3,17 @@ import { db } from '../config/db';
 import { splitWithdrawalFee } from '../lib/money';
 
 /**
- * Admin reports (§14.9), built from the records 9jaPay-era money actually
+ * Admin reports (§14.9), built from the records the provider-era money actually
  * lands in:
  *
  *   checkouts        — what students/guests paid, Duevy's processing fee
  *   ledger_entries   — each space's balance: payments, direct deposits,
  *                      withdrawals (+ fees), reversals, manual credits
- *   payouts          — withdrawals to reps' banks, 9jaPay's charge + VAT
- *   sweeps           — business account → space account (9jaPay bills Duevy)
+ *   payouts          — withdrawals to reps' banks, the provider's charge + VAT
+ *   sweeps           — business account → space account (the provider bills Duevy)
  *   direct_deposits  — money sent straight to a space's account
  *
- * The old `transactions` table is not used: under 9jaPay only manual credits
+ * The old `transactions` table is not used: under the provider only manual credits
  * and referral rewards are written there.
  *
  * Dates are Lagos calendar days (UTC+1, no DST): `from` 00:00 to `to` 23:59:59.999.
@@ -171,13 +171,13 @@ async function financialSummary({ range, spaceId, subtitle }: Ctx): Promise<Repo
       section('MONEY OUT'),
       ['Withdrawals paid out (gross from space balances)', paidOut.length, naira(gross)],
       ['  sent to reps’ banks', null, naira(net)],
-      ['  9jaPay transfer charges', null, naira(charge)],
+      ['  Transfer charges', null, naira(charge)],
       ['  VAT on transfer charges', null, naira(vat)],
       ['Withdrawals failed or reversed (balance restored)', failed._count._all, naira(failed._sum.amount)],
       ['Refunds', refunds._count._all, naira(refunds._sum.amountKobo)],
       section('SETTLEMENT'),
       ['Sweeps into space accounts', sweeps._count._all, naira(sweeps._sum.amountKobo)],
-      ['9jaPay sweep charges (Duevy cost)', null, naira(sweepCharges)],
+      ['Sweep charges (Duevy cost)', null, naira(sweepCharges)],
       section('DUEVY'),
       ['Net revenue (processing fees - sweep charges)', null, naira(processingFees - sweepCharges)],
       [`Owed to ${spaceId ? 'this space' : 'spaces'} at end of period`, null, naira(Math.max(0, credits - debits))],
@@ -224,7 +224,7 @@ async function spaceCollection({ range, spaceId, subtitle }: Ctx): Promise<Repor
     columns: [
       { label: 'Space' },
       { label: 'Code' },
-      { label: '9jaPay account' },
+      { label: 'Space account' },
       { label: 'Members', kind: 'count' },
       { label: 'Payments', kind: 'count' },
       { label: 'Dues collected (NGN)', kind: 'money' },
@@ -361,7 +361,7 @@ async function spaceLedger({ range, spaceId, subtitle }: Ctx): Promise<ReportTab
     title: SCOPE_TITLES.full_ledger,
     subtitle: [
       ...subtitle,
-      'Every movement on space balances. Sweeps are not listed: they move money between 9jaPay accounts, not on or off a balance.',
+      'Every movement on space balances. Sweeps are not listed: they move money between the provider accounts, not on or off a balance.',
       ...(total > entries.length ? [`Showing the first ${entries.length.toLocaleString('en-NG')} of ${total.toLocaleString('en-NG')} entries. Narrow the range for the rest.`] : []),
     ],
     columns: [

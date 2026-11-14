@@ -29,7 +29,7 @@ import { adminPaymentsRouter } from './adminPayments';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireAdmin);
-// 9jaPay money flow: summary, sweeps, direct deposits, webhooks, payout/checkout actions.
+// the provider money flow: summary, sweeps, direct deposits, webhooks, payout/checkout actions.
 adminRouter.use(adminPaymentsRouter);
 
 const userSpaces = {
@@ -251,7 +251,7 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
       needsReview: c.needsReview,
       reviewReason: c.reviewReason,
       isGuest: c.user.isGuest,
-      // The one-time 9jaPay account the student was told to pay into.
+      // The one-time the provider account the student was told to pay into.
       account: c.vaAccountNumber ? { number: c.vaAccountNumber, bankName: c.vaBankName, name: c.vaAccountName } : null,
       providerTransactionId: c.providerTransactionId,
       expiresAt: c.expiresAt.toISOString(),
@@ -337,7 +337,7 @@ adminRouter.get('/payouts', requireAdminPermission('payouts'), async (req: Reque
  * Duevy's revenue and payment counts, all-time and for the last 30 days.
  *  revenue      = processing fees on paid checkouts + the withdrawal fees kept
  *                 (feeSettlementKobo; Bachs-era withdrawals only — under
- *                 9jaPay the withdrawal fee is 9jaPay's own charge)
+ *                 the provider the withdrawal fee is the provider's own charge)
  *  transactions = paid student checkouts; volume is what students paid
  */
 async function platformMetrics() {
@@ -417,7 +417,7 @@ async function computeAdminOverview() {
       _count: { _all: true },
     }),
     db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
-    // 9jaPay plumbing that needs a human.
+    // the provider plumbing that needs a human.
     Promise.all([
       db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: hourAgo } } }),
       db.checkout.count({ where: { needsReview: true } }),
@@ -455,7 +455,7 @@ async function computeAdminOverview() {
       tone: 'danger',
       badge: 'Withdrawals',
       title: `${plural(payments.stuckPayouts, 'withdrawal')} stuck for over an hour`,
-      detail: 'Recheck them with 9jaPay. Reps are waiting on this money.',
+      detail: 'Recheck them with the provider. Reps are waiting on this money.',
       href: '/admin/withdrawals?view=stuck',
       linkLabel: 'Open withdrawals',
     });
@@ -476,7 +476,7 @@ async function computeAdminOverview() {
       id: 'dead-webhooks',
       tone: 'danger',
       badge: 'Webhooks',
-      title: `${plural(payments.deadWebhooks, '9jaPay event')} failed every retry`,
+      title: `${plural(payments.deadWebhooks, 'provider event')} failed every retry`,
       detail: 'Payments or transfers may not be reflected until these are retried.',
       href: '/admin/webhooks?view=dead',
       linkLabel: 'Open webhooks',
@@ -497,8 +497,8 @@ async function computeAdminOverview() {
     attention.push({
       id: 'spaces-no-account',
       tone: 'warning',
-      badge: '9jaPay account',
-      title: `${plural(payments.spacesWithoutAccount, 'space')} without a 9jaPay account`,
+      badge: 'Space account',
+      title: `${plural(payments.spacesWithoutAccount, 'space')} without a space account`,
       detail: 'They can collect, but can’t receive sweeps or withdraw until an account is opened.',
       href: '/admin/spaces?account=missing',
       linkLabel: 'Open spaces',
@@ -1267,7 +1267,7 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
   if (kind && ['department', 'association', 'faculty', 'club'].includes(kind)) where.kind = kind as never;
   if (school) where.school = { contains: school, mode: 'insensitive' };
   if (q) where.OR = [{ name: { contains: q, mode: 'insensitive' } }, { short: { contains: q, mode: 'insensitive' } }];
-  // ?account=missing|open: whether the space's own 9jaPay account exists.
+  // ?account=missing|open: whether the space's own the provider account exists.
   if (req.query.account === 'missing') {
     where.walletAccountNumber = null;
     where.isArchived = false;
@@ -1300,9 +1300,9 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
       withdrawalPinLocked: !!s.withdrawalPinLockedUntil && s.withdrawalPinLockedUntil > new Date(),
       withdrawalPinHoldUntil: s.withdrawalPinHoldUntil && s.withdrawalPinHoldUntil > new Date() ? s.withdrawalPinHoldUntil : null,
       frozenReason: s.frozenReason,
-      // The ledger balance: owed to the space, wherever 9jaPay holds it.
+      // The ledger balance: owed to the space, wherever the provider holds it.
       balance: Math.max(0, fin?.held ?? 0),
-      // The space's own 9jaPay account (null until opened).
+      // The space's own the provider account (null until opened).
       account: s.walletAccountNumber ? { number: s.walletAccountNumber, bankName: s.walletBankName, name: s.walletAccountName } : null,
     };
   });
@@ -2021,7 +2021,7 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
 });
 
 // ===========================================================================
-// §14.9 Reports — built by services/reports.service.ts from the 9jaPay-era
+// §14.9 Reports — built by services/reports.service.ts from the the provider-era
 // records (checkouts, space ledgers, payouts, sweeps, direct deposits).
 // ===========================================================================
 /** One CSV cell. Text that a spreadsheet would run as a formula is prefixed with ' first. */

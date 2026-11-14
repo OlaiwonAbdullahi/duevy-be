@@ -12,24 +12,20 @@ import { fulfilCheckout } from '../services/checkout.service';
 /**
  * Sandbox-only helpers for wiring and testing the frontend. Never live:
  *
- *  - 9jaPay: only on the sandbox base URL, and only with
- *    NINEJAPAY_SANDBOX_AUTH_KEY set (simulate-deposit needs it).
+ *  - Interswitch: only in its test environment (simulate-payment shortcut).
  *  - The fake provider: only outside production.
  *
  * Anywhere else every route here answers 404, as if it didn't exist.
  */
 export const devRouter = Router();
 
-const SANDBOX_HOST = 'developer.test.9japay.com';
-
 export function devToolsEnabled(): boolean {
   if (env.NODE_ENV === 'production') return false;
   // Interswitch: the gateway popup can't be driven from the server, so we offer
   // a simulate-payment shortcut instead of simulate-deposit — test env only.
   if (env.PAYMENT_PROVIDER === 'interswitch') return env.INTERSWITCH_ENV === 'test';
-  if (!getPaymentProvider().simulateDeposit) return false;
-  if (env.PAYMENT_PROVIDER === 'fake') return true;
-  return new URL(env.NINEJAPAY_BASE_URL).host === SANDBOX_HOST && !!env.NINEJAPAY_SANDBOX_AUTH_KEY;
+  // Fake rail: always on outside production.
+  return env.PAYMENT_PROVIDER === 'fake';
 }
 
 devRouter.use((_req, res, next) => {
@@ -46,14 +42,14 @@ const simulateSchema = z.object({
   amount: z.number().int().positive(),
 });
 
-/** 9jaPay's transaction list can lag the deposit by a moment, so the checkout is checked a few times. */
+/** the provider's transaction list can lag the deposit by a moment, so the checkout is checked a few times. */
 const CONFIRM_ATTEMPTS = 4;
 const CONFIRM_GAP_MS = 1_500;
 
 // ---------------------------------------------------------------------------
 // POST /dev/simulate-deposit — pretend a student transferred `amount` kobo
 // into `accountNumber`, then confirm the checkout holding it straight away
-// (9jaPay's webhook can't reach localhost; the pay page turns "paid" on its
+// (the provider's webhook can't reach localhost; the pay page turns "paid" on its
 // next status poll either way).
 // ---------------------------------------------------------------------------
 devRouter.post('/simulate-deposit', validate(simulateSchema), async (req: Request, res: Response): Promise<void> => {
@@ -68,7 +64,7 @@ devRouter.post('/simulate-deposit', validate(simulateSchema), async (req: Reques
     orderBy: { createdAt: 'desc' },
   });
   if (checkout && checkout.totalKobo !== amount) {
-    // 9jaPay would refuse it with a confusing "Recipient account is invalid".
+    // the provider would refuse it with a confusing "Recipient account is invalid".
     fail(res, 422, 'AMOUNT_MISMATCH', `This account only accepts exactly ${checkout.totalKobo} kobo (checkout ${checkout.reference}).`, [
       { field: 'amount', issue: `expected ${checkout.totalKobo}` },
     ]);
@@ -78,10 +74,10 @@ devRouter.post('/simulate-deposit', validate(simulateSchema), async (req: Reques
   try {
     await getPaymentProvider().simulateDeposit!(accountNumber, amount);
   } catch (err) {
-    // A sandbox tool: say what 9jaPay said. "25" means an unknown, closed or
+    // A sandbox tool: say what the provider said. "25" means an unknown, closed or
     // already-paid account, or the wrong amount; a closed one can also come back as a 500.
     if (err instanceof ProviderError) {
-      fail(res, 422, 'DEPOSIT_REFUSED', `9jaPay refused the deposit: ${err.message}`);
+      fail(res, 422, 'DEPOSIT_REFUSED', `The provider refused the deposit: ${err.message}`);
       return;
     }
     throw err;
