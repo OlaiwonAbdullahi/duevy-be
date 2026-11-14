@@ -57,13 +57,17 @@ const envSchema = z.object({
   // Secret used to verify webhook signatures from the Quickteller dashboard.
   INTERSWITCH_WEBHOOK_SECRET: z.string().optional(),
   // Base URLs. Defaults are the test hosts; the live hosts are set per-env.
-  // Passport (OAuth2 token):
-  INTERSWITCH_PASSPORT_URL: z.string().url().default('https://sandbox.interswitchng.com/passport/oauth/token'),
+  // Passport (OAuth2 token). TEST host is passport-sandbox (NOT sandbox) —
+  // docs.interswitchgroup.com/docs/authentication. LIVE: passport.interswitchng.com.
+  INTERSWITCH_PASSPORT_URL: z.string().url().default('https://passport-sandbox.interswitchng.com/passport/oauth/token'),
   // Transaction query (gettransaction.json) + collections base:
   INTERSWITCH_COLLECTIONS_URL: z.string().url().default('https://sandbox.interswitchng.com'),
   // Payouts API base:
   INTERSWITCH_PAYOUTS_URL: z.string().url().default('https://payouts-sandbox.interswitchng.com/api/v1/payouts'),
-  // Virtual Accounts API base (confirm the exact host in the portal):
+  // Virtual Accounts live under the non-card paymentgateway product, reached at
+  // {host}/paymentgateway/api/v1/payable/virtualaccount. TEST host is
+  // sandbox.interswitchng.com (the docs' qa.interswitchng.com host 404s); LIVE:
+  // the live paymentgateway host. docs.interswitchgroup.com/docs/non-card-payments.
   INTERSWITCH_VA_URL: z.string().url().default('https://sandbox.interswitchng.com'),
   // Host that serves inline-checkout.js for the frontend. TEST:
   // newwebpay-sandbox.interswitchng.com ; LIVE: newwebpay.interswitchng.com.

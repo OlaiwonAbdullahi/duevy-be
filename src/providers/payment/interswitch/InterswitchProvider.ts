@@ -179,22 +179,24 @@ export class InterswitchProvider implements PaymentProvider {
   // Space permanent account — Interswitch Virtual Accounts
   // -------------------------------------------------------------------------
 
-  /** ⚠️ Confirm the VA-create endpoint + payload in the Quickteller Business portal. */
+  /**
+   * Generate a permanent virtual account number for a space (non-card "Transfer"
+   * product). Endpoint + payload per docs.interswitchgroup.com/docs/non-card-payments:
+   * POST {paymentgateway}/api/v1/payable/virtualaccount, body { merchantCode, accountName }.
+   * `provider` (9PSB | WEMA | FBP) is optional; omitted to use Interswitch's default bank.
+   * Note: this endpoint has no idempotency key, so a network retry can orphan a VA
+   * at the provider; ensureSpaceAccount still guards the single DB write.
+   */
   async createSpaceAccount(input: CreateSpaceAccountInput): Promise<SpaceAccount> {
-    const requestReference = `${SPACE_ACCOUNT_PREFIX}${this.wireReference(input.reference)}`;
     const res = await this.client.request<Record<string, unknown>>({
       method: 'POST',
       baseUrl: this.cfg.vaUrl,
-      path: 'api/v1/virtualaccounts',
+      path: 'paymentgateway/api/v1/payable/virtualaccount',
       op: 'space_account.create',
       ref: input.reference,
       body: {
         merchantCode: this.cfg.merchantCode,
-        currencyCode: this.cfg.currency,
         accountName: input.accountName,
-        transactionReference: requestReference,
-        // A permanent account that accepts many payments (not tied to one amount).
-        isPermanent: true,
       },
     });
     const data = (field(res, 'data') as Record<string, unknown>) ?? res;
