@@ -82,11 +82,12 @@ const envSchema = z.object({
   // Virtual Accounts API base (confirm the exact host in the portal):
   INTERSWITCH_VA_URL: z.string().url().default('https://sandbox.interswitchng.com'),
   // Host that serves inline-checkout.js for the frontend. TEST:
-  // newwebpay.qa.interswitchng.com ; LIVE: newwebpay.interswitchng.com.
+  // newwebpay-sandbox.interswitchng.com ; LIVE: newwebpay.interswitchng.com.
+  // (docs.interswitchgroup.com/docs/web-checkout)
   INTERSWITCH_INLINE_CHECKOUT_URL: z
     .string()
     .url()
-    .default('https://newwebpay.qa.interswitchng.com/inline-checkout.js'),
+    .default('https://newwebpay-sandbox.interswitchng.com/inline-checkout.js'),
 
   // ---------------------------------------------------------------------------
   // AI assistant — NVIDIA NIM (OpenAI-compatible). Drives the chat + WhatsApp
