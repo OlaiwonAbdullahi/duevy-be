@@ -109,6 +109,9 @@ export class InterswitchProvider implements PaymentProvider {
     return {
       provider: this.name,
       scriptUrl: this.cfg.inlineCheckoutUrl,
+      // Same host as inline-checkout.js, but the hosted checkout page: POST the
+      // fields here to redirect the payer straight to Interswitch's own page.
+      formUrl: this.cfg.inlineCheckoutUrl.replace(/\/inline-checkout\.js.*$/, '/collections/w/pay'),
       merchantCode: this.cfg.merchantCode,
       payItemId: this.cfg.payItemId,
       txnRef: this.wireReference(input.reference),

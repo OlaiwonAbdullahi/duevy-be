@@ -83,6 +83,12 @@ export interface GatewayCheckoutParams {
   provider: string;
   /** The inline-checkout.js host to load for this environment. */
   scriptUrl: string;
+  /**
+   * The hosted checkout page for this environment (…/collections/w/pay). The
+   * frontend can POST the same fields here to send the payer straight to
+   * Interswitch's own page (all methods) instead of opening the inline popup.
+   */
+  formUrl: string;
   merchantCode: string;
   payItemId: string;
   /** The server-created txn_ref (= our reference), stored before the popup opens. */
