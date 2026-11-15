@@ -59,6 +59,60 @@ const boolArg = (v: unknown): boolean => v === true || v === 'true';
 
 const payLink = (dueId: string) => `${env.FRONTEND_URL}/pay/${dueId}`;
 
+/** Common short names reps use that don't substring-match the official bank name. */
+const BANK_ALIASES: Record<string, string> = {
+  gtb: 'guaranty trust',
+  gtbank: 'guaranty trust',
+  uba: 'united bank for africa',
+  fcmb: 'first city monument',
+  firstbank: 'first bank',
+  stanbic: 'stanbic ibtc',
+  zenith: 'zenith bank',
+  access: 'access bank',
+  opay: 'opay',
+  palmpay: 'palmpay',
+  kuda: 'kuda',
+  moniepoint: 'moniepoint',
+  wema: 'wema bank',
+  polaris: 'polaris bank',
+  sterling: 'sterling bank',
+  fidelity: 'fidelity bank',
+  union: 'union bank',
+};
+
+type BankResolved = { bankCode: string } | { error: string; banks: { code: string; name: string }[] };
+
+/**
+ * Resolve a bank to its provider code. Reps say bank NAMES ("palmpay", "gtb",
+ * "opay"), not codes, so the agent should never have to know codes: pass a
+ * numeric code straight through, otherwise match the name against the live bank
+ * list (with a few common aliases). On ambiguity, return the candidates so the
+ * agent can ask which one.
+ */
+async function resolveBankCode(args: Record<string, unknown>, ctx: ToolContext): Promise<BankResolved> {
+  const code = str(args.bank_code);
+  // A bare numeric code is used as-is (don't treat it as a name to look up).
+  if (code && /^\d{3,6}$/.test(code)) return { bankCode: code };
+
+  // The name may arrive in bank_name, or the model may have put it in bank_code.
+  const query = str(args.bank_name) ?? code;
+  if (!query) return { error: 'Tell me the bank (its name is fine, e.g. "PalmPay").', banks: [] };
+
+  const res = await apiCall<{ code: string; name: string }[]>({ method: 'GET', path: '/banks', token: ctx.token });
+  if (!res.ok || !Array.isArray(res.data)) return { error: 'Could not fetch the bank list to resolve that bank. Try again.', banks: [] };
+  const banks = res.data;
+
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const q = norm(BANK_ALIASES[norm(query)] ?? query);
+
+  const exact = banks.find((b) => norm(b.name) === q);
+  if (exact) return { bankCode: exact.code };
+  const matches = banks.filter((b) => norm(b.name).includes(q));
+  if (matches.length === 1) return { bankCode: matches[0]!.code };
+  if (matches.length > 1) return { error: `More than one bank matches "${query}". Which one?`, banks: matches.slice(0, 8).map((b) => ({ code: b.code, name: b.name })) };
+  return { error: `No Nigerian bank matches "${query}". Ask the rep to confirm the bank name.`, banks: [] };
+}
+
 const GUEST_FIELD_TYPES = ['text', 'textarea', 'number', 'email', 'phone', 'select'] as const;
 type GuestFieldOut = { id: string; label: string; type: (typeof GUEST_FIELD_TYPES)[number]; required: boolean; options?: string[] };
 
@@ -374,16 +428,22 @@ export const tools: AgentTool[] = [
   },
   {
     name: 'lookup_account',
-    description: 'Name-enquiry: resolve the account holder name for a bank code + account number before saving/paying it.',
+    description: 'Name-enquiry: resolve the account holder name for a bank + 10-digit account number before saving/paying it. Pass the bank by NAME (bank_name, e.g. "PalmPay") — you do NOT need the numeric code; it is resolved for you.',
     parameters: {
       type: 'object',
-      properties: { bank_code: { type: 'string' }, account_number: { type: 'string', description: '10-digit NUBAN' } },
-      required: ['bank_code', 'account_number'],
+      properties: {
+        bank_name: { type: 'string', description: 'The bank name as the rep said it (e.g. "PalmPay", "GTB", "OPay"). Preferred.' },
+        bank_code: { type: 'string', description: 'Numeric bank code, only if you already have it.' },
+        account_number: { type: 'string', description: '10-digit NUBAN' },
+      },
+      required: ['account_number'],
     },
     async run(args, ctx) {
       const s = resolveSpace(ctx);
       if ('error' in s) return s;
-      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/payout/beneficiaries/lookup`, token: ctx.token, body: { bankCode: str(args.bank_code), accountNumber: str(args.account_number) } });
+      const bank = await resolveBankCode(args, ctx);
+      if ('error' in bank) return bank;
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/payout/beneficiaries/lookup`, token: ctx.token, body: { bankCode: bank.bankCode, accountNumber: str(args.account_number) } });
       return res.ok ? res.data : { error: res.error };
     },
   },
@@ -400,22 +460,25 @@ export const tools: AgentTool[] = [
   },
   {
     name: 'add_beneficiary',
-    description: 'Save a payout destination (lead rep only). Call lookup_account first; call without confirmed to confirm the resolved name with the rep.',
+    description: 'Save a payout destination (lead rep only). Pass the bank by NAME (bank_name) — the code is resolved for you. Call lookup_account first; call without confirmed to confirm the resolved name with the rep.',
     parameters: {
       type: 'object',
       properties: {
-        bank_code: { type: 'string' },
+        bank_name: { type: 'string', description: 'The bank name as the rep said it (e.g. "PalmPay", "GTB"). Preferred.' },
+        bank_code: { type: 'string', description: 'Numeric bank code, only if you already have it.' },
         account_number: { type: 'string' },
         label: { type: 'string' },
         confirmed: { type: 'boolean' },
       },
-      required: ['bank_code', 'account_number'],
+      required: ['account_number'],
     },
     async run(args, ctx) {
       const s = resolveSpace(ctx);
       if ('error' in s) return s;
+      const bank = await resolveBankCode(args, ctx);
+      if ('error' in bank) return bank;
       if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Resolve the name with lookup_account and confirm it with the rep before saving.' };
-      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/payout/beneficiaries`, token: ctx.token, body: { bankCode: str(args.bank_code), accountNumber: str(args.account_number), label: str(args.label) } });
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/payout/beneficiaries`, token: ctx.token, body: { bankCode: bank.bankCode, accountNumber: str(args.account_number), label: str(args.label) } });
       return res.ok ? { saved: res.data } : { error: res.error };
     },
   },
