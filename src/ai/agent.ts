@@ -4,6 +4,8 @@ import { toolSpecs, findTool, type ToolContext } from './tools';
 import { todayContext } from './dates';
 import { loadRepContext, mintToken, type RepContext } from './identity';
 import { logger } from '../lib/logger';
+import { apiCall } from './api';
+import type { BankCard } from '../lib/banks';
 
 /**
  * The Duevy rep assistant. Turns a rep's natural-language message into actions
@@ -83,7 +85,7 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string): str
     '- DUE TITLE: use the name the rep gives in their message — take it directly whether they phrase it as "call it X", "make it X", "named X", or just drop a clear name/code like "CSC305 manual", "202 manual", "SUG levy". Do NOT ask again for a title that is already in their message. ONLY ask "what should the title be?" when the message truly has no name — e.g. "create a ₦2000 due for Friday" with no label at all. Never invent a generic title like "Departmental Due".',
     '- FORM BUILDER: when the rep says "ask for / collect / require" something from payers (e.g. "ask for their level and age"), pass those as create_due `fields` — one field per item (label + a sensible type: number for age, select with options for level, etc.). Do NOT put requested questions in the `note`; the note is only a short message. Mention the questions in the summary you read back.',
     '- BANKS: when the rep gives a bank by name (e.g. "8052412442 palmpay"), pass that name straight to lookup_account/add_beneficiary as bank_name and the account number — the code is resolved for you. NEVER ask the rep for a bank code or offer to list banks just to get one. Only use list_banks if a lookup comes back saying more than one bank matched, then ask which one.',
-    '- LISTING BANKS: if the rep asks to see/choose from all banks, call list_banks. The UI shows the full list as selectable cards with logos, so DO NOT paste the banks or their codes into your reply — just say one short line like "Here are the banks — tap the one you want." Never dump the list as a sentence.',
+    '- LISTING BANKS: if the rep asks to see or choose from the banks, you MUST call the list_banks tool first and wait for its result — never answer from memory. The UI turns its result into selectable cards with logos, so your reply must be ONE short sentence telling them to pick a bank (vary the wording), and must NOT contain any bank names or codes. If you did not call list_banks this turn, do not claim a list is shown.',
     '- Withdrawals: always show the quote and destination and get a clear yes; if the space uses a PIN, ask for the 4-digit PIN and pass it.',
     '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, character for character, in full and as plain text. NEVER shorten it, swap its host, replace the id with x\'s or dots, write a placeholder like "[Link to pay]" or "[Link]", or wrap it in markdown link syntax. The rep copies the raw URL, so the literal tool-returned URL must appear verbatim in your reply. If a tool did not return a payLink, call get_pay_link before answering; never guess or fabricate a link.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables, and no markdown link syntax — write raw URLs.',
@@ -210,6 +212,18 @@ export async function handleMessage(userId: string, text: string): Promise<Agent
   }
 
   if (!finalText) finalText = "I couldn't finish that just now. Please try rephrasing, or use the dashboard.";
+
+  // Safety net: the model sometimes offers a bank picker ("pick a bank") without
+  // actually calling list_banks, so no card is produced. If the reply invites a
+  // bank choice but no banks card was captured, fetch the list ourselves so the
+  // UI still renders the picker (deterministic, not dependent on the model).
+  const offersBankChoice = /\b(tap|choose|select|pick|here are)\b[^.!?]*\bbank/i.test(finalText) || /\bbank[^.!?]*\b(tap|choose|select|pick)\b/i.test(finalText);
+  if (offersBankChoice && !cards.some((c) => c.kind === 'banks')) {
+    const res = await apiCall<BankCard[]>({ method: 'GET', path: '/banks', token });
+    if (res.ok && Array.isArray(res.data) && res.data.length > 0) {
+      cards.push({ kind: 'banks', items: res.data });
+    }
+  }
 
   // Repair the pay link: models sometimes echo a placeholder ("[Link to pay]") or
   // a hallucinated URL (wrong host, id masked as x's) instead of the real link the
