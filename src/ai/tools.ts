@@ -149,7 +149,7 @@ export const tools: AgentTool[] = [
   {
     name: 'create_due',
     description:
-      'Create a due for the space. Amount is in NAIRA. Call first WITHOUT confirmed to get the summary (face, 1.5% student fee, total, extra questions, pay link) to read back to the rep; only call again with confirmed:true once they approve. Set publish:true to open it for payment immediately (needs the space to have passed KYC). When the rep wants to COLLECT extra info from payers ("ask for / collect / require X"), put those in `fields` (the form builder) — NOT in `note`.',
+      'Create (and by default publish) a due for the space. Amount is in NAIRA. Call first WITHOUT confirmed to get the summary (face, 1.5% student fee, total, extra questions, pay link) to read back to the rep; only call again with confirmed:true once they approve. Publishing is the DEFAULT: a confirmed create opens the due for payment immediately and returns the pay link — there is no separate publish step. Pass publish:false ONLY when the rep explicitly asks to keep it a draft. (Publishing needs the space to have passed KYC.) When the rep wants to COLLECT extra info from payers ("ask for / collect / require X"), put those in `fields` (the form builder) — NOT in `note`.',
     parameters: {
       type: 'object',
       properties: {
@@ -174,7 +174,7 @@ export const tools: AgentTool[] = [
           },
         },
         allow_guests: { type: 'boolean', description: 'Let non-members pay via the public link. Default true.' },
-        publish: { type: 'boolean', description: 'Publish immediately. Default false (saved as draft).' },
+        publish: { type: 'boolean', description: 'Open the due for payment immediately. Default TRUE. Set false only if the rep explicitly wants to keep it as a draft.' },
         confirmed: { type: 'boolean', description: 'Only true after the rep has approved the summary.' },
       },
       required: ['title', 'amount_naira', 'due_date', 'category'],
@@ -204,7 +204,9 @@ export const tools: AgentTool[] = [
           : [],
         note: str(args.note) ?? null,
         allowGuests: args.allow_guests === undefined ? true : boolArg(args.allow_guests),
-        willPublish: boolArg(args.publish),
+        // Publishing is the default — there's no separate draft step. Only keep
+        // it a draft when the rep explicitly passes publish:false.
+        willPublish: args.publish === undefined ? true : boolArg(args.publish),
       };
       if (!boolArg(args.confirmed)) {
         return { needsConfirmation: true, summary, instruction: 'Read this summary to the rep (including the extra questions the form will ask) and ask them to confirm before saving.' };
@@ -231,13 +233,23 @@ export const tools: AgentTool[] = [
   },
   {
     name: 'publish_due',
-    description: 'Publish a draft due so students can pay it. Requires the space to have passed KYC.',
+    description: 'Publish an EXISTING draft due (created in an earlier turn) so students can pay it. Requires the space to have passed KYC. Do NOT use this for a due you just created with create_due — that already publishes. Only pass a due_id you got from a tool; never invent one.',
     parameters: { type: 'object', properties: { due_id: { type: 'string' } }, required: ['due_id'] },
     async run(args, ctx) {
       const s = resolveSpace(ctx);
       if ('error' in s) return s;
-      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/dues/${str(args.due_id)}/publish`, token: ctx.token });
-      return res.ok ? { published: res.data, payLink: payLink(str(args.due_id)!) } : { error: res.error };
+      const dueId = str(args.due_id);
+      // Guard against a hallucinated id (e.g. "due_123"): verify it's a real due
+      // in this space before publishing, and hand back the real list if not.
+      const listRes = await apiCall<{ id: string; title: string; status?: string }[]>({ method: 'GET', path: `/spaces/${s.spaceId}/dues`, token: ctx.token });
+      if (listRes.ok) {
+        const list = Array.isArray(listRes.data) ? listRes.data : [];
+        if (!list.some((d) => d.id === dueId)) {
+          return { error: 'No due with that id in this space — do not guess an id. If you just created a due, it is already published; otherwise pick one of these by its exact id.', dues: list.map((d) => ({ id: d.id, title: d.title, status: d.status })) };
+        }
+      }
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/dues/${dueId}/publish`, token: ctx.token });
+      return res.ok ? { published: res.data, payLink: payLink(dueId!) } : { error: res.error };
     },
   },
   {
