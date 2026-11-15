@@ -19,6 +19,21 @@ import { logger } from '../lib/logger';
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
+/**
+ * A structured attachment a tool produced for the UI to render (e.g. a bank
+ * picker with logos). Carried out of the turn alongside the text reply; text-only
+ * channels like WhatsApp ignore it.
+ */
+export interface AgentCard {
+  kind: string;
+  items: unknown[];
+}
+
+export interface AgentReply {
+  reply: string;
+  cards: AgentCard[];
+}
+
 interface Session {
   history: Msg[];
   activeSpaceId: string | null;
@@ -68,6 +83,7 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string): str
     '- DUE TITLE: use the name the rep gives in their message — take it directly whether they phrase it as "call it X", "make it X", "named X", or just drop a clear name/code like "CSC305 manual", "202 manual", "SUG levy". Do NOT ask again for a title that is already in their message. ONLY ask "what should the title be?" when the message truly has no name — e.g. "create a ₦2000 due for Friday" with no label at all. Never invent a generic title like "Departmental Due".',
     '- FORM BUILDER: when the rep says "ask for / collect / require" something from payers (e.g. "ask for their level and age"), pass those as create_due `fields` — one field per item (label + a sensible type: number for age, select with options for level, etc.). Do NOT put requested questions in the `note`; the note is only a short message. Mention the questions in the summary you read back.',
     '- BANKS: when the rep gives a bank by name (e.g. "8052412442 palmpay"), pass that name straight to lookup_account/add_beneficiary as bank_name and the account number — the code is resolved for you. NEVER ask the rep for a bank code or offer to list banks just to get one. Only use list_banks if a lookup comes back saying more than one bank matched, then ask which one.',
+    '- LISTING BANKS: if the rep asks to see/choose from all banks, call list_banks. The UI shows the full list as selectable cards with logos, so DO NOT paste the banks or their codes into your reply — just say one short line like "Here are the banks — tap the one you want." Never dump the list as a sentence.',
     '- Withdrawals: always show the quote and destination and get a clear yes; if the space uses a PIN, ask for the 4-digit PIN and pass it.',
     '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, character for character, in full and as plain text. NEVER shorten it, swap its host, replace the id with x\'s or dots, write a placeholder like "[Link to pay]" or "[Link]", or wrap it in markdown link syntax. The rep copies the raw URL, so the literal tool-returned URL must appear verbatim in your reply. If a tool did not return a payLink, call get_pay_link before answering; never guess or fabricate a link.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables, and no markdown link syntax — write raw URLs.',
@@ -103,10 +119,10 @@ export function repairPayLink(text: string, realLink: string | null): string {
   return out;
 }
 
-/** Run one rep message to a final text reply. */
-export async function handleMessage(userId: string, text: string): Promise<string> {
+/** Run one rep message to a final reply plus any structured UI cards. */
+export async function handleMessage(userId: string, text: string): Promise<AgentReply> {
   const rep = await loadRepContext(userId);
-  if (!rep) return "I couldn't find an active Duevy rep account for you. If you just became a rep, sign in to the dashboard first.";
+  if (!rep) return { reply: "I couldn't find an active Duevy rep account for you. If you just became a rep, sign in to the dashboard first.", cards: [] };
 
   const token = await mintToken(rep);
   const session = getSession(userId);
@@ -131,6 +147,8 @@ export async function handleMessage(userId: string, text: string): Promise<strin
   // get_pay_link). We use it to repair the model's final reply if it parrots a
   // placeholder or hallucinates a wrong host/id instead of the actual URL.
   let realPayLink: string | null = null;
+  // Structured attachments (e.g. a bank picker) tools produced this turn, for the UI.
+  const cards: AgentCard[] = [];
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const resp = await nim.chat.completions.create({
       model: AI_MODEL,
@@ -176,7 +194,18 @@ export async function handleMessage(userId: string, text: string): Promise<strin
       if (result && typeof result === 'object' && typeof (result as { payLink?: unknown }).payLink === 'string') {
         realPayLink = (result as { payLink: string }).payLink;
       }
-      messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+      // Capture any UI card a tool produced, and strip it from what the model sees
+      // (it only needs the lean data, not logo URLs) so context stays small.
+      let modelResult = result;
+      if (result && typeof result === 'object' && 'ui' in (result as Record<string, unknown>)) {
+        const { ui, ...rest } = result as Record<string, unknown> & { ui?: unknown };
+        const card = ui as { kind?: unknown; items?: unknown } | undefined;
+        if (card && typeof card.kind === 'string' && Array.isArray(card.items)) {
+          cards.push({ kind: card.kind, items: card.items });
+        }
+        modelResult = rest;
+      }
+      messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(modelResult) });
     }
   }
 
@@ -193,5 +222,5 @@ export async function handleMessage(userId: string, text: string): Promise<strin
   session.activeSpaceId = ctx.getActiveSpaceId();
   session.updatedAt = Date.now();
 
-  return finalText;
+  return { reply: finalText, cards };
 }

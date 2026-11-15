@@ -34,8 +34,8 @@ const chatSchema = z.object({ message: z.string().trim().min(1).max(2000) });
 // POST /ai/chat — one turn of conversation.
 aiRouter.post('/chat', validate(chatSchema), async (req: Request, res: Response): Promise<void> => {
   const { message } = req.body as z.infer<typeof chatSchema>;
-  const reply = await handleMessage(uid(req), message);
-  ok(res, { reply });
+  const { reply, cards } = await handleMessage(uid(req), message);
+  ok(res, { reply, cards });
 });
 
 // POST /ai/reset — clear the conversation context.

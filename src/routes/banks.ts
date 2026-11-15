@@ -3,6 +3,7 @@ import { authenticate } from '../middleware/auth';
 import { ok, fail } from '../lib/response';
 import { logger } from '../lib/logger';
 import { getPaymentProvider, type Bank } from '../providers/payment';
+import { toBankCards } from '../lib/banks';
 
 export const banksRouter = Router();
 banksRouter.use(authenticate);
@@ -30,7 +31,7 @@ export async function listBanksCached(): Promise<Bank[]> {
 // GET /banks — Nigerian banks available as a payout destination (§10.2).
 banksRouter.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
-    ok(res, await listBanksCached());
+    ok(res, toBankCards(await listBanksCached()));
   } catch {
     fail(res, 502, 'PROVIDER_ERROR', 'Could not fetch the bank list right now');
   }

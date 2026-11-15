@@ -32,5 +32,6 @@ export async function handleWhatsappMessage(fromNumber: string, text: string): P
     ].join('\n');
   }
 
-  return handleMessage(userId, trimmed);
+  // WhatsApp is text-only, so we drop any UI cards and send just the reply text.
+  return (await handleMessage(userId, trimmed)).reply;
 }

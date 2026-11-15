@@ -2,6 +2,7 @@ import type OpenAI from 'openai';
 import { env } from '../config/env';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { nairaToKobo, formatNaira, checkoutFee } from '../lib/money';
+import type { BankCard } from '../lib/banks';
 import { apiCall } from './api';
 import { resolveDueDate } from './dates';
 import type { RepContext } from './identity';
@@ -419,11 +420,20 @@ export const tools: AgentTool[] = [
   },
   {
     name: 'list_banks',
-    description: 'List Nigerian banks (with codes) for choosing a payout destination.',
+    description:
+      'List Nigerian banks (with codes) for choosing a payout destination. The UI renders the full list as selectable cards with logos, so after calling this just invite the rep to pick one — do NOT re-list every bank in your text reply.',
     parameters: { type: 'object', properties: {} },
     async run(_args, ctx) {
-      const res = await apiCall({ method: 'GET', path: `/banks`, token: ctx.token });
-      return res.ok ? res.data : { error: res.error };
+      const res = await apiCall<BankCard[]>({ method: 'GET', path: `/banks`, token: ctx.token });
+      if (!res.ok) return { error: res.error };
+      const banks = Array.isArray(res.data) ? res.data : [];
+      // `ui` is captured by the agent loop and returned to the frontend as a card
+      // list; it is stripped from what the model sees to keep context lean.
+      return {
+        count: banks.length,
+        banks: banks.map((b) => ({ name: b.name, code: b.code })),
+        ui: { kind: 'banks', items: banks },
+      };
     },
   },
   {
