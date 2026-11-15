@@ -67,10 +67,38 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string): str
     '- DUE TITLE: use the name the rep gives in their message — take it directly whether they phrase it as "call it X", "make it X", "named X", or just drop a clear name/code like "CSC305 manual", "202 manual", "SUG levy". Do NOT ask again for a title that is already in their message. ONLY ask "what should the title be?" when the message truly has no name — e.g. "create a ₦2000 due for Friday" with no label at all. Never invent a generic title like "Departmental Due".',
     '- FORM BUILDER: when the rep says "ask for / collect / require" something from payers (e.g. "ask for their level and age"), pass those as create_due `fields` — one field per item (label + a sensible type: number for age, select with options for level, etc.). Do NOT put requested questions in the `note`; the note is only a short message. Mention the questions in the summary you read back.',
     '- Withdrawals: always show the quote and destination and get a clear yes; if the space uses a PIN, ask for the 4-digit PIN and pass it.',
-    '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, in full and as plain text (e.g. https://app.duevy.app/pay/due_123). NEVER write a placeholder like "[Link to pay]", "[Link]" or a markdown link with hidden href — the rep copies the raw URL, so the literal URL must appear in your reply. If a tool did not return a payLink, call get_pay_link before answering; do not make one up.',
+    '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, character for character, in full and as plain text. NEVER shorten it, swap its host, replace the id with x\'s or dots, write a placeholder like "[Link to pay]" or "[Link]", or wrap it in markdown link syntax. The rep copies the raw URL, so the literal tool-returned URL must appear verbatim in your reply. If a tool did not return a payLink, call get_pay_link before answering; never guess or fabricate a link.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables, and no markdown link syntax — write raw URLs.',
     '- If a tool returns an error, explain it simply and suggest the fix.',
   ].join('\n');
+}
+
+/**
+ * Force the real pay link into the model's reply. LLMs sometimes write a
+ * placeholder ("[Link to pay]"), mask the id ("/pay/due_xxxxxxxx"), or swap the
+ * host — all of which hand the rep a dead link. When a tool produced the real
+ * `payLink` this turn, we (1) replace bracket/parenthetical placeholders and any
+ * markdown link, (2) rewrite any .../pay/<id> URL to the real one, and (3) if the
+ * reply mentions a link but has none, append it.
+ */
+export function repairPayLink(text: string, realLink: string | null): string {
+  if (!realLink) return text;
+  let out = text;
+
+  // Markdown links [label](href) → the real URL as plain text.
+  out = out.replace(/\[[^\]]*\]\((https?:\/\/[^)]*\/pay\/[^)\s]*|[^)]*)\)/gi, realLink);
+
+  // Bare placeholder tokens like [Link to pay], [Link], [pay link].
+  out = out.replace(/\[[^\]]*(?:link|pay)[^\]]*\]/gi, realLink);
+
+  // Any pay-style URL (wrong host or masked id) → the real URL.
+  out = out.replace(/https?:\/\/[^\s)]+\/pay\/[^\s)]+/gi, realLink);
+
+  // If the model mentions a link but none ended up in the text, append it.
+  if (!out.includes(realLink) && /\blink\b/i.test(out)) {
+    out = `${out.trimEnd()}\n${realLink}`;
+  }
+  return out;
 }
 
 /** Run one rep message to a final text reply. */
@@ -97,6 +125,10 @@ export async function handleMessage(userId: string, text: string): Promise<strin
   const nim = getNim();
 
   let finalText = '';
+  // The real pay link produced by a tool this turn (create_due / publish_due /
+  // get_pay_link). We use it to repair the model's final reply if it parrots a
+  // placeholder or hallucinates a wrong host/id instead of the actual URL.
+  let realPayLink: string | null = null;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const resp = await nim.chat.completions.create({
       model: AI_MODEL,
@@ -139,11 +171,19 @@ export async function handleMessage(userId: string, text: string): Promise<strin
           result = { error: (err as Error).message };
         }
       }
+      if (result && typeof result === 'object' && typeof (result as { payLink?: unknown }).payLink === 'string') {
+        realPayLink = (result as { payLink: string }).payLink;
+      }
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
 
   if (!finalText) finalText = "I couldn't finish that just now. Please try rephrasing, or use the dashboard.";
+
+  // Repair the pay link: models sometimes echo a placeholder ("[Link to pay]") or
+  // a hallucinated URL (wrong host, id masked as x's) instead of the real link the
+  // tool returned. If we captured a real payLink this turn, force it into the reply.
+  finalText = repairPayLink(finalText, realPayLink);
 
   // Persist only the clean turn, so stored history is always a valid transcript.
   session.history.push({ role: 'user', content: text }, { role: 'assistant', content: finalText });
