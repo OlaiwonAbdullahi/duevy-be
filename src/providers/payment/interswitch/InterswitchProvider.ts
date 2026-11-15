@@ -21,6 +21,7 @@ import {
   type TransferState,
 } from '../types';
 import { InterswitchClient, type InterswitchConfig } from './client';
+import { FALLBACK_BANKS } from './banks.fallback';
 import { normaliseInterswitchEvent } from './events';
 import { MalformedEventError } from '../types';
 import { verifyInterswitchSignature } from './signature';
@@ -279,27 +280,40 @@ export class InterswitchProvider implements PaymentProvider {
     }
   }
 
-  /** ⚠️ Confirm the bank-list endpoint; falls back to an empty list on failure. */
+  /**
+   * Nigerian banks for payouts. Interswitch calls these "receiving institutions"
+   * (GET {payoutsUrl}/receiving-institutions, Bearer-auth), returning a top-level
+   * array of { code, name, nipCode, cbnCode }.
+   *
+   * The sandbox currently returns a server-side 400 ("error getting banks list")
+   * even for a correct request, so on any failure or empty result we serve a
+   * bundled fallback list (FALLBACK_BANKS) rather than an empty list — otherwise
+   * every "list banks" / beneficiary lookup silently breaks.
+   */
   async listBanks(): Promise<Bank[]> {
     try {
-      const res = await this.client.request<Record<string, unknown>>({
+      const res = await this.client.request<unknown>({
         method: 'GET',
         baseUrl: this.cfg.payoutsUrl,
-        path: 'banks',
+        path: 'receiving-institutions',
         op: 'banks.list',
       });
-      const rows = (field(res, 'data', 'banks') as unknown[]) ?? [];
-      return (Array.isArray(rows) ? rows : [])
+      // The response is a top-level array; tolerate an enveloped shape too.
+      const rows = Array.isArray(res) ? res : ((field(res as Record<string, unknown>, 'data', 'banks', 'institutions') as unknown[]) ?? []);
+      const banks = (Array.isArray(rows) ? rows : [])
         .map((r) => {
           const b = r as Record<string, unknown>;
-          const code = str(field(b, 'code', 'bankCode', 'cbnCode'));
+          const code = str(field(b, 'code', 'nipCode', 'cbnCode', 'bankCode'));
           const name = str(field(b, 'name', 'bankName'));
           return code && name ? { code, name } : null;
         })
         .filter((b): b is Bank => b !== null);
+      if (banks.length > 0) return banks;
+      logger.warn('interswitch receiving-institutions returned no banks — serving fallback list');
+      return FALLBACK_BANKS;
     } catch (err) {
-      logger.warn({ err: (err as Error).message }, 'interswitch bank list unavailable');
-      return [];
+      logger.warn({ err: (err as Error).message }, 'interswitch bank list unavailable — serving fallback list');
+      return FALLBACK_BANKS;
     }
   }
 
