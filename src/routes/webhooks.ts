@@ -4,7 +4,7 @@ import { enqueueEvent, recordMalformedEvent } from '../services/webhookProcessor
 import { kickWebhookWorker } from '../jobs/webhookWorker';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
-import { verifyWebhookChallenge, verifyWebhookSignature, processCloudWebhook } from '../channels/whatsapp/cloud';
+import { verifyWebhookChallenge, verifyWebhookSignature, processCloudWebhook, recordWebhookSignature, getWebhookDiag } from '../channels/whatsapp/cloud';
 
 export const webhooksRouter = Router();
 
@@ -94,7 +94,11 @@ webhooksRouter.get('/whatsapp', (req: Request, res: Response): void => {
 
 webhooksRouter.post('/whatsapp', (req: Request, res: Response): void => {
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
-  if (!verifyWebhookSignature(rawBody, req.header('x-hub-signature-256'))) {
+  const signatureOk = verifyWebhookSignature(rawBody, req.header('x-hub-signature-256'));
+  // Record every delivery (pass or fail) for /whatsapp/diag.
+  recordWebhookSignature(signatureOk);
+  logger.info({ signatureOk, hasSig: !!req.header('x-hub-signature-256') }, 'whatsapp webhook POST received');
+  if (!signatureOk) {
     logger.warn({ ip: req.ip }, 'whatsapp webhook rejected (bad signature)');
     res.sendStatus(401);
     return;
@@ -103,4 +107,27 @@ webhooksRouter.post('/whatsapp', (req: Request, res: Response): void => {
   // actual work (transcribe/agent/reply) happens after we've responded.
   res.sendStatus(200);
   void processCloudWebhook(req.body);
+});
+
+/**
+ * GET /webhooks/whatsapp/diag?key=<WHATSAPP_VERIFY_TOKEN> — a redacted snapshot
+ * of the LAST webhook interaction (no numbers/text), to debug delivery without
+ * server logs. Gated by the verify token so it isn't publicly readable.
+ */
+webhooksRouter.get('/whatsapp/diag', (req: Request, res: Response): void => {
+  if (!env.WHATSAPP_VERIFY_TOKEN || req.query.key !== env.WHATSAPP_VERIFY_TOKEN) {
+    res.sendStatus(403);
+    return;
+  }
+  res.status(200).json({
+    success: true,
+    data: {
+      provider: env.WHATSAPP_PROVIDER,
+      sttEnabled: env.STT_ENABLED,
+      hasPhoneNumberId: !!env.WHATSAPP_PHONE_NUMBER_ID,
+      hasAccessToken: !!env.WHATSAPP_ACCESS_TOKEN,
+      hasAppSecret: !!env.WHATSAPP_APP_SECRET,
+      lastWebhook: getWebhookDiag() ?? 'no webhook POST received yet',
+    },
+  });
 });

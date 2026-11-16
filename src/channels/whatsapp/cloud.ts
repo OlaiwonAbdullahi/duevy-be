@@ -22,6 +22,39 @@ const GRAPH = 'https://graph.facebook.com';
 const base = () => `${GRAPH}/${env.WHATSAPP_GRAPH_VERSION}`;
 const authHeader = () => ({ Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}` });
 
+// --- Diagnostics -----------------------------------------------------------
+// A redacted snapshot of the LAST webhook interaction, for debugging delivery
+// without server log access. No phone numbers or message text — only outcomes.
+
+export interface WebhookDiag {
+  at: string;
+  signatureOk: boolean | null;
+  messageCount: number;
+  messageTypes: string[];
+  sttUsed: boolean;
+  replyAttempted: boolean;
+  replyStatus: number | null;
+  error: string | null;
+}
+
+let lastDiag: WebhookDiag | null = null;
+export function getWebhookDiag(): WebhookDiag | null {
+  return lastDiag;
+}
+/** Called by the route on every POST, after the signature check. */
+export function recordWebhookSignature(ok: boolean): void {
+  lastDiag = {
+    at: new Date().toISOString(),
+    signatureOk: ok,
+    messageCount: 0,
+    messageTypes: [],
+    sttUsed: false,
+    replyAttempted: false,
+    replyStatus: null,
+    error: null,
+  };
+}
+
 // --- Webhook auth ----------------------------------------------------------
 
 /**
@@ -51,7 +84,8 @@ export function verifyWebhookSignature(rawBody: Buffer, signatureHeader: string 
 // --- Graph API calls -------------------------------------------------------
 
 /** Send a plain-text WhatsApp message to a number (international digits, no +). */
-async function sendText(toNumber: string, text: string): Promise<void> {
+async function sendText(toNumber: string, text: string): Promise<number | null> {
+  if (lastDiag) lastDiag.replyAttempted = true;
   try {
     const res = await fetch(`${base()}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
@@ -65,12 +99,17 @@ async function sendText(toNumber: string, text: string): Promise<void> {
       }),
       signal: AbortSignal.timeout(15_000),
     });
+    if (lastDiag) lastDiag.replyStatus = res.status;
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       logger.warn({ status: res.status, body: body.slice(0, 300) }, 'whatsapp cloud send failed');
+      if (lastDiag) lastDiag.error = `send ${res.status}: ${body.slice(0, 200)}`;
     }
+    return res.status;
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'whatsapp cloud send did not complete');
+    if (lastDiag) lastDiag.error = `send failed: ${(err as Error).message}`;
+    return null;
   }
 }
 
@@ -113,7 +152,14 @@ export async function processCloudWebhook(body: unknown): Promise<void> {
       const messages = (change as { value?: { messages?: InboundMessage[] } })?.value?.messages;
       if (!Array.isArray(messages)) continue;
       for (const msg of messages) {
-        await handleInbound(msg).catch((err) => logger.warn({ err: (err as Error).message }, 'whatsapp cloud message handling failed'));
+        if (lastDiag) {
+          lastDiag.messageCount += 1;
+          lastDiag.messageTypes.push(msg.type ?? 'unknown');
+        }
+        await handleInbound(msg).catch((err) => {
+          logger.warn({ err: (err as Error).message }, 'whatsapp cloud message handling failed');
+          if (lastDiag) lastDiag.error = `handle: ${(err as Error).message}`;
+        });
       }
     }
   }
@@ -134,6 +180,7 @@ async function handleInbound(msg: InboundMessage): Promise<void> {
       await sendText(from, 'I can only read text for now — please type your message.');
       return;
     }
+    if (lastDiag) lastDiag.sttUsed = true;
     const media = await downloadMedia(msg.audio.id);
     const transcription = media ? await transcribeAudio(media.bytes, media.mime) : null;
     if (!transcription?.text) {
