@@ -33,3 +33,6 @@ temp/
 
 # Uploaded assets (avatars, etc.)
 uploads/
+
+# Baileys WhatsApp session state (credentials) — never commit
+.whatsapp-auth/

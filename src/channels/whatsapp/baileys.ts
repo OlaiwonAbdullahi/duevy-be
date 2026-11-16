@@ -100,10 +100,17 @@ class BaileysChannel implements MessagingChannel {
   private async onMessage(m: WAMessage): Promise<void> {
     const jid = m.key.remoteJid;
     if (!jid || m.key.fromMe) return;
-    // Direct chats only (ignore groups, status, broadcasts).
-    if (!jid.endsWith('@s.whatsapp.net')) return;
+    // Direct chats only (ignore groups @g.us, status@broadcast, newsletters).
+    // Accept BOTH classic phone-number addressing (@s.whatsapp.net) and WhatsApp's
+    // newer hidden LID addressing (@lid) — modern clients use @lid for 1:1 chats.
+    if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
 
-    const number = jid.split('@')[0]!.replace(/[^\d]/g, '');
+    // The stable per-contact id we key the rep on. For @lid this is the LID, not
+    // the phone number, but it's consistent for the same contact, so linking and
+    // lookup still match. Prefer a phone-number alt from the key when present.
+    const altJid = (m.key as { remoteJidAlt?: string }).remoteJidAlt;
+    const idJid = altJid?.endsWith('@s.whatsapp.net') ? altJid : jid;
+    const number = idJid.split('@')[0]!.replace(/[^\d]/g, '');
     const sock = this.sock;
     if (!sock) return;
 
