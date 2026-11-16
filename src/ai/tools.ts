@@ -10,7 +10,9 @@ import type { RepContext } from './identity';
 /**
  * The agent's tools. Each is a thin wrapper over a Duevy REST endpoint, called
  * as the linked rep (see api.ts). Together they cover the rep's whole surface:
- * dues, collections/reporting, payouts & beneficiaries, team, KYC, settings.
+ * dues (create/edit/publish/close/delete/remind), collections/reporting,
+ * payouts & beneficiaries, withdrawals, polls (create/publish/close/results),
+ * the circle (members, reps, join code, audit log), KYC and settings.
  *
  * Confirmation gate: anything that creates, moves money, or is destructive
  * takes `confirmed`. Called without it, the tool does NOT act — it returns a
@@ -154,6 +156,35 @@ function buildGuestFields(raw: unknown): GuestFieldOut[] | null {
       : undefined;
     if (type === 'select' && (!options || options.length < 2)) type = 'text';
     out.push({ id, label, type, required: boolArg(f.required), ...(type === 'select' ? { options } : {}) });
+  }
+  return out.length ? out : null;
+}
+
+type PollNominee = { name: string };
+type PollCategoryOut = { title: string; nominees: PollNominee[] };
+
+/**
+ * Turn the model's `categories` argument into a poll's categories + nominees.
+ * Each category needs a title and at least TWO nominees (the API rejects fewer),
+ * so categories that don't clear that bar are dropped. Nominees may arrive as
+ * bare strings ("Ada") or objects ({ name: "Ada" }). Returns null when nothing
+ * usable remains.
+ */
+function buildPollCategories(raw: unknown): PollCategoryOut[] | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: PollCategoryOut[] = [];
+  for (const item of raw.slice(0, 20)) {
+    const c = (item ?? {}) as Record<string, unknown>;
+    const title = str(c.title);
+    if (!title) continue;
+    const nomineesRaw = Array.isArray(c.nominees) ? c.nominees : [];
+    const nominees: PollNominee[] = [];
+    for (const n of nomineesRaw.slice(0, 50)) {
+      const name = typeof n === 'string' ? str(n) : str((n as Record<string, unknown>)?.name);
+      if (name) nominees.push({ name });
+    }
+    if (nominees.length < 2) continue; // a category is only valid with ≥2 nominees
+    out.push({ title, nominees });
   }
   return out.length ? out : null;
 }
@@ -337,6 +368,56 @@ export const tools: AgentTool[] = [
       if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Confirm with the rep before deleting the draft.' };
       const res = await apiCall({ method: 'DELETE', path: `/spaces/${s.spaceId}/dues/${str(args.due_id)}`, token: ctx.token });
       return res.ok ? { deleted: true } : { error: res.error };
+    },
+  },
+  {
+    name: 'edit_due',
+    description:
+      'Edit an existing due that is NOT closed — change its title, amount, deadline, category, note, or guest access. Amount is in NAIRA and CANNOT change once anyone has paid. Pass only the fields you want to change. Call first WITHOUT confirmed to show the rep what will change, then again with confirmed:true once they approve. Use the exact due_id from a tool; never invent one.',
+    parameters: {
+      type: 'object',
+      properties: {
+        due_id: { type: 'string' },
+        title: { type: 'string' },
+        amount_naira: { type: 'number', description: 'New amount in naira. Rejected if payments already exist.' },
+        due_date: { type: 'string', description: 'New deadline — a date or an everyday phrase like "next Friday" / "in 2 weeks"; resolved for you.' },
+        category: { type: 'string', enum: [...DUE_TYPES] },
+        note: { type: 'string', description: 'Short message shown to payers (pass an empty string to clear it).' },
+        allow_guests: { type: 'boolean', description: 'Whether non-members can pay via the public link.' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['due_id'],
+    },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const dueId = str(args.due_id);
+      if (!dueId) return { error: 'due_id is required.' };
+      // Guard against a made-up id: confirm the due exists in this space first.
+      const listRes = await apiCall<{ id: string; title: string; status?: string }[]>({ method: 'GET', path: `/spaces/${s.spaceId}/dues`, token: ctx.token });
+      if (listRes.ok) {
+        const list = Array.isArray(listRes.data) ? listRes.data : [];
+        if (!list.some((d) => d.id === dueId)) {
+          return { error: 'No due with that id in this space — do not guess an id. Pick one of these by its exact id.', dues: list.map((d) => ({ id: d.id, title: d.title, status: d.status })) };
+        }
+      }
+      const body: Record<string, unknown> = {};
+      const changes: Record<string, unknown> = {};
+      if (str(args.title)) { body.title = str(args.title); changes.title = body.title; }
+      const amt = numArg(args.amount_naira);
+      if (amt !== undefined) { body.amount = nairaToKobo(amt); changes.amount = formatNaira(nairaToKobo(amt)); }
+      if (args.due_date !== undefined) {
+        const d = resolveDueDate(str(args.due_date));
+        if (!d) return { error: `I couldn't read "${str(args.due_date) ?? ''}" as a date. Give a specific day (e.g. "next Friday", "in 2 weeks", or a date).` };
+        body.dueDate = d; changes.dueDate = d;
+      }
+      if (str(args.category)) { body.category = str(args.category); changes.category = body.category; }
+      if (args.note !== undefined) { body.note = str(args.note) ?? ''; changes.note = body.note; }
+      if (args.allow_guests !== undefined) { body.allowGuests = boolArg(args.allow_guests); changes.allowGuests = body.allowGuests; }
+      if (Object.keys(body).length === 0) return { error: 'Nothing to change — tell me what to update (title, amount, deadline, category, note, or guest access).' };
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, changes, instruction: 'Read these changes back to the rep and get a clear yes before calling again with confirmed:true.' };
+      const res = await apiCall({ method: 'PATCH', path: `/spaces/${s.spaceId}/dues/${dueId}`, token: ctx.token, body });
+      return res.ok ? { updated: res.data } : { error: res.error };
     },
   },
   {
@@ -632,6 +713,179 @@ export const tools: AgentTool[] = [
       if (!boolArg(args.confirmed)) return { needsConfirmation: true, changes: body, instruction: 'Confirm these changes with the rep first.' };
       const res = await apiCall({ method: 'PATCH', path: `/spaces/${s.spaceId}`, token: ctx.token, body });
       return res.ok ? { updated: res.data } : { error: res.error };
+    },
+  },
+
+  // --- Polls (voting / awards) -------------------------------------------
+  {
+    name: 'list_polls',
+    description: 'List the polls / voting campaigns this space has created, with vote counts. Optional status filter. (Polls must be enabled for the space; if not, the tool says so.)',
+    parameters: { type: 'object', properties: { status: { type: 'string', enum: ['draft', 'active', 'closed'] } } },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const res = await apiCall({ method: 'GET', path: `/spaces/${s.spaceId}/polls`, token: ctx.token, query: { status: str(args.status) } });
+      return res.ok ? res.data : { error: res.error };
+    },
+  },
+  {
+    name: 'create_poll',
+    description:
+      'Create a poll / awards-style vote for the space. A poll has one or more categories, each with AT LEAST TWO nominees. By default it is PUBLISHED immediately (set publish:false to keep a draft). If paid:true, amount_per_vote_naira (in NAIRA) is required. Call first WITHOUT confirmed to read the summary (categories + nominees) back to the rep; only call again with confirmed:true once they approve.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        deadline: { type: 'string', description: 'When voting closes — a date or an everyday phrase; resolved for you. Must be in the future.' },
+        description: { type: 'string' },
+        members_only: { type: 'boolean', description: 'Only space members may vote. Default false (anyone with the link).' },
+        paid: { type: 'boolean', description: 'Charge per vote. Default false.' },
+        amount_per_vote_naira: { type: 'number', description: 'Price per vote in naira. Required when paid:true.' },
+        categories: {
+          type: 'array',
+          description: 'The award categories. Each needs a title and at least two nominees.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              nominees: { type: 'array', items: { type: 'string' }, description: 'Nominee names — at least two.' },
+            },
+            required: ['title', 'nominees'],
+          },
+        },
+        publish: { type: 'boolean', description: 'Open for voting immediately. Default TRUE; set false only to keep a draft.' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['title', 'deadline', 'categories'],
+    },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const title = str(args.title);
+      const deadline = resolveDueDate(str(args.deadline));
+      if (!title) return { error: 'A poll title is required.' };
+      if (!deadline) return { error: `I couldn't read "${str(args.deadline) ?? ''}" as a date. Give a specific closing day.` };
+      const paid = boolArg(args.paid);
+      const amountPerVoteNaira = numArg(args.amount_per_vote_naira);
+      if (paid && (amountPerVoteNaira === undefined || amountPerVoteNaira <= 0)) return { error: 'For a paid poll, tell me the price per vote (in naira).' };
+      const categories = buildPollCategories(args.categories);
+      if (!categories) return { error: 'A poll needs at least one category, each with at least two nominees. Give me the categories and their nominees.' };
+      const membersOnly = boolArg(args.members_only);
+      const willPublish = args.publish === undefined ? true : boolArg(args.publish);
+      const summary = {
+        title,
+        deadline,
+        membersOnly,
+        paid,
+        ...(paid ? { amountPerVote: formatNaira(nairaToKobo(amountPerVoteNaira!)) } : {}),
+        categories: categories.map((c) => ({ title: c.title, nominees: c.nominees.map((n) => n.name) })),
+        willPublish,
+      };
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, summary, instruction: 'Read this poll summary back to the rep (categories and nominees, deadline, members-only/paid) and get a clear yes before calling again with confirmed:true.' };
+      const res = await apiCall({
+        method: 'POST',
+        path: `/spaces/${s.spaceId}/polls`,
+        token: ctx.token,
+        body: {
+          title,
+          description: str(args.description),
+          deadline,
+          membersOnly,
+          paid,
+          ...(paid ? { amountPerVote: nairaToKobo(amountPerVoteNaira!) } : {}),
+          categories: categories.map((c) => ({ title: c.title, nominees: c.nominees.map((n) => ({ name: n.name })) })),
+          publish: willPublish,
+        },
+      });
+      return res.ok ? { created: res.data } : { error: res.error };
+    },
+  },
+  {
+    name: 'publish_poll',
+    description: 'Publish an existing DRAFT poll so voting opens. Use the exact poll_id from list_polls; never invent one. Call without confirmed to confirm first.',
+    parameters: { type: 'object', properties: { poll_id: { type: 'string' }, confirmed: { type: 'boolean' } }, required: ['poll_id'] },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Confirm with the rep that they want to publish this poll.' };
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/polls/${str(args.poll_id)}/publish`, token: ctx.token, body: {} });
+      return res.ok ? { published: res.data } : { error: res.error };
+    },
+  },
+  {
+    name: 'close_poll',
+    description: 'Close a poll so it stops accepting votes. Use the exact poll_id from list_polls. Call without confirmed to confirm first.',
+    parameters: { type: 'object', properties: { poll_id: { type: 'string' }, confirmed: { type: 'boolean' } }, required: ['poll_id'] },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Confirm with the rep that they want to close this poll.' };
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/polls/${str(args.poll_id)}/close`, token: ctx.token, body: {} });
+      return res.ok ? { closed: res.data } : { error: res.error };
+    },
+  },
+  {
+    name: 'poll_results',
+    description: 'The current results / standings for a poll — nominees and their vote tallies (and revenue for a paid poll). Use the exact poll_id from list_polls.',
+    parameters: { type: 'object', properties: { poll_id: { type: 'string' } }, required: ['poll_id'] },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const res = await apiCall({ method: 'GET', path: `/spaces/${s.spaceId}/polls/${str(args.poll_id)}/results`, token: ctx.token });
+      return res.ok ? res.data : { error: res.error };
+    },
+  },
+
+  // --- Circle admin (members, reps, join code, audit) --------------------
+  {
+    name: 'audit_log',
+    description: "The space's recent activity log (who did what, when) — rep changes, join-code rotations, poll and payout events.",
+    parameters: { type: 'object', properties: {} },
+    async run(_args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const res = await apiCall({ method: 'GET', path: `/spaces/${s.spaceId}/audit-log`, token: ctx.token });
+      return res.ok ? res.data : { error: res.error };
+    },
+  },
+  {
+    name: 'regenerate_join_code',
+    description: "Rotate the space's join code. The OLD code stops working immediately, so warn the rep. Call without confirmed to confirm first; on success returns the new code to share.",
+    parameters: { type: 'object', properties: { confirmed: { type: 'boolean' } } },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Warn the rep the current join code will stop working, and confirm before rotating it.' };
+      const res = await apiCall<{ code?: string }>({ method: 'POST', path: `/spaces/${s.spaceId}/join-code/regenerate`, token: ctx.token, body: {} });
+      return res.ok ? { joinCode: res.data?.code ?? null } : { error: res.error };
+    },
+  },
+  {
+    name: 'remove_member',
+    description: 'Remove a member from the space (lead rep only). Pass the exact user_id from list_members — never invent one. If they are also a rep, remove the rep role first. Call without confirmed to confirm first.',
+    parameters: { type: 'object', properties: { user_id: { type: 'string' }, confirmed: { type: 'boolean' } }, required: ['user_id'] },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const uid = str(args.user_id);
+      if (!uid) return { error: 'user_id is required — get it from list_members.' };
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Confirm with the rep which member to remove (by name) before calling again with confirmed:true.' };
+      const res = await apiCall({ method: 'DELETE', path: `/spaces/${s.spaceId}/members/${uid}`, token: ctx.token });
+      return res.ok ? { removed: true } : { error: res.error };
+    },
+  },
+  {
+    name: 'remove_rep',
+    description: 'Remove a co-rep (revoke their rep role) — lead rep only. Pass the exact user_id from list_reps; never invent one. You cannot remove the sole lead rep. Call without confirmed to confirm first.',
+    parameters: { type: 'object', properties: { user_id: { type: 'string' }, confirmed: { type: 'boolean' } }, required: ['user_id'] },
+    async run(args, ctx) {
+      const s = resolveSpace(ctx);
+      if ('error' in s) return s;
+      const uid = str(args.user_id);
+      if (!uid) return { error: 'user_id is required — get it from list_reps.' };
+      if (!boolArg(args.confirmed)) return { needsConfirmation: true, instruction: 'Confirm with the rep which co-rep to remove (by name) before calling again with confirmed:true.' };
+      const res = await apiCall({ method: 'DELETE', path: `/spaces/${s.spaceId}/reps/${uid}`, token: ctx.token });
+      return res.ok ? { removed: true } : { error: res.error };
     },
   },
 ];
