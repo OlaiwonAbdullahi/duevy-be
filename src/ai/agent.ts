@@ -127,8 +127,10 @@ export function repairPayLink(text: string, realLink: string | null): string {
   // e.g. a hallucinated "duevy.com/pay/abc") → the real URL.
   out = out.replace(/(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/pay\/[^\s)]+/gi, realLink);
 
-  // If the model mentions a link but none ended up in the text, append it.
-  if (!out.includes(realLink) && /\blink\b/i.test(out)) {
+  // A tool produced a real pay link this turn, so the reply is about that due.
+  // If the real link isn't already in the text (model omitted it, or pasted
+  // garbage like an amount), append it on its own line so it's never missing.
+  if (!out.includes(realLink)) {
     out = `${out.trimEnd()}\n${realLink}`;
   }
   return out;

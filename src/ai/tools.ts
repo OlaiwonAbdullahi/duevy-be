@@ -314,7 +314,19 @@ export const tools: AgentTool[] = [
       });
       if (!res.ok) return { error: res.error };
       const due = res.data as { id?: string };
-      return { created: res.data, payLink: due.id ? payLink(due.id) : null };
+      const link = due.id ? payLink(due.id) : null;
+      // Return a LEAN, unambiguous result (no raw kobo fields) so the model can't
+      // grab an amount and paste it where the link belongs.
+      return {
+        created: true,
+        dueId: due.id ?? null,
+        title,
+        published: summary.willPublish,
+        totalStudentPays: summary.studentPays,
+        payLink: link,
+        instruction:
+          'Saved. Tell the rep it is live (if published) and share the payLink EXACTLY as given below. The ONLY thing you may present as the link is this payLink string — NEVER output an amount, an id, or any number as the link.',
+      };
     },
   },
   {
