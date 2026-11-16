@@ -123,9 +123,11 @@ export function repairPayLink(text: string, realLink: string | null): string {
   // Bare placeholder tokens like [Link to pay], [Link], [pay link].
   out = out.replace(/\[[^\]]*(?:link|pay)[^\]]*\]/gi, realLink);
 
-  // Any pay-style URL (wrong host, wrong domain, masked id, or NO scheme at all —
-  // e.g. a hallucinated "duevy.com/pay/abc") → the real URL.
-  out = out.replace(/(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/pay\/[^\s)]+/gi, realLink);
+  // When a tool produced the real link this turn, ANY path-bearing URL the model
+  // wrote in this reply is meant to be it — replace every one (wrong host, wrong
+  // path like /d/, double-domain, or no scheme) with the real link. Requires a
+  // "/path" so bare brand mentions (e.g. "duevy.app") are left alone.
+  out = out.replace(/(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/[^\s)]+/gi, realLink);
 
   // A tool produced a real pay link this turn, so the reply is about that due.
   // If the real link isn't already in the text (model omitted it, or pasted
