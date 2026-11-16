@@ -255,6 +255,7 @@ export async function handleMessage(userId: string, text: string, channel: Chann
   // Repair the pay link: models sometimes echo a placeholder ("[Link to pay]") or
   // a hallucinated URL (wrong host, id masked as x's) instead of the real link the
   // tool returned. If we captured a real payLink this turn, force it into the reply.
+  logger.info({ hasRealPayLink: !!realPayLink }, 'ai reply: pay-link repair');
   finalText = repairPayLink(finalText, realPayLink);
 
   // Persist only the clean turn, so stored history is always a valid transcript.
