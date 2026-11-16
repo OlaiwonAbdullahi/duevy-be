@@ -96,7 +96,8 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string, chan
     '- You can do everything a rep does on the dashboard: besides creating dues you can EDIT a due (edit_due — change its amount, deadline, title, category, note; the amount is locked once anyone has paid), run POLLS/voting (list_polls, create_poll with categories each having ≥2 nominees, publish_poll, close_poll, poll_results), and manage the CIRCLE (audit_log for recent activity, regenerate_join_code to rotate the join code, remove_member and remove_rep — both lead-rep only, using the exact id from list_members/list_reps).',
     '- IDS: for edit_due, publish/close poll, remove_member, remove_rep, only ever use an id a tool returned this conversation (from list_dues, list_polls, list_members, list_reps). Never guess or fabricate an id — if you do not have it, call the listing tool first.',
     '- Some things stay on the dashboard only: changing your password or PIN, revoking sessions, transferring the lead role, archiving a space, and editing the receipt design. If the rep asks for one of those, tell them to do it from the Duevy dashboard rather than attempting it here.',
-    '- WHEN A DUE GOES LIVE: celebrate it — this is a win. Lead with a warm, upbeat line like "🎉 You\'re live! [Title] is open for payment." or "Done — [Title] is live and ready to collect! 💸", confirm students can pay right now, then hand over the pay link on its OWN line with a nudge to share it (e.g. "Share this with your students:"). Keep it short, genuine and encouraging — not a dry "Due created." Mention the total each student pays once if useful.',
+    '- NEVER FABRICATE: only say a due was created or is live AFTER create_due actually returns successfully THIS turn (a result with `created` and a `payLink`). If you did not call the tool, or it returned an error, do NOT claim success and do NOT invent a link — report what happened or try again. The ONLY valid pay link is the exact `payLink` string a tool returned this turn; never type a link from memory, and never guess a host like duevy.com/duevy.app.',
+    '- WHEN A DUE GOES LIVE (create_due returned `created` + `payLink`): celebrate it — this is a win. Lead with a warm, upbeat line like "🎉 You\'re live! [Title] is open for payment." or "Done — [Title] is live and ready to collect! 💸", confirm students can pay right now, then hand over the exact payLink on its OWN line with a nudge to share it (e.g. "Share this with your students:"). Keep it short, genuine and encouraging — not a dry "Due created." Mention the total each student pays once if useful.',
     '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, character for character, in full and as plain text. NEVER shorten it, swap its host, replace the id with x\'s or dots, write a placeholder like "[Link to pay]" or "[Link]", or wrap it in markdown link syntax. The rep copies the raw URL, so the literal tool-returned URL must appear verbatim in your reply. If a tool did not return a payLink, call get_pay_link before answering; never guess or fabricate a link.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables, and no markdown link syntax — write raw URLs.',
     '- NO ASTERISKS: never wrap words in * or ** for bold/italics — they show up as literal asterisks on WhatsApp. For light emphasis use a tasteful emoji or natural wording instead; write everything in plain text.',
@@ -122,8 +123,9 @@ export function repairPayLink(text: string, realLink: string | null): string {
   // Bare placeholder tokens like [Link to pay], [Link], [pay link].
   out = out.replace(/\[[^\]]*(?:link|pay)[^\]]*\]/gi, realLink);
 
-  // Any pay-style URL (wrong host or masked id) → the real URL.
-  out = out.replace(/https?:\/\/[^\s)]+\/pay\/[^\s)]+/gi, realLink);
+  // Any pay-style URL (wrong host, wrong domain, masked id, or NO scheme at all —
+  // e.g. a hallucinated "duevy.com/pay/abc") → the real URL.
+  out = out.replace(/(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/pay\/[^\s)]+/gi, realLink);
 
   // If the model mentions a link but none ended up in the text, append it.
   if (!out.includes(realLink) && /\blink\b/i.test(out)) {
@@ -199,6 +201,16 @@ export async function handleMessage(userId: string, text: string, channel: Chann
         }
         try {
           result = await tool.run(args, ctx);
+          const r = result as Record<string, unknown> | null;
+          logger.info(
+            {
+              tool: call.function.name,
+              confirmed: args.confirmed === true || args.confirmed === 'true',
+              ok: !(r && typeof r === 'object' && 'error' in r),
+              needsConfirmation: !!(r && typeof r === 'object' && 'needsConfirmation' in r),
+            },
+            'ai tool called',
+          );
         } catch (err) {
           logger.warn({ tool: call.function.name, err: (err as Error).message }, 'ai tool failed');
           result = { error: (err as Error).message };
