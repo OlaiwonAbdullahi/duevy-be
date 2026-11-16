@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+# Hugging Face model cache, if pointed here
+models/

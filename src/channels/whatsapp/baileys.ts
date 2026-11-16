@@ -3,6 +3,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
   Browsers,
   type WASocket,
   type WAMessage,
@@ -10,6 +11,7 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal';
 import { env } from '../../config/env';
 import { logger } from '../../lib/logger';
+import { transcribeAudio } from '../../ai/stt';
 import { handleWhatsappMessage } from './handler';
 
 /**
@@ -37,6 +39,12 @@ function extractText(message: Record<string, unknown> | null | undefined): strin
   const imageCaption = (message.imageMessage as { caption?: string } | undefined)?.caption;
   if (imageCaption) return imageCaption;
   return null;
+}
+
+/** The voice-note (push-to-talk) or audio message on a Baileys message, if any. */
+function extractAudio(message: Record<string, unknown> | null | undefined): { mimetype?: string } | null {
+  const audio = message?.audioMessage as { mimetype?: string } | undefined;
+  return audio ?? null;
 }
 
 class BaileysChannel implements MessagingChannel {
@@ -94,12 +102,33 @@ class BaileysChannel implements MessagingChannel {
     if (!jid || m.key.fromMe) return;
     // Direct chats only (ignore groups, status, broadcasts).
     if (!jid.endsWith('@s.whatsapp.net')) return;
-    const text = extractText(m.message as Record<string, unknown> | null | undefined);
-    if (!text) return;
 
     const number = jid.split('@')[0]!.replace(/[^\d]/g, '');
     const sock = this.sock;
     if (!sock) return;
+
+    const message = m.message as Record<string, unknown> | null | undefined;
+    let text = extractText(message);
+    let viaVoice = false;
+
+    // A voice note (or audio) with no caption: transcribe it, then treat the
+    // transcript exactly like a typed message. The agent is untouched.
+    if (!text && extractAudio(message)) {
+      if (!env.STT_ENABLED) {
+        await sock.sendMessage(jid, { text: 'I can only read text for now — please type your message.' });
+        return;
+      }
+      await sock.sendPresenceUpdate('recording', jid).catch(() => {});
+      const transcript = await this.transcribeVoiceNote(m);
+      if (!transcript) {
+        await sock.sendMessage(jid, { text: "I couldn't make out that voice note. Please try again, speak clearly, or type your message." });
+        return;
+      }
+      text = transcript;
+      viaVoice = true;
+    }
+
+    if (!text) return;
 
     await sock.sendPresenceUpdate('composing', jid).catch(() => {});
     let reply: string;
@@ -109,7 +138,29 @@ class BaileysChannel implements MessagingChannel {
       logger.error({ err: (err as Error).message }, 'whatsapp agent error');
       reply = 'Sorry, something went wrong on my side. Please try again in a moment.';
     }
-    await sock.sendMessage(jid, { text: reply });
+    // Echo what we heard so the rep can catch a mis-hearing before acting on it.
+    const out = viaVoice ? `🎙️ I heard: “${text}”\n\n${reply}` : reply;
+    await sock.sendMessage(jid, { text: out });
+  }
+
+  /** Download a voice note's audio and transcribe it via the STT sidecar. */
+  private async transcribeVoiceNote(m: WAMessage): Promise<string | null> {
+    const sock = this.sock;
+    if (!sock) return null;
+    try {
+      // Baileys bundles its own pino; our logger is a compatible instance, so we
+      // cast the whole context to the function's own (unexported) context type.
+      const ctx = { logger, reuploadRequest: sock.updateMediaMessage } as unknown as NonNullable<
+        Parameters<typeof downloadMediaMessage>[3]
+      >;
+      const buffer = (await downloadMediaMessage(m, 'buffer', {}, ctx)) as Buffer;
+      const mimetype = extractAudio(m.message as Record<string, unknown> | null | undefined)?.mimetype ?? 'audio/ogg';
+      const result = await transcribeAudio(buffer, mimetype);
+      return result?.text ?? null;
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'voice note download/transcription failed');
+      return null;
+    }
   }
 
   async stop(): Promise<void> {
@@ -130,6 +181,12 @@ export async function startWhatsappBot(): Promise<void> {
   if (!env.WHATSAPP_ENABLED) return;
   if (!env.AI_ENABLED) {
     logger.warn('WHATSAPP_ENABLED is true but AI_ENABLED is false; the bot needs the AI assistant. Not starting.');
+    return;
+  }
+  // Cloud API is webhook-driven (routes/webhooks.ts → /webhooks/whatsapp), so
+  // there is no socket to start here — just log that it's the active transport.
+  if (env.WHATSAPP_PROVIDER === 'cloud') {
+    logger.info('whatsapp transport: Meta Cloud API (inbound via /v1/webhooks/whatsapp)');
     return;
   }
   if (channel) return;

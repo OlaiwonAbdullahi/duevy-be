@@ -4,6 +4,7 @@ import { enqueueEvent, recordMalformedEvent } from '../services/webhookProcessor
 import { kickWebhookWorker } from '../jobs/webhookWorker';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
+import { verifyWebhookChallenge, verifyWebhookSignature, processCloudWebhook } from '../channels/whatsapp/cloud';
 
 export const webhooksRouter = Router();
 
@@ -72,4 +73,34 @@ webhooksRouter.post('/interswitch', handleProviderWebhook);
  */
 webhooksRouter.post('/bachs', (_req: Request, res: Response): void => {
   res.status(200).json({ success: true });
+});
+
+/**
+ * WhatsApp Cloud API webhook (WHATSAPP_PROVIDER=cloud). Register this URL plus
+ * your verify token in the Meta app (WhatsApp → Configuration → Webhook), and
+ * subscribe to the `messages` field.
+ *
+ *   GET  /webhooks/whatsapp — Meta's subscription handshake (echo the challenge).
+ *   POST /webhooks/whatsapp — inbound messages; signature-verified, then 200 fast.
+ */
+webhooksRouter.get('/whatsapp', (req: Request, res: Response): void => {
+  const challenge = verifyWebhookChallenge(req.query as Record<string, unknown>);
+  if (challenge) {
+    res.status(200).type('text/plain').send(challenge);
+    return;
+  }
+  res.sendStatus(403);
+});
+
+webhooksRouter.post('/whatsapp', (req: Request, res: Response): void => {
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from('');
+  if (!verifyWebhookSignature(rawBody, req.header('x-hub-signature-256'))) {
+    logger.warn({ ip: req.ip }, 'whatsapp webhook rejected (bad signature)');
+    res.sendStatus(401);
+    return;
+  }
+  // Ack immediately — Meta retries on any non-200 and times out quickly. The
+  // actual work (transcribe/agent/reply) happens after we've responded.
+  res.sendStatus(200);
+  void processCloudWebhook(req.body);
 });

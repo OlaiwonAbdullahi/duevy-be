@@ -95,9 +95,41 @@ const envSchema = z.object({
   // WhatsApp bot — Baileys (unofficial WhatsApp Web client). See docs/WHATSAPP.md.
   // ---------------------------------------------------------------------------
   WHATSAPP_ENABLED: z.string().transform((v) => v === 'true').default('false'),
+  // Which transport the bot uses:
+  //   baileys = unofficial WhatsApp Web client (QR, demo only, ToS/ban risk)
+  //   cloud   = Meta's official WhatsApp Cloud API (webhook + Graph API)
+  WHATSAPP_PROVIDER: z.enum(['baileys', 'cloud']).default('baileys'),
   // Directory for Baileys multi-file auth state (the linked session). Keep it
-  // off version control and persistent across restarts.
+  // off version control and persistent across restarts. (baileys only)
   WHATSAPP_AUTH_DIR: z.string().default('./.whatsapp-auth'),
+
+  // Meta WhatsApp Cloud API (WHATSAPP_PROVIDER=cloud). All but the Graph version
+  // come from developers.facebook.com → your app → WhatsApp → API Setup, and
+  // business.facebook.com → Business Settings → System Users (for the token).
+  // See docs/WHATSAPP_CLOUD.md.
+  //   - PHONE_NUMBER_ID: the 15-digit Phone Number ID (NOT the display number).
+  //   - BUSINESS_ACCOUNT_ID: the WABA ID (optional; for management calls).
+  //   - ACCESS_TOKEN: a long-lived System User token (whatsapp_business_messaging
+  //     + whatsapp_business_management), with the app + WABA + number assigned.
+  //   - VERIFY_TOKEN: any random string you pick; used for the webhook handshake.
+  //   - APP_SECRET: App Settings → Basic; verifies inbound webhook signatures.
+  WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
+  WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().optional(),
+  WHATSAPP_ACCESS_TOKEN: z.string().optional(),
+  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
+  WHATSAPP_APP_SECRET: z.string().optional(),
+  WHATSAPP_GRAPH_VERSION: z.string().default('v23.0'),
+
+  // ---------------------------------------------------------------------------
+  // Voice notes — speech-to-text sidecar. The bundled faster-whisper service
+  // (see stt/) runs locally with NO api key and NO usage cap; swap STT_URL for a
+  // Riva/NIM or other OpenAI-compatible endpoint later. See docs/VOICE.md.
+  // ---------------------------------------------------------------------------
+  STT_ENABLED: z.string().transform((v) => v === 'true').default('false'),
+  // Base URL of the transcription service; it must serve POST /transcribe.
+  STT_URL: z.string().url().default('http://localhost:8001'),
+  // Hard cap on how long we wait for a transcription before giving up.
+  STT_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   // Didit (docs.didit.me) — rep NIN + date of birth checks against NIMC.
   // Required with the live rail. Under PAYMENT_PROVIDER=fake, leaving the key
@@ -177,6 +209,16 @@ const envSchema = z.object({
   }
   if (val.AI_ENABLED && !val.NVIDIA_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['NVIDIA_API_KEY'], message: 'required when AI_ENABLED=true' });
+  }
+  if (val.WHATSAPP_ENABLED && val.WHATSAPP_PROVIDER === 'cloud') {
+    for (const key of [
+      'WHATSAPP_PHONE_NUMBER_ID',
+      'WHATSAPP_ACCESS_TOKEN',
+      'WHATSAPP_VERIFY_TOKEN',
+      'WHATSAPP_APP_SECRET',
+    ] as const) {
+      if (!val[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when WHATSAPP_PROVIDER=cloud' });
+    }
   }
   if (val.PAYMENT_PROVIDER !== 'fake' && !val.DIDIT_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['DIDIT_API_KEY'], message: 'required for rep NIN checks' });
