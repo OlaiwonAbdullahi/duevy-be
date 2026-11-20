@@ -91,14 +91,68 @@ describe('guest pay', () => {
     expect(twice.body.error.code).toBe('DUE_ALREADY_PAID');
   });
 
-  it('sends people with an account to sign in instead', async () => {
+  it('lets anyone pay as a guest, even with an email that already has an account', async () => {
     const { students, dues } = await makeSpace();
     await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });
+    const before = await db.user.count({ where: { email: students[0]!.email } });
     const res = await api('POST', `/v1/public/dues/${dues[0]!.id}/checkout`, {
       body: { name: 'Someone', matricNo: 'CSC/21/001', email: students[0]!.email },
     });
+    expect(res.status).toBe(201);
+    // The payment attaches to the existing account; no duplicate row is made.
+    expect(await db.user.count({ where: { email: students[0]!.email } })).toBe(before);
+    const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: res.body.data.reference } });
+    expect(checkout.userId).toBe(students[0]!.id);
+  });
+
+  it('lets one payer settle a due for several people in one transfer (group pay)', async () => {
+    const { rep, space, dues } = await makeSpace();
+    const due = await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });
+    const stamp = `${Date.now()}_${seq++}`;
+    const people = [
+      { name: 'Ada One', email: `ada_${stamp}@test.duevy`, matricNo: 'CSC/1' },
+      { name: 'Bola Two', email: `bola_${stamp}@test.duevy`, matricNo: 'CSC/2' },
+      { name: 'Chidi Three', email: `chidi_${stamp}@test.duevy`, matricNo: 'CSC/3' },
+    ];
+
+    const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { people } });
+    expect(opened.status).toBe(201);
+    const { reference, token, amount } = opened.body.data;
+    // Face × 3 plus the 1.5% fee on the whole basket.
+    expect(amount).toBe(500_000 * 3 + 22_500);
+
+    await pay(reference, amount);
+
+    // Each person is recorded as their own payer, crediting the space at face.
+    expect(await db.duePayment.count({ where: { dueId: due.id } })).toBe(3);
+    expect(await getSpaceBalance(space.id)).toBe(500_000 * 3);
+
+    const repToken = await tokenFor(rep);
+    const roster = await api('GET', `/v1/spaces/${space.id}/dues/${due.id}/collections`, { token: repToken });
+    expect(roster.body.data.totals).toMatchObject({ guestPaid: 3 });
+    expect(roster.body.data.guests.map((g: { name: string }) => g.name).sort()).toEqual(['Ada One', 'Bola Two', 'Chidi Three']);
+
+    // One receipt, reachable with the shared token, listing everyone.
+    const status = await api('GET', `/v1/public/checkouts/${reference}?t=${token}`);
+    expect(status.body.data.status).toBe('paid');
+    const receipt = await fetch(`${await startHttp()}/v1/public/checkouts/${reference}/receipt?t=${token}`);
+    expect(receipt.status).toBe(200);
+  });
+
+  it('refuses a group payment that lists the same email twice', async () => {
+    const { dues } = await makeSpace();
+    const due = await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });
+    const dupe = guestEmail();
+    const res = await api('POST', `/v1/public/dues/${due.id}/checkout`, {
+      body: {
+        people: [
+          { name: 'Ada One', email: dupe, matricNo: 'CSC/1' },
+          { name: 'Ada Again', email: dupe, matricNo: 'CSC/2' },
+        ],
+      },
+    });
     expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe('EMAIL_HAS_ACCOUNT');
+    expect(res.body.error.code).toBe('DUPLICATE_PAYER');
   });
 
   it("won't let a guest pay a members-only due, even through the service", async () => {

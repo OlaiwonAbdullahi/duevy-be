@@ -475,6 +475,7 @@ model User {
   payoutApprovals    PayoutApproval[]
   payoutOtps         PayoutOtp[]
   checkouts          Checkout[]
+  checkoutBeneficiary CheckoutItem[]     @relation("CheckoutBeneficiary")
   receipts           Receipt[]
   partnerRedemptions PartnerRedemption[]
 
@@ -729,7 +730,7 @@ model Due {
   title          String
   note           String?
   amount         Int // kobo
-  dueDate        DateTime // YYYY-MM-DD — the deadline
+  dueDate        DateTime? // YYYY-MM-DD — the deadline; null = no deadline
   category       DueType // exposed as `type` in the API
   status         RepDueStatus @default(draft)
   allowGuests    Boolean      @default(false)
@@ -864,12 +865,24 @@ model CheckoutItem {
   dueId      String
   faceKobo   Int // the due's face amount at the time of checkout
   feeKobo    Int // this line's share of the checkout fee (sums to Checkout.feeKobo)
+  // Who this line pays for. NULL = the checkout's own user (single-payer, legacy).
+  // Set on every line of a group checkout, where one payer settles a due for
+  // several people — each a distinct guest user with their own DuePayment.
+  beneficiaryUserId String?
+  // That person's answers to the due's questions (group pay). A single-payer
+  // checkout keeps its answers on Checkout.guestAnswers instead.
+  guestAnswers Json?
 
-  checkout Checkout @relation(fields: [checkoutId], references: [id], onDelete: Cascade)
-  due      Due      @relation(fields: [dueId], references: [id])
+  checkout    Checkout @relation(fields: [checkoutId], references: [id], onDelete: Cascade)
+  due         Due      @relation(fields: [dueId], references: [id])
+  beneficiary User?    @relation("CheckoutBeneficiary", fields: [beneficiaryUserId], references: [id])
 
-  @@unique([checkoutId, dueId])
+  // A due appears once per beneficiary. Single-payer rows have a NULL
+  // beneficiary; Postgres treats NULLs as distinct, but a single-payer basket
+  // never repeats a due, so this still forbids paying the same due twice.
+  @@unique([checkoutId, dueId, beneficiaryUserId])
   @@index([dueId])
+  @@index([beneficiaryUserId])
   @@map("checkout_items")
 }
 

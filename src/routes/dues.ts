@@ -25,7 +25,8 @@ type ViewerStatus = 'unpaid' | 'paid' | 'overdue';
 
 function viewerStatus(due: Due, payment: DuePayment | undefined, now: Date): ViewerStatus {
   if (payment) return 'paid';
-  if (due.dueDate < now) return 'overdue';
+  // A due with no deadline is never overdue.
+  if (due.dueDate && due.dueDate < now) return 'overdue';
   return 'unpaid';
 }
 
@@ -44,7 +45,7 @@ function serializeStudentDue(due: Due, payment: DuePayment | undefined, now: Dat
     amount: due.amount, // face amount the rep set
     processingFee: charge.fee, // 1.5%, added on top
     payableAmount: charge.total, // what the student pays for this due alone
-    dueDate: due.dueDate.toISOString().slice(0, 10),
+    dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     type: due.category,
     category: due.category, // deprecated alias of `type`
     status: viewerStatus(due, payment, now),
@@ -83,7 +84,8 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
     filters.status === 'paid'
       ? { payments: { some: { userId: id } } }
       : filters.status === 'unpaid'
-        ? { payments: { none: { userId: id } }, dueDate: { gte: now } }
+        ? // Not overdue: still open (deadline ahead) or without a deadline at all.
+          { payments: { none: { userId: id } }, OR: [{ dueDate: { gte: now } }, { dueDate: null }] }
         : filters.status === 'overdue'
           ? { payments: { none: { userId: id } }, dueDate: { lt: now } }
           : {};

@@ -2020,6 +2020,80 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
   ok(res, { role, permissions: perms });
 });
 
+// ---------------------------------------------------------------------------
+// Admins — the people who hold an admin role, added by email.
+// ---------------------------------------------------------------------------
+
+/** The admin roster the settings page lists. */
+adminRouter.get('/admins', requireAdminPermission('userManagement'), async (_req: Request, res: Response): Promise<void> => {
+  const admins = await db.user.findMany({
+    where: { role: 'admin', adminSubRole: { not: null } },
+    select: { id: true, name: true, email: true, avatarUrl: true, adminSubRole: true, createdAt: true, isSuspended: true, isDeactivated: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  ok(
+    res,
+    admins.map((a) => ({
+      id: a.id,
+      name: a.name,
+      email: a.email,
+      avatarUrl: a.avatarUrl,
+      subRole: a.adminSubRole,
+      suspended: a.isSuspended || a.isDeactivated,
+      createdAt: a.createdAt.toISOString(),
+    })),
+  );
+});
+
+const addAdminSchema = z.object({
+  email: z.string().trim().email().max(254).transform((e) => e.toLowerCase()),
+  subRole: z.enum(ROLE_KEYS),
+});
+
+// Grant an existing account an admin role by their email. Super-admin only, so
+// it sits behind the same guard as changing a role's permissions. A new admin
+// inherits their tier's current permissions; the Roles tab adjusts them after.
+adminRouter.post('/admins', requireSuperAdmin(), validate(addAdminSchema), async (req: Request, res: Response): Promise<void> => {
+  const { email, subRole } = req.body as z.infer<typeof addAdminSchema>;
+
+  const user = await db.user.findUnique({
+    where: { email },
+    select: { id: true, name: true, email: true, role: true, isGuest: true, isSuspended: true, isDeactivated: true },
+  });
+  if (!user) {
+    fail(res, 404, 'USER_NOT_FOUND', 'No Duevy account uses this email. Ask them to sign up first, then add them.');
+    return;
+  }
+  if (user.isGuest) {
+    fail(res, 409, 'NOT_A_FULL_ACCOUNT', 'This email has only paid as a guest. They need to finish creating their account first.');
+    return;
+  }
+  if (user.isSuspended || user.isDeactivated) {
+    fail(res, 409, 'ACCOUNT_INACTIVE', 'This account is suspended or deactivated.');
+    return;
+  }
+
+  // Seed the new admin's permissions from their tier's current settings, so
+  // they match the other admins on that role straight away. Read before the
+  // write; a brand-new tier has no sample and starts with nothing.
+  const sample = await db.adminPermission.findFirst({ where: { user: { adminSubRole: subRole } } });
+  const seed = {
+    userManagement: sample?.userManagement ?? false,
+    payouts: sample?.payouts ?? false,
+    disputes: sample?.disputes ?? false,
+    overrides: sample?.overrides ?? false,
+  };
+
+  await db.$transaction([
+    db.user.update({ where: { id: user.id }, data: { role: 'admin', adminSubRole: subRole } }),
+    // Leave an existing admin's permissions as they are; only seed a new row.
+    db.adminPermission.upsert({ where: { userId: user.id }, update: {}, create: { userId: user.id, ...seed } }),
+  ]);
+
+  await writeAdminAudit(req, 'admins.add', { target: email, severity: 'critical', metadata: { subRole, wasAdmin: user.role === 'admin' } });
+  ok(res, { id: user.id, name: user.name, email: user.email, subRole }, user.role === 'admin' ? 200 : 201);
+});
+
 // ===========================================================================
 // §14.9 Reports — built by services/reports.service.ts from the 9jaPay-era
 // records (checkouts, space ledgers, payouts, sweeps, direct deposits).

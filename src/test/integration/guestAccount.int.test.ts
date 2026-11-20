@@ -132,25 +132,22 @@ describe('matric number is always asked', () => {
     await open(due.id, { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail() });
   });
 
-  it("uses a signed-in student's profile matric number, filling it only when missing", async () => {
-    const { students } = await makeSpace({ members: 2 });
-    const [withNone, withOne] = [students[0]!, students[1]!];
-    await db.user.update({ where: { id: withOne.id }, data: { matricNo: 'STU/123' } });
+  it('always asks for a matric number, ignoring any session', async () => {
+    const { students } = await makeSpace({ members: 1 });
+    const student = students[0]!;
     const { due } = await guestDue();
 
-    // No matric on the profile: it must be given, and fills the profile.
+    // Matric is always required — no profile fallback, even with a session token.
     const none = await api('POST', `/v1/public/dues/${due.id}/checkout`, {
       body: { name: 'X Y', email: guestEmail() },
-      token: await tokenFor(withNone),
+      token: await tokenFor(student),
+      headers: asNewGuest(),
     });
     expect(none.body.error.details).toEqual([expect.objectContaining({ field: 'matricNo' })]);
-    await open(due.id, { name: 'X Y', email: guestEmail(), matricNo: 'NEW/001' }, await tokenFor(withNone));
-    expect((await db.user.findUniqueOrThrow({ where: { id: withNone.id } })).matricNo).toBe('NEW/001');
 
-    // One on the profile: not asked for, and a typed one never overwrites it.
-    const c = await open(due.id, { name: 'X Y', email: guestEmail(), matricNo: 'SOMETHING-ELSE' }, await tokenFor(withOne));
-    expect((await db.user.findUniqueOrThrow({ where: { id: withOne.id } })).matricNo).toBe('STU/123');
-    expect((await statusOf(c.reference, c.token)).payer.matricNo).toBe('STU/123');
+    // Paying with an account's own email attaches to it — by email, not session.
+    const c = await open(due.id, { name: 'X Y', email: student.email, matricNo: 'TYPED/1' }, await tokenFor(student));
+    expect((await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } })).userId).toBe(student.id);
   });
 });
 
@@ -292,31 +289,22 @@ describe('guest checkout account opt-in', () => {
     expect(ca.userId).toBe(cb.userId);
   });
 
-  it('pays as the signed-in account for an existing user, never as a guest', async () => {
+  it('attaches a guest payment to the account that owns the typed email', async () => {
     const { students } = await makeSpace();
     const student = students[0]!;
     const { rep, due } = await guestDue(); // a different space: they aren't a member
 
-    // Typing the email of an account without signing in is refused.
-    const anon = await api('POST', `/v1/public/dues/${due.id}/checkout`, {
-      body: { name: 'Sola Ade', matricNo: 'CSC/21/001', email: student.email },
-      headers: asNewGuest(),
-    });
-    expect(anon.body.error.code).toBe('EMAIL_HAS_ACCOUNT');
-
-    // Signed in, the session decides who pays — not the typed email.
-    const c = await open(due.id, { name: 'Whoever', matricNo: 'CSC/21/001', email: guestEmail(), createAccount: true }, await tokenFor(student));
-    const checkout = await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } });
-    expect(checkout.userId).toBe(student.id);
-    expect(checkout.accountRequestedAt).toBeNull();
+    // Any email can pay — even one that has an account. It attaches to that
+    // account (reusing the row), with no sign-in needed.
+    const c = await open(due.id, { name: 'Sola Ade', matricNo: 'CSC/21/001', email: student.email });
+    expect((await db.checkout.findUniqueOrThrow({ where: { reference: c.reference } })).userId).toBe(student.id);
 
     await pay(c.reference, c.amount);
     const status = await statusOf(c.reference, c.token);
     expect(status).toMatchObject({ status: 'paid', account: { exists: true }, payer: { email: student.email } });
     expect(await db.duePayment.count({ where: { userId: student.id, dueId: due.id } })).toBe(1);
-    expect((await api('POST', `/v1/public/checkouts/${c.reference}/account?t=${c.token}`)).body.error.code).toBe('ACCOUNT_EXISTS');
 
-    // A signed-in non-member paying through the link is a guest payment on the roster.
+    // A non-member paying through the link counts as a guest on the roster.
     const roster = await api('GET', `/v1/spaces/${due.spaceId}/dues/${due.id}/collections`, { token: await tokenFor(rep) });
     expect(roster.body.data.totals).toMatchObject({ paid: 0, guestPaid: 1 });
   });

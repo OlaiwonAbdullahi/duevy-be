@@ -13,12 +13,12 @@ import {
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
-import { createCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken } from '../services/checkout.service';
+import { createCheckout, createGroupCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken, type GroupPerson } from '../services/checkout.service';
 import { syncPendingCheckout } from './transactions';
 import { renderReceiptByNumber } from '../services/receipt.service';
 import { getSpaceKycState } from '../services/kyc.service';
 import { checkGuestAnswers, readGuestFields } from '../lib/guestForm';
-import { optionalAuthenticate, type AuthenticatedRequest } from '../middleware/auth';
+import { optionalAuthenticate } from '../middleware/auth';
 import { requestGuestAccount } from '../services/guestAccount.service';
 
 /**
@@ -69,7 +69,7 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     title: due.title,
     note: due.note,
     type: due.category,
-    dueDate: due.dueDate.toISOString().slice(0, 10),
+    dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     amount: charge.face,
     fee: charge.fee,
     total: charge.total,
@@ -83,21 +83,34 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
 // ---------------------------------------------------------------------------
 // POST /public/dues/{dueId}/checkout — open a guest checkout
 // ---------------------------------------------------------------------------
-const guestCheckoutSchema = z.object({
+const emailField = z.string().trim().email().max(254).transform((e) => e.toLowerCase());
+
+/** One beneficiary of a group payment (paying for several people at once). */
+const groupPersonSchema = z.object({
   name: z.string().trim().min(2).max(80),
-  email: z
-    .string()
-    .trim()
-    .email()
-    .max(254)
-    .transform((e) => e.toLowerCase()),
-  // Always asked. Optional here only for a signed-in payer whose profile already has one.
-  matricNo: z.string().trim().min(1).max(32).optional(),
-  // Answers to the due's guestFields, keyed by field id.
+  email: emailField,
+  matricNo: z.string().trim().min(1).max(32),
   answers: z.record(z.string().max(1000)).optional(),
-  // "Create a free Duevy account for me" — consent only; nothing is created until it's paid.
-  createAccount: z.boolean().optional(),
 });
+
+const guestCheckoutSchema = z
+  .object({
+    // The single payer's details. Optional only so a group request (which
+    // carries `people` instead) still validates.
+    name: z.string().trim().min(2).max(80).optional(),
+    email: emailField.optional(),
+    matricNo: z.string().trim().min(1).max(32).optional(),
+    // Answers to the due's guestFields, keyed by field id.
+    answers: z.record(z.string().max(1000)).optional(),
+    // "Create a free Duevy account for me" — consent only; nothing is created until it's paid.
+    createAccount: z.boolean().optional(),
+    // Group pay: one transfer settling the due for several people. When given,
+    // the single-payer fields above are ignored.
+    people: z.array(groupPersonSchema).min(1).max(20).optional(),
+  })
+  .refine((v) => (v.people && v.people.length > 0) || (!!v.name && !!v.email), {
+    message: 'Provide a name and email, or a list of people',
+  });
 
 const payerSelect = { id: true, isGuest: true, isSuspended: true, isDeactivated: true, matricNo: true } as const;
 
@@ -109,12 +122,20 @@ function loadGuestDueForCheckout(dueId: string) {
   });
 }
 
-/** The guest's user row: reused across their payments, created on first pay. `existing` is its prefetched lookup by email. */
-async function guestPayer(input: z.infer<typeof guestCheckoutSchema>, existing: Prisma.UserGetPayload<{ select: typeof payerSelect }> | null) {
+/**
+ * The payer's user row for a guest payment. Any email can pay: if the email
+ * already has a row (a guest OR a full account) it's reused and the payment
+ * lands on it; otherwise a fresh guest row is created. `existing` is the
+ * prefetched lookup by email.
+ */
+async function guestPayer(
+  person: { name: string; email: string; matricNo: string },
+  existing: Prisma.UserGetPayload<{ select: typeof payerSelect }> | null,
+) {
   if (existing) {
     // A guest row carries their latest matric number; a real account's profile is left alone.
-    if (existing.isGuest && input.matricNo && existing.matricNo !== input.matricNo) {
-      return db.user.update({ where: { id: existing.id }, data: { matricNo: input.matricNo }, select: payerSelect });
+    if (existing.isGuest && existing.matricNo !== person.matricNo) {
+      return db.user.update({ where: { id: existing.id }, data: { matricNo: person.matricNo }, select: payerSelect });
     }
     return existing;
   }
@@ -122,9 +143,9 @@ async function guestPayer(input: z.infer<typeof guestCheckoutSchema>, existing: 
     return await db.user.create({
       data: {
         id: generateId('user'),
-        name: input.name,
-        email: input.email,
-        matricNo: input.matricNo ?? null,
+        name: person.name,
+        email: person.email,
+        matricNo: person.matricNo,
         isGuest: true,
         role: 'student',
       },
@@ -133,7 +154,7 @@ async function guestPayer(input: z.infer<typeof guestCheckoutSchema>, existing: 
   } catch (err) {
     // Two tabs paying with the same new email at once: the other one won.
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      return db.user.findUniqueOrThrow({ where: { email: input.email }, select: payerSelect });
+      return db.user.findUniqueOrThrow({ where: { email: person.email }, select: payerSelect });
     }
     throw err;
   }
@@ -141,7 +162,6 @@ async function guestPayer(input: z.infer<typeof guestCheckoutSchema>, existing: 
 
 guestPayRouter.post(
   '/dues/:dueId/checkout',
-  // Before the limiter, so a signed-in payer is limited per account, not per (shared campus) IP.
   optionalAuthenticate,
   guestCheckoutPersonLimiter,
   guestCheckoutNetworkLimiter,
@@ -149,48 +169,51 @@ guestPayRouter.post(
   async (req: Request, res: Response): Promise<void> => {
     const dueId = req.params.dueId as string;
     const input = req.body as z.infer<typeof guestCheckoutSchema>;
-    const sessionUserId = (req as Partial<AuthenticatedRequest>).user?.sub;
-    // One parallel round instead of three in a row: the due, the signed-in
-    // account, and the guest row for this email (only created further down,
-    // once everything checks out).
-    const [due, account, existingGuest] = await Promise.all([
-      loadGuestDueForCheckout(dueId),
-      sessionUserId ? db.user.findUnique({ where: { id: sessionUserId }, select: payerSelect }) : null,
-      sessionUserId ? null : db.user.findUnique({ where: { email: input.email }, select: payerSelect }),
-    ]);
+
+    const due = await loadGuestDueForCheckout(dueId);
     if (!due) {
       errors.notFound(res, 'This payment link is not open');
       return;
     }
-
     const fields = readGuestFields(due.guestFields);
+
+    // --- Group pay: one transfer settling the due for several people --------
+    if (input.people && input.people.length > 0) {
+      const people: GroupPerson[] = [];
+      for (const person of input.people) {
+        const checked = fields ? checkGuestAnswers(fields, person.answers) : { answers: null };
+        if ('issues' in checked) {
+          errors.validation(res, checked.issues);
+          return;
+        }
+        people.push({ name: person.name, email: person.email, matricNo: person.matricNo, answers: checked.answers ?? null });
+      }
+      const { checkout } = await createGroupCheckout(dueId, people);
+      ok(res, { ...checkout, reused: false, token: guestCheckoutToken(checkout.reference) }, 201);
+      return;
+    }
+
+    // --- Single payer: anyone can pay as a guest ----------------------------
+    // No account or sign-in needed; the refine guarantees name + email here.
+    if (!input.name || !input.email) {
+      errors.validation(res, [{ field: 'name', issue: 'Name and email are required' }]);
+      return;
+    }
+    if (!input.matricNo) {
+      errors.validation(res, [{ field: 'matricNo', issue: 'Matric number is required' }]);
+      return;
+    }
+
     const checked = fields ? checkGuestAnswers(fields, input.answers) : { answers: null };
     if ('issues' in checked) {
       errors.validation(res, checked.issues);
       return;
     }
 
-    // Signed in: pay as yourself. The session proves who you are, so the
-    // typed name and email are ignored, and the profile's matric number is used.
-    if (sessionUserId && !account) {
-      errors.unauthorized(res);
-      return;
-    }
-    // Matric number is always asked — except of an account that already has one.
-    if (!input.matricNo && !account?.matricNo) {
-      errors.validation(res, [{ field: 'matricNo', issue: 'Matric number is required' }]);
-      return;
-    }
-    const payer = account
-      ? account.matricNo || !input.matricNo
-        ? account
-        : await db.user.update({ where: { id: account.id }, data: { matricNo: input.matricNo }, select: payerSelect })
-      : await guestPayer(input, existingGuest);
-    // A real account pays signed in, so the payment lands in their history.
-    if (!sessionUserId && !payer.isGuest) {
-      fail(res, 409, 'EMAIL_HAS_ACCOUNT', 'This email has a Duevy account. Sign in to pay.');
-      return;
-    }
+    // Any email can pay. Reuse the row that email already has (guest or full
+    // account) so the payment lands on it; otherwise make a fresh guest row.
+    const existing = await db.user.findUnique({ where: { email: input.email }, select: payerSelect });
+    const payer = await guestPayer({ name: input.name, email: input.email, matricNo: input.matricNo }, existing);
     if (payer.isSuspended || payer.isDeactivated) {
       errors.forbidden(res, "This email can't be used to pay");
       return;
@@ -200,7 +223,7 @@ guestPayRouter.post(
       guest: true,
       guestData: {
         ...(checked.answers ? { guestAnswers: checked.answers } : {}),
-        // Consent is the guest's; someone with an account already has one.
+        // Consent is the guest's; a full account already has one.
         accountRequestedAt: payer.isGuest && input.createAccount ? new Date() : null,
       },
     });

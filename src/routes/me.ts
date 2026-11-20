@@ -378,12 +378,14 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
     }),
   ]);
 
-  // Overdue first, then earliest deadline.
+  // Overdue first, then earliest deadline; dues with no deadline come last.
   openDuesAll.sort((a, b) => {
-    const aOver = a.dueDate < now ? 0 : 1;
-    const bOver = b.dueDate < now ? 0 : 1;
+    const aOver = a.dueDate && a.dueDate < now ? 0 : 1;
+    const bOver = b.dueDate && b.dueDate < now ? 0 : 1;
     if (aOver !== bOver) return aOver - bOver;
-    return a.dueDate.getTime() - b.dueDate.getTime();
+    const at = a.dueDate ? a.dueDate.getTime() : Infinity;
+    const bt = b.dueDate ? b.dueDate.getTime() : Infinity;
+    return at - bt;
   });
 
   const outstandingAmount = openDuesAll.reduce((sum, d) => sum + d.amount, 0);
@@ -395,10 +397,10 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
       id: d.id,
       title: d.title,
       amount: d.amount,
-      dueDate: d.dueDate.toISOString().slice(0, 10),
+      dueDate: d.dueDate ? d.dueDate.toISOString().slice(0, 10) : null,
       category: d.category,
       status: d.status,
-      overdue: d.dueDate < now,
+      overdue: !!d.dueDate && d.dueDate < now,
       space: d.space,
     })),
     recentTransactions: recentTransactions.map((t) => ({

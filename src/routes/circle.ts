@@ -349,7 +349,7 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       id: d.id,
       title: d.title,
       amount: d.amount,
-      dueDate: d.dueDate.toISOString().slice(0, 10),
+      dueDate: d.dueDate ? d.dueDate.toISOString().slice(0, 10) : null,
       type: d.category,
       category: d.category,
       status: d.status,
