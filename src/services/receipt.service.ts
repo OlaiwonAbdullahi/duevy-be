@@ -16,7 +16,11 @@ async function loadOwnedReceipt(where: { checkoutId: string } | { number: string
   const receipt = await db.receipt.findUnique({
     where,
     include: {
-      checkout: { include: { items: { include: { due: { select: { title: true } } } } } },
+      checkout: {
+        include: {
+          items: { include: { due: { select: { title: true } }, beneficiary: { select: { name: true } } } },
+        },
+      },
       space: { select: { name: true } },
       user: { select: { name: true } },
     },
@@ -69,11 +73,22 @@ export async function listReceipts(userId: string, skip: number, take: number) {
 
 async function renderPdf(r: LoadedReceipt) {
   const c = r.checkout;
+  // A group checkout pays one due for several people; label each line with the
+  // person it paid for so the receipt reads as a list of payers, not a due
+  // repeated. A single-payer checkout keeps the due titles.
+  const group = c.items.some((i) => i.beneficiaryUserId);
   const pdf = await renderReceiptPdf({
     receiptNumber: r.number,
     reference: c.reference,
-    title: c.items.length === 1 ? c.items[0]!.due.title : `${c.items.length} dues`,
-    lines: c.items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
+    title: group
+      ? `${c.items[0]!.due.title} — ${c.items.length} ${c.items.length === 1 ? 'person' : 'people'}`
+      : c.items.length === 1
+        ? c.items[0]!.due.title
+        : `${c.items.length} dues`,
+    lines: c.items.map((i) => ({
+      title: i.beneficiary ? `${i.beneficiary.name} — ${i.due.title}` : i.due.title,
+      amountKobo: i.faceKobo,
+    })),
     spaceName: r.space.name,
     payerName: r.user.name,
     amountPaid: c.totalKobo,

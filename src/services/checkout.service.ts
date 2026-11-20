@@ -42,6 +42,8 @@ type Tx = Prisma.TransactionClient;
 type CheckoutWithItems = Checkout & { items: (CheckoutItem & { due: { title: string } })[] };
 
 const MAX_DUES_PER_CHECKOUT = 20;
+/** One payer can settle a due for at most this many people in a single checkout. */
+const MAX_PEOPLE_PER_CHECKOUT = 20;
 /** A pending checkout younger than this with no bank account yet is still being opened. */
 const OPENING_GRACE_MS = 30_000;
 
@@ -241,6 +243,10 @@ export async function createCheckout(
       vaAccountNumber: null,
       vaBankName: null,
       vaAccountName: null,
+      senderName: null,
+      senderAccountNumber: null,
+      senderBank: null,
+      senderBankCode: null,
       lastProviderCheckAt: null,
       checkoutUrl: null,
       guestAnswers: (opts.guestData?.guestAnswers ?? null) as Checkout['guestAnswers'],
@@ -280,7 +286,13 @@ export async function createCheckout(
 
     const checkout: CheckoutWithItems = {
       ...created,
-      items: items.map((item) => ({ ...item, due: { title: ordered.find((d) => d.id === item.dueId)!.title } })),
+      // Single-payer lines have no beneficiary and keep answers on the checkout.
+      items: items.map((item) => ({
+        ...item,
+        beneficiaryUserId: null,
+        guestAnswers: null,
+        due: { title: ordered.find((d) => d.id === item.dueId)!.title },
+      })),
     };
     return { checkout, reused: false };
   }, { timeout: 10_000 }); // 4 round trips normally; headroom for a slow database link
@@ -301,6 +313,164 @@ export async function createCheckout(
 
   logger.info({ ref: checkout.reference, userId, spaceId: checkout.spaceId, total: checkout.totalKobo, reused: outcome.reused }, 'checkout ready');
   return { checkout: serializeCheckout(checkout), reused: outcome.reused };
+}
+
+// ---------------------------------------------------------------------------
+// Group checkout — one payer settles a due for several people at once
+// ---------------------------------------------------------------------------
+
+/** One person a group checkout pays for. `email` is already normalised. */
+export interface GroupPerson {
+  name: string;
+  email: string;
+  matricNo?: string;
+  /** The person's validated answers to the due's questions (lib/guestForm). */
+  answers?: Prisma.InputJsonValue | null;
+}
+
+const groupPayerSelect = { id: true, isGuest: true, isSuspended: true, isDeactivated: true, matricNo: true } as const;
+
+/** Resolve (or create) the user a group line pays for. Any email can pay: an
+ *  existing row (guest or full account) is reused, else a guest row is made. */
+async function resolveGroupUser(p: GroupPerson) {
+  const existing = await db.user.findUnique({ where: { email: p.email }, select: groupPayerSelect });
+  if (existing) {
+    if (existing.isSuspended || existing.isDeactivated) throw forbidden(`${p.email} can't be used to pay`);
+    // A guest row carries their latest matric number; a full account's profile is left alone.
+    if (existing.isGuest && p.matricNo && existing.matricNo !== p.matricNo) {
+      return db.user.update({ where: { id: existing.id }, data: { matricNo: p.matricNo }, select: groupPayerSelect });
+    }
+    return existing;
+  }
+  try {
+    return await db.user.create({
+      data: { id: generateId('user'), name: p.name, email: p.email, matricNo: p.matricNo ?? null, isGuest: true, role: 'student' },
+      select: groupPayerSelect,
+    });
+  } catch (err) {
+    // Two tabs creating the same new email at once: the other one won.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      return db.user.findUniqueOrThrow({ where: { email: p.email }, select: groupPayerSelect });
+    }
+    throw err;
+  }
+}
+
+/**
+ * One guest-enabled due, paid for several people with ONE transfer. Each person
+ * is a distinct guest user with their own CheckoutItem (carrying their answers)
+ * and, once paid, their own DuePayment and ledger credit — so each shows up in
+ * the rep's roster. The person filling the form is the checkout's primary user.
+ *
+ *   face  = due.amount × people           → credited to the space in full
+ *   fee   = 1.5% of face                   → the processing fee, on top
+ *   total = face + fee                     → one transfer
+ */
+export async function createGroupCheckout(dueId: string, people: GroupPerson[]): Promise<CheckoutResult> {
+  if (people.length < 1 || people.length > MAX_PEOPLE_PER_CHECKOUT) {
+    throw new AppError(400, 'VALIDATION_ERROR', `Pay for between 1 and ${MAX_PEOPLE_PER_CHECKOUT} people`);
+  }
+  // No one listed twice: the same person can't pay a due twice anyway.
+  const seen = new Set<string>();
+  for (const p of people) {
+    if (seen.has(p.email)) throw conflict('DUPLICATE_PAYER', `${p.email} is listed more than once.`);
+    seen.add(p.email);
+  }
+
+  const [due, kycPolicy] = await Promise.all([
+    db.due.findUnique({ where: { id: dueId }, include: { space: { select: { id: true, name: true, isArchived: true } } } }),
+    getKycPolicy(),
+  ]);
+  // One answer for every "not open" reason, as the single-payer route does.
+  if (!due || !due.allowGuests || due.status !== 'active' || due.space.isArchived) {
+    throw notFound('This payment link is not open');
+  }
+  const leadUser = await db.user.findFirst({
+    where: { spaceReps: { some: { role: 'lead', space: { id: due.space.id } } } },
+    select: { kycStatus: true, studentIdStatus: true, livenessStatus: true },
+  });
+  if (!leadUser || !canCollect(leadUser, kycPolicy)) {
+    throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
+  }
+
+  const users = await Promise.all(people.map(resolveGroupUser));
+  const alreadyPaid = await db.duePayment.findMany({ where: { dueId, userId: { in: users.map((u) => u.id) } }, select: { userId: true } });
+  if (alreadyPaid.length > 0) {
+    const paidIds = new Set(alreadyPaid.map((p) => p.userId));
+    const names = users.map((u, i) => (paidIds.has(u.id) ? people[i]!.name : null)).filter(Boolean);
+    throw conflict('DUE_ALREADY_PAID', `"${due.title}" has already been paid for ${names.join(', ')}.`);
+  }
+
+  const face = due.amount * people.length;
+  const fee = checkoutFee(face);
+  const feeShares = allocate(fee, people.map(() => due.amount));
+  const primaryId = users[0]!.id;
+
+  const open = async (): Promise<CheckoutWithItems> =>
+    db.$transaction(async (tx) => {
+      const reference = generateReference();
+      const now = new Date();
+      const checkout = await tx.checkout.create({
+        data: {
+          id: generateId('checkout'),
+          reference,
+          userId: primaryId,
+          spaceId: due.space.id,
+          status: 'pending',
+          faceKobo: face,
+          feeKobo: fee,
+          totalKobo: face + fee,
+          overpaidKobo: 0,
+          // Prefixed so the single-payer reuse check never mistakes a group
+          // checkout for one person's own basket of the same due.
+          dueSetKey: `group:${dueId}`,
+          provider: getPaymentProvider().name,
+          guestAnswers: Prisma.DbNull,
+          expiresAt: new Date(now.getTime() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
+          needsReview: false,
+          items: {
+            create: users.map((u, i) => ({
+              id: generateId('checkoutItem'),
+              dueId,
+              faceKobo: due.amount,
+              feeKobo: feeShares[i]!,
+              beneficiaryUserId: u.id,
+              guestAnswers: people[i]!.answers ?? Prisma.DbNull,
+            })),
+          },
+        },
+        include: withItems,
+      });
+      await tx.transaction.create({
+        data: {
+          id: generateId('transaction'),
+          userId: primaryId,
+          type: 'due',
+          title: people.length === 1 ? due.title : `${due.title} (${people.length} people)`,
+          detail: due.space.name,
+          amount: -(face + fee),
+          method: 'Bank transfer',
+          status: 'pending',
+          reference,
+          spaceId: due.space.id,
+        },
+      });
+      return checkout;
+    }, { timeout: 10_000 });
+
+  let created: CheckoutWithItems | undefined;
+  for (let attempt = 0; !created; attempt++) {
+    try {
+      created = await open();
+    } catch (err) {
+      if (attempt < 3 && isReferenceCollision(err)) continue;
+      throw err;
+    }
+  }
+
+  const checkout = await openCollectionAccount(created, false);
+  logger.info({ ref: checkout.reference, primaryId, spaceId: checkout.spaceId, people: people.length, total: checkout.totalKobo }, 'group checkout ready');
+  return { checkout: serializeCheckout(checkout), reused: false };
 }
 
 /**
@@ -439,6 +609,14 @@ async function lockCheckout(tx: Tx, checkoutId: string): Promise<Checkout> {
 
 export type FulfilOutcome = 'paid' | 'already_paid' | 'underpaid';
 
+/** The payer's source account, as the rail reported it on the credit. */
+export interface CheckoutSender {
+  name: string | null;
+  accountNumber: string | null;
+  bank: string | null;
+  bankCode: string | null;
+}
+
 /**
  * Money arrived. If it covers the total: mark every due paid, credit the
  * space's ledger at face value, complete the transaction, issue the receipt.
@@ -461,6 +639,8 @@ export async function fulfilCheckout(
    * checkouts: a second checkout claiming the same credit fails to commit.
    */
   providerTransactionId: string | null = null,
+  /** The payer's source account, recorded so a rep can refund back to it. */
+  sender: CheckoutSender | null = null,
 ): Promise<FulfilOutcome> {
   const result = await db.$transaction(
     async (tx) => {
@@ -497,25 +677,31 @@ export async function fulfilCheckout(
       // linked to its first due line only (the legacy receipt route reads it).
       let txnToLink = txn && !(await tx.duePayment.findUnique({ where: { txnId: txn.id } })) ? txn.id : null;
 
-      // One query for every line's existing payment, instead of one per due.
-      const existingByDue = new Map(
+      // Who each line pays for: its beneficiary, or the checkout's own user
+      // (single-payer / legacy). A group checkout settles one due for several
+      // people, each a distinct user with their own DuePayment.
+      const beneficiaryOf = (item: { beneficiaryUserId: string | null }) => item.beneficiaryUserId ?? checkout.userId;
+      const payerIds = [...new Set(items.map(beneficiaryOf))];
+      // One query for every line's existing payment, keyed by payer+due.
+      const existingByKey = new Map(
         (
           await tx.duePayment.findMany({
-            where: { userId: checkout.userId, dueId: { in: items.map((i) => i.dueId) } },
-            select: { dueId: true, checkoutId: true, reference: true },
+            where: { userId: { in: payerIds }, dueId: { in: items.map((i) => i.dueId) } },
+            select: { userId: true, dueId: true, checkoutId: true, reference: true },
           })
-        ).map((p) => [p.dueId, p]),
+        ).map((p) => [`${p.userId}:${p.dueId}`, p]),
       );
 
       for (const item of items) {
-        const existing = existingByDue.get(item.dueId);
+        const payerId = beneficiaryOf(item);
+        const existing = existingByKey.get(`${payerId}:${item.dueId}`);
         if (existing) {
           if (existing.checkoutId !== checkoutId) flags.push(`"${item.due.title}" was already paid (${existing.reference})`);
           continue;
         }
         const duePayment = await tx.duePayment.create({
           data: {
-            userId: checkout.userId,
+            userId: payerId,
             dueId: item.dueId,
             checkoutId,
             txnId: txnToLink,
@@ -554,6 +740,10 @@ export async function fulfilCheckout(
           receivedKobo,
           overpaidKobo: excess,
           ...(providerTransactionId ? { providerTransactionId } : {}),
+          // Record who paid, so a rep can refund back to the same account.
+          ...(sender?.accountNumber
+            ? { senderName: sender.name, senderAccountNumber: sender.accountNumber, senderBank: sender.bank, senderBankCode: sender.bankCode }
+            : {}),
           needsReview: flags.length > 0 || checkout.needsReview,
           reviewReason: flags.length ? flags.join('; ') : checkout.reviewReason,
         },

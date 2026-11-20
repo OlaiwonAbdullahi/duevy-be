@@ -10,6 +10,9 @@ import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
+import { renderDuePoster } from '../lib/poster';
+import { requestRefund } from '../services/refund.service';
+import { env } from '../config/env';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { DEFAULT_GUEST_FIELDS, guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
 import { getSpaceKycState } from '../services/kyc.service';
@@ -152,11 +155,14 @@ const createDueSchema = z.object({
   title: z.string().min(3).max(120),
   note: z.string().max(500).optional(),
   amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO),
-  dueDate: dueDateField.refine((s) => {
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-    return new Date(`${s}T00:00:00Z`) >= today;
-  }, 'must be today or later'),
+  // Optional: a due can have no deadline. When given it must be today or later.
+  dueDate: dueDateField
+    .refine((s) => {
+      const today = new Date();
+      today.setUTCHours(0, 0, 0, 0);
+      return new Date(`${s}T00:00:00Z`) >= today;
+    }, 'must be today or later')
+    .nullish(),
   category: categoryField,
   publish: z.boolean().default(false),
   // Lead only: the co-rep who can withdraw this due's collections. Defaults to the creator.
@@ -202,7 +208,7 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         title: data.title,
         note: data.note,
         amount: data.amount,
-        dueDate: new Date(`${data.dueDate}T00:00:00Z`),
+        dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null,
         category: data.category,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
@@ -240,7 +246,8 @@ const patchDueSchema = z.object({
   title: z.string().min(3).max(120).optional(),
   note: z.string().max(500).optional(),
   amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO).optional(),
-  dueDate: dueDateField.optional(),
+  // `null` clears the deadline; a string sets it.
+  dueDate: dueDateField.nullish(),
   category: categoryField.optional(),
   allowGuests: z.boolean().optional(),
   guestFields: guestFieldsSchema.optional(),
@@ -279,7 +286,7 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
       ...(data.title !== undefined ? { title: data.title } : {}),
       ...(data.note !== undefined ? { note: data.note } : {}),
       ...(data.amount !== undefined ? { amount: data.amount } : {}),
-      ...(data.dueDate !== undefined ? { dueDate: new Date(`${data.dueDate}T00:00:00Z`) } : {}),
+      ...(data.dueDate !== undefined ? { dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
       ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
       ...(data.guestFields !== undefined ? { guestFields: data.guestFields ?? Prisma.DbNull } : {}),
@@ -424,11 +431,12 @@ async function guestPayers(sid: string, dueId: string) {
     where: { dueId, ...paidByOutsider(sid) },
     include: {
       user: { select: { id: true, name: true, email: true, matricNo: true } },
-      checkout: { select: { guestAnswers: true } },
+      checkout: { select: { guestAnswers: true, senderAccountNumber: true, senderBank: true } },
     },
     orderBy: { paidAt: 'desc' },
     take: 500,
   });
+  const refunded = await refundedByPayment(rows.map((p) => p.id));
   return rows.map((p) => ({
     id: p.user.id,
     name: p.user.name,
@@ -437,7 +445,35 @@ async function guestPayers(sid: string, dueId: string) {
     paidAt: p.paidAt.toISOString(),
     reference: p.reference,
     answers: readGuestAnswers(p.checkout?.guestAnswers),
+    ...refundFields(p, refunded.get(p.id) ?? 0),
   }));
+}
+
+/** Sum of refunds already issued or in flight, per payment. */
+async function refundedByPayment(ids: string[]): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map();
+  const sums = await db.refund.groupBy({
+    by: ['duePaymentId'],
+    where: { duePaymentId: { in: ids }, status: { in: ['pending', 'processing', 'success'] } },
+    _sum: { amountKobo: true },
+  });
+  return new Map(sums.map((s) => [s.duePaymentId, s._sum.amountKobo ?? 0]));
+}
+
+/** The refund state of one payment, for a roster row. */
+function refundFields(
+  p: { id: string; amountPaid: number; checkout: { senderAccountNumber: string | null; senderBank: string | null } | null },
+  refundedKobo: number,
+) {
+  const canRefund = !!p.checkout?.senderAccountNumber;
+  return {
+    duePaymentId: p.id,
+    amountPaid: p.amountPaid,
+    refundedKobo,
+    refundableKobo: Math.max(0, p.amountPaid - refundedKobo),
+    canRefund,
+    sourceAccount: canRefund ? `${p.checkout!.senderBank ?? 'Bank'} ••••${p.checkout!.senderAccountNumber!.slice(-4)}` : null,
+  };
 }
 
 async function buildRoster(
@@ -473,7 +509,17 @@ async function buildRoster(
         user: {
           select: {
             id: true, name: true, matricNo: true, level: true, email: true,
-            duePayments: { where: { dueId }, select: { paidAt: true, reference: true }, take: 1 },
+            duePayments: {
+              where: { dueId },
+              select: {
+                id: true,
+                paidAt: true,
+                reference: true,
+                amountPaid: true,
+                checkout: { select: { senderAccountNumber: true, senderBank: true } },
+              },
+              take: 1,
+            },
           },
         },
       },
@@ -481,6 +527,9 @@ async function buildRoster(
       ...(pageOpts ? { skip: pageOpts.skip, take: pageOpts.take } : {}),
     }),
   ]);
+
+  const paidIds = memberships.map((m) => m.user.duePayments[0]?.id).filter((x): x is string => !!x);
+  const refunded = await refundedByPayment(paidIds);
 
   const students = memberships.map((m) => {
     const payment = m.user.duePayments[0];
@@ -493,6 +542,7 @@ async function buildRoster(
       status: payment ? ('paid' as const) : ('unpaid' as const),
       paidAt: payment ? payment.paidAt.toISOString() : null,
       reference: payment ? payment.reference : null,
+      ...(payment ? refundFields(payment, refunded.get(payment.id) ?? 0) : {}),
     };
   });
 
@@ -607,6 +657,89 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
   res.setHeader('Content-Disposition', `attachment; filename="collections-${due.id}.csv"`);
   res.status(200).send(csv);
 });
+
+// ---------------------------------------------------------------------------
+// GET /dues/{dueId}/poster — a printable "scan to pay" QR poster for the due's
+// public pay link. Rep prints it and puts it up; guests scan it to pay.
+// ---------------------------------------------------------------------------
+repDuesRouter.get('/dues/:dueId/poster', async (req: Request, res: Response): Promise<void> => {
+  const sid = spaceId(req);
+  const due = await db.due.findUnique({
+    where: { id: req.params.dueId as string },
+    include: { space: { select: { name: true } } },
+  });
+  if (!due || due.spaceId !== sid) {
+    errors.notFound(res, 'Due not found');
+    return;
+  }
+  // The poster carries the guest pay link, which only exists for a published,
+  // guest-enabled due. Anything else has no link to put on a wall.
+  if (due.status !== 'active' || !due.allowGuests) {
+    fail(res, 409, 'POSTER_UNAVAILABLE', 'A poster is only available once the due is published with its pay link on.');
+    return;
+  }
+
+  const payUrl = `${env.FRONTEND_URL}/pay/${encodeURIComponent(due.id)}`;
+  const deadline = due.dueDate?.toLocaleDateString('en-NG', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'Africa/Lagos',
+  });
+  const pdf = await renderDuePoster({
+    spaceName: due.space.name,
+    dueTitle: due.title,
+    amountKobo: due.amount,
+    deadline,
+    payUrl,
+  });
+
+  const slug = due.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'due';
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${slug}-poster.pdf"`);
+  res.status(200).send(pdf);
+});
+
+// ---------------------------------------------------------------------------
+// POST /dues/{dueId}/payments/{duePaymentId}/refund — send a payer's money
+// back to the account they paid from. Lead only; asks for the withdrawal code.
+// ---------------------------------------------------------------------------
+const refundSchema = z.object({
+  amountKobo: z.number().int().positive(),
+  pin: z.string().min(1).max(32),
+  reason: z.string().max(300).optional(),
+});
+
+repDuesRouter.post(
+  '/dues/:dueId/payments/:duePaymentId/refund',
+  requireSpaceRep(true),
+  validate(refundSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const body = req.body as z.infer<typeof refundSchema>;
+    const refund = await requestRefund({
+      spaceId: spaceId(req),
+      dueId: req.params.dueId as string,
+      duePaymentId: req.params.duePaymentId as string,
+      requestedById: uid(req),
+      amountKobo: body.amountKobo,
+      pin: body.pin,
+      reason: body.reason,
+    });
+    ok(
+      res,
+      {
+        id: refund.id,
+        reference: refund.reference,
+        status: refund.status,
+        amountKobo: refund.amountKobo,
+        accountMasked: refund.accountMasked,
+        createdAt: refund.createdAt.toISOString(),
+      },
+      201,
+    );
+  },
+);
 
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/remind — nudge unpaid members (§7.7)

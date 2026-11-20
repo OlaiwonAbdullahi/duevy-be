@@ -40,6 +40,12 @@ export interface CollectionCredit {
   transactionId: string;
   amountKobo: number;
   at: Date;
+  // Who sent the money — recorded on the checkout so a rep can refund it back
+  // to the same account. The bank code is what a transfer back needs.
+  senderName?: string | null;
+  senderAccountNumber?: string | null;
+  senderBank?: string | null;
+  senderBankCode?: string | null;
 }
 
 export interface CollectionStatus {
@@ -68,6 +74,8 @@ export interface AccountCredit {
   senderName: string | null;
   senderAccountNumber: string | null;
   senderBank: string | null;
+  /** The sender bank's code, needed to transfer back to them (e.g. a refund). */
+  senderBankCode: string | null;
   narration: string | null;
 }
 

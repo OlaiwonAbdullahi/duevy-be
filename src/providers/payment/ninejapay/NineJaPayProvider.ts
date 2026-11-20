@@ -249,7 +249,15 @@ export class NineJaPayProvider implements PaymentProvider {
       if ((t.transactionType ?? '').toLowerCase() !== 'credit' || (t.accountNumber ?? accountNumber) !== accountNumber) continue;
       const at = parseNineJaPayDate(t.transactionDate);
       if (at === null || at < window.from || at > window.to || !t.transactionId) continue;
-      credits.push({ transactionId: String(t.transactionId), amountKobo: Number(t.amount ?? 0), at });
+      credits.push({
+        transactionId: String(t.transactionId),
+        amountKobo: Number(t.amount ?? 0),
+        at,
+        senderName: t.metadata?.senderAccountName ?? null,
+        senderAccountNumber: t.metadata?.senderAccountNumber ?? null,
+        senderBank: t.metadata?.senderBank ?? null,
+        senderBankCode: t.metadata?.senderBankCode ?? null,
+      });
     }
     credits.sort((a, b) => a.at.getTime() - b.at.getTime());
     if (credits.length === 0) return { state: 'open', receivedKobo: null, credits };
@@ -309,6 +317,7 @@ export class NineJaPayProvider implements PaymentProvider {
         senderName: t.metadata?.senderAccountName ?? null,
         senderAccountNumber: sender,
         senderBank: t.metadata?.senderBank ?? null,
+        senderBankCode: t.metadata?.senderBankCode ?? null,
         narration,
       });
     }

@@ -28,7 +28,7 @@ function serializeDue(d: {
   id: string;
   title: string;
   amount: number;
-  dueDate: Date;
+  dueDate: Date | null;
   category: string;
   status: string;
 }) {
@@ -36,7 +36,7 @@ function serializeDue(d: {
     id: d.id,
     title: d.title,
     amount: d.amount,
-    dueDate: d.dueDate.toISOString().slice(0, 10),
+    dueDate: d.dueDate ? d.dueDate.toISOString().slice(0, 10) : null,
     type: d.category,
     category: d.category,
     status: d.status,
