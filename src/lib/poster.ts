@@ -131,44 +131,35 @@ export async function renderDuePoster(data: PosterData): Promise<Buffer> {
     doc.font('body').fontSize(10.5).fillColor(COLOR.onBrandMuted)
       .text('SCAN TO PAY', 0, bandH - 40, { ...centre, characterSpacing: 3 });
 
-    // ── Space + due title ────────────────────────────────────────────────────
-    let y = bandH + 44;
-    doc.font('body').fontSize(12).fillColor(COLOR.muted)
-      .text(data.spaceName.toUpperCase(), M, y, { ...centre, characterSpacing: 1.2 });
-    y = doc.y + 8;
+    // ── Due title ─────────────────────────────────────────────────────────────
+    let y = bandH + 48;
     doc.font('bold').fontSize(29).fillColor(COLOR.ink).text(data.dueTitle, M, y, centre);
-    y = doc.y + 20;
+    y = doc.y + 14;
 
-    // ── Amount + fine print ──────────────────────────────────────────────────
-    nairaCentred(formatNaira(charge.total), y, 38, 'bold', COLOR.brand);
-    y += 44;
-    const fineprint = `Includes ${formatNaira(charge.fee)} processing fee${data.deadline ? `  ·  Due ${data.deadline}` : ''}`;
-    doc.font('sym').fontSize(11.5).fillColor(COLOR.muted).text(fineprint, M, y, centre);
-    y = doc.y + 24;
+    // ── Amount (the due amount; the processing fee is added at checkout) ───────
+    nairaCentred(formatNaira(charge.face), y, 40, 'bold', COLOR.brand);
+    y += 58;
 
     // ── The branded QR in a framed card ──────────────────────────────────────
-    const qrBox = 262;
+    const qrBox = 312;
     const pad = 22;
     const cardW = qrBox + pad * 2;
     const cardX = (W - cardW) / 2;
-    doc.roundedRect(cardX, y, cardW, cardW, 28).lineWidth(1.25).fillAndStroke(COLOR.paper, COLOR.line);
+    doc.roundedRect(cardX, y, cardW, cardW, 30).lineWidth(1.25).fillAndStroke(COLOR.paper, COLOR.line);
     drawStylishQr(doc, modules, cardX + pad, y + pad, qrBox, COLOR.paper);
-    y += cardW + 28;
+    y += cardW + 26;
 
     // ── Call to action ───────────────────────────────────────────────────────
     doc.font('bold').fontSize(17).fillColor(COLOR.ink).text('Scan with your phone camera to pay', M, y, centre);
     y = doc.y + 7;
     doc.font('body').fontSize(12).fillColor(COLOR.muted).text('No Duevy account needed — you get a receipt by email.', M, y, centre);
-    y = doc.y + 16;
-    doc.font('body').fontSize(10).fillColor(COLOR.brand)
-      .text(data.payUrl, M, y, { ...centre, link: data.payUrl, underline: false });
 
     // ── Footer ───────────────────────────────────────────────────────────────
     const footH = 50;
     const footY = PAGE.height - footH;
     doc.rect(0, footY, W, footH).fill(COLOR.brandDeep);
     doc.font('body').fontSize(10.5).fillColor(COLOR.onBrandMuted);
-    doc.text('Powered by Duevy', 0, footY + (footH - doc.currentLineHeight()) / 2, centre);
+    doc.text('Powered by Duevy', M, footY + (footH - doc.currentLineHeight()) / 2, centre);
 
     doc.end();
   });
