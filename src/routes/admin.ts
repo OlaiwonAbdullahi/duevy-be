@@ -1983,15 +1983,15 @@ adminRouter.get('/roles', requireAdminPermission('userManagement'), async (_req:
         db.user.count({ where: { adminSubRole: role } }),
         db.adminPermission.findFirst({ where: { user: { adminSubRole: role } } }),
       ]);
+      // Flat shape: the dashboard reads `row.userManagement` etc. directly, and
+      // the PUT below takes the same flat body.
       return {
         role,
         userCount,
-        permissions: {
-          userManagement: sample?.userManagement ?? false,
-          payouts: sample?.payouts ?? false,
-          disputes: sample?.disputes ?? false,
-          overrides: sample?.overrides ?? false,
-        },
+        userManagement: sample?.userManagement ?? false,
+        payouts: sample?.payouts ?? false,
+        disputes: sample?.disputes ?? false,
+        overrides: sample?.overrides ?? false,
       };
     }),
   );
@@ -2017,7 +2017,7 @@ adminRouter.put('/roles/:role', requireSuperAdmin(), validate(rolePermsSchema), 
     admins.map((a) => db.adminPermission.upsert({ where: { userId: a.id }, update: perms, create: { userId: a.id, ...perms } })),
   );
   await writeAdminAudit(req, 'roles.update', { target: role, severity: 'critical', metadata: perms });
-  ok(res, { role, permissions: perms });
+  ok(res, { role, userCount: admins.length, ...perms });
 });
 
 // ---------------------------------------------------------------------------
