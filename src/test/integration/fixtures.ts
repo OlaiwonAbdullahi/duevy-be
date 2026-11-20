@@ -185,10 +185,26 @@ export function creditEvent(opts: { accountNumber: string; accountRequestReferen
  * records show it (what the handler reads back) and the webhook says so.
  * Pass `receivedKobo` for an under- or overpayment. Drain the queue after.
  */
-export async function payCheckout(fake: FakeProvider, reference: string, opts: { receivedKobo?: number; eventId?: string } = {}) {
+export async function payCheckout(
+  fake: FakeProvider,
+  reference: string,
+  opts: { receivedKobo?: number; eventId?: string; sender?: { name?: string; accountNumber: string; bank?: string; bankCode: string } } = {},
+) {
   const c = await db.checkout.findUniqueOrThrow({ where: { reference } });
   const amountKobo = opts.receivedKobo ?? c.totalKobo;
-  fake.collectionStatus.set(c.vaAccountNumber!, { state: 'paid', receivedKobo: amountKobo });
+  // With a sender, report it on the credit so the checkout records who paid.
+  const credits = opts.sender
+    ? [{
+        transactionId: `fakecr_${reference}`,
+        amountKobo,
+        at: new Date(),
+        senderName: opts.sender.name ?? 'Test Payer',
+        senderAccountNumber: opts.sender.accountNumber,
+        senderBank: opts.sender.bank ?? 'Test Bank',
+        senderBankCode: opts.sender.bankCode,
+      }]
+    : undefined;
+  fake.collectionStatus.set(c.vaAccountNumber!, { state: 'paid', receivedKobo: amountKobo, ...(credits ? { credits } : {}) });
   return sendWebhook(
     creditEvent({ id: opts.eventId, accountNumber: c.vaAccountNumber!, accountRequestReference: c.providerCheckoutId!, amountKobo }),
   );

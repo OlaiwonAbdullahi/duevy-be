@@ -119,8 +119,9 @@ export const CLEARED_PIN = {
 } satisfies Prisma.SpaceUpdateInput;
 
 /** Check a code against the space's hash. Wrong guesses are counted
- *  atomically; the fifth locks the code for PIN_LOCK_MS. */
-async function checkPin(space: Space, pin: string): Promise<void> {
+ *  atomically; the fifth locks the code for PIN_LOCK_MS. Exported for the
+ *  refund flow, which asks for the same withdrawal security code. */
+export async function checkPin(space: Space, pin: string): Promise<void> {
   if (!space.withdrawalPinHash) {
     throw forbidden('Set a withdrawal security code on the Payout page first.', 'WITHDRAWAL_PIN_NOT_SET');
   }

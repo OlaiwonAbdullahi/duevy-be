@@ -17,6 +17,7 @@ const prefixes = {
   checkout: 'chk',
   checkoutItem: 'chi',
   ledger: 'led',
+  refund: 'rfd',
 } as const;
 
 type Prefix = keyof typeof prefixes;

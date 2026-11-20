@@ -6,6 +6,7 @@ import { logger, scrub } from '../lib/logger';
 import { type ProviderEvent } from '../providers/payment';
 import { CheckoutNotFoundError, findCheckoutId } from './checkout.service';
 import { refreshPayout } from './withdrawal.service';
+import { refreshRefund } from './refund.service';
 import { refreshSweep, refreshSweepsForAccount } from './sweep.service';
 import { confirmReceivedPayment } from '../jobs/reconciliation';
 
@@ -105,11 +106,16 @@ export async function processEvent(stored: ProviderEvent): Promise<void> {
         return;
       }
       const payout = await db.payout.findUnique({ where: { providerPayoutId: event.providerReference }, select: { id: true } });
-      if (!payout) {
-        logger.warn({ ...log, providerReference: event.providerReference }, 'transfer event for nothing we sent');
+      if (payout) {
+        await refreshPayout(payout.id);
         return;
       }
-      await refreshPayout(payout.id);
+      const refund = await db.refund.findUnique({ where: { providerRefundId: event.providerReference }, select: { id: true } });
+      if (refund) {
+        await refreshRefund(refund.id);
+        return;
+      }
+      logger.warn({ ...log, providerReference: event.providerReference }, 'transfer event for nothing we sent');
       return;
     }
     case 'ignored':

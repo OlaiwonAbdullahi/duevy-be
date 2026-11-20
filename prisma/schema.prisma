@@ -173,12 +173,21 @@ enum PayoutApprovalDecision {
 
 enum LedgerEntryType {
   due_payment // credit: a student's payment, at face value
-  refund
+  refund // debit: money sent back to a payer's source account
+  refund_reversal // credit: a failed refund, restored to the space
   payout // debit: what was sent to the rep's bank
   payout_fee // debit: the withdrawal fee, deducted from the withdrawal
   payout_reversal // credit: a failed or reversed withdrawal, restored in full
   manual_credit
   direct_deposit // credit: money sent straight to the space's own account, not through a checkout
+}
+
+enum RefundStatus {
+  pending // created, the transfer not yet sent
+  processing // the transfer is in flight
+  success // the money reached the payer
+  failed // the transfer failed; the space's balance was restored
+  reversed // the bank returned a completed refund; the space's balance was restored
 }
 
 enum LedgerDirection {
@@ -476,6 +485,8 @@ model User {
   payoutOtps         PayoutOtp[]
   checkouts          Checkout[]
   checkoutBeneficiary CheckoutItem[]     @relation("CheckoutBeneficiary")
+  refundsReceived    Refund[]            @relation("RefundPayer")
+  refundsRequested   Refund[]            @relation("RefundRequestedBy")
   receipts           Receipt[]
   partnerRedemptions PartnerRedemption[]
 
@@ -622,6 +633,7 @@ model Space {
   partnerRedemption PartnerRedemption?
   sweeps            Sweep[]
   directDeposits    DirectDeposit[]
+  refunds           Refund[]
 
   @@index([institution])
   @@map("spaces")
@@ -748,6 +760,7 @@ model Due {
   assignedRep   User?          @relation("DueAssignedRep", fields: [assignedRepId], references: [id], onDelete: SetNull)
   ledgerEntries LedgerEntry[]
   checkoutItems CheckoutItem[]
+  refunds       Refund[]
 
   @@index([spaceId])
   @@index([assignedRepId])
@@ -782,6 +795,7 @@ model DuePayment {
   transaction   Transaction?  @relation(fields: [txnId], references: [id])
   checkout      Checkout?     @relation(fields: [checkoutId], references: [id])
   ledgerEntries LedgerEntry[]
+  refunds       Refund[]
 
   @@unique([userId, dueId])
   @@index([dueId])
@@ -822,6 +836,13 @@ model Checkout {
   vaAccountNumber       String?
   vaBankName            String?
   vaAccountName         String?
+  // Who paid — the source account the transfer came from, captured when the
+  // payment is confirmed. A rep refunds back to this account; the bank code is
+  // what the transfer needs. Null on older payments (and any the rail didn't report).
+  senderName            String?
+  senderAccountNumber   String?
+  senderBank            String?
+  senderBankCode        String?
   // When the pay-page status poll last asked the provider (cross-instance throttle).
   lastProviderCheckAt   DateTime?
   // Legacy (Bachs): a hosted checkout's page.
@@ -1225,6 +1246,7 @@ model LedgerEntry {
   payoutId        String?
   // Set for direct_deposit entries: one entry per deposit.
   directDepositId String?
+  refundId        String? // set for refund / refund_reversal entries
   type            LedgerEntryType
   direction       LedgerDirection
   amountKobo      Int // always positive; direction gives the sign
@@ -1242,14 +1264,63 @@ model LedgerEntry {
   duePayment    DuePayment?    @relation(fields: [duePaymentId], references: [id])
   payout        Payout?        @relation(fields: [payoutId], references: [id])
   directDeposit DirectDeposit? @relation(fields: [directDepositId], references: [id])
+  refund        Refund?        @relation(fields: [refundId], references: [id])
 
   @@unique([type, duePaymentId])
   @@unique([type, payoutId])
   @@unique([type, directDepositId])
+  @@unique([type, refundId])
   @@index([spaceId, createdAt])
   @@index([dueId])
   @@index([reference])
   @@map("ledger_entries")
+}
+
+// A rep sending a student's money back to the account they paid from. Duevy
+// fronts the transfer from its business account and debits the space's ledger
+// by the refund amount (type `refund`); a failed transfer restores the balance
+// (`refund_reversal`). Partial refunds are allowed, so a payment can have
+// several. Only a payment with a recorded source account (Checkout.sender*) can
+// be refunded.
+model Refund {
+  id               String       @id @default(cuid())
+  reference        String       @unique // ours; also the provider reference and idempotency key
+  spaceId          String
+  dueId            String
+  duePaymentId     String
+  checkoutId       String?
+  userId           String // the payer being refunded
+  amountKobo       Int // kobo sent back, debited from the space's balance
+  status           RefundStatus @default(pending)
+  // The payer's source account, copied in at refund time (what the transfer needs).
+  bankCode         String
+  bankName         String?
+  accountNumber    String
+  accountName      String?
+  accountMasked    String // "GTBank •••• 6789" — safe to show
+  reason           String?
+  requestedById    String // the lead rep who issued it
+  provider         String       @default("ninejapay")
+  providerRefundId String?      @unique // the provider's copy of `reference`
+  failureReason    String?
+  processingAt     DateTime?
+  settledAt        DateTime?
+  failedAt         DateTime?
+  reversedAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  space         Space         @relation(fields: [spaceId], references: [id])
+  due           Due           @relation(fields: [dueId], references: [id])
+  duePayment    DuePayment    @relation(fields: [duePaymentId], references: [id])
+  user          User          @relation("RefundPayer", fields: [userId], references: [id])
+  requestedBy   User          @relation("RefundRequestedBy", fields: [requestedById], references: [id])
+  ledgerEntries LedgerEntry[]
+
+  @@index([spaceId, status])
+  @@index([duePaymentId])
+  @@index([status, createdAt])
+  @@map("refunds")
 }
 
 // ---------------------------------------------------------------------------

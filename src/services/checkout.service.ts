@@ -243,6 +243,10 @@ export async function createCheckout(
       vaAccountNumber: null,
       vaBankName: null,
       vaAccountName: null,
+      senderName: null,
+      senderAccountNumber: null,
+      senderBank: null,
+      senderBankCode: null,
       lastProviderCheckAt: null,
       checkoutUrl: null,
       guestAnswers: (opts.guestData?.guestAnswers ?? null) as Checkout['guestAnswers'],
@@ -605,6 +609,14 @@ async function lockCheckout(tx: Tx, checkoutId: string): Promise<Checkout> {
 
 export type FulfilOutcome = 'paid' | 'already_paid' | 'underpaid';
 
+/** The payer's source account, as the rail reported it on the credit. */
+export interface CheckoutSender {
+  name: string | null;
+  accountNumber: string | null;
+  bank: string | null;
+  bankCode: string | null;
+}
+
 /**
  * Money arrived. If it covers the total: mark every due paid, credit the
  * space's ledger at face value, complete the transaction, issue the receipt.
@@ -627,6 +639,8 @@ export async function fulfilCheckout(
    * checkouts: a second checkout claiming the same credit fails to commit.
    */
   providerTransactionId: string | null = null,
+  /** The payer's source account, recorded so a rep can refund back to it. */
+  sender: CheckoutSender | null = null,
 ): Promise<FulfilOutcome> {
   const result = await db.$transaction(
     async (tx) => {
@@ -726,6 +740,10 @@ export async function fulfilCheckout(
           receivedKobo,
           overpaidKobo: excess,
           ...(providerTransactionId ? { providerTransactionId } : {}),
+          // Record who paid, so a rep can refund back to the same account.
+          ...(sender?.accountNumber
+            ? { senderName: sender.name, senderAccountNumber: sender.accountNumber, senderBank: sender.bank, senderBankCode: sender.bankCode }
+            : {}),
           needsReview: flags.length > 0 || checkout.needsReview,
           reviewReason: flags.length ? flags.join('; ') : checkout.reviewReason,
         },

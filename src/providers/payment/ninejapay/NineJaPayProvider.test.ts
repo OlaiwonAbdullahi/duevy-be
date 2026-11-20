@@ -146,7 +146,7 @@ describe('one-time account numbers are reused', () => {
     expect(await provider.getCollectionStatus('9000143193', window)).toEqual({
       state: 'paid',
       receivedKobo: 507_500,
-      credits: [{ transactionId: 'c1', amountKobo: 507_500, at: new Date('2026-11-07T07:35:38.005Z') }],
+      credits: [{ transactionId: 'c1', amountKobo: 507_500, at: new Date('2026-11-07T07:35:38.005Z'), senderName: null, senderAccountNumber: null, senderBank: null, senderBankCode: null }],
     });
 
     // An older checkout that once had this number sees nothing of today's money.

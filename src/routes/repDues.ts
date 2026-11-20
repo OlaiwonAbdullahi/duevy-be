@@ -11,6 +11,7 @@ import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
 import { computeCharge } from '../lib/money';
 import { renderDuePoster } from '../lib/poster';
+import { requestRefund } from '../services/refund.service';
 import { env } from '../config/env';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { DEFAULT_GUEST_FIELDS, guestFieldsSchema, readGuestAnswers, readGuestFields } from '../lib/guestForm';
@@ -430,11 +431,12 @@ async function guestPayers(sid: string, dueId: string) {
     where: { dueId, ...paidByOutsider(sid) },
     include: {
       user: { select: { id: true, name: true, email: true, matricNo: true } },
-      checkout: { select: { guestAnswers: true } },
+      checkout: { select: { guestAnswers: true, senderAccountNumber: true, senderBank: true } },
     },
     orderBy: { paidAt: 'desc' },
     take: 500,
   });
+  const refunded = await refundedByPayment(rows.map((p) => p.id));
   return rows.map((p) => ({
     id: p.user.id,
     name: p.user.name,
@@ -443,7 +445,35 @@ async function guestPayers(sid: string, dueId: string) {
     paidAt: p.paidAt.toISOString(),
     reference: p.reference,
     answers: readGuestAnswers(p.checkout?.guestAnswers),
+    ...refundFields(p, refunded.get(p.id) ?? 0),
   }));
+}
+
+/** Sum of refunds already issued or in flight, per payment. */
+async function refundedByPayment(ids: string[]): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map();
+  const sums = await db.refund.groupBy({
+    by: ['duePaymentId'],
+    where: { duePaymentId: { in: ids }, status: { in: ['pending', 'processing', 'success'] } },
+    _sum: { amountKobo: true },
+  });
+  return new Map(sums.map((s) => [s.duePaymentId, s._sum.amountKobo ?? 0]));
+}
+
+/** The refund state of one payment, for a roster row. */
+function refundFields(
+  p: { id: string; amountPaid: number; checkout: { senderAccountNumber: string | null; senderBank: string | null } | null },
+  refundedKobo: number,
+) {
+  const canRefund = !!p.checkout?.senderAccountNumber;
+  return {
+    duePaymentId: p.id,
+    amountPaid: p.amountPaid,
+    refundedKobo,
+    refundableKobo: Math.max(0, p.amountPaid - refundedKobo),
+    canRefund,
+    sourceAccount: canRefund ? `${p.checkout!.senderBank ?? 'Bank'} ••••${p.checkout!.senderAccountNumber!.slice(-4)}` : null,
+  };
 }
 
 async function buildRoster(
@@ -479,7 +509,17 @@ async function buildRoster(
         user: {
           select: {
             id: true, name: true, matricNo: true, level: true, email: true,
-            duePayments: { where: { dueId }, select: { paidAt: true, reference: true }, take: 1 },
+            duePayments: {
+              where: { dueId },
+              select: {
+                id: true,
+                paidAt: true,
+                reference: true,
+                amountPaid: true,
+                checkout: { select: { senderAccountNumber: true, senderBank: true } },
+              },
+              take: 1,
+            },
           },
         },
       },
@@ -487,6 +527,9 @@ async function buildRoster(
       ...(pageOpts ? { skip: pageOpts.skip, take: pageOpts.take } : {}),
     }),
   ]);
+
+  const paidIds = memberships.map((m) => m.user.duePayments[0]?.id).filter((x): x is string => !!x);
+  const refunded = await refundedByPayment(paidIds);
 
   const students = memberships.map((m) => {
     const payment = m.user.duePayments[0];
@@ -499,6 +542,7 @@ async function buildRoster(
       status: payment ? ('paid' as const) : ('unpaid' as const),
       paidAt: payment ? payment.paidAt.toISOString() : null,
       reference: payment ? payment.reference : null,
+      ...(payment ? refundFields(payment, refunded.get(payment.id) ?? 0) : {}),
     };
   });
 
@@ -656,6 +700,46 @@ repDuesRouter.get('/dues/:dueId/poster', async (req: Request, res: Response): Pr
   res.setHeader('Content-Disposition', `attachment; filename="${slug}-poster.pdf"`);
   res.status(200).send(pdf);
 });
+
+// ---------------------------------------------------------------------------
+// POST /dues/{dueId}/payments/{duePaymentId}/refund — send a payer's money
+// back to the account they paid from. Lead only; asks for the withdrawal code.
+// ---------------------------------------------------------------------------
+const refundSchema = z.object({
+  amountKobo: z.number().int().positive(),
+  pin: z.string().min(1).max(32),
+  reason: z.string().max(300).optional(),
+});
+
+repDuesRouter.post(
+  '/dues/:dueId/payments/:duePaymentId/refund',
+  requireSpaceRep(true),
+  validate(refundSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const body = req.body as z.infer<typeof refundSchema>;
+    const refund = await requestRefund({
+      spaceId: spaceId(req),
+      dueId: req.params.dueId as string,
+      duePaymentId: req.params.duePaymentId as string,
+      requestedById: uid(req),
+      amountKobo: body.amountKobo,
+      pin: body.pin,
+      reason: body.reason,
+    });
+    ok(
+      res,
+      {
+        id: refund.id,
+        reference: refund.reference,
+        status: refund.status,
+        amountKobo: refund.amountKobo,
+        accountMasked: refund.accountMasked,
+        createdAt: refund.createdAt.toISOString(),
+      },
+      201,
+    );
+  },
+);
 
 // ---------------------------------------------------------------------------
 // POST /dues/{dueId}/remind — nudge unpaid members (§7.7)

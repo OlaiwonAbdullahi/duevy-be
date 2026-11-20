@@ -2,8 +2,9 @@ import { type Checkout } from '@prisma/client';
 import { db } from '../config/db';
 import { logger } from '../lib/logger';
 import { getPaymentProvider, type CollectionStatus } from '../providers/payment';
-import { expireCheckout, fulfilCheckout, markUnderpaid } from '../services/checkout.service';
+import { expireCheckout, fulfilCheckout, markUnderpaid, type CheckoutSender } from '../services/checkout.service';
 import { dispatchPayout, refreshPayout } from '../services/withdrawal.service';
+import { dispatchRefund, refreshRefund } from '../services/refund.service';
 import { reconcileSweeps, runDailySweeps } from '../services/sweep.service';
 import { reconcileDirectDeposits } from '../services/directDeposit.service';
 import { expireStaleApprovals } from '../services/withdrawalApproval.service';
@@ -48,9 +49,9 @@ type ReconcilableCheckout = Pick<Checkout, 'id' | 'reference' | 'status' | 'vaAc
  * payment: a one-time account refuses any other amount, so a different one
  * in the window was paid to an earlier holder of the number.
  */
-async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string }): Promise<CollectionStatus & { transactionId: string | null }> {
+async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string }): Promise<CollectionStatus & { transactionId: string | null; sender: CheckoutSender | null }> {
   const status = await getPaymentProvider().getCollectionStatus(c.vaAccountNumber, paymentWindow(c));
-  if (!status.credits) return { ...status, transactionId: null };
+  if (!status.credits) return { ...status, transactionId: null, sender: null };
   const ids = status.credits.map((cr) => cr.transactionId);
   const claimed = new Set(
     ids.length
@@ -64,9 +65,15 @@ async function collectionFor(c: ReconcilableCheckout & { vaAccountNumber: string
     if (unclaimed.length) {
       logger.warn({ ref: c.reference, amounts: unclaimed.map((cr) => cr.amountKobo), expected: c.totalKobo }, "credits in this checkout's window that aren't its amount; left alone");
     }
-    return { state: 'open', receivedKobo: null, transactionId: null };
+    return { state: 'open', receivedKobo: null, transactionId: null, sender: null };
   }
-  return { state: 'paid', receivedKobo: credit.amountKobo, transactionId: credit.transactionId };
+  const sender: CheckoutSender = {
+    name: credit.senderName ?? null,
+    accountNumber: credit.senderAccountNumber ?? null,
+    bank: credit.senderBank ?? null,
+    bankCode: credit.senderBankCode ?? null,
+  };
+  return { state: 'paid', receivedKobo: credit.amountKobo, transactionId: credit.transactionId, sender };
 }
 
 export async function reconcileCheckouts(): Promise<void> {
@@ -112,7 +119,7 @@ export async function reconcileCheckout(
       logger.warn({ ref: c.reference, source: opts.source }, 'provider reports paid without a received amount; not fulfilling');
       return;
     }
-    await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source, null, status.transactionId);
+    await fulfilCheckout(c.id, status.receivedKobo, 0, opts.source, null, status.transactionId, status.sender);
   }
   else if (status.state === 'underpaid') await markUnderpaid(c.id, status.receivedKobo ?? 0, c.totalKobo, opts.source);
   else if (status.state === 'expired' || status.state === 'failed') await expireCheckout(c.id);
@@ -132,7 +139,7 @@ export async function confirmReceivedPayment(c: ReconcilableCheckout, source: st
     logger.warn({ ref: c.reference, source, state: status.state }, 'payment event without a matching credit at the provider; nothing applied');
     return;
   }
-  await fulfilCheckout(c.id, status.receivedKobo, 0, source, null, status.transactionId);
+  await fulfilCheckout(c.id, status.receivedKobo, 0, source, null, status.transactionId, status.sender);
 }
 
 export async function reconcilePayouts(): Promise<void> {
@@ -159,6 +166,28 @@ export async function reconcilePayouts(): Promise<void> {
 
   // Multisig withdrawals nobody approved in time: cancel and restore the balance.
   await expireStaleApprovals();
+}
+
+/** Resend refunds the provider never accepted, and settle ones stuck processing. */
+export async function reconcileRefunds(): Promise<void> {
+  const provider = getPaymentProvider();
+  const now = Date.now();
+
+  const undispatched = await db.refund.findMany({
+    where: { provider: provider.name, status: 'pending', createdAt: { lte: new Date(now - RETRY_DISPATCH_AFTER_MS) } },
+    take: 25,
+  });
+  for (const r of undispatched) {
+    await dispatchRefund(r.id).catch((err) => logger.warn({ ref: r.reference, err: (err as Error).message }, 'refund retry failed'));
+  }
+
+  const processing = await db.refund.findMany({
+    where: { provider: provider.name, status: 'processing', processingAt: { lte: new Date(now - CHECK_PROCESSING_AFTER_MS) } },
+    take: 25,
+  });
+  for (const r of processing) {
+    await refreshRefund(r.id).catch((err) => logger.warn({ ref: r.reference, err: (err as Error).message }, 'refund refresh failed'));
+  }
 }
 
 /** Housekeeping: drop idempotency keys past their 24h window. */
@@ -217,6 +246,7 @@ export function resetAuthPurgeClock(): void {
 export async function runReconciliationOnce(): Promise<void> {
   await reconcileCheckouts().catch((err) => logger.error({ err: (err as Error).message }, 'checkout reconciliation run failed'));
   await reconcilePayouts().catch((err) => logger.error({ err: (err as Error).message }, 'payout reconciliation run failed'));
+  await reconcileRefunds().catch((err) => logger.error({ err: (err as Error).message }, 'refund reconciliation run failed'));
   await reconcileSweeps().catch((err) => logger.error({ err: (err as Error).message }, 'sweep reconciliation run failed'));
   await reconcileDirectDeposits().catch((err) => logger.error({ err: (err as Error).message }, 'direct deposit reconciliation failed'));
   await runDailySweeps().catch((err) => logger.error({ err: (err as Error).message }, 'daily sweep run failed'));

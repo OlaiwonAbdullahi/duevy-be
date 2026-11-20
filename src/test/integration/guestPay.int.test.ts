@@ -155,6 +155,46 @@ describe('guest pay', () => {
     expect(res.body.error.code).toBe('DUPLICATE_PAYER');
   });
 
+  it('records the payer source account on a paid checkout (for refunds)', async () => {
+    const { dues } = await makeSpace();
+    const due = await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });
+    const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, {
+      body: { name: 'Tolu Ade', matricNo: 'CSC/21/001', email: guestEmail() },
+    });
+    const { reference, amount } = opened.body.data;
+
+    await payCheckout(fake, reference, {
+      receivedKobo: amount,
+      sender: { name: 'Tolu Ade', accountNumber: '0123456789', bank: 'GTBank', bankCode: '058' },
+    });
+    await drainWebhookQueue();
+
+    const checkout = await db.checkout.findUniqueOrThrow({ where: { reference } });
+    expect(checkout).toMatchObject({
+      status: 'paid',
+      senderAccountNumber: '0123456789',
+      senderBankCode: '058',
+      senderBank: 'GTBank',
+    });
+  });
+
+  it('allows a due with no deadline, shown as null everywhere', async () => {
+    const { rep, space } = await makeSpace();
+    const repToken = await tokenFor(rep);
+
+    const created = await api('POST', `/v1/spaces/${space.id}/dues`, {
+      token: repToken,
+      body: { title: 'Open Welfare Fund', amount: 200_000, type: 'other', publish: true, allowGuests: true },
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.data).toMatchObject({ status: 'active', dueDate: null });
+
+    // The public pay page is happy with no deadline.
+    const pub = await api('GET', `/v1/public/dues/${created.body.data.id}`);
+    expect(pub.status).toBe(200);
+    expect(pub.body.data.dueDate).toBeNull();
+  });
+
   it("won't let a guest pay a members-only due, even through the service", async () => {
     const { dues } = await makeSpace();
     const guest = await db.user.create({ data: { name: 'G', matricNo: 'CSC/21/001', email: guestEmail(), isGuest: true } });

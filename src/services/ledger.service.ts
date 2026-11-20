@@ -35,13 +35,14 @@ export interface LedgerWrite {
   duePaymentId?: string | null;
   payoutId?: string | null;
   directDepositId?: string | null;
+  refundId?: string | null;
   grossKobo?: number | null;
   feeKobo?: number | null;
   netKobo?: number | null;
   actorId?: string | null;
 }
 
-const CREDIT_TYPES: LedgerEntryType[] = ['due_payment', 'manual_credit', 'payout_reversal', 'direct_deposit'];
+const CREDIT_TYPES: LedgerEntryType[] = ['due_payment', 'manual_credit', 'payout_reversal', 'refund_reversal', 'direct_deposit'];
 const DEBIT_TYPES: LedgerEntryType[] = ['payout', 'payout_fee', 'refund'];
 
 /**
@@ -63,11 +64,11 @@ export async function appendLedgerEntry(tx: Tx, entry: LedgerWrite): Promise<boo
   // abort the surrounding Postgres transaction.
   const inserted = await tx.$executeRaw`
     INSERT INTO "ledger_entries"
-      ("id", "spaceId", "dueId", "txnId", "duePaymentId", "payoutId", "directDepositId", "type", "direction",
+      ("id", "spaceId", "dueId", "txnId", "duePaymentId", "payoutId", "directDepositId", "refundId", "type", "direction",
        "amountKobo", "grossKobo", "feeKobo", "netKobo", "reference", "description", "actorId", "createdAt")
     VALUES
       (${cuidLike()}, ${entry.spaceId}, ${entry.dueId ?? null}, ${entry.txnId ?? null}, ${entry.duePaymentId ?? null},
-       ${entry.payoutId ?? null}, ${entry.directDepositId ?? null}, ${entry.type}::"LedgerEntryType", ${entry.direction}::"LedgerDirection",
+       ${entry.payoutId ?? null}, ${entry.directDepositId ?? null}, ${entry.refundId ?? null}, ${entry.type}::"LedgerEntryType", ${entry.direction}::"LedgerDirection",
        ${entry.amountKobo}, ${entry.grossKobo ?? null}, ${entry.feeKobo ?? null}, ${entry.netKobo ?? null},
        ${entry.reference}, ${entry.description}, ${entry.actorId ?? null}, (${new Date()}::timestamptz AT TIME ZONE 'UTC'))
     ON CONFLICT DO NOTHING`;
@@ -157,7 +158,7 @@ export async function getSpaceLedgerSummary(spaceId: string): Promise<SpaceLedge
 
   const collected = sum('due_payment') + sum('manual_credit') + sum('direct_deposit');
   const balance =
-    collected + sum('payout_reversal') - sum('payout') - sum('payout_fee') - sum('refund');
+    collected + sum('payout_reversal') + sum('refund_reversal') - sum('payout') - sum('payout_fee') - sum('refund');
   return {
     balance,
     collected,
