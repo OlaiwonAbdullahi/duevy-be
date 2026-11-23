@@ -3,6 +3,7 @@ import {
   allocate,
   checkoutFee,
   computeCharge,
+  computeChargeFor,
   computeWithdrawal,
   decimalToKobo,
   koboToDecimal,
@@ -41,6 +42,25 @@ describe('checkoutFee — 1.5%, on top', () => {
     expect(checkoutFee(0)).toBe(0);
     expect(() => checkoutFee(100.5)).toThrow(RangeError);
     expect(() => checkoutFee(-1)).toThrow(RangeError);
+  });
+});
+
+describe('computeChargeFor — who bears the fee', () => {
+  it('student-borne: fee on top, student pays face + fee (same as computeCharge)', () => {
+    const c = computeChargeFor(5_000 * NAIRA, true);
+    expect(c).toEqual(computeCharge(5_000 * NAIRA));
+    expect(c.face).toBe(500_000);
+    expect(c.fee).toBe(7_500);
+    expect(c.total).toBe(507_500); // student transfers ₦5,075
+  });
+
+  it('space-borne: no fee on top, student pays only the face', () => {
+    const c = computeChargeFor(5_000 * NAIRA, false);
+    expect(c.face).toBe(500_000);
+    expect(c.fee).toBe(0); // the student pays nothing on top
+    expect(c.total).toBe(500_000); // student transfers ₦5,000
+    // The space is credited face − the full fee, computed where the money lands.
+    expect(500_000 - checkoutFee(500_000)).toBe(492_500); // ₦4,925
   });
 });
 

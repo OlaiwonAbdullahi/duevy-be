@@ -1,8 +1,11 @@
 import { Router, type Request, type Response } from 'express';
-import { verifyPassword } from '../lib/password';
+import { verifyPassword, hashPassword, generateTempPassword } from '../lib/password';
 import { z } from 'zod';
 import { type RepRole } from '@prisma/client';
 import { db } from '../config/db';
+import { env } from '../config/env';
+import { generateId } from '../lib/id';
+import { sendCoRepTempPasswordEmail } from '../lib/email';
 import { getKycPolicy } from '../services/kycPolicy.service';
 import { canCollect } from '../services/kyc.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
@@ -164,81 +167,130 @@ circleRouter.get('/reps', requireSpaceRep(), async (req: Request, res: Response)
 });
 
 // ---------------------------------------------------------------------------
-// POST /reps — the lead adds a co-rep: a member of the space (`userId`), or
-// any Duevy account by `email` (dues are paid through pay links now, so most
-// spaces have no members to pick from; the account is added as a member too).
+// POST /reps — the lead adds a co-rep by email. Dues are paid through pay
+// links now, so spaces have no student members to pick from: email is the only
+// way in. If no Duevy account uses the email (or it's a guest pay-link payer
+// with no password), we create/activate a co-rep account and email a one-time
+// password so they can sign in. An existing full account is added as-is, with
+// its password untouched.
 // A co-rep can manage dues and withdraw from the dues the lead assigns them
 // (POST /dues/{dueId}/reassign); the lead can also nominate them as a
 // withdrawal signatory (PUT /payout/signatories).
 // ---------------------------------------------------------------------------
-const addRepSchema = z.union([
-  z.object({ userId: z.string().min(1) }).strict(),
-  z.object({ email: z.string().trim().email().max(254).transform((e) => e.toLowerCase()) }).strict(),
-]);
+const addRepSchema = z
+  .object({
+    email: z.string().trim().email().max(254).transform((e) => e.toLowerCase()),
+    // Optional display name for a freshly created account; falls back to the
+    // email's local part. Ignored when the email already has an account.
+    name: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
+
+/** A readable display name from an email local part, e.g. "bola.ade" → "Bola Ade". */
+function nameFromEmail(email: string): string {
+  const local = email.split('@')[0] ?? '';
+  const titled = local
+    .replace(/[._-]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  return titled || 'New rep';
+}
 
 circleRouter.post('/reps', requireSpaceRep(true), validate(addRepSchema), async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
-  const input = req.body as z.infer<typeof addRepSchema>;
+  const { email, name } = req.body as z.infer<typeof addRepSchema>;
 
-  let targetId: string;
-  let addMembership = false;
-  if ('email' in input) {
-    // Guests (pay-link payers) have no password, so they can't sign in to be a rep.
-    const account = await db.user.findFirst({
-      where: { email: { equals: input.email, mode: 'insensitive' }, isGuest: false },
-      select: { id: true },
-    });
-    if (!account) {
-      fail(res, 404, 'NO_ACCOUNT', 'No Duevy account uses this email');
-      return;
-    }
-    targetId = account.id;
-    addMembership = true;
-  } else {
-    targetId = input.userId;
-  }
-
-  const [membership, existing, target] = await Promise.all([
-    db.spaceMembership.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
-    db.spaceRep.findUnique({ where: { userId_spaceId: { userId: targetId, spaceId: sid } } }),
-    db.user.findUnique({ where: { id: targetId }, select: { id: true, name: true, email: true, role: true, referralCode: true, isSuspended: true, isDeactivated: true } }),
+  const [space, existing] = await Promise.all([
+    db.space.findUnique({ where: { id: sid }, select: { name: true } }),
+    db.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+      select: { id: true, name: true, email: true, role: true, referralCode: true, isGuest: true, passwordHash: true, isSuspended: true, isDeactivated: true },
+    }),
   ]);
-  if (!target || (!membership && !addMembership)) {
-    errors.notFound(res, 'That user is not a member of this space');
-    return;
-  }
-  if (existing) {
-    errors.conflict(res, 'ALREADY_REP', 'That user is already a rep of this space');
-    return;
-  }
-  if (target.isSuspended || target.isDeactivated) {
+
+  if (existing && (existing.isSuspended || existing.isDeactivated)) {
     errors.conflict(res, 'USER_INACTIVE', 'Suspended or deactivated users cannot be added as reps');
     return;
   }
+  if (existing) {
+    const alreadyRep = await db.spaceRep.findUnique({ where: { userId_spaceId: { userId: existing.id, spaceId: sid } } });
+    if (alreadyRep) {
+      errors.conflict(res, 'ALREADY_REP', 'That user is already a rep of this space');
+      return;
+    }
+  }
 
-  const referralCode = target.referralCode ?? (await generateReferralCode(target.name));
+  // A brand-new email, or a guest/passwordless account, gets a one-time
+  // password so they can sign in. An existing full account keeps its password.
+  const needsPassword = !existing || existing.isGuest || !existing.passwordHash;
+  const tempPassword = needsPassword ? generateTempPassword() : null;
+  const passwordHash = tempPassword ? await hashPassword(tempPassword, env.BCRYPT_ROUNDS) : undefined;
+  const displayName = existing?.name ?? name ?? nameFromEmail(email);
   const me = await actor(req);
+
   const created = await db.$transaction(async (tx) => {
-    if (!membership) await tx.spaceMembership.create({ data: { userId: targetId, spaceId: sid } });
-    const r = await tx.spaceRep.create({ data: { userId: targetId, spaceId: sid, role: 'co' } });
-    // Attaching a rep promotes the account, as an admin assignment does.
-    await tx.user.update({
-      where: { id: targetId },
-      data: { role: target.role === 'admin' ? 'admin' : 'rep', isRep: true, repApplicationStatus: 'approved', referralCode },
-    });
-    await writeAudit(sid, me, 'rep_invited', `Added ${target.name} as a co-rep`, tx);
-    return r;
+    let userId: string;
+    if (!existing) {
+      const user = await tx.user.create({
+        data: {
+          id: generateId('user'),
+          name: displayName,
+          email,
+          emailVerified: true,
+          passwordHash,
+          role: 'rep',
+          isRep: true,
+          repApplicationStatus: 'approved',
+          referralCode: await generateReferralCode(displayName),
+        },
+      });
+      userId = user.id;
+    } else {
+      userId = existing.id;
+      const referralCode = existing.referralCode ?? (await generateReferralCode(existing.name));
+      // Attaching a rep promotes the account, as an admin assignment does.
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          role: existing.role === 'admin' ? 'admin' : 'rep',
+          isRep: true,
+          repApplicationStatus: 'approved',
+          referralCode,
+          // Activate a guest/passwordless account with the one-time password.
+          ...(needsPassword ? { passwordHash, isGuest: false, emailVerified: true } : {}),
+        },
+      });
+    }
+    await tx.spaceMembership.upsert({ where: { userId_spaceId: { userId, spaceId: sid } }, update: {}, create: { userId, spaceId: sid } });
+    const r = await tx.spaceRep.create({ data: { userId, spaceId: sid, role: 'co' } });
+    await writeAudit(sid, me, 'rep_invited', `Added ${displayName} as a co-rep`, tx);
+    return { userId, rep: r };
   });
 
+  if (tempPassword) {
+    await sendCoRepTempPasswordEmail(email, displayName, {
+      spaceName: space?.name ?? 'your space',
+      inviterName: me.name,
+      tempPassword,
+    }).catch((err) => console.error('[co-rep temp password email]', err));
+  }
+
   await notify({
-    userId: targetId,
+    userId: created.userId,
     kind: 'system',
     title: 'You are now a co-rep',
     detail: `${me.name} added you as a co-rep. You can now help manage dues for this space.`,
     href: '/dashboard',
   });
 
-  ok(res, { id: target.id, name: target.name, email: target.email, role: created.role, isSignatory: false, addedAt: created.addedAt.toISOString() }, 201);
+  ok(
+    res,
+    { id: created.userId, name: displayName, email, role: created.rep.role, isSignatory: false, addedAt: created.rep.addedAt.toISOString(), accountCreated: !existing, activated: needsPassword },
+    201,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -338,13 +390,9 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
   );
 
   let collected = 0;
-  let expected = 0;
-  let unpaidCount = 0;
   const activeDuesOut = activeDues.map((d) => {
     const agg = paidByDue.get(d.id) ?? { count: 0, guests: 0, sum: 0 };
     collected += agg.sum;
-    expected += d.amount * memberCount;
-    unpaidCount += Math.max(0, memberCount - agg.count);
     return {
       id: d.id,
       title: d.title,
@@ -368,9 +416,6 @@ circleRouter.get('/overview', requireSpaceRep(), async (req: Request, res: Respo
       // Lifetime money received from students across every due (same as the
       // payout page's "Total collected"); `collected` covers active dues only.
       totalCollected: ledger.collected,
-      outstanding: Math.max(0, expected - collected),
-      unpaidCount,
-      collectionRate: expected > 0 ? collected / expected : 0,
     },
     activeDues: activeDuesOut,
     newMembers: newMembers.map((m) => serializeStudent(m.user, m.joinedAt)),

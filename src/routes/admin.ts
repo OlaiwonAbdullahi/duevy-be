@@ -10,7 +10,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFeedback, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
-import { computeCharge, generateReference } from '../lib/money';
+import { checkoutFee, computeChargeFor, generateReference } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listLivenessForReview, listNinReviews, listStudentIdsForReview, reviewLiveness, reviewNin, reviewStudentId } from '../services/kyc.service';
@@ -40,28 +40,18 @@ const userSpaces = {
 // ---------------------------------------------------------------------------
 // Shared financial aggregation over a set of spaces.
 // ---------------------------------------------------------------------------
-type SpaceMoney = { collected: number; held: number; expected: number; collectedActive: number };
+type SpaceMoney = { collected: number; held: number };
 
 /** Roll per-space money up into the shape the admin views show. */
 function summarizeFinancials(parts: Iterable<SpaceMoney | undefined>) {
   let collected = 0;
   let held = 0;
-  let expected = 0;
-  let collectedActive = 0;
   for (const p of parts) {
     if (!p) continue;
     collected += p.collected;
     held += p.held;
-    expected += p.expected;
-    collectedActive += p.collectedActive;
   }
-  return {
-    collected,
-    held,
-    expected,
-    uncollected: Math.max(0, expected - collectedActive),
-    collectionRate: expected > 0 ? collectedActive / expected : 0,
-  };
+  return { collected, held };
 }
 
 /**
@@ -69,26 +59,18 @@ function summarizeFinancials(parts: Iterable<SpaceMoney | undefined>) {
  * (no per-row aggregates). Spaces with no activity map to zeros.
  */
 async function financialsBySpace(spaceIds: string[]): Promise<Map<string, SpaceMoney>> {
-  const out = new Map<string, SpaceMoney>(spaceIds.map((id) => [id, { collected: 0, held: 0, expected: 0, collectedActive: 0 }]));
+  const out = new Map<string, SpaceMoney>(spaceIds.map((id) => [id, { collected: 0, held: 0 }]));
   if (spaceIds.length === 0) return out;
 
-  const [dues, paidPerDue, ledgerGroups, memberGroups] = await Promise.all([
-    db.due.findMany({ where: { spaceId: { in: spaceIds } }, select: { id: true, spaceId: true, amount: true, status: true } }),
+  const [dues, paidPerDue, ledgerGroups] = await Promise.all([
+    db.due.findMany({ where: { spaceId: { in: spaceIds } }, select: { id: true, spaceId: true } }),
     db.duePayment.groupBy({ by: ['dueId'], where: { due: { spaceId: { in: spaceIds } } }, _sum: { netToSpace: true } }),
     db.ledgerEntry.groupBy({ by: ['spaceId', 'direction'], where: { spaceId: { in: spaceIds } }, _sum: { amountKobo: true } }),
-    db.spaceMembership.groupBy({ by: ['spaceId'], where: { spaceId: { in: spaceIds } }, _count: { _all: true } }),
   ]);
 
-  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
   const paid = new Map(paidPerDue.map((p) => [p.dueId, p._sum.netToSpace ?? 0]));
   for (const d of dues) {
-    const m = out.get(d.spaceId)!;
-    const net = paid.get(d.id) ?? 0;
-    m.collected += net;
-    if (d.status === 'active') {
-      m.expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
-      m.collectedActive += net;
-    }
+    out.get(d.spaceId)!.collected += paid.get(d.id) ?? 0;
   }
   // The ledger is the balance: credits − debits per space.
   for (const g of ledgerGroups) {
@@ -100,35 +82,10 @@ async function financialsBySpace(spaceIds: string[]): Promise<Map<string, SpaceM
 
 /** Platform-wide financials over every space matching a filter (no id lists). */
 async function spacesFinancials(spaceWhere: Prisma.SpaceWhereInput) {
-  const [collectedAgg, ledgerAgg, activeDues, memberGroups, paidPerDue] = await Promise.all([
+  const [collectedAgg, ledgerAgg] = await Promise.all([
     db.duePayment.aggregate({ where: { due: { space: spaceWhere } }, _sum: { netToSpace: true } }),
     db.ledgerEntry.groupBy({ by: ['direction'], where: { space: spaceWhere }, _sum: { amountKobo: true } }),
-    db.due.findMany({ where: { space: spaceWhere, status: 'active' }, select: { id: true, spaceId: true, amount: true } }),
-    db.spaceMembership.groupBy({ by: ['spaceId'], where: { space: spaceWhere }, _count: { _all: true } }),
-    db.duePayment.groupBy({ by: ['dueId'], where: { due: { space: spaceWhere, status: 'active' } }, _sum: { netToSpace: true } }),
   ]);
-
-  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-  const paid = new Map(paidPerDue.map((p) => [p.dueId, p._sum.netToSpace ?? 0]));
-
-  // Per-space expected/collected for active dues, reused for the low-collection count.
-  const bySpace = new Map<string, { expected: number; collected: number }>();
-  for (const d of activeDues) {
-    const agg = bySpace.get(d.spaceId) ?? { expected: 0, collected: 0 };
-    agg.expected += d.amount * (memberCount.get(d.spaceId) ?? 0);
-    agg.collected += paid.get(d.id) ?? 0;
-    bySpace.set(d.spaceId, agg);
-  }
-
-  let expected = 0;
-  let collectedActive = 0;
-  let lowCollectionCount = 0;
-  for (const s of bySpace.values()) {
-    expected += s.expected;
-    collectedActive += s.collected;
-    // Spaces with active dues collecting below 30% of what's expected.
-    if (s.expected > 0 && s.collected / s.expected < 0.3) lowCollectionCount += 1;
-  }
 
   return {
     collected: collectedAgg._sum.netToSpace ?? 0,
@@ -136,10 +93,6 @@ async function spacesFinancials(spaceWhere: Prisma.SpaceWhereInput) {
     held:
       (ledgerAgg.find((g) => g.direction === 'credit')?._sum.amountKobo ?? 0) -
       (ledgerAgg.find((g) => g.direction === 'debit')?._sum.amountKobo ?? 0),
-    expected,
-    uncollected: Math.max(0, expected - collectedActive),
-    collectionRate: expected > 0 ? collectedActive / expected : 0,
-    lowCollectionCount,
   };
 }
 
@@ -392,13 +345,10 @@ adminRouter.get('/overview', async (_req: Request, res: Response): Promise<void>
 
 async function computeAdminOverview() {
   const now = new Date();
-  // Overdue: active dues past their date, still short of full collection.
-  const overdueWhere: Prisma.DueWhereInput = { status: 'active', dueDate: { lt: now } };
 
-  // One round trip: every figure below is independent (the overdue counts
-  // filter by relation, not by a list of due ids read first).
+  // One round trip: every figure below is independent.
   const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, overdueDues, memberGroups, paidGroups, payments] = await Promise.all([
+  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, payments] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
@@ -410,13 +360,6 @@ async function computeAdminOverview() {
       WHERE "status" IN ('open', 'under_review')
         AND "createdAt" + make_interval(days => "slaDays") < ${now}
     `,
-    db.due.findMany({ where: overdueWhere, select: { id: true, spaceId: true, amount: true } }),
-    db.spaceMembership.groupBy({
-      by: ['spaceId'],
-      where: { space: { dues: { some: overdueWhere } } },
-      _count: { _all: true },
-    }),
-    db.duePayment.groupBy({ by: ['dueId'], where: { due: overdueWhere, user: { isGuest: false } }, _count: { _all: true } }),
     // 9jaPay plumbing that needs a human.
     Promise.all([
       db.payout.count({ where: { status: { in: ['pending', 'processing'] }, requestedAt: { lte: hourAgo } } }),
@@ -432,20 +375,7 @@ async function computeAdminOverview() {
       spacesWithoutAccount,
     })),
   ]);
-  const lowCollectionCount = fin.lowCollectionCount;
   const breachedDisputes = breachedRows[0]?.n ?? 0;
-
-  let overdueAmount = 0;
-  let overdueCount = 0;
-  const memberCount = new Map(memberGroups.map((g) => [g.spaceId, g._count._all]));
-  const paidCounts = new Map(paidGroups.map((p) => [p.dueId, p._count._all]));
-  for (const d of overdueDues) {
-    const unpaid = Math.max(0, (memberCount.get(d.spaceId) ?? 0) - (paidCounts.get(d.id) ?? 0));
-    if (unpaid > 0) {
-      overdueCount += 1;
-      overdueAmount += d.amount * unpaid;
-    }
-  }
 
   const attention: unknown[] = [];
   const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -515,28 +445,6 @@ async function computeAdminOverview() {
       linkLabel: 'Review reps',
     });
   }
-  if (overdueCount > 0) {
-    attention.push({
-      id: 'overdue-dues',
-      tone: 'warning',
-      badge: 'Overdue',
-      title: `${overdueCount} due${overdueCount === 1 ? '' : 's'} past deadline with unpaid balances`,
-      detail: `₦${(overdueAmount / 100).toLocaleString('en-NG')} still outstanding across overdue dues.`,
-      href: '/admin/spaces',
-      linkLabel: 'Review spaces',
-    });
-  }
-  if (lowCollectionCount > 0) {
-    attention.push({
-      id: 'low-collection',
-      tone: 'warning',
-      badge: 'Low collection',
-      title: `${lowCollectionCount} space${lowCollectionCount === 1 ? '' : 's'} collecting below 30% of expected dues`,
-      detail: 'These spaces may need a reminder push or rep follow-up.',
-      href: '/admin/spaces',
-      linkLabel: 'Review spaces',
-    });
-  }
   if (breachedDisputes > 0) {
     attention.push({
       id: 'dispute-sla',
@@ -553,9 +461,7 @@ async function computeAdminOverview() {
     totalUsers,
     activeReps,
     duesCollected: fin.collected,
-    duesTarget: fin.expected,
     floatHeld: Math.max(0, fin.held),
-    overdue: { amount: overdueAmount, count: overdueCount },
     revenue: metrics.revenue,
     transactions: metrics.transactions,
     attention,
@@ -845,8 +751,6 @@ function serializeAdminRep(
         }
       : null,
     heldAmount: Math.max(0, fin.held),
-    uncollectedAmount: fin.uncollected,
-    collectionRate: fin.collectionRate,
   };
 }
 
@@ -1289,7 +1193,6 @@ adminRouter.get('/spaces', requireAdminPermission('userManagement'), async (req:
       kind: s.kind,
       school: s.school,
       memberCount: s._count.memberships,
-      duesTarget: fin?.expected ?? 0,
       collectedAmount: fin?.collected ?? 0,
       assignedRepIds: s.reps.map((r) => r.userId),
       isArchived: s.isArchived,
@@ -1626,10 +1529,15 @@ adminRouter.post(
       return;
     }
 
-    // Credited at face value, the same as a real collection. This puts money
-    // on the space's ledger that the provider may not hold for it, so it is
-    // only for a payment that demonstrably happened (and is audited as critical).
-    const charge = computeCharge(due.amount);
+    // Credited the same way a real collection would be. Student-borne: the
+    // student paid face + fee, the space gets the full face. Space-borne: the
+    // student paid only the face, the space absorbs the fee (credited face − fee).
+    // This puts money on the space's ledger that the provider may not hold for
+    // it, so it is only for a payment that demonstrably happened (audited as critical).
+    const studentBears = due.feePayer === 'student';
+    const charge = computeChargeFor(due.amount, studentBears);
+    const fullFee = checkoutFee(due.amount);
+    const netToSpace = due.amount - (studentBears ? 0 : fullFee);
     const reference = suppliedReference ?? generateReference('MAN');
     const actorId = (req as AuthenticatedRequest).user.sub as string;
 
@@ -1657,8 +1565,8 @@ adminRouter.post(
             reference,
             amountPaid: charge.total,
             processingFee: 0,
-            duevyFee: charge.fee,
-            netToSpace: charge.face,
+            duevyFee: fullFee,
+            netToSpace,
           },
         });
         await lockSpace(tx, due.spaceId);
@@ -1669,10 +1577,10 @@ adminRouter.post(
           duePaymentId: duePayment.id,
           type: 'manual_credit',
           direction: 'credit',
-          amountKobo: charge.face,
+          amountKobo: netToSpace,
           grossKobo: charge.total,
-          feeKobo: charge.fee,
-          netKobo: charge.face,
+          feeKobo: fullFee,
+          netKobo: netToSpace,
           reference,
           description: reason,
           actorId,

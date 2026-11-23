@@ -12,7 +12,7 @@ import {
 } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
-import { computeCharge } from '../lib/money';
+import { computeChargeFor } from '../lib/money';
 import { createCheckout, createGroupCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken, type GroupPerson } from '../services/checkout.service';
 import { syncPendingCheckout } from './transactions';
 import { renderReceiptByNumber } from '../services/receipt.service';
@@ -62,13 +62,14 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     errors.notFound(res, 'This payment link is not open');
     return;
   }
-  const charge = computeCharge(due.amount);
+  const charge = computeChargeFor(due.amount, due.feePayer === 'student');
   const kyc = await getSpaceKycState(due.space.id);
   ok(res, {
     id: due.id,
     title: due.title,
     note: due.note,
     type: due.category,
+    feePayer: due.feePayer,
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     amount: charge.face,
     fee: charge.fee,

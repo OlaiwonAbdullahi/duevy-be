@@ -153,6 +153,10 @@ async function financialSummary({ range, spaceId, subtitle }: Ctx): Promise<Repo
   const debits = balanceAgg.find((g) => g.direction === 'debit')?._sum.amountKobo ?? 0;
   const processingFees = paid._sum.feeKobo ?? 0;
   const sweepCharges = sweeps._sum.feeKobo ?? 0;
+  // What spaces are actually credited: everything students transferred, less
+  // Duevy's full fee. Equals Σ faceKobo when students bear every fee, and less
+  // when a space absorbed the fee on a due (fee taken out of what it collects).
+  const creditedToSpaces = (paid._sum.totalKobo ?? 0) - processingFees;
 
   const section = (label: string): Cell[] => [label, null, null];
   return {
@@ -162,7 +166,7 @@ async function financialSummary({ range, spaceId, subtitle }: Ctx): Promise<Repo
     rows: [
       section('MONEY IN'),
       ['Payments received from students and guests', paid._count._all, naira(paid._sum.totalKobo)],
-      ['  of which dues credited to spaces', null, naira(paid._sum.faceKobo)],
+      ['  of which dues credited to spaces', null, naira(creditedToSpaces)],
       ['  of which Duevy processing fees', null, naira(processingFees)],
       ['  overpayments flagged for refund', null, naira(paid._sum.overpaidKobo)],
       ['Direct deposits into space accounts', deposits._count._all, naira(deposits._sum.amountKobo)],
@@ -205,7 +209,7 @@ async function spaceCollection({ range, spaceId, subtitle }: Ctx): Promise<Repor
     SELECT s."name", s."short", s."walletAccountNumber" AS account, s."isArchived" AS archived,
       (SELECT COUNT(*)::int FROM "space_memberships" m WHERE m."spaceId" = s."id") AS members,
       (SELECT COUNT(*)::int FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS payments,
-      (SELECT COALESCE(SUM(c."faceKobo"), 0)::bigint FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS collected,
+      (SELECT COALESCE(SUM(c."totalKobo" - c."feeKobo"), 0)::bigint FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS collected,
       (SELECT COALESCE(SUM(d."amountKobo"), 0)::bigint FROM "direct_deposits" d WHERE d."spaceId" = s."id" AND d."receivedAt" BETWEEN ${range.gte} AND ${range.lte}) AS deposits,
       (SELECT COUNT(*)::int FROM "payouts" p WHERE p."spaceId" = s."id" AND p."status" = 'success' AND p."settledAt" BETWEEN ${range.gte} AND ${range.lte}) AS withdrawals,
       (SELECT COALESCE(SUM(p."amount"), 0)::bigint FROM "payouts" p WHERE p."spaceId" = s."id" AND p."status" = 'success' AND p."settledAt" BETWEEN ${range.gte} AND ${range.lte}) AS withdrawn,
@@ -282,7 +286,7 @@ async function repPerformance({ range, spaceId, subtitle }: Ctx): Promise<Report
     SELECT u."name" AS rep, u."email", s."name" AS space, sr."role"::text AS role, u."isSuspended" AS suspended,
       (SELECT COUNT(*)::int FROM "space_memberships" m WHERE m."spaceId" = s."id") AS members,
       (SELECT COUNT(DISTINCT c."userId")::int FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS payers,
-      (SELECT COALESCE(SUM(c."faceKobo"), 0)::bigint FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS collected,
+      (SELECT COALESCE(SUM(c."totalKobo" - c."feeKobo"), 0)::bigint FROM "checkouts" c WHERE c."spaceId" = s."id" AND c."status" = 'paid' AND c."paidAt" BETWEEN ${range.gte} AND ${range.lte}) AS collected,
       (SELECT COUNT(*)::int FROM "payouts" p WHERE p."spaceId" = s."id" AND p."requestedById" = u."id" AND p."status" = 'success' AND p."settledAt" BETWEEN ${range.gte} AND ${range.lte}) AS withdrawals,
       (SELECT COALESCE(SUM(p."amount"), 0)::bigint FROM "payouts" p WHERE p."spaceId" = s."id" AND p."requestedById" = u."id" AND p."status" = 'success' AND p."settledAt" BETWEEN ${range.gte} AND ${range.lte}) AS withdrawn
     FROM "space_reps" sr

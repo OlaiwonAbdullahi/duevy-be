@@ -388,10 +388,7 @@ meRouter.get('/overview', async (req: Request, res: Response): Promise<void> => 
     return at - bt;
   });
 
-  const outstandingAmount = openDuesAll.reduce((sum, d) => sum + d.amount, 0);
-
   ok(res, {
-    outstanding: { amount: outstandingAmount, count: openDuesAll.length },
     paidThisSession: paidAgg._sum.amountPaid ?? 0,
     openDues: openDuesAll.slice(0, 4).map((d) => ({
       id: d.id,

@@ -59,7 +59,7 @@ async function team() {
   const bola = await member(s.space.id, 'Bola');
   const chidi = await member(s.space.id, 'Chidi');
   for (const u of [bola, chidi]) {
-    expect((await api('POST', `${base}/reps`, { token: leadToken, body: { userId: u.id } })).status).toBe(201);
+    expect((await api('POST', `${base}/reps`, { token: leadToken, body: { email: u.email } })).status).toBe(201);
   }
   return { ...s, lead: s.rep, leadToken, base, bola, chidi };
 }
@@ -76,7 +76,7 @@ async function sign(base: string, payoutId: string, user: { id: string; email: s
 }
 
 describe('team management', () => {
-  it('the lead adds members as co-reps; non-members, duplicates and co-reps are refused', async () => {
+  it('the lead adds co-reps by email; a brand-new email is created, duplicates and non-leads are refused', async () => {
     const t = await team();
     const reps = await api('GET', `${t.base}/reps`, { token: t.leadToken });
     expect(reps.body.data.map((r: { name: string; role: string }) => [r.name, r.role])).toEqual([
@@ -86,11 +86,15 @@ describe('team management', () => {
     ]);
     expect((await db.user.findUniqueOrThrow({ where: { id: t.bola.id } })).isRep).toBe(true);
 
-    const outsider = await db.user.create({ data: { name: 'Out', email: `out_${t.space.id}@test.duevy` } });
-    expect((await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { userId: outsider.id } })).status).toBe(404);
-    expect((await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { userId: t.bola.id } })).status).toBe(409);
+    // A brand-new email creates a co-rep account.
+    const fresh = await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { email: `fresh_${t.space.id}@test.duevy` } });
+    expect(fresh.status).toBe(201);
+    expect(fresh.body.data).toMatchObject({ accountCreated: true, role: 'co' });
+
+    // Adding the same person again is a conflict; a co-rep (not the lead) can't add anyone.
+    expect((await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { email: t.bola.email } })).status).toBe(409);
     const dayo = await member(t.space.id, 'Dayo');
-    const asCo = await api('POST', `${t.base}/reps`, { token: await tokenFor(t.bola), body: { userId: dayo.id } });
+    const asCo = await api('POST', `${t.base}/reps`, { token: await tokenFor(t.bola), body: { email: dayo.email } });
     expect(asCo.status).toBe(403);
   });
 
@@ -210,7 +214,7 @@ describe('signatory approval (multisig)', () => {
     expect((await sign(t.base, id, t.lead)).body.error.code).toBe('ALREADY_SIGNED');
     // A co-rep who isn't a signatory can't sign.
     const dayo = await member(t.space.id, 'Dayo');
-    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { userId: dayo.id } });
+    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { email: dayo.email } });
     expect((await api('POST', `${t.base}/payout/${id}/otp`, { token: await tokenFor(dayo) })).body.error.code).toBe('NOT_A_SIGNATORY');
 
     const second = await sign(t.base, id, t.chidi);
@@ -223,7 +227,7 @@ describe('signatory approval (multisig)', () => {
     const [due] = t.dues;
     await creditDue(t.space.id, due!.id, 800_000);
     const dayo = await member(t.space.id, 'Dayo');
-    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { userId: dayo.id } });
+    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { email: dayo.email } });
     await api('POST', `${t.base}/dues/${due!.id}/reassign`, { token: t.leadToken, body: { userId: dayo.id } });
     await turnOnMultisig(t);
 
@@ -271,7 +275,7 @@ describe('signatory approval (multisig)', () => {
     await creditSpace(t.space.id, 1_000_000);
     await turnOnMultisig(t);
     const dayo = await member(t.space.id, 'Dayo');
-    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { userId: dayo.id } });
+    await api('POST', `${t.base}/reps`, { token: t.leadToken, body: { email: dayo.email } });
 
     // Approvals on: can't drop below two co-rep signatories, and a swap starts a hold.
     const drop = await api('PUT', `${t.base}/payout/signatories`, { token: t.leadToken, body: { userIds: [t.bola.id], password: PASSWORD } });

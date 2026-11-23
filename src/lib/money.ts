@@ -141,7 +141,18 @@ export interface Charge {
 }
 
 export function computeCharge(faceKobo: number): Charge {
-  const fee = checkoutFee(faceKobo);
+  return computeChargeFor(faceKobo, true);
+}
+
+/**
+ * The charge for a due whose fee the student may or may not bear.
+ *   studentBearsFee — the student pays the fee on top (`fee` > 0, total = face + fee).
+ *   !studentBearsFee — the space absorbs it: the student pays only the face,
+ *                      so `fee` is 0 here (what the student pays on top) and the
+ *                      space is credited face − checkoutFee(face) instead.
+ */
+export function computeChargeFor(faceKobo: number, studentBearsFee: boolean): Charge {
+  const fee = studentBearsFee ? checkoutFee(faceKobo) : 0;
   return { face: faceKobo, fee, total: faceKobo + fee };
 }
 

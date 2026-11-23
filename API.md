@@ -120,7 +120,7 @@ All endpoints are under `/spaces/:spaceId` and the caller must be a rep of the s
 
 ### `GET /dues/:dueId/collections?status=all|paid|unpaid`
 
-`200`: `{ totals: { paid, unpaid, collected, fees, net, expected, rate }, students: [{ id, name, matricNo, level, email, status: "paid"|"unpaid", paidAt, reference }] }`
+`200`: `{ totals: { paid, collected, fees, net, guestPaid }, students: [{ id, name, matricNo, level, email, status: "paid"|"unpaid", paidAt, reference }] }`
 
 This shows who has paid and who has not. `GET /dues/:dueId/collections/export` returns the same list as CSV.
 
@@ -404,7 +404,7 @@ Every set, change and reset is written to the space audit log. The code is clear
 | Endpoint | Behaviour |
 |---|---|
 | `GET /reps` | Any rep. `[{ id, name, email, role: "lead" \| "co", isSignatory, kycVerified, assignedDues, addedAt }]`. |
-| `POST /reps` | Lead only. `{ "userId": "…" }`: a member of the space becomes a co-rep. `201` with the rep. Errors: `404` (not a member), `409 ALREADY_REP`, `409 USER_INACTIVE`. |
+| `POST /reps` | Lead only. `{ "email": "…", "name"?: "…" }`: adds a co-rep by email — the only way to add one (students no longer join spaces; dues are paid through pay links). If the email already has a full Duevy account it's added as-is (password untouched). Otherwise — a brand-new email, or a guest pay-link account with no password — an account is created/activated with `role: rep`, promoted to co-rep, and a one-time password is emailed so they can sign in and set their own. Optional `name` labels a freshly created account (else it's derived from the email). `201` with the rep, plus `accountCreated` and `activated` flags. Errors: `409 ALREADY_REP`, `409 USER_INACTIVE`. |
 | `DELETE /reps/:userId` | Lead only. Removes a rep. Their due assignments are cleared. |
 | `POST /dues/:dueId/reassign` | Lead only. `{ "userId": coRepId }`: assigns the due to a co-rep, who can then withdraw its collections. |
 
@@ -486,7 +486,7 @@ Also: `POST /admin/users/:userId/kyc/review` only accepts `decision: "rejected"`
 | `PUT /admin/settings/kyc` | **overrides** | Body: `{ ninRequired?, livenessRequired? }`. Applies to every rep at once (within ~10 s on every server): turning a check on stops collection for spaces whose lead rep hasn't passed it; the response's `leadRepsNotMeetingPolicy` says how many. Audit-logged as `settings.kyc_policy`. |
 | `GET /admin/kyc/nin-reviews?status=pending` | userManagement | NIN checks that only partly matched: `[{ userId, name, email, matricNo, institution, kycStatus, submittedAt, nameMatchScore, reviewStatus, reviewedAt, reviewNote, providerReference, studentIdStatus }]`. The NIN itself is never stored, so never shown; look the check up in the Didit console by `providerReference`. |
 | `POST /admin/users/:userId/nin/review` | userManagement | Body: `{ "decision": "approved" | "rejected", "note"? }`; a note is required to reject. Approve verifies the rep; reject counts as a failed attempt. Audit-logged as `user.nin_review`. |
-| `GET /admin/spaces?q=&school=&type=` | userManagement | `[{ id, name, short, kind, school, memberCount, duesTarget, collectedAmount, assignedRepIds, isArchived, payoutsFrozen }]` |
+| `GET /admin/spaces?q=&school=&type=` | userManagement | `[{ id, name, short, kind, school, memberCount, collectedAmount, assignedRepIds, isArchived, payoutsFrozen }]` |
 | `GET /admin/transactions?type=&status=&spaceId=&userId=&from=&to=` | userManagement | Every transaction. |
 | `GET /admin/checkouts?status=&needsReview=true&overpaid=true&spaceId=` | userManagement | The review queue: underpaid, overpaid, late and duplicate payments. |
 | `POST /admin/checkouts/:reference/resolve` | overrides | Clears a review flag. Body: `{ note }`. |

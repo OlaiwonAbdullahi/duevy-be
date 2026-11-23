@@ -247,6 +247,7 @@ export function serializeRepDue(
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     type: due.category,
     category: due.category, // deprecated alias of `type`
+    feePayer: due.feePayer,
     status: due.status,
     assignedRepId: due.assignedRepId,
     allowGuests: due.allowGuests,

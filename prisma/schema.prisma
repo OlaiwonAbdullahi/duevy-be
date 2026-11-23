@@ -93,6 +93,18 @@ enum RepDueStatus {
   closed
 }
 
+// Who absorbs the 1.5% processing fee on a due.
+//   student — the student pays it on top (amount + fee); the space is credited
+//             the full face amount. The default, and how every due worked
+//             before this choice existed.
+//   space   — the student pays only the face amount; the fee is taken out of
+//             what the space collects, so the space is credited face − fee.
+// Either way Duevy collects the same fee; only who bears it differs.
+enum FeePayer {
+  student
+  space
+}
+
 enum PayMethod {
   wallet
   card
@@ -745,6 +757,9 @@ model Due {
   dueDate        DateTime? // YYYY-MM-DD — the deadline; null = no deadline
   category       DueType // exposed as `type` in the API
   status         RepDueStatus @default(draft)
+  // Who pays the 1.5% processing fee (see enum FeePayer). Captured onto each
+  // CheckoutItem at checkout time, so changing it never alters a paid checkout.
+  feePayer       FeePayer     @default(student)
   allowGuests    Boolean      @default(false)
   guestFields    Json? // extra questions on the guest pay link (lib/guestForm.ts); null = the original form
   publishedAt    DateTime?
@@ -817,9 +832,12 @@ model Checkout {
   userId                String
   spaceId               String
   status                CheckoutStatus @default(pending)
-  faceKobo              Int // sum of the dues' face amounts — what the space receives
-  feeKobo               Int // the 1.5% processing fee, on top
-  totalKobo             Int // faceKobo + feeKobo — what the student must transfer
+  faceKobo              Int // sum of the dues' face amounts (their sticker price)
+  feeKobo               Int // the full 1.5% processing fee Duevy takes on the basket
+  // What the student actually transfers: faceKobo plus only the fee on the dues
+  // whose feePayer is `student`. Equals faceKobo + feeKobo when the student
+  // bears every fee (the common case). The space is credited totalKobo − feeKobo.
+  totalKobo             Int
   receivedKobo          Int? // what the provider reported as received
   overpaidKobo          Int            @default(0)
   // The sorted due ids, so a repeat request for the same basket returns the
@@ -886,6 +904,11 @@ model CheckoutItem {
   dueId      String
   faceKobo   Int // the due's face amount at the time of checkout
   feeKobo    Int // this line's share of the checkout fee (sums to Checkout.feeKobo)
+  // The due's feePayer, captured at checkout time. true = the student paid this
+  // line's fee on top (paid faceKobo + feeKobo, space credited faceKobo);
+  // false = the space absorbs it (student paid faceKobo, space credited
+  // faceKobo − feeKobo). Legacy rows default true.
+  studentBearsFee Boolean @default(true)
   // Who this line pays for. NULL = the checkout's own user (single-payer, legacy).
   // Set on every line of a group checkout, where one payer settles a due for
   // several people — each a distinct guest user with their own DuePayment.

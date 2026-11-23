@@ -8,7 +8,7 @@ import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { checkoutLimiter } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { computeCharge } from '../lib/money';
+import { computeChargeFor } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { createCheckout } from '../services/checkout.service';
 import { renderDueReceipt } from '../services/receipt.service';
@@ -36,15 +36,17 @@ function viewerStatus(due: Due, payment: DuePayment | undefined, now: Date): Vie
  * so its total is less than the sum of these.
  */
 function serializeStudentDue(due: Due, payment: DuePayment | undefined, now: Date) {
-  const charge = computeCharge(due.amount);
+  // A space-borne fee isn't charged to the student: they pay only the face.
+  const charge = computeChargeFor(due.amount, due.feePayer === 'student');
   return {
     id: due.id,
     spaceId: due.spaceId,
     title: due.title,
     note: due.note,
     amount: due.amount, // face amount the rep set
-    processingFee: charge.fee, // 1.5%, added on top
+    processingFee: charge.fee, // 1.5% added on top, or 0 when the space absorbs it
     payableAmount: charge.total, // what the student pays for this due alone
+    feePayer: due.feePayer,
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     type: due.category,
     category: due.category, // deprecated alias of `type`

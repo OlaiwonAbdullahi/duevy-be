@@ -9,7 +9,6 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeRepDue } from '../lib/serializers';
 import { generateId } from '../lib/id';
-import { computeCharge } from '../lib/money';
 import { renderDuePoster } from '../lib/poster';
 import { requestRefund } from '../services/refund.service';
 import { env } from '../config/env';
@@ -164,6 +163,9 @@ const createDueSchema = z.object({
     }, 'must be today or later')
     .nullish(),
   category: categoryField,
+  // Who pays the 1.5% processing fee: `student` (on top, the default) or
+  // `space` (absorbed — the space collects the amount less the fee).
+  feePayer: z.enum(['student', 'space']).default('student'),
   publish: z.boolean().default(false),
   // Lead only: the co-rep who can withdraw this due's collections. Defaults to the creator.
   assignedRepId: z.string().min(1).optional(),
@@ -210,6 +212,7 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         amount: data.amount,
         dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null,
         category: data.category,
+        feePayer: data.feePayer,
         status: publishing ? 'active' : 'draft',
         publishedAt: publishing ? new Date() : null,
         assignedRepId: assignee,
@@ -249,6 +252,7 @@ const patchDueSchema = z.object({
   // `null` clears the deadline; a string sets it.
   dueDate: dueDateField.nullish(),
   category: categoryField.optional(),
+  feePayer: z.enum(['student', 'space']).optional(),
   allowGuests: z.boolean().optional(),
   guestFields: guestFieldsSchema.optional(),
 });
@@ -271,11 +275,15 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
     return;
   }
 
-  // amount is immutable once any payment exists.
-  if (data.amount !== undefined && data.amount !== due.amount) {
+  // amount and feePayer are immutable once any payment exists: both are baked
+  // into every settled checkout, so changing them would desync paid records.
+  const changingAmount = data.amount !== undefined && data.amount !== due.amount;
+  const changingFeePayer = data.feePayer !== undefined && data.feePayer !== due.feePayer;
+  if (changingAmount || changingFeePayer) {
     const payments = await db.duePayment.count({ where: { dueId: due.id } });
     if (payments > 0) {
-      errors.conflict(res, 'DUE_HAS_PAYMENTS', 'Amount cannot change after payments have been made');
+      const field = changingAmount ? 'Amount' : 'Who pays the processing fee';
+      errors.conflict(res, 'DUE_HAS_PAYMENTS', `${field} cannot change after payments have been made`);
       return;
     }
   }
@@ -288,6 +296,7 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
       ...(data.amount !== undefined ? { amount: data.amount } : {}),
       ...(data.dueDate !== undefined ? { dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
+      ...(data.feePayer !== undefined ? { feePayer: data.feePayer } : {}),
       ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
       ...(data.guestFields !== undefined ? { guestFields: data.guestFields ?? Prisma.DbNull } : {}),
     },
@@ -567,10 +576,9 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   // Everything in one round trip. The due's ownership check runs alongside
   // the reads, not before them: if the due isn't this space's, the results
   // are discarded and nothing but the 404 leaves.
-  const [due, { matching, students }, memberCount, agg, guests, paidCount] = await Promise.all([
+  const [due, { matching, students }, agg, guests, paidCount] = await Promise.all([
     loadDue(sid, dueId),
     buildRoster(sid, dueId, statusFilter, q, { skip, take }),
-    db.spaceMembership.count({ where: { spaceId: sid } }),
     // Money totals include guests: that money really arrived.
     db.duePayment.aggregate({
       where: { dueId },
@@ -587,20 +595,15 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   const collected = agg._sum.amountPaid ?? 0;
   const fees = (agg._sum.processingFee ?? 0) + (agg._sum.duevyFee ?? 0);
   const net = agg._sum.netToSpace ?? 0;
-  // Expected is the gross the space would collect if every member paid.
-  const expected = computeCharge(due.amount).total * memberCount;
 
   ok(
     res,
     {
       totals: {
         paid: paidCount,
-        unpaid: Math.max(0, memberCount - paidCount),
         collected,
         fees,
         net,
-        expected,
-        rate: expected > 0 ? collected / expected : 0,
         guestPaid: guests.length,
       },
       students,

@@ -1,4 +1,16 @@
 import bcrypt from 'bcrypt';
+import { randomInt } from 'crypto';
+
+// Unambiguous alphabet for one-time passwords: no 0/O, 1/l/I. Emailed to a new
+// co-rep so they can sign in once and set their own password.
+const TEMP_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+
+/** A random temporary password for an invited account. */
+export function generateTempPassword(length = 12): string {
+  let out = '';
+  for (let i = 0; i < length; i++) out += TEMP_PASSWORD_ALPHABET[randomInt(TEMP_PASSWORD_ALPHABET.length)];
+  return out;
+}
 
 /**
  * Password / PIN hashing. Native bcrypt: the async calls run on libuv's

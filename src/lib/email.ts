@@ -237,6 +237,37 @@ export async function sendAccountActivationEmail(
   });
 }
 
+/**
+ * A lead added someone as a co-rep by email and we created (or activated) a
+ * Duevy account for them. The one-time password rides in this email; they sign
+ * in with it and are expected to set their own password straight away.
+ */
+export async function sendCoRepTempPasswordEmail(
+  to: string,
+  name: string,
+  opts: { spaceName: string; inviterName: string; tempPassword: string },
+): Promise<void> {
+  const link = `${env.FRONTEND_URL}/login`;
+  const html = renderEmail(
+    `
+    <h1>You're a co-rep of ${escapeHtml(opts.spaceName)}</h1>
+    <p>Hi ${escapeHtml(firstName(name))}, ${escapeHtml(opts.inviterName)} added you as a co-rep of ${escapeHtml(opts.spaceName)} on Duevy. We created an account for this email address so you can help manage dues.</p>
+    <p class="callout">Sign in with <strong>${escapeHtml(to)}</strong> and this temporary password:<br><strong style="font-size:18px;letter-spacing:1px;">${escapeHtml(opts.tempPassword)}</strong></p>
+    <a href="${link}" class="btn">Sign in</a>
+    <p class="muted">For your security, change this password as soon as you sign in. If you didn't expect this, you can ignore this email.</p>
+  `,
+    BRAND,
+    { preheader: `You're now a co-rep of ${opts.spaceName}. Here's how to sign in.` },
+  );
+
+  await sendEmail({
+    to,
+    subject: `You're a co-rep of ${opts.spaceName} on Duevy`,
+    html,
+    text: `Hi ${firstName(name)},\n\n${opts.inviterName} added you as a co-rep of ${opts.spaceName} on Duevy. We created an account for this email address.\n\nSign in at ${link} with:\nEmail: ${to}\nTemporary password: ${opts.tempPassword}\n\nChange this password as soon as you sign in.`,
+  });
+}
+
 export type DuePaymentReceipt = {
   spaceName: string;
   reference: string;
@@ -268,11 +299,13 @@ function emailReceiptTable(input: DuePaymentReceipt): string {
       </tr>`;
   const items = input.items.map((item) => row(escapeHtml(item.title), nairaExact(item.amountKobo))).join('');
   const subtotal = input.items.length > 1 ? row('Dues total', nairaExact(input.faceKobo), { soft: true }) : '';
+  // Only shown when the student actually paid a fee; a space-absorbed fee isn't theirs.
+  const feeRow = input.feeKobo > 0 ? row('Processing fee', nairaExact(input.feeKobo), { soft: true }) : '';
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 20px;border-bottom:1px solid ${LINE};">
       ${items}
       ${subtotal}
-      ${row('Processing fee', nairaExact(input.feeKobo), { soft: true })}
+      ${feeRow}
     </table>`;
 }
 
@@ -294,7 +327,12 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
     ['Method', 'Bank transfer'],
     ['Reference', input.reference],
   ];
-  const note = `${input.spaceName || 'Your department'} gets the full ${nairaExact(input.faceKobo)}. The 1.5% processing fee is charged on top. You can use this email as proof of payment.`;
+  // feeKobo here is what the student paid on top: 0 when the space chose to
+  // absorb the processing fee, so the note never over-promises either way.
+  const note =
+    input.feeKobo > 0
+      ? `Includes a ${nairaExact(input.feeKobo)} processing fee on top of your dues. You can use this email as proof of payment.`
+      : 'You can use this email as proof of payment.';
 
   const html = renderEmail(
     `
@@ -313,7 +351,7 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
   const lines = input.items.map((i) => `${i.title}: ${nairaExact(i.amountKobo)}`).join('\n');
   const text =
     `${lead}\n\n${lines}\n` +
-    `${single ? '' : `Dues total: ${nairaExact(input.faceKobo)}\n`}Processing fee: ${nairaExact(input.feeKobo)}\nTotal paid: ${amount}\n\n` +
+    `${single ? '' : `Dues total: ${nairaExact(input.faceKobo)}\n`}${input.feeKobo > 0 ? `Processing fee: ${nairaExact(input.feeKobo)}\n` : ''}Total paid: ${amount}\n\n` +
     details.map(([k, v]) => `${k}: ${v}`).join('\n') +
     `\n\n${note}\n\nView receipt: ${receiptLink}`;
 
@@ -340,8 +378,10 @@ export type RepPaymentReceived = {
   reference: string;
   /** Every due settled by this payment, at its face amount. */
   items: { title: string; amountKobo: number }[];
-  /** What the space receives: the dues' face amount, without the student's processing fee. */
+  /** What the space actually receives: the face amount less any fee it absorbed. */
   faceKobo: number;
+  /** The processing fee the space chose to absorb (0 when the student bore it). */
+  feeAbsorbedKobo?: number;
   paidAt: Date;
   /** The due's collections roster, or the dues list for a basket. */
   link: string;
@@ -353,13 +393,18 @@ export function buildRepPaymentReceivedEmail(repName: string, input: RepPaymentR
   const single = input.items.length === 1;
   const summary = single ? input.items[0]!.title : `${input.items.length} dues`;
   const payer = input.payerName;
-  const lead = `Hi ${firstName(repName)}, ${payer} just paid ${amount} for ${summary} in ${input.spaceName}. It's already in the space balance.`;
+  const absorbed = input.feeAbsorbedKobo ?? 0;
+  const lead = `Hi ${firstName(repName)}, ${payer} just paid ${summary} in ${input.spaceName}. ${amount} is already in the space balance.`;
   const rows: [string, string][] = [
     ...(single ? [] : input.items.map((i) => [i.title, nairaExact(i.amountKobo)] as [string, string])),
     ['Date', lagosTime(input.paidAt)],
     ['Reference', input.reference],
   ];
   const optOut = 'To stop these emails, go to Settings, then Notifications, and turn off Payment emails.';
+  const feeNote =
+    absorbed > 0
+      ? `You chose to cover the ${nairaExact(absorbed)} processing fee on ${single ? 'this due' : 'these dues'}, so it's been taken out of this payment.`
+      : 'The student pays the processing fee on top, so the space gets the full amount.';
   const html = renderEmail(
     `
     <h1>${escapeHtml(payer)} paid</h1>
@@ -367,7 +412,7 @@ export function buildRepPaymentReceivedEmail(repName: string, input: RepPaymentR
     <p>${escapeHtml(`Hi ${firstName(repName)}, that's for ${summary} in ${input.spaceName}, and it's already in the space balance.`)}</p>
     ${emailDetails(rows.map(([k, v]) => [escapeHtml(k), escapeHtml(v)] as [string, string]))}
     <a href="${input.link}" class="btn">View collections</a>
-    <p class="muted">The student pays the processing fee on top, so the space gets the full amount. ${optOut}</p>
+    <p class="muted">${escapeHtml(feeNote)} ${optOut}</p>
   `,
     undefined,
     { preheader: `${payer} paid ${amount} for ${summary}.` },

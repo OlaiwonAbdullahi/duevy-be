@@ -43,7 +43,8 @@ export function serializeReceipt(r: LoadedReceipt) {
     method: 'Bank transfer',
     items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo })),
     face: c.faceKobo,
-    fee: c.feeKobo,
+    // The fee the payer actually paid on top (0 where the space absorbed it).
+    fee: c.totalKobo - c.faceKobo,
     total: c.totalKobo,
     received: c.receivedKobo,
   };
@@ -93,7 +94,9 @@ async function renderPdf(r: LoadedReceipt) {
     payerName: r.user.name,
     amountPaid: c.totalKobo,
     processingFee: 0,
-    duevyFee: c.feeKobo,
+    // What the payer paid as fee (0 where the space absorbed it). The "Due
+    // amount" line stays the dues' face value — what the payer paid for.
+    duevyFee: c.totalKobo - c.faceKobo,
     netToSpace: c.faceKobo,
     paidAt: c.paidAt ?? r.issuedAt,
     method: 'Bank transfer',
@@ -126,9 +129,9 @@ export async function renderDueReceipt(checkoutId: string, dueId: string, userId
     lines: [{ title: item.due.title, amountKobo: item.faceKobo }],
     spaceName: r.space.name,
     payerName: r.user.name,
-    amountPaid: item.faceKobo + item.feeKobo,
+    amountPaid: item.faceKobo + (item.studentBearsFee ? item.feeKobo : 0),
     processingFee: 0,
-    duevyFee: item.feeKobo,
+    duevyFee: item.studentBearsFee ? item.feeKobo : 0,
     netToSpace: item.faceKobo,
     paidAt: c.paidAt ?? r.issuedAt,
     method: 'Bank transfer',
@@ -194,7 +197,7 @@ export async function verifyReceipt(rawNumber: string) {
     const item = sorted[Number(part) - 1];
     if (!item || c.items.length <= 1) return null;
     items = [item];
-    total = item.faceKobo + item.feeKobo;
+    total = item.faceKobo + (item.studentBearsFee ? item.feeKobo : 0);
   }
   return {
     valid: true as const,

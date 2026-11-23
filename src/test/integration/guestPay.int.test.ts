@@ -91,6 +91,32 @@ describe('guest pay', () => {
     expect(twice.body.error.code).toBe('DUE_ALREADY_PAID');
   });
 
+  it('space-borne fee: student pays only the face, the space absorbs the 1.5%', async () => {
+    const { space, dues } = await makeSpace();
+    const due = await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true, feePayer: 'space' } });
+    const email = guestEmail();
+
+    // The public summary charges the student no fee on top.
+    const summary = await api('GET', `/v1/public/dues/${due.id}`);
+    expect(summary.body.data).toMatchObject({ amount: 500_000, fee: 0, total: 500_000, feePayer: 'space' });
+
+    const opened = await api('POST', `/v1/public/dues/${due.id}/checkout`, { body: { name: 'Ngozi A', matricNo: 'CSC/21/009', email } });
+    expect(opened.status).toBe(201);
+    const { reference, token, amount } = opened.body.data;
+    expect(amount).toBe(500_000); // student transfers only the face
+
+    await pay(reference, amount);
+
+    const status = await api('GET', `/v1/public/checkouts/${reference}?t=${token}`);
+    expect(status.body.data).toMatchObject({ status: 'paid' });
+    expect(status.body.data.breakdown).toMatchObject({ face: 500_000, fee: 0, total: 500_000 });
+
+    // The space is credited the face less the full fee: ₦5,000 − ₦75 = ₦4,925.
+    expect(await getSpaceBalance(space.id)).toBe(492_500);
+    const payment = await db.duePayment.findFirstOrThrow({ where: { dueId: due.id } });
+    expect(payment).toMatchObject({ amountPaid: 500_000, duevyFee: 7_500, netToSpace: 492_500 });
+  });
+
   it('lets anyone pay as a guest, even with an email that already has an account', async () => {
     const { students, dues } = await makeSpace();
     await db.due.update({ where: { id: dues[0]!.id }, data: { allowGuests: true } });

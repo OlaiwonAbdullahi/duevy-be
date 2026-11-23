@@ -59,8 +59,10 @@ export function serializeCheckout(c: CheckoutWithItems) {
     status: c.status,
     spaceId: c.spaceId,
     amount: c.totalKobo,
-    breakdown: { face: c.faceKobo, fee: c.feeKobo, total: c.totalKobo },
-    items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo, fee: i.feeKobo })),
+    // The fee the student pays on top — only the fees on student-borne lines.
+    // Equals c.feeKobo in the common case; 0 for a wholly space-absorbed basket.
+    breakdown: { face: c.faceKobo, fee: c.totalKobo - c.faceKobo, total: c.totalKobo },
+    items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo, fee: i.studentBearsFee ? i.feeKobo : 0 })),
     // Set on a hosted checkout: redirect the student here to pay.
     checkoutUrl: hosted ? c.checkoutUrl : null,
     bankTransfer: open
@@ -216,6 +218,12 @@ export async function createCheckout(
     const fee = checkoutFee(face);
     const ordered = dueIds.map((id) => dues.find((d) => d.id === id)!);
     const feeShares = allocate(fee, ordered.map((d) => d.amount));
+    // Per line: does the student bear its fee, or does the space absorb it?
+    const studentBears = ordered.map((d) => d.feePayer === 'student');
+    // The student transfers the full face plus only the fees they bear; the
+    // space absorbs the rest (credited face − its fee at fulfilment).
+    const studentFee = feeShares.reduce((sum, share, i) => sum + (studentBears[i] ? share : 0), 0);
+    const total = face + studentFee;
     // No look-up first: the unique indexes on reference catch the ~1 in 10¹²
     // collision, and the caller draws a new one.
     const reference = generateReference();
@@ -231,7 +239,7 @@ export async function createCheckout(
       status: 'pending',
       faceKobo: face,
       feeKobo: fee,
-      totalKobo: face + fee,
+      totalKobo: total,
       receivedKobo: null,
       overpaidKobo: 0,
       dueSetKey,
@@ -262,7 +270,7 @@ export async function createCheckout(
       createdAt: now,
       updatedAt: now,
     };
-    const items = ordered.map((d, i) => ({ id: generateId('checkoutItem'), checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]! }));
+    const items = ordered.map((d, i) => ({ id: generateId('checkoutItem'), checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]!, studentBearsFee: studentBears[i]! }));
 
     // The checkout, its lines and the student's history row (completed on
     // payment) in ONE statement: Postgres runs every data-modifying CTE.
@@ -271,17 +279,17 @@ export async function createCheckout(
         INSERT INTO "checkouts" ("id", "reference", "userId", "spaceId", "status", "faceKobo", "feeKobo", "totalKobo",
                                  "overpaidKobo", "dueSetKey", "provider", "guestAnswers", "accountRequestedAt",
                                  "expiresAt", "needsReview", "createdAt", "updatedAt")
-        VALUES (${created.id}, ${reference}, ${userId}, ${space.id}, 'pending'::"CheckoutStatus", ${face}, ${fee}, ${face + fee},
+        VALUES (${created.id}, ${reference}, ${userId}, ${space.id}, 'pending'::"CheckoutStatus", ${face}, ${fee}, ${total},
                 0, ${dueSetKey}, ${created.provider},
                 ${created.guestAnswers === null ? null : JSON.stringify(created.guestAnswers)}::jsonb,
                 ${utc(created.accountRequestedAt)}, ${utc(created.expiresAt)}, false, ${utc(now)}, ${utc(now)})
       ),
       i AS (
-        INSERT INTO "checkout_items" ("id", "checkoutId", "dueId", "faceKobo", "feeKobo")
-        VALUES ${Prisma.join(items.map((it) => Prisma.sql`(${it.id}, ${it.checkoutId}, ${it.dueId}, ${it.faceKobo}, ${it.feeKobo})`))}
+        INSERT INTO "checkout_items" ("id", "checkoutId", "dueId", "faceKobo", "feeKobo", "studentBearsFee")
+        VALUES ${Prisma.join(items.map((it) => Prisma.sql`(${it.id}, ${it.checkoutId}, ${it.dueId}, ${it.faceKobo}, ${it.feeKobo}, ${it.studentBearsFee})`))}
       )
       INSERT INTO "transactions" ("id", "userId", "type", "title", "detail", "amount", "method", "status", "reference", "spaceId", "createdAt", "updatedAt")
-      VALUES (${generateId('transaction')}, ${userId}, 'due'::"TxnType", ${title}, ${space.name}, ${-(face + fee)}, 'Bank transfer',
+      VALUES (${generateId('transaction')}, ${userId}, 'due'::"TxnType", ${title}, ${space.name}, ${-total}, 'Bank transfer',
               'pending'::"TxnStatus", ${reference}, ${space.id}, ${utc(now)}, ${utc(now)})`;
 
     const checkout: CheckoutWithItems = {
@@ -404,6 +412,10 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
   const face = due.amount * people.length;
   const fee = checkoutFee(face);
   const feeShares = allocate(fee, people.map(() => due.amount));
+  const studentBears = due.feePayer === 'student';
+  // Student-borne: the fee rides on top. Space-borne: the space absorbs it, so
+  // the payer transfers only the faces and the space is credited face − fee.
+  const total = face + (studentBears ? fee : 0);
   const primaryId = users[0]!.id;
 
   const open = async (): Promise<CheckoutWithItems> =>
@@ -419,7 +431,7 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
           status: 'pending',
           faceKobo: face,
           feeKobo: fee,
-          totalKobo: face + fee,
+          totalKobo: total,
           overpaidKobo: 0,
           // Prefixed so the single-payer reuse check never mistakes a group
           // checkout for one person's own basket of the same due.
@@ -434,6 +446,7 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
               dueId,
               faceKobo: due.amount,
               feeKobo: feeShares[i]!,
+              studentBearsFee: studentBears,
               beneficiaryUserId: u.id,
               guestAnswers: people[i]!.answers ?? Prisma.DbNull,
             })),
@@ -448,7 +461,7 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
           type: 'due',
           title: people.length === 1 ? due.title : `${due.title} (${people.length} people)`,
           detail: due.space.name,
-          amount: -(face + fee),
+          amount: -total,
           method: 'Bank transfer',
           status: 'pending',
           reference,
@@ -699,6 +712,13 @@ export async function fulfilCheckout(
           if (existing.checkoutId !== checkoutId) flags.push(`"${item.due.title}" was already paid (${existing.reference})`);
           continue;
         }
+        // Student-borne: the student paid face + fee and the space is credited
+        // the full face. Space-borne: the student paid only the face and the
+        // space absorbs the fee, credited face − fee. Duevy's fee (item.feeKobo)
+        // is the same either way.
+        const studentFeeLine = item.studentBearsFee ? item.feeKobo : 0;
+        const amountPaidLine = item.faceKobo + studentFeeLine;
+        const netLine = item.faceKobo - (item.studentBearsFee ? 0 : item.feeKobo);
         const duePayment = await tx.duePayment.create({
           data: {
             userId: payerId,
@@ -706,10 +726,10 @@ export async function fulfilCheckout(
             checkoutId,
             txnId: txnToLink,
             reference: checkout.reference,
-            amountPaid: item.faceKobo + item.feeKobo,
+            amountPaid: amountPaidLine,
             processingFee: 0,
             duevyFee: item.feeKobo,
-            netToSpace: item.faceKobo,
+            netToSpace: netLine,
             paidAt: new Date(),
           },
         });
@@ -721,10 +741,10 @@ export async function fulfilCheckout(
           duePaymentId: duePayment.id,
           type: 'due_payment',
           direction: 'credit',
-          amountKobo: item.faceKobo,
-          grossKobo: item.faceKobo + item.feeKobo,
+          amountKobo: netLine,
+          grossKobo: amountPaidLine,
           feeKobo: item.feeKobo,
-          netKobo: item.faceKobo,
+          netKobo: netLine,
           reference: checkout.reference,
           description: `Payment for "${item.due.title}"`,
         });
@@ -925,7 +945,8 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       receiptNumber: receipt?.number ?? null,
       items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
       faceKobo: checkout.faceKobo,
-      feeKobo: checkout.feeKobo,
+      // The fee the student actually paid on top (0 where the space absorbed it).
+      feeKobo: checkout.totalKobo - checkout.faceKobo,
       amountPaidKobo: checkout.receivedKobo ?? checkout.totalKobo,
       paidAt: checkout.paidAt ?? new Date(),
       receiptUrl: payer.isGuest && items[0] ? guestReceiptUrl(items[0].dueId, checkout.reference) : undefined,
@@ -941,7 +962,9 @@ async function afterPaid(checkout: Checkout): Promise<void> {
         payerName: payer?.name ?? 'A member',
         reference: checkout.reference,
         items: items.map((i) => ({ title: i.due.title, amountKobo: i.faceKobo })),
-        faceKobo: checkout.faceKobo,
+        // What actually landed in the space balance: face − any fee the space absorbed.
+        faceKobo: checkout.totalKobo - checkout.feeKobo,
+        feeAbsorbedKobo: checkout.faceKobo - (checkout.totalKobo - checkout.feeKobo),
         paidAt: checkout.paidAt ?? new Date(),
         link: `${env.FRONTEND_URL}${rosterHref}`,
       }),
