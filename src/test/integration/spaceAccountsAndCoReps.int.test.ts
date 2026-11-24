@@ -114,21 +114,28 @@ describe('approving a rep applicant as a co-rep of an existing department', () =
     expect(twice.body.error.code).toBe('NOT_PENDING');
   });
 
-  it('holds the applicant to the same KYC bar as /verify, and refuses archived spaces', async () => {
+  it('needs no KYC bar — the lead is already verified — but still refuses archived spaces', async () => {
     const { space } = await makeSpace();
     const user = await applicant('Physics');
     const adm = await admin();
-    await db.user.update({ where: { id: user.id }, data: { livenessStatus: null } });
+    // Clear every KYC check: a co-rep inherits trust from the space's verified lead.
+    await db.user.update({
+      where: { id: user.id },
+      data: { livenessStatus: null, studentIdStatus: null, kycStatus: 'unverified', kycSubmittedAt: null },
+    });
 
-    const early = await api('POST', `/v1/admin/reps/${user.id}/approve-as-co-rep`, { token: adm, body: { spaceId: space.id } });
-    expect(early.status).toBe(409);
-    expect(early.body.error.code).toBe('KYC_INCOMPLETE');
+    const res = await api('POST', `/v1/admin/reps/${user.id}/approve-as-co-rep`, { token: adm, body: { spaceId: space.id } });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.data.space).toEqual({ id: space.id, name: space.name, role: 'co' });
+    expect(await db.spaceRep.findUnique({ where: { userId_spaceId: { userId: user.id, spaceId: space.id } } })).toMatchObject({ role: 'co' });
 
-    await db.user.update({ where: { id: user.id }, data: { livenessStatus: 'pending' } });
-    await db.space.update({ where: { id: space.id }, data: { isArchived: true } });
-    const archived = await api('POST', `/v1/admin/reps/${user.id}/approve-as-co-rep`, { token: adm, body: { spaceId: space.id } });
+    // Archived spaces are still refused (fresh pending applicant).
+    const { space: archivedSpace } = await makeSpace();
+    const user2 = await applicant('Chemistry');
+    await db.space.update({ where: { id: archivedSpace.id }, data: { isArchived: true } });
+    const archived = await api('POST', `/v1/admin/reps/${user2.id}/approve-as-co-rep`, { token: adm, body: { spaceId: archivedSpace.id } });
     expect(archived.status).toBe(404);
-    expect(await db.spaceRep.count({ where: { userId: user.id } })).toBe(0);
+    expect(await db.spaceRep.count({ where: { userId: user2.id } })).toBe(0);
   });
 
   it('needs userManagement', async () => {

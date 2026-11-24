@@ -1001,9 +1001,10 @@ adminRouter.post('/reps/:repId/verify', requireAdminPermission('userManagement')
 
 // POST /reps/:repId/approve-as-co-rep — the applicant's department already
 // has a space: approve them as a co-rep of it instead of opening a second
-// space (and a second bank account) for the same department. Same KYC bar as
-// /verify. A co-rep can't withdraw on their own (only the lead's code or the
-// signatories can), so userManagement is enough, as for rep invites.
+// space (and a second bank account) for the same department. No KYC bar: the
+// space's lead rep is already verified, and that's what gates collection; a
+// co-rep can't withdraw on their own (only the lead's code or the signatories
+// can), so userManagement is enough, as for rep invites.
 const approveAsCoRepSchema = z.object({ spaceId: z.string().min(1), note: z.string().max(500).optional() });
 
 adminRouter.post(
@@ -1034,11 +1035,6 @@ adminRouter.post(
     }
     if (user.isSuspended || user.isDeactivated) {
       errors.conflict(res, 'USER_INACTIVE', 'Suspended or deactivated users cannot be approved as reps');
-      return;
-    }
-    const kycProblem = await applicantKycProblem(user);
-    if (kycProblem) {
-      errors.conflict(res, 'KYC_INCOMPLETE', kycProblem);
       return;
     }
 
