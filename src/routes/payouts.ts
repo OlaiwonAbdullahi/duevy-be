@@ -314,7 +314,9 @@ payoutsRouter.post('/payout/kyc/liveness', ...submitLivenessHandlers);
 
 payoutsRouter.get('/payout/kyc-status', async (req: Request, res: Response): Promise<void> => {
   const [space, mine] = await Promise.all([getSpaceKycState(spaceId(req)), getKycState(uid(req))]);
-  ok(res, { ...space, mine });
+  // Co-reps don't verify themselves — only the lead's KYC gates the space — so
+  // the client needs to know which one the caller is.
+  ok(res, { ...space, mine, isLead: space.leadRepId === uid(req) });
 });
 
 // ---------------------------------------------------------------------------
