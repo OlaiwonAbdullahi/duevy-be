@@ -182,7 +182,12 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
     db.checkout.count({ where }),
     db.checkout.findMany({
       where,
-      include: { user: { select: { name: true, email: true, isGuest: true } }, space: { select: { name: true } }, _count: { select: { items: true } } },
+      include: {
+        user: { select: { name: true, email: true, isGuest: true } },
+        space: { select: { name: true } },
+        items: { select: { faceKobo: true, tierLabel: true, due: { select: { id: true, title: true } } } },
+        _count: { select: { items: true } },
+      },
       orderBy: { createdAt: 'desc' },
       skip,
       take,
@@ -190,12 +195,21 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
   ]);
   ok(
     res,
-    rows.map((c) => ({
+    rows.map((c) => {
+      // The dues this checkout settles, deduped (a group checkout repeats one
+      // due per person) and keyed by due + chosen tier.
+      const byDue = new Map<string, { title: string; tier: string | null; amount: number }>();
+      for (const it of c.items) {
+        const key = `${it.due.id}|${it.tierLabel ?? ''}`;
+        if (!byDue.has(key)) byDue.set(key, { title: it.due.title, tier: it.tierLabel, amount: it.faceKobo });
+      }
+      return {
       reference: c.reference,
       status: c.status,
       user: { id: c.userId, name: c.user.name, email: c.user.email },
       space: { id: c.spaceId, name: c.space.name },
       dueCount: c._count.items,
+      dues: [...byDue.values()],
       face: c.faceKobo,
       fee: c.feeKobo,
       total: c.totalKobo,
@@ -210,7 +224,8 @@ adminRouter.get('/checkouts', requireAdminPermission('userManagement'), async (r
       expiresAt: c.expiresAt.toISOString(),
       paidAt: c.paidAt?.toISOString() ?? null,
       createdAt: c.createdAt.toISOString(),
-    })),
+      };
+    }),
     200,
     buildMeta(page, perPage, total),
   );
@@ -439,7 +454,7 @@ async function computeAdminOverview() {
   // One round trip: every figure below is independent.
   const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
   const liveSpace = { space: { isArchived: false } } as const;
-  const [totalUsers, activeReps, activeLeadReps, activeCoReps, pendingReps, metrics, fin, breachedRows, payments, trends] = await Promise.all([
+  const [totalUsers, activeReps, activeLeadReps, activeCoReps, pendingReps, metrics, fin, breachedRows, payments, trends, duesByStatus, tieredDues] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     // Leads: active reps who lead at least one live space.
@@ -472,8 +487,20 @@ async function computeAdminOverview() {
       spacesWithoutAccount,
     })),
     adminTrends(),
+    // Dues raised across every space, grouped by lifecycle, plus how many are tiered.
+    db.due.groupBy({ by: ['status'], _count: { _all: true } }),
+    db.due.count({ where: { pricingMode: 'tiered' } }),
   ]);
   const breachedDisputes = breachedRows[0]?.n ?? 0;
+
+  const dueCount = (status: 'active' | 'draft' | 'closed') => duesByStatus.find((r) => r.status === status)?._count._all ?? 0;
+  const dues = {
+    total: duesByStatus.reduce((sum, r) => sum + r._count._all, 0),
+    active: dueCount('active'),
+    draft: dueCount('draft'),
+    closed: dueCount('closed'),
+    tiered: tieredDues,
+  };
 
   const attention: unknown[] = [];
   const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -561,6 +588,7 @@ async function computeAdminOverview() {
     activeLeadReps,
     activeCoReps,
     duesCollected: fin.collected,
+    dues,
     floatHeld: Math.max(0, fin.held),
     revenue: metrics.revenue,
     profit: metrics.profit,
