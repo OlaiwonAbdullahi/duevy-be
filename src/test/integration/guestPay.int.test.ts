@@ -295,7 +295,7 @@ describe('guest pay', () => {
 
     const csv = await fetch(`${await startHttp()}${path}/collections/export`, { headers: { Authorization: `Bearer ${repToken}` } });
     const [header, ...rows] = (await csv.text()).split('\n');
-    expect(header).toBe('Name,Matric No,Level,Email,Paid Via,Amount Paid (NGN),Status,Paid At,Reference,Size');
+    expect(header).toBe('Name,Matric No,Level,Email,Paid Via,Amount Paid (NGN),Paid At,Reference,Size');
     expect(rows.find((r) => r.includes(email))).toMatch(/,M$/);
   });
 });

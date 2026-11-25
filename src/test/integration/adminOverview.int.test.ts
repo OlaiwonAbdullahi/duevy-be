@@ -27,20 +27,25 @@ async function overview() {
     activeLeadReps: number;
     activeCoReps: number;
     profit: { total: number; providerFees: number; last30Days: number };
-    trends: { month: string; volume: number; payments: number; revenue: number; profit: number }[];
+    trends: { day: TrendPoint[]; week: TrendPoint[]; month: TrendPoint[] };
   };
 }
+
+type TrendPoint = { bucket: string; volume: number; payments: number; revenue: number; profit: number };
 
 describe('admin overview: rep split and profit', () => {
   it('counts a new lead under reps and a new co-rep under co-reps', async () => {
     const before = await overview();
     expect(typeof before.profit.total).toBe('number');
     expect(typeof before.profit.providerFees).toBe('number');
-    // Trends are a (possibly empty) monthly series, oldest first.
-    expect(Array.isArray(before.trends)).toBe(true);
-    for (const m of before.trends) {
-      expect(m.month).toMatch(/^\d{4}-\d{2}$/);
-      expect(m.profit).toBe(m.revenue - Math.ceil((m.volume * 50) / 10_000));
+    // Trends come at three zoom levels, each zero-filled to a fixed length.
+    expect(before.trends.day).toHaveLength(24);
+    expect(before.trends.week).toHaveLength(7);
+    expect(before.trends.month).toHaveLength(30);
+    expect(before.trends.day[0]!.bucket).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:00:00$/);
+    expect(before.trends.week[0]!.bucket).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    for (const p of [...before.trends.day, ...before.trends.week, ...before.trends.month]) {
+      expect(p.profit).toBe(p.revenue - Math.ceil((p.volume * 50) / 10_000));
     }
 
     // makeSpace provisions one active lead rep.

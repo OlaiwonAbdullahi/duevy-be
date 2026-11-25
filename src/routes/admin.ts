@@ -343,45 +343,82 @@ async function platformMetrics() {
 }
 
 /**
- * The last 12 Lagos calendar months of collections, for the overview charts:
- * what students paid (`volume`), how many payments, the processing fees Duevy
- * earned (`revenue`) and its take-home after 9jaPay's cut (`profit`). The
- * leading all-zero months before the first payment are dropped.
+ * Collections over time for the overview chart, at three zoom levels: the last
+ * 24 hours by hour, the last 7 days by day, and the last 30 days by day. Each
+ * bucket carries what students paid (`volume`), how many payments, the
+ * processing fees Duevy earned (`revenue`) and its take-home after 9jaPay's cut
+ * (`profit`). Empty buckets are filled with zeros so the axis stays continuous.
  */
-const TREND_MONTHS = 12;
-const LAGOS_OFFSET_MS = 60 * 60 * 1000; // UTC+1 all year, no DST.
+export type AdminTrendPoint = { bucket: string; volume: number; payments: number; revenue: number; profit: number };
+export type AdminTrends = { day: AdminTrendPoint[]; week: AdminTrendPoint[]; month: AdminTrendPoint[] };
 
-export type AdminTrendMonth = { month: string; volume: number; payments: number; revenue: number; profit: number };
+type TrendRow = { bucket: string; volume: bigint; payments: number; fees: bigint };
 
-async function adminTrends(now: Date): Promise<AdminTrendMonth[]> {
-  const lagos = new Date(now.getTime() + LAGOS_OFFSET_MS);
-  const y = lagos.getUTCFullYear();
-  const m = lagos.getUTCMonth();
-  const months: string[] = [];
-  for (let i = TREND_MONTHS - 1; i >= 0; i--) {
-    const d = new Date(Date.UTC(y, m - i, 1));
-    months.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`);
-  }
-  const since = new Date(Date.UTC(y, m - (TREND_MONTHS - 1), 1) - LAGOS_OFFSET_MS);
-
-  const rows = await db.$queryRaw<{ month: string; volume: bigint; payments: number; fees: bigint }[]>`
-    SELECT to_char(date_trunc('month', ("paidAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos'), 'YYYY-MM') AS month,
-           COALESCE(SUM("totalKobo"), 0)::bigint AS volume,
-           COUNT(*)::int AS payments,
-           COALESCE(SUM("feeKobo"), 0)::bigint AS fees
-    FROM "checkouts"
-    WHERE "status" = 'paid' AND "paidAt" >= ${since}
-    GROUP BY 1
-  `;
-  const byMonth = new Map(rows.map((r) => [r.month, r]));
-  const series = months.map((month) => {
-    const row = byMonth.get(month);
-    const volume = row ? Number(row.volume) : 0;
-    const revenue = row ? Number(row.fees) : 0;
-    return { month, volume, payments: row?.payments ?? 0, revenue, profit: revenue - providerCollectionFee(volume) };
+function toTrendPoints(rows: TrendRow[]): AdminTrendPoint[] {
+  return rows.map((r) => {
+    const volume = Number(r.volume);
+    const revenue = Number(r.fees);
+    return { bucket: r.bucket, volume, payments: r.payments, revenue, profit: revenue - providerCollectionFee(volume) };
   });
-  const first = series.findIndex((s) => s.payments > 0);
-  return first === -1 ? [] : series.slice(first);
+}
+
+/** The last `hours` hourly buckets (Lagos), zero-filled, oldest first. */
+async function hourlyTrend(hours: number): Promise<AdminTrendPoint[]> {
+  const rows = await db.$queryRaw<TrendRow[]>`
+    WITH buckets AS (
+      SELECT generate_series(
+        date_trunc('hour', (now() AT TIME ZONE 'Africa/Lagos')) - make_interval(hours => ${hours - 1}::int),
+        date_trunc('hour', (now() AT TIME ZONE 'Africa/Lagos')),
+        interval '1 hour'
+      ) AS b
+    ),
+    data AS (
+      SELECT date_trunc('hour', ("paidAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos') AS b,
+             SUM("totalKobo") AS volume, COUNT(*) AS payments, SUM("feeKobo") AS fees
+      FROM "checkouts"
+      WHERE "status" = 'paid' AND "paidAt" >= now() - make_interval(hours => ${hours + 2}::int)
+      GROUP BY 1
+    )
+    SELECT to_char(buckets.b, 'YYYY-MM-DD"T"HH24:00:00') AS bucket,
+           COALESCE(data.volume, 0)::bigint AS volume,
+           COALESCE(data.payments, 0)::int AS payments,
+           COALESCE(data.fees, 0)::bigint AS fees
+    FROM buckets LEFT JOIN data ON data.b = buckets.b
+    ORDER BY buckets.b
+  `;
+  return toTrendPoints(rows);
+}
+
+/** The last `days` daily buckets (Lagos), zero-filled, oldest first. */
+async function dailyTrend(days: number): Promise<AdminTrendPoint[]> {
+  const rows = await db.$queryRaw<TrendRow[]>`
+    WITH buckets AS (
+      SELECT generate_series(
+        date_trunc('day', (now() AT TIME ZONE 'Africa/Lagos')) - make_interval(days => ${days - 1}::int),
+        date_trunc('day', (now() AT TIME ZONE 'Africa/Lagos')),
+        interval '1 day'
+      ) AS b
+    ),
+    data AS (
+      SELECT date_trunc('day', ("paidAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos') AS b,
+             SUM("totalKobo") AS volume, COUNT(*) AS payments, SUM("feeKobo") AS fees
+      FROM "checkouts"
+      WHERE "status" = 'paid' AND "paidAt" >= now() - make_interval(days => ${days + 1}::int)
+      GROUP BY 1
+    )
+    SELECT to_char(buckets.b, 'YYYY-MM-DD') AS bucket,
+           COALESCE(data.volume, 0)::bigint AS volume,
+           COALESCE(data.payments, 0)::int AS payments,
+           COALESCE(data.fees, 0)::bigint AS fees
+    FROM buckets LEFT JOIN data ON data.b = buckets.b
+    ORDER BY buckets.b
+  `;
+  return toTrendPoints(rows);
+}
+
+async function adminTrends(): Promise<AdminTrends> {
+  const [day, week, month] = await Promise.all([hourlyTrend(24), dailyTrend(7), dailyTrend(30)]);
+  return { day, week, month };
 }
 
 /**
@@ -434,7 +471,7 @@ async function computeAdminOverview() {
       failedSweeps,
       spacesWithoutAccount,
     })),
-    adminTrends(now),
+    adminTrends(),
   ]);
   const breachedDisputes = breachedRows[0]?.n ?? 0;
 

@@ -576,7 +576,7 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
   // Everything in one round trip. The due's ownership check runs alongside
   // the reads, not before them: if the due isn't this space's, the results
   // are discarded and nothing but the 404 leaves.
-  const [due, { matching, students }, agg, guests, paidCount] = await Promise.all([
+  const [due, { matching, students }, agg, guests, paidCount, memberCount] = await Promise.all([
     loadDue(sid, dueId),
     buildRoster(sid, dueId, statusFilter, q, { skip, take }),
     // Money totals include guests: that money really arrived.
@@ -587,6 +587,7 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
     guestPayers(sid, dueId),
     // Paid/unpaid compare against members, so guests are left out of them.
     db.duePayment.count({ where: { dueId, ...paidByMember(sid) } }),
+    db.spaceMembership.count({ where: { spaceId: sid } }),
   ]);
   if (!due) {
     errors.notFound(res, 'Due not found');
@@ -601,6 +602,7 @@ repDuesRouter.get('/dues/:dueId/collections', async (req: Request, res: Response
     {
       totals: {
         paid: paidCount,
+        unpaid: Math.max(0, memberCount - paidCount),
         collected,
         fees,
         net,
@@ -641,11 +643,6 @@ function csvNaira(kobo: number | null | undefined): string | null {
   return kobo == null ? null : (kobo / 100).toFixed(2);
 }
 
-// The roster can come back as CSV (default) or, later, other formats.
-const collectionsExportQuery = collectionsQuery.extend({
-  format: z.enum(['csv']).default('csv'),
-});
-
 repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const due = await loadDue(sid, req.params.dueId as string);
@@ -654,11 +651,11 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
     return;
   }
 
-  const parsed = collectionsExportQuery.safeParse(req.query);
-  const statusFilter = parsed.success ? parsed.data.status : 'all';
+  // The CSV is strictly the "who paid" sheet: members who paid plus guest-link
+  // payers. Unpaid members are never exported, whatever the query asks for.
   const [{ students }, guests] = await Promise.all([
-    buildRoster(sid, due.id, statusFilter),
-    statusFilter === 'unpaid' ? Promise.resolve([]) : guestPayers(sid, due.id),
+    buildRoster(sid, due.id, 'paid'),
+    guestPayers(sid, due.id),
   ]);
 
   // A column per guest question: the due's current fields, then any that were
@@ -669,23 +666,22 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
   const blanks = questionIds.map(() => null);
 
   const header = [
-    'Name', 'Matric No', 'Level', 'Email', 'Paid Via', 'Amount Paid (NGN)', 'Status', 'Paid At', 'Reference',
+    'Name', 'Matric No', 'Level', 'Email', 'Paid Via', 'Amount Paid (NGN)', 'Paid At', 'Reference',
     ...questions.values(),
   ];
   const rows = [
     ...students.map((s) => {
       // amountPaid only rides along on students who actually paid.
       const amountPaid = 'amountPaid' in s ? s.amountPaid : null;
-      const paidVia = s.status === 'paid' ? 'Member' : null;
       return [
-        s.name, s.matricNo, s.level, s.email, paidVia, csvNaira(amountPaid), s.status, csvPaidAt(s.paidAt), s.reference,
+        s.name, s.matricNo, s.level, s.email, 'Member', csvNaira(amountPaid), csvPaidAt(s.paidAt), s.reference,
         ...blanks,
       ].map(csvCell).join(',');
     }),
     ...guests.map((g) => {
       const answers = questionIds.map((id) => g.answers.find((a) => a.fieldId === id)?.value ?? null);
       return [
-        g.name, g.matricNo, null, g.email, 'Pay link', csvNaira(g.amountPaid), 'paid', csvPaidAt(g.paidAt), g.reference,
+        g.name, g.matricNo, null, g.email, 'Pay link', csvNaira(g.amountPaid), csvPaidAt(g.paidAt), g.reference,
         ...answers,
       ].map(csvCell).join(',');
     }),
