@@ -306,21 +306,40 @@ async function platformMetrics() {
       where: { status: 'success', feeSettledAt: from ? { gte: from } : { not: null } },
       _sum: { feeSettlementKobo: true },
     });
-  const [all, recent, wdAll, wdRecent, payouts] = await Promise.all([
+  // What 9jaPay charges Duevy to sweep money into space accounts — a real cost
+  // that eats into the processing fees, so profit is revenue minus this.
+  const sweepCharges = (from?: Date) =>
+    db.sweep.aggregate({
+      where: { status: 'succeeded', ...(from ? { settledAt: { gte: from } } : {}) },
+      _sum: { feeKobo: true },
+    });
+  const [all, recent, wdAll, wdRecent, swAll, swRecent, payouts] = await Promise.all([
     paidCheckouts(),
     paidCheckouts(since),
     keptWithdrawalFees(),
     keptWithdrawalFees(since),
+    sweepCharges(),
+    sweepCharges(since),
     db.payout.count({ where: { status: 'success' } }),
   ]);
   const checkoutFees = all._sum.feeKobo ?? 0;
   const withdrawalFees = wdAll._sum.feeSettlementKobo ?? 0;
+  const revenueTotal = checkoutFees + withdrawalFees;
+  const revenueRecent = (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0);
+  const sweepChargesTotal = swAll._sum.feeKobo ?? 0;
+  const sweepChargesRecent = swRecent._sum.feeKobo ?? 0;
   return {
     revenue: {
-      total: checkoutFees + withdrawalFees,
+      total: revenueTotal,
       checkoutFees,
       withdrawalFees,
-      last30Days: (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0),
+      last30Days: revenueRecent,
+    },
+    // Duevy's take-home: fees earned less the sweep charges paid to 9jaPay.
+    profit: {
+      total: revenueTotal - sweepChargesTotal,
+      sweepCharges: sweepChargesTotal,
+      last30Days: revenueRecent - sweepChargesRecent,
     },
     transactions: {
       count: all._count._all,
@@ -348,9 +367,16 @@ async function computeAdminOverview() {
 
   // One round trip: every figure below is independent.
   const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-  const [totalUsers, activeReps, pendingReps, metrics, fin, breachedRows, payments] = await Promise.all([
+  const liveSpace = { space: { isArchived: false } } as const;
+  const [totalUsers, activeReps, activeLeadReps, activeCoReps, pendingReps, metrics, fin, breachedRows, payments] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
+    // Leads: active reps who lead at least one live space.
+    db.user.count({ where: { isRep: true, isSuspended: false, spaceReps: { some: { role: 'lead', ...liveSpace } } } }),
+    // Co-reps: active reps who assist on a live space but lead none (no double count).
+    db.user.count({
+      where: { isRep: true, isSuspended: false, spaceReps: { some: { role: 'co', ...liveSpace }, none: { role: 'lead', ...liveSpace } } },
+    }),
     db.user.count({ where: { repApplicationStatus: 'pending' } }),
     platformMetrics(),
     spacesFinancials({ isArchived: false }),
@@ -460,9 +486,12 @@ async function computeAdminOverview() {
   return {
     totalUsers,
     activeReps,
+    activeLeadReps,
+    activeCoReps,
     duesCollected: fin.collected,
     floatHeld: Math.max(0, fin.held),
     revenue: metrics.revenue,
+    profit: metrics.profit,
     transactions: metrics.transactions,
     attention,
   };
