@@ -260,6 +260,7 @@ export async function createCheckout(
       guestAnswers: (opts.guestData?.guestAnswers ?? null) as Checkout['guestAnswers'],
       accountRequestedAt: (opts.guestData?.accountRequestedAt as Date | null | undefined) ?? null,
       accountInviteSentAt: null,
+      abandonedReminderSentAt: null,
       // Provisional; replaced by the provider's own expiry once the account opens.
       expiresAt: new Date(now.getTime() + env.CHECKOUT_EXPIRY_MINUTES * 60_000),
       paidAt: null,

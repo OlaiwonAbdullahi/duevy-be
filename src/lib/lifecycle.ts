@@ -5,6 +5,7 @@ import { closeRedis } from './redis';
 import { stopWebhookWorker } from '../jobs/webhookWorker';
 import { reconciliationIdle } from '../jobs/reconciliation';
 import { stopKycReminderJob } from '../jobs/kycReminders';
+import { stopAbandonedCheckoutJob } from '../jobs/abandonedCheckouts';
 
 /**
  * Process lifecycle shared by the API (src/server.ts) and the standalone
@@ -51,7 +52,7 @@ export function installShutdownHandlers(opts: { server?: Server; timers: NodeJS.
         })
       : Promise.resolve();
 
-    const results = await Promise.allSettled([closeServer, stopWebhookWorker(), reconciliationIdle(), stopKycReminderJob()]);
+    const results = await Promise.allSettled([closeServer, stopWebhookWorker(), reconciliationIdle(), stopKycReminderJob(), stopAbandonedCheckoutJob()]);
     for (const r of results) if (r.status === 'rejected') logger.warn({ err: (r.reason as Error)?.message }, 'error while draining');
 
     await closeRedis();

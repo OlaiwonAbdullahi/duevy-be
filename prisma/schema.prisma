@@ -871,6 +871,9 @@ model Checkout {
   // claimed after payment: an activation link goes out once it's paid.
   accountRequestedAt    DateTime?
   accountInviteSentAt   DateTime?
+  // Set when the "you started a payment but didn't finish" reminder has gone
+  // out, so the sweep (jobs/abandonedCheckouts.ts) emails each checkout once.
+  abandonedReminderSentAt DateTime?
   expiresAt             DateTime
   paidAt                DateTime?
   expiredAt             DateTime?

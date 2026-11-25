@@ -6,6 +6,7 @@ import { startReconciliationJob } from './jobs/reconciliation';
 import { startWebhookWorker } from './jobs/webhookWorker';
 import { startKycReminderJob } from './jobs/kycReminders';
 import { startMilestoneJob } from './jobs/milestones';
+import { startAbandonedCheckoutJob } from './jobs/abandonedCheckouts';
 import { getPaymentProvider } from './providers/payment';
 import { installShutdownHandlers } from './lib/lifecycle';
 
@@ -39,7 +40,9 @@ async function startServer() {
 
     // The webhook queue worker and the reconciliation sweep run in-process by
     // default. Set RUN_WORKERS=false to run them separately (npm run worker).
-    const timers = env.RUN_WORKERS ? [startWebhookWorker(), startReconciliationJob(), startKycReminderJob(), startMilestoneJob()] : [];
+    const timers = env.RUN_WORKERS
+      ? [startWebhookWorker(), startReconciliationJob(), startKycReminderJob(), startMilestoneJob(), startAbandonedCheckoutJob()]
+      : [];
 
     installShutdownHandlers({ server, timers });
 

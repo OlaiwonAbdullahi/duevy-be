@@ -622,6 +622,30 @@ function csvCell(value: string | null): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
+/** An ISO timestamp as a readable Lagos date-time for the sheet, or blank. */
+function csvPaidAt(iso: string | null): string | null {
+  if (!iso) return null;
+  return new Date(iso).toLocaleString('en-NG', {
+    timeZone: 'Africa/Lagos',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+/** Kobo as a plain naira amount for a spreadsheet cell (numeric, no symbol), or blank. */
+function csvNaira(kobo: number | null | undefined): string | null {
+  return kobo == null ? null : (kobo / 100).toFixed(2);
+}
+
+// The roster can come back as CSV (default) or, later, other formats.
+const collectionsExportQuery = collectionsQuery.extend({
+  format: z.enum(['csv']).default('csv'),
+});
+
 repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: Response): Promise<void> => {
   const sid = spaceId(req);
   const due = await loadDue(sid, req.params.dueId as string);
@@ -630,7 +654,7 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
     return;
   }
 
-  const parsed = collectionsQuery.safeParse(req.query);
+  const parsed = collectionsExportQuery.safeParse(req.query);
   const statusFilter = parsed.success ? parsed.data.status : 'all';
   const [{ students }, guests] = await Promise.all([
     buildRoster(sid, due.id, statusFilter),
@@ -644,14 +668,26 @@ repDuesRouter.get('/dues/:dueId/collections/export', async (req: Request, res: R
   const questionIds = [...questions.keys()];
   const blanks = questionIds.map(() => null);
 
-  const header = ['Name', 'Matric No', 'Level', 'Email', 'Status', 'Paid At', 'Reference', ...questions.values()];
+  const header = [
+    'Name', 'Matric No', 'Level', 'Email', 'Paid Via', 'Amount Paid (NGN)', 'Status', 'Paid At', 'Reference',
+    ...questions.values(),
+  ];
   const rows = [
-    ...students.map((s) =>
-      [s.name, s.matricNo, s.level, s.email, s.status, s.paidAt, s.reference, ...blanks].map(csvCell).join(','),
-    ),
+    ...students.map((s) => {
+      // amountPaid only rides along on students who actually paid.
+      const amountPaid = 'amountPaid' in s ? s.amountPaid : null;
+      const paidVia = s.status === 'paid' ? 'Member' : null;
+      return [
+        s.name, s.matricNo, s.level, s.email, paidVia, csvNaira(amountPaid), s.status, csvPaidAt(s.paidAt), s.reference,
+        ...blanks,
+      ].map(csvCell).join(',');
+    }),
     ...guests.map((g) => {
       const answers = questionIds.map((id) => g.answers.find((a) => a.fieldId === id)?.value ?? null);
-      return [g.name, g.matricNo, null, g.email, 'paid', g.paidAt, g.reference, ...answers].map(csvCell).join(',');
+      return [
+        g.name, g.matricNo, null, g.email, 'Pay link', csvNaira(g.amountPaid), 'paid', csvPaidAt(g.paidAt), g.reference,
+        ...answers,
+      ].map(csvCell).join(',');
     }),
   ];
   const csv = [header.join(','), ...rows].join('\n');

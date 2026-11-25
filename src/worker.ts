@@ -4,6 +4,7 @@ import { startReconciliationJob } from './jobs/reconciliation';
 import { startWebhookWorker } from './jobs/webhookWorker';
 import { startKycReminderJob } from './jobs/kycReminders';
 import { startMilestoneJob } from './jobs/milestones';
+import { startAbandonedCheckoutJob } from './jobs/abandonedCheckouts';
 import { installShutdownHandlers } from './lib/lifecycle';
 
 /**
@@ -15,7 +16,7 @@ import { installShutdownHandlers } from './lib/lifecycle';
  */
 async function main() {
   await db.$connect();
-  const timers = [startWebhookWorker(), startReconciliationJob(), startKycReminderJob(), startMilestoneJob()];
+  const timers = [startWebhookWorker(), startReconciliationJob(), startKycReminderJob(), startMilestoneJob(), startAbandonedCheckoutJob()];
   logger.info('worker started');
 
   installShutdownHandlers({ timers });

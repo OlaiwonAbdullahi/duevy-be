@@ -57,6 +57,10 @@ const envSchema = z.object({
 
   // How long a checkout's one-time bank account stays open, in minutes.
   CHECKOUT_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(1440).default(60),
+  // How long after a guest opens a checkout, without paying, the "finish your
+  // payment" reminder goes out. Kept below CHECKOUT_EXPIRY_MINUTES so there's
+  // still time to pay when it lands (jobs/abandonedCheckouts.ts).
+  ABANDONED_CHECKOUT_REMINDER_MINUTES: z.coerce.number().int().min(1).max(1440).default(30),
   // Run the webhook/job worker and reconciliation inside the API process.
   // Turn off when they run as a separate process (npm run worker).
   // Webhook events handled at once per process. Each holds a DB connection

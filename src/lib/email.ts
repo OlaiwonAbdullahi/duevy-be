@@ -502,6 +502,48 @@ export async function sendKycReminderEmail(
   await sendEmail({ to, subject: copy.subject, html, text: `${copy.body}\n\nFinish verification: ${link}` });
 }
 
+export interface AbandonedCheckout {
+  dueTitle: string;
+  spaceName: string;
+  amountKobo: number;
+  /** Deep link back to the guest pay page, with the checkout's reference + token. */
+  resumeUrl: string;
+  /** When the transfer account closes — the payer still has until then. */
+  expiresAt: Date;
+}
+
+/**
+ * "You started a payment but didn't finish it" — sent once, a while after a
+ * guest opened a checkout and left before the money arrived, while the transfer
+ * account is still open so they can pick up where they left off.
+ */
+export async function sendAbandonedCheckoutEmail(to: string, name: string, c: AbandonedCheckout): Promise<void> {
+  const first = firstName(name);
+  const amount = nairaExact(c.amountKobo);
+  const body =
+    `Hi ${first}, you started paying ${c.dueTitle} for ${c.spaceName} but we haven't received the transfer yet. ` +
+    `Your payment details are still active — you can finish before they close at ${lagosTime(c.expiresAt)}.`;
+
+  const html = renderEmail(
+    `
+    <h1>Finish paying ${escapeHtml(c.dueTitle)}</h1>
+    <p>${escapeHtml(body)}</p>
+    ${emailHero(amount)}
+    <a href="${c.resumeUrl}" class="btn">Finish payment</a>
+    <p class="muted">Already paid? You can ignore this email — your receipt arrives once the transfer settles.</p>
+  `,
+    BRAND,
+    { preheader: `Your ${amount} payment for ${c.dueTitle} is still waiting.` },
+  );
+
+  await sendEmail({
+    to,
+    subject: `Finish your ${amount} payment for ${c.dueTitle}`,
+    html,
+    text: `${body}\n\nFinish payment: ${c.resumeUrl}`,
+  });
+}
+
 export async function sendRepApprovedEmail(
   to: string,
   name: string,
