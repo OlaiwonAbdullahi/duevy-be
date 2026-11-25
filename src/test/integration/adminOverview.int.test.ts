@@ -26,7 +26,7 @@ async function overview() {
     activeReps: number;
     activeLeadReps: number;
     activeCoReps: number;
-    profit: { total: number; sweepCharges: number; last30Days: number };
+    profit: { total: number; providerFees: number; last30Days: number };
   };
 }
 
@@ -34,7 +34,7 @@ describe('admin overview: rep split and profit', () => {
   it('counts a new lead under reps and a new co-rep under co-reps', async () => {
     const before = await overview();
     expect(typeof before.profit.total).toBe('number');
-    expect(typeof before.profit.sweepCharges).toBe('number');
+    expect(typeof before.profit.providerFees).toBe('number');
 
     // makeSpace provisions one active lead rep.
     const { space } = await makeSpace();

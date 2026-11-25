@@ -10,7 +10,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFeedback, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
-import { checkoutFee, computeChargeFor, generateReference } from '../lib/money';
+import { checkoutFee, computeChargeFor, generateReference, providerCollectionFee } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listLivenessForReview, listNinReviews, listStudentIdsForReview, reviewLiveness, reviewNin, reviewStudentId } from '../services/kyc.service';
@@ -306,41 +306,32 @@ async function platformMetrics() {
       where: { status: 'success', feeSettledAt: from ? { gte: from } : { not: null } },
       _sum: { feeSettlementKobo: true },
     });
-  // What 9jaPay charges Duevy to sweep money into space accounts — a real cost
-  // that eats into the processing fees, so profit is revenue minus this.
-  const sweepCharges = (from?: Date) =>
-    db.sweep.aggregate({
-      where: { status: 'succeeded', ...(from ? { settledAt: { gte: from } } : {}) },
-      _sum: { feeKobo: true },
-    });
-  const [all, recent, wdAll, wdRecent, swAll, swRecent, payouts] = await Promise.all([
+  const [all, recent, wdAll, wdRecent, payouts] = await Promise.all([
     paidCheckouts(),
     paidCheckouts(since),
     keptWithdrawalFees(),
     keptWithdrawalFees(since),
-    sweepCharges(),
-    sweepCharges(since),
     db.payout.count({ where: { status: 'success' } }),
   ]);
   const checkoutFees = all._sum.feeKobo ?? 0;
   const withdrawalFees = wdAll._sum.feeSettlementKobo ?? 0;
-  const revenueTotal = checkoutFees + withdrawalFees;
-  const revenueRecent = (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0);
-  const sweepChargesTotal = swAll._sum.feeKobo ?? 0;
-  const sweepChargesRecent = swRecent._sum.feeKobo ?? 0;
+  // 9jaPay's 0.5% cut of every collection, computed from what students
+  // transferred (it isn't stored per checkout; only the 1.5% fee is).
+  const providerFeesTotal = providerCollectionFee(all._sum.totalKobo ?? 0);
+  const providerFeesRecent = providerCollectionFee(recent._sum.totalKobo ?? 0);
   return {
     revenue: {
-      total: revenueTotal,
+      total: checkoutFees + withdrawalFees,
       checkoutFees,
       withdrawalFees,
-      last30Days: revenueRecent,
+      last30Days: (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0),
     },
-    // Duevy's take-home: the processing fee charged on checkouts, less the
-    // 9jaPay sweep charges it costs to move that money into space accounts.
+    // Duevy's take-home: the 1.5% processing fee less 9jaPay's 0.5% collection
+    // cut — about the remaining 1% of what was collected.
     profit: {
-      total: checkoutFees - sweepChargesTotal,
-      sweepCharges: sweepChargesTotal,
-      last30Days: (recent._sum.feeKobo ?? 0) - sweepChargesRecent,
+      total: checkoutFees - providerFeesTotal,
+      providerFees: providerFeesTotal,
+      last30Days: (recent._sum.feeKobo ?? 0) - providerFeesRecent,
     },
     transactions: {
       count: all._count._all,

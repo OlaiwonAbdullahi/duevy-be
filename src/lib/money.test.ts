@@ -7,6 +7,7 @@ import {
   computeWithdrawal,
   decimalToKobo,
   koboToDecimal,
+  providerCollectionFee,
   splitWithdrawalFee,
   transferFee,
   withdrawalFee,
@@ -36,6 +37,14 @@ describe('checkoutFee — 1.5%, on top', () => {
     }
     expect(checkoutFee(10_000 * NAIRA)).toBe(15_000); // ₦150 against ₦100.75
     expect(checkoutFee(500_000 * NAIRA)).toBe(750_000); // ₦7,500, uncapped
+  });
+
+  it('providerCollectionFee — 9jaPay takes 0.5% of the transfer, leaving ~1% profit', () => {
+    const total = 507_500; // a ₦5,000 due paid with its ₦75 fee
+    expect(providerCollectionFee(total)).toBe(2_538); // ⌈₦25.375⌉
+    // Of the ₦75 processing fee, 9jaPay's ₦25.38 cut leaves Duevy ₦49.62 (~1%).
+    expect(checkoutFee(500_000) - providerCollectionFee(total)).toBe(4_962);
+    expect(providerCollectionFee(0)).toBe(0);
   });
 
   it('is zero for an empty basket and rejects non-integer or negative kobo', () => {

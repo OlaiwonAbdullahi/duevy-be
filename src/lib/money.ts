@@ -131,6 +131,19 @@ export function checkoutFee(faceKobo: number): number {
   return Math.ceil((faceKobo * COLLECTION_FEE_BPS) / 10_000);
 }
 
+/**
+ * 9jaPay's cut of a collection: 0.5% of what the student transfers. Out of the
+ * 1.5% processing fee Duevy charges, this is the third that goes to 9jaPay, so
+ * Duevy's profit on a checkout is its fee minus this. The ₦750 cap and the ₦50
+ * stamp duty from ₦10,000 aren't modelled — this is the nominal rate 9jaPay
+ * quotes, and on small campus payments the cap never bites.
+ */
+export const PROVIDER_COLLECTION_FEE_BPS = 50;
+export function providerCollectionFee(amountKobo: number): number {
+  assertKobo(amountKobo, 'amountKobo');
+  return Math.ceil((amountKobo * PROVIDER_COLLECTION_FEE_BPS) / 10_000);
+}
+
 export interface Charge {
   /** What the space receives — the full face amount. */
   face: number;
