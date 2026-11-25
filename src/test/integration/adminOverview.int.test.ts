@@ -27,6 +27,7 @@ async function overview() {
     activeLeadReps: number;
     activeCoReps: number;
     profit: { total: number; providerFees: number; last30Days: number };
+    trends: { month: string; volume: number; payments: number; revenue: number; profit: number }[];
   };
 }
 
@@ -35,6 +36,12 @@ describe('admin overview: rep split and profit', () => {
     const before = await overview();
     expect(typeof before.profit.total).toBe('number');
     expect(typeof before.profit.providerFees).toBe('number');
+    // Trends are a (possibly empty) monthly series, oldest first.
+    expect(Array.isArray(before.trends)).toBe(true);
+    for (const m of before.trends) {
+      expect(m.month).toMatch(/^\d{4}-\d{2}$/);
+      expect(m.profit).toBe(m.revenue - Math.ceil((m.volume * 50) / 10_000));
+    }
 
     // makeSpace provisions one active lead rep.
     const { space } = await makeSpace();

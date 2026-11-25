@@ -343,6 +343,48 @@ async function platformMetrics() {
 }
 
 /**
+ * The last 12 Lagos calendar months of collections, for the overview charts:
+ * what students paid (`volume`), how many payments, the processing fees Duevy
+ * earned (`revenue`) and its take-home after 9jaPay's cut (`profit`). The
+ * leading all-zero months before the first payment are dropped.
+ */
+const TREND_MONTHS = 12;
+const LAGOS_OFFSET_MS = 60 * 60 * 1000; // UTC+1 all year, no DST.
+
+export type AdminTrendMonth = { month: string; volume: number; payments: number; revenue: number; profit: number };
+
+async function adminTrends(now: Date): Promise<AdminTrendMonth[]> {
+  const lagos = new Date(now.getTime() + LAGOS_OFFSET_MS);
+  const y = lagos.getUTCFullYear();
+  const m = lagos.getUTCMonth();
+  const months: string[] = [];
+  for (let i = TREND_MONTHS - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(y, m - i, 1));
+    months.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`);
+  }
+  const since = new Date(Date.UTC(y, m - (TREND_MONTHS - 1), 1) - LAGOS_OFFSET_MS);
+
+  const rows = await db.$queryRaw<{ month: string; volume: bigint; payments: number; fees: bigint }[]>`
+    SELECT to_char(date_trunc('month', ("paidAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos'), 'YYYY-MM') AS month,
+           COALESCE(SUM("totalKobo"), 0)::bigint AS volume,
+           COUNT(*)::int AS payments,
+           COALESCE(SUM("feeKobo"), 0)::bigint AS fees
+    FROM "checkouts"
+    WHERE "status" = 'paid' AND "paidAt" >= ${since}
+    GROUP BY 1
+  `;
+  const byMonth = new Map(rows.map((r) => [r.month, r]));
+  const series = months.map((month) => {
+    const row = byMonth.get(month);
+    const volume = row ? Number(row.volume) : 0;
+    const revenue = row ? Number(row.fees) : 0;
+    return { month, volume, payments: row?.payments ?? 0, revenue, profit: revenue - providerCollectionFee(volume) };
+  });
+  const first = series.findIndex((s) => s.payments > 0);
+  return first === -1 ? [] : series.slice(first);
+}
+
+/**
  * Platform-wide aggregates: their cost grows with the whole database, not the
  * page, so they're cached for 30s and shared by every API instance (Redis).
  * Rep approval/rejection drops the cache so its alert updates at once.
@@ -360,7 +402,7 @@ async function computeAdminOverview() {
   // One round trip: every figure below is independent.
   const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
   const liveSpace = { space: { isArchived: false } } as const;
-  const [totalUsers, activeReps, activeLeadReps, activeCoReps, pendingReps, metrics, fin, breachedRows, payments] = await Promise.all([
+  const [totalUsers, activeReps, activeLeadReps, activeCoReps, pendingReps, metrics, fin, breachedRows, payments, trends] = await Promise.all([
     db.user.count(),
     db.user.count({ where: { isRep: true, isSuspended: false } }),
     // Leads: active reps who lead at least one live space.
@@ -392,6 +434,7 @@ async function computeAdminOverview() {
       failedSweeps,
       spacesWithoutAccount,
     })),
+    adminTrends(now),
   ]);
   const breachedDisputes = breachedRows[0]?.n ?? 0;
 
@@ -485,6 +528,7 @@ async function computeAdminOverview() {
     revenue: metrics.revenue,
     profit: metrics.profit,
     transactions: metrics.transactions,
+    trends,
     attention,
   };
 }
