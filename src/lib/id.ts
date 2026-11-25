@@ -16,6 +16,7 @@ const prefixes = {
   report: 'rpt',
   checkout: 'chk',
   checkoutItem: 'chi',
+  dueTier: 'dtr',
   ledger: 'led',
   refund: 'rfd',
 } as const;

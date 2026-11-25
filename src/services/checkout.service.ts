@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { Prisma, type Checkout, type CheckoutItem, type CheckoutStatus } from '@prisma/client';
+import { Prisma, type Checkout, type CheckoutItem, type CheckoutStatus, type DuePricing, type DueTier } from '@prisma/client';
 import { db } from '../config/db';
 import { env } from '../config/env';
 import { AppError, conflict, forbidden, notFound } from '../lib/errors';
@@ -47,6 +47,31 @@ const MAX_PEOPLE_PER_CHECKOUT = 20;
 /** A pending checkout younger than this with no bank account yet is still being opened. */
 const OPENING_GRACE_MS = 30_000;
 
+/** What a single line costs, with the tier snapshot captured onto its CheckoutItem. */
+type LinePrice = { amount: number; tierId: string | null; tierLabel: string | null };
+
+/**
+ * Resolve a due's pay amount. A flat due charges its `amount` and must NOT carry
+ * a tier; a tiered due charges the chosen tier's amountKobo and REQUIRES a valid,
+ * non-archived tier (the caller passes only non-archived tiers). The returned
+ * tierId/tierLabel are snapshotted onto the CheckoutItem so a later edit or
+ * archival never changes what a paid line cost.
+ */
+function resolveLinePrice(
+  due: { id: string; title: string; amount: number; pricingMode: DuePricing },
+  tiersForDue: DueTier[],
+  tierId: string | undefined,
+): LinePrice {
+  if (due.pricingMode !== 'tiered') {
+    if (tierId) throw new AppError(400, 'TIER_NOT_ALLOWED', `"${due.title}" has a fixed price`);
+    return { amount: due.amount, tierId: null, tierLabel: null };
+  }
+  if (!tierId) throw new AppError(400, 'TIER_REQUIRED', `Choose an option for "${due.title}"`);
+  const tier = tiersForDue.find((t) => t.id === tierId);
+  if (!tier) throw new AppError(400, 'TIER_INVALID', `That option is no longer available for "${due.title}"`);
+  return { amount: tier.amountKobo, tierId: tier.id, tierLabel: tier.label };
+}
+
 // ---------------------------------------------------------------------------
 // Serialisation
 // ---------------------------------------------------------------------------
@@ -62,7 +87,7 @@ export function serializeCheckout(c: CheckoutWithItems) {
     // The fee the student pays on top — only the fees on student-borne lines.
     // Equals c.feeKobo in the common case; 0 for a wholly space-absorbed basket.
     breakdown: { face: c.faceKobo, fee: c.totalKobo - c.faceKobo, total: c.totalKobo },
-    items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, amount: i.faceKobo, fee: i.studentBearsFee ? i.feeKobo : 0 })),
+    items: c.items.map((i) => ({ dueId: i.dueId, title: i.due.title, tier: i.tierLabel, amount: i.faceKobo, fee: i.studentBearsFee ? i.feeKobo : 0 })),
     // Set on a hosted checkout: redirect the student here to pay.
     checkoutUrl: hosted ? c.checkoutUrl : null,
     bankTransfer: open
@@ -129,6 +154,12 @@ export interface CreateCheckoutOptions {
    * answers and choice win), so the guest route needs no extra write.
    */
   guestData?: Pick<Prisma.CheckoutUncheckedCreateInput, 'guestAnswers' | 'accountRequestedAt'>;
+  /**
+   * For a `tiered` due, the tier the payer chose, keyed by due id. Required for
+   * every tiered due in the basket; rejected for a flat due. The chosen tier's
+   * amountKobo becomes that line's face, pinned onto the CheckoutItem.
+   */
+  tierSelections?: Record<string, string>;
 }
 
 export async function createCheckout(
@@ -147,7 +178,7 @@ export async function createCheckout(
   // run in the same order as before. With mixed spaces, member/lead may be
   // any of them, but that request is refused before they're used.
   const viaDues = { dues: { some: { id: { in: dueIds } } } };
-  const [user, dues, spaces, member, paid, leadUser, kycPolicy] = await Promise.all([
+  const [user, dues, spaces, member, paid, leadUser, kycPolicy, tiers] = await Promise.all([
     db.user.findUnique({ where: { id: userId }, select: { id: true } }),
     db.due.findMany({ where: { id: { in: dueIds } } }),
     db.space.findMany({ where: viaDues, select: { id: true, name: true, isArchived: true } }),
@@ -158,6 +189,7 @@ export async function createCheckout(
       select: { kycStatus: true, studentIdStatus: true, livenessStatus: true },
     }),
     getKycPolicy(),
+    db.dueTier.findMany({ where: { dueId: { in: dueIds }, isArchived: false } }),
   ]);
   if (!user) throw notFound('User not found');
   if (dues.length !== dueIds.length) throw notFound('One or more dues could not be found');
@@ -187,6 +219,13 @@ export async function createCheckout(
     throw conflict('SPACE_NOT_VERIFIED', "This space can't take payments yet — its rep hasn't completed verification");
   }
 
+  // Resolve each line's price (flat amount, or the chosen tier's) and capture the
+  // tier snapshot — before the lock, so a bad/missing tier fails fast.
+  const tiersByDue = new Map<string, DueTier[]>();
+  for (const t of tiers) tiersByDue.set(t.dueId, [...(tiersByDue.get(t.dueId) ?? []), t]);
+  const linePrices = new Map<string, LinePrice>();
+  for (const d of dues) linePrices.set(d.id, resolveLinePrice(d, tiersByDue.get(d.id) ?? [], opts.tierSelections?.[d.id]));
+
   const dueSetKey = [...dueIds].sort().join(',');
 
   // Serialise checkout creation per student so two tabs can't open two
@@ -214,10 +253,12 @@ export async function createCheckout(
       );
     }
 
-    const face = dues.reduce((sum, d) => sum + d.amount, 0);
-    const fee = checkoutFee(face);
     const ordered = dueIds.map((id) => dues.find((d) => d.id === id)!);
-    const feeShares = allocate(fee, ordered.map((d) => d.amount));
+    // Each line's face is its resolved price (flat amount or chosen tier).
+    const lineAmounts = ordered.map((d) => linePrices.get(d.id)!.amount);
+    const face = lineAmounts.reduce((sum, a) => sum + a, 0);
+    const fee = checkoutFee(face);
+    const feeShares = allocate(fee, lineAmounts);
     // Per line: does the student bear its fee, or does the space absorb it?
     const studentBears = ordered.map((d) => d.feePayer === 'student');
     // The student transfers the full face plus only the fees they bear; the
@@ -271,7 +312,10 @@ export async function createCheckout(
       createdAt: now,
       updatedAt: now,
     };
-    const items = ordered.map((d, i) => ({ id: generateId('checkoutItem'), checkoutId: created.id, dueId: d.id, faceKobo: d.amount, feeKobo: feeShares[i]!, studentBearsFee: studentBears[i]! }));
+    const items = ordered.map((d, i) => {
+      const lp = linePrices.get(d.id)!;
+      return { id: generateId('checkoutItem'), checkoutId: created.id, dueId: d.id, faceKobo: lineAmounts[i]!, feeKobo: feeShares[i]!, studentBearsFee: studentBears[i]!, tierId: lp.tierId, tierLabel: lp.tierLabel };
+    });
 
     // The checkout, its lines and the student's history row (completed on
     // payment) in ONE statement: Postgres runs every data-modifying CTE.
@@ -286,8 +330,8 @@ export async function createCheckout(
                 ${utc(created.accountRequestedAt)}, ${utc(created.expiresAt)}, false, ${utc(now)}, ${utc(now)})
       ),
       i AS (
-        INSERT INTO "checkout_items" ("id", "checkoutId", "dueId", "faceKobo", "feeKobo", "studentBearsFee")
-        VALUES ${Prisma.join(items.map((it) => Prisma.sql`(${it.id}, ${it.checkoutId}, ${it.dueId}, ${it.faceKobo}, ${it.feeKobo}, ${it.studentBearsFee})`))}
+        INSERT INTO "checkout_items" ("id", "checkoutId", "dueId", "faceKobo", "feeKobo", "studentBearsFee", "tierId", "tierLabel")
+        VALUES ${Prisma.join(items.map((it) => Prisma.sql`(${it.id}, ${it.checkoutId}, ${it.dueId}, ${it.faceKobo}, ${it.feeKobo}, ${it.studentBearsFee}, ${it.tierId}, ${it.tierLabel})`))}
       )
       INSERT INTO "transactions" ("id", "userId", "type", "title", "detail", "amount", "method", "status", "reference", "spaceId", "createdAt", "updatedAt")
       VALUES (${generateId('transaction')}, ${userId}, 'due'::"TxnType", ${title}, ${space.name}, ${-total}, 'Bank transfer',
@@ -335,6 +379,8 @@ export interface GroupPerson {
   matricNo?: string;
   /** The person's validated answers to the due's questions (lib/guestForm). */
   answers?: Prisma.InputJsonValue | null;
+  /** For a tiered due, the tier this person chose. Each person may pick a different tier. */
+  tierId?: string;
 }
 
 const groupPayerSelect = { id: true, isGuest: true, isSuspended: true, isDeactivated: true, matricNo: true } as const;
@@ -371,7 +417,8 @@ async function resolveGroupUser(p: GroupPerson) {
  * and, once paid, their own DuePayment and ledger credit — so each shows up in
  * the rep's roster. The person filling the form is the checkout's primary user.
  *
- *   face  = due.amount × people           → credited to the space in full
+ *   face  = Σ each person's price          → credited to the space in full
+ *           (the flat amount, or each person's chosen tier)
  *   fee   = 1.5% of face                   → the processing fee, on top
  *   total = face + fee                     → one transfer
  */
@@ -386,9 +433,10 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
     seen.add(p.email);
   }
 
-  const [due, kycPolicy] = await Promise.all([
+  const [due, kycPolicy, dueTiers] = await Promise.all([
     db.due.findUnique({ where: { id: dueId }, include: { space: { select: { id: true, name: true, isArchived: true } } } }),
     getKycPolicy(),
+    db.dueTier.findMany({ where: { dueId, isArchived: false } }),
   ]);
   // One answer for every "not open" reason, as the single-payer route does.
   if (!due || !due.allowGuests || due.status !== 'active' || due.space.isArchived) {
@@ -410,9 +458,12 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
     throw conflict('DUE_ALREADY_PAID', `"${due.title}" has already been paid for ${names.join(', ')}.`);
   }
 
-  const face = due.amount * people.length;
+  // Each person's price: the flat amount, or their chosen tier (people may differ).
+  const personPrices = people.map((p) => resolveLinePrice(due, dueTiers, p.tierId));
+  const personAmounts = personPrices.map((lp) => lp.amount);
+  const face = personAmounts.reduce((sum, a) => sum + a, 0);
   const fee = checkoutFee(face);
-  const feeShares = allocate(fee, people.map(() => due.amount));
+  const feeShares = allocate(fee, personAmounts);
   const studentBears = due.feePayer === 'student';
   // Student-borne: the fee rides on top. Space-borne: the space absorbs it, so
   // the payer transfers only the faces and the space is credited face − fee.
@@ -445,11 +496,13 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
             create: users.map((u, i) => ({
               id: generateId('checkoutItem'),
               dueId,
-              faceKobo: due.amount,
+              faceKobo: personAmounts[i]!,
               feeKobo: feeShares[i]!,
               studentBearsFee: studentBears,
               beneficiaryUserId: u.id,
               guestAnswers: people[i]!.answers ?? Prisma.DbNull,
+              tierId: personPrices[i]!.tierId,
+              tierLabel: personPrices[i]!.tierLabel,
             })),
           },
         },

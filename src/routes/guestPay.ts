@@ -9,13 +9,14 @@ import {
   guestCheckoutPersonLimiter,
   guestCheckoutStatusLimiter,
   guestLinkLimiter,
+  paymentLookupLimiter,
 } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
 import { computeChargeFor } from '../lib/money';
 import { createCheckout, createGroupCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken, type GroupPerson } from '../services/checkout.service';
 import { syncPendingCheckout } from './transactions';
-import { renderReceiptByNumber } from '../services/receipt.service';
+import { renderReceiptByNumber, maskName } from '../services/receipt.service';
 import { getSpaceKycState } from '../services/kyc.service';
 import { checkGuestAnswers, readGuestFields } from '../lib/guestForm';
 import { optionalAuthenticate } from '../middleware/auth';
@@ -45,7 +46,10 @@ export const guestPayRouter = Router();
 async function loadGuestDue(dueId: string) {
   const due = await db.due.findUnique({
     where: { id: dueId },
-    include: { space: { select: { id: true, name: true, short: true, kind: true, hue: true, isArchived: true } } },
+    include: {
+      space: { select: { id: true, name: true, short: true, kind: true, hue: true, isArchived: true } },
+      tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } },
+    },
   });
   // One answer for "doesn't exist", "not open to guests" and "not open at
   // all", so the link can't be used to probe a space's members-only dues.
@@ -62,8 +66,10 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     errors.notFound(res, 'This payment link is not open');
     return;
   }
-  const charge = computeChargeFor(due.amount, due.feePayer === 'student');
+  const studentBears = due.feePayer === 'student';
+  const charge = computeChargeFor(due.amount, studentBears);
   const kyc = await getSpaceKycState(due.space.id);
+  const tiered = due.pricingMode === 'tiered';
   ok(res, {
     id: due.id,
     title: due.title,
@@ -71,13 +77,70 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     type: due.category,
     feePayer: due.feePayer,
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
-    amount: charge.face,
-    fee: charge.fee,
-    total: charge.total,
+    pricingMode: due.pricingMode,
+    // Flat due: one amount. Tiered due: the payer must choose a tier, each with
+    // its own fee/total; the flat amount/fee/total are null.
+    amount: tiered ? null : charge.face,
+    fee: tiered ? null : charge.fee,
+    total: tiered ? null : charge.total,
+    tiers: tiered
+      ? due.tiers.map((t) => {
+          const c = computeChargeFor(t.amountKobo, studentBears);
+          return { id: t.id, label: t.label, amount: c.face, fee: c.fee, total: c.total };
+        })
+      : [],
     canCollect: kyc.canCollect,
     // The rep's extra questions, on top of name, email and matric number.
     fields: readGuestFields(due.guestFields),
     space: { id: due.space.id, name: due.space.name, short: due.space.short, kind: due.space.kind, hue: due.space.hue },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /public/dues/{dueId}/lookup?matric= — "have I paid this?"
+//
+// A payer (or a faculty staffer at a desk) checks whether a matric number has
+// paid this due. Returns the minimum needed to self-verify — a masked name and
+// the receipt number (which verifies at /public/receipts/verify/{number}) — and
+// never any contact details, answers, or full name. Keyed to a supplied matric,
+// so there is no "list everyone who paid" shape. Rate-limited to blunt sweeping.
+// ---------------------------------------------------------------------------
+guestPayRouter.get('/dues/:dueId/lookup', paymentLookupLimiter, async (req: Request, res: Response): Promise<void> => {
+  const due = await loadGuestDue(req.params.dueId as string);
+  if (!due) {
+    // Same answer as a closed/unknown link, so this can't probe members-only dues.
+    errors.notFound(res, 'This payment link is not open');
+    return;
+  }
+  const matric = typeof req.query.matric === 'string' ? req.query.matric.trim() : '';
+  if (!matric || matric.length > 32) {
+    errors.validation(res, [{ field: 'matric', issue: 'Enter a matric number' }]);
+    return;
+  }
+
+  // A DuePayment row exists only once a checkout is fulfilled, so its presence
+  // means paid. Guest payers carry their matric number on their user row.
+  const payment = await db.duePayment.findFirst({
+    where: { dueId: due.id, user: { matricNo: matric } },
+    select: {
+      paidAt: true,
+      user: { select: { name: true } },
+      checkout: { select: { receipt: { select: { number: true } } } },
+    },
+    orderBy: { paidAt: 'desc' },
+  });
+
+  if (!payment) {
+    ok(res, { paid: false });
+    return;
+  }
+  const receiptNumber = payment.checkout?.receipt?.number ?? null;
+  ok(res, {
+    paid: true,
+    name: maskName(payment.user.name),
+    paidAt: payment.paidAt.toISOString(),
+    receiptNumber,
+    verifyUrl: receiptNumber ? `/public/receipts/verify/${receiptNumber}` : null,
   });
 });
 
@@ -92,6 +155,8 @@ const groupPersonSchema = z.object({
   email: emailField,
   matricNo: z.string().trim().min(1).max(32),
   answers: z.record(z.string().max(1000)).optional(),
+  // For a tiered due, the option this person chose (each may differ).
+  tierId: z.string().min(1).optional(),
 });
 
 const guestCheckoutSchema = z
@@ -103,6 +168,8 @@ const guestCheckoutSchema = z
     matricNo: z.string().trim().min(1).max(32).optional(),
     // Answers to the due's guestFields, keyed by field id.
     answers: z.record(z.string().max(1000)).optional(),
+    // For a tiered due, the option the payer chose. Required when the due is tiered.
+    tierId: z.string().min(1).optional(),
     // "Create a free Duevy account for me" — consent only; nothing is created until it's paid.
     createAccount: z.boolean().optional(),
     // Group pay: one transfer settling the due for several people. When given,
@@ -187,7 +254,7 @@ guestPayRouter.post(
           errors.validation(res, checked.issues);
           return;
         }
-        people.push({ name: person.name, email: person.email, matricNo: person.matricNo, answers: checked.answers ?? null });
+        people.push({ name: person.name, email: person.email, matricNo: person.matricNo, answers: checked.answers ?? null, tierId: person.tierId });
       }
       const { checkout } = await createGroupCheckout(dueId, people);
       ok(res, { ...checkout, reused: false, token: guestCheckoutToken(checkout.reference) }, 201);
@@ -222,6 +289,7 @@ guestPayRouter.post(
 
     const { checkout, reused } = await createCheckout(payer.id, [dueId], {
       guest: true,
+      ...(input.tierId ? { tierSelections: { [dueId]: input.tierId } } : {}),
       guestData: {
         ...(checked.answers ? { guestAnswers: checked.answers } : {}),
         // Consent is the guest's; a full account already has one.

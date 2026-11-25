@@ -1,5 +1,6 @@
 import { payoutSummary } from './narration';
 import { splitWithdrawalFee } from './money';
+import { collectiveLabel, leaderLabel, isJoinable } from './spaceVocab';
 import {
   type Space,
   type Due,
@@ -228,6 +229,12 @@ export function serializeSpace(
     institution: space.institution,
     memberCount: opts.memberCount,
     theme: space.theme,
+    // Faculty-aware vocabulary (copy only, derived from kind): what to call the
+    // space ("department"/"faculty"), its leader ("rep"/"faculty exec"), and
+    // whether people join it (faculties collect publicly — nobody joins).
+    collective: collectiveLabel(space.kind),
+    leader: leaderLabel(space.kind),
+    joinable: isJoinable(space.kind),
     createdAt: space.createdAt.toISOString(),
     ...(opts.membership ? { membership: opts.membership } : {}),
   };
@@ -236,7 +243,12 @@ export function serializeSpace(
 /** The rep-facing `RepDue` resource (§7) — Due plus progress counters. */
 export function serializeRepDue(
   due: Due,
-  opts: { paidCount: number; memberCount: number; guestPaidCount?: number },
+  opts: {
+    paidCount: number;
+    memberCount: number;
+    guestPaidCount?: number;
+    tiers?: { id: string; label: string; amountKobo: number; sortOrder: number }[];
+  },
 ) {
   return {
     id: due.id,
@@ -244,6 +256,9 @@ export function serializeRepDue(
     title: due.title,
     note: due.note,
     amount: due.amount,
+    pricingMode: due.pricingMode,
+    // The priced options for a `tiered` due (empty for a flat due).
+    tiers: (opts.tiers ?? []).map((t) => ({ id: t.id, label: t.label, amountKobo: t.amountKobo, sortOrder: t.sortOrder })),
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     type: due.category,
     category: due.category, // deprecated alias of `type`

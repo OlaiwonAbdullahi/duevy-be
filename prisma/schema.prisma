@@ -105,6 +105,15 @@ enum FeePayer {
   space
 }
 
+// How a due is priced.
+//   flat   — one `amount` everyone pays (the default, how dues always worked).
+//   tiered — the payer chooses one of the due's DueTiers, and that tier's
+//            amountKobo is what they're charged. `Due.amount` is then unused.
+enum DuePricing {
+  flat
+  tiered
+}
+
 enum PayMethod {
   wallet
   card
@@ -753,7 +762,12 @@ model Due {
   spaceId        String
   title          String
   note           String?
+  // The flat price, in kobo. Charged to everyone when pricingMode is `flat`.
+  // When pricingMode is `tiered` this column is IGNORED — the payer's chosen
+  // DueTier.amountKobo is charged instead (see enum DuePricing). Kept non-null
+  // so existing rows need no backfill; a tiered due may leave it at any value.
   amount         Int // kobo
+  pricingMode    DuePricing   @default(flat)
   dueDate        DateTime? // YYYY-MM-DD — the deadline; null = no deadline
   category       DueType // exposed as `type` in the API
   status         RepDueStatus @default(draft)
@@ -776,10 +790,33 @@ model Due {
   ledgerEntries LedgerEntry[]
   checkoutItems CheckoutItem[]
   refunds       Refund[]
+  tiers         DueTier[]
 
   @@index([spaceId])
   @@index([assignedRepId])
   @@map("dues")
+}
+
+// A priced option on a `tiered` due (see enum DuePricing) — e.g. "100 level" at
+// one amount, "Final year" at another. The payer picks exactly one at checkout
+// and is charged its `amountKobo`. The chosen tier is snapshotted onto the
+// CheckoutItem (tierId + tierLabel + faceKobo) so a later edit or archival can
+// never change what a paid line cost. Never mutate a referenced tier's
+// amountKobo; retire it with `isArchived` and add a new tier instead.
+model DueTier {
+  id         String   @id @default(cuid())
+  dueId      String
+  label      String
+  amountKobo Int
+  sortOrder  Int      @default(0)
+  isArchived Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  due   Due            @relation(fields: [dueId], references: [id], onDelete: Cascade)
+  items CheckoutItem[]
+
+  @@index([dueId])
+  @@map("due_tiers")
 }
 
 model DuePayment {
@@ -919,10 +956,17 @@ model CheckoutItem {
   // That person's answers to the due's questions (group pay). A single-payer
   // checkout keeps its answers on Checkout.guestAnswers instead.
   guestAnswers Json?
+  // The DueTier this line paid, for a `tiered` due. NULL on a flat due. tierId
+  // points at the chosen tier; tierLabel snapshots its label at pay time so a
+  // later edit/archival never blanks history. The amount paid is pinned by
+  // faceKobo above, exactly as for a flat due.
+  tierId    String?
+  tierLabel String?
 
   checkout    Checkout @relation(fields: [checkoutId], references: [id], onDelete: Cascade)
   due         Due      @relation(fields: [dueId], references: [id])
   beneficiary User?    @relation("CheckoutBeneficiary", fields: [beneficiaryUserId], references: [id])
+  tier        DueTier? @relation(fields: [tierId], references: [id])
 
   // A due appears once per beneficiary. Single-payer rows have a NULL
   // beneficiary; Postgres treats NULLs as distinct, but a single-payer basket
@@ -930,6 +974,7 @@ model CheckoutItem {
   @@unique([checkoutId, dueId, beneficiaryUserId])
   @@index([dueId])
   @@index([beneficiaryUserId])
+  @@index([tierId])
   @@map("checkout_items")
 }
 

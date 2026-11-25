@@ -244,6 +244,20 @@ export const receiptVerifyLimiter = limiter("receiptVerify", {
   },
 });
 
+// Public "have I paid?" lookup by matric number (a payer at a faculty desk).
+// Matric numbers are low-entropy and enumerable, so this is keyed by network +
+// the matric being asked about: generous for one person checking their own,
+// too slow to sweep a department's numbers for who paid.
+export const paymentLookupLimiter = limiter("paymentLookup", {
+  windowMs: 60 * 1000,
+  max: 20,
+  keyGenerator: (req: Request) =>
+    `${req.ip ?? "anon"}:${String(req.query?.matric ?? "").trim().toLowerCase().slice(0, 32)}`,
+  handler: (req, res) => {
+    fail(res, 429, "RATE_LIMITED", "Too many checks — wait a minute and try again.");
+  },
+});
+
 // "Email me my receipts": a few per address and per network, so it can't be
 // used to flood someone's inbox.
 export const receiptLookupLimiter = limiter("receiptLookup", {

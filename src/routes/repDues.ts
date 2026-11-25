@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { Prisma, type RepRole } from '@prisma/client';
+import { Prisma, type RepRole, type Due } from '@prisma/client';
 import { db } from '../config/db';
 import { validate } from '../middleware/validate';
 import { type AuthenticatedRequest } from '../middleware/auth';
@@ -37,7 +37,10 @@ async function actor(req: Request): Promise<{ id: string; name: string; role: Re
 
 /** Load a due and confirm it belongs to the space in the path. */
 async function loadDue(sid: string, dueId: string) {
-  const due = await db.due.findUnique({ where: { id: dueId } });
+  const due = await db.due.findUnique({
+    where: { id: dueId },
+    include: { tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } } },
+  });
   if (!due || due.spaceId !== sid) return null;
   return due;
 }
@@ -51,14 +54,15 @@ async function loadDue(sid: string, dueId: string) {
 const paidByMember = (spaceId: string) => ({ user: { spaceMemberships: { some: { spaceId } } } });
 const paidByOutsider = (spaceId: string) => ({ user: { spaceMemberships: { none: { spaceId } } } });
 
-async function repDuePayload(sid: string, due: Awaited<ReturnType<typeof loadDue>>) {
+async function repDuePayload(sid: string, due: Due | null) {
   if (!due) throw new Error('due required');
-  const [paidCount, guestPaidCount, memberCount] = await Promise.all([
+  const [paidCount, guestPaidCount, memberCount, tiers] = await Promise.all([
     db.duePayment.count({ where: { dueId: due.id, ...paidByMember(sid) } }),
     db.duePayment.count({ where: { dueId: due.id, ...paidByOutsider(sid) } }),
     db.spaceMembership.count({ where: { spaceId: sid } }),
+    db.dueTier.findMany({ where: { dueId: due.id, isArchived: false }, orderBy: { sortOrder: 'asc' } }),
   ]);
-  return serializeRepDue(due, { paidCount, guestPaidCount, memberCount });
+  return serializeRepDue(due, { paidCount, guestPaidCount, memberCount, tiers });
 }
 
 const dueDateField = z
@@ -71,6 +75,42 @@ const categoryField = z.enum(DUE_TYPES);
 // ₦1,000,000 in kobo. Due amounts live in an Int4 column and are multiplied
 // by member counts and fees, so an unbounded amount overflows into a 500.
 export const MAX_DUE_AMOUNT_KOBO = 100_000_000;
+
+/** A tiered due may offer at most this many priced options. */
+export const MAX_DUE_TIERS = 10;
+
+/** One priced option on a tiered due. */
+const tierInputSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  amountKobo: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO),
+  sortOrder: z.number().int().min(0).max(1000).optional(),
+});
+type TierInput = z.infer<typeof tierInputSchema>;
+
+/**
+ * Reconcile a due's pricing: a `flat` due needs a positive `amount` and no
+ * tiers; a `tiered` due needs ≥1 tier (its `amount` is unused — stored as 0).
+ * Returns the row's `amount`/`pricingMode`, or a validation issue to report.
+ */
+function normalizeTierPlan(input: {
+  pricingMode: 'flat' | 'tiered';
+  amount?: number;
+  tiers?: TierInput[];
+}): { amount: number; pricingMode: 'flat' | 'tiered'; tiers: TierInput[] } | { issue: { field: string; issue: string } } {
+  if (input.pricingMode === 'tiered') {
+    if (!input.tiers || input.tiers.length === 0) {
+      return { issue: { field: 'tiers', issue: 'a tiered due needs at least one option' } };
+    }
+    return { amount: 0, pricingMode: 'tiered', tiers: input.tiers };
+  }
+  if (input.tiers && input.tiers.length > 0) {
+    return { issue: { field: 'tiers', issue: 'a flat due cannot have tiers' } };
+  }
+  if (input.amount === undefined) {
+    return { issue: { field: 'amount', issue: 'amount is required for a flat due' } };
+  }
+  return { amount: input.amount, pricingMode: 'flat', tiers: [] };
+}
 
 /** `type` is the field name; `category` is accepted as its legacy alias. */
 function typeAlias(req: Request, _res: Response, next: () => void): void {
@@ -153,7 +193,12 @@ repDuesRouter.get('/dues', async (req: Request, res: Response): Promise<void> =>
 const createDueSchema = z.object({
   title: z.string().min(3).max(120),
   note: z.string().max(500).optional(),
-  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO),
+  // Required for a flat due; unused (and may be omitted) for a tiered due.
+  amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO).optional(),
+  // `flat` (one price, the default) or `tiered` (the payer picks an option).
+  pricingMode: z.enum(['flat', 'tiered']).default('flat'),
+  // The priced options for a tiered due.
+  tiers: z.array(tierInputSchema).max(MAX_DUE_TIERS).optional(),
   // Optional: a due can have no deadline. When given it must be today or later.
   dueDate: dueDateField
     .refine((s) => {
@@ -200,16 +245,23 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
     assigneeName = target.user.name;
   }
 
+  const plan = normalizeTierPlan({ pricingMode: data.pricingMode, amount: data.amount, tiers: data.tiers });
+  if ('issue' in plan) {
+    errors.validation(res, [plan.issue]);
+    return;
+  }
+
   if (publishing && !(await assertCanCollect(sid, res))) return;
 
-  const due = await db.$transaction(async (tx) => {
+  const dueId = await db.$transaction(async (tx) => {
     const created = await tx.due.create({
       data: {
         id: generateId('due'),
         spaceId: sid,
         title: data.title,
         note: data.note,
-        amount: data.amount,
+        amount: plan.amount,
+        pricingMode: plan.pricingMode,
         dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null,
         category: data.category,
         feePayer: data.feePayer,
@@ -218,6 +270,9 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
         assignedRepId: assignee,
         allowGuests: data.allowGuests,
         guestFields: data.guestFields === undefined ? DEFAULT_GUEST_FIELDS : (data.guestFields ?? Prisma.DbNull),
+        ...(plan.tiers.length > 0
+          ? { tiers: { create: plan.tiers.map((t, i) => ({ id: generateId('dueTier'), label: t.label, amountKobo: t.amountKobo, sortOrder: t.sortOrder ?? i })) } }
+          : {}),
       },
     });
     if (publishing) {
@@ -226,8 +281,9 @@ repDuesRouter.post('/dues', typeAlias, validate(createDueSchema), async (req: Re
     if (assigneeName) {
       await writeAudit(sid, await actor(req), 'due_reassigned', `Assigned due "${created.title}" to ${assigneeName}`, tx);
     }
-    return created;
+    return created.id;
   });
+  const due = (await loadDue(sid, dueId))!;
 
   if (assigneeName) {
     await notify({
@@ -249,6 +305,9 @@ const patchDueSchema = z.object({
   title: z.string().min(3).max(120).optional(),
   note: z.string().max(500).optional(),
   amount: z.number().int().positive().max(MAX_DUE_AMOUNT_KOBO).optional(),
+  pricingMode: z.enum(['flat', 'tiered']).optional(),
+  // When given, replaces the due's tier set wholesale (only before any payment).
+  tiers: z.array(tierInputSchema).max(MAX_DUE_TIERS).optional(),
   // `null` clears the deadline; a string sets it.
   dueDate: dueDateField.nullish(),
   category: categoryField.optional(),
@@ -275,32 +334,62 @@ repDuesRouter.patch('/dues/:dueId', typeAlias, validate(patchDueSchema), async (
     return;
   }
 
-  // amount and feePayer are immutable once any payment exists: both are baked
-  // into every settled checkout, so changing them would desync paid records.
+  // amount, feePayer and pricing (mode + tiers) are immutable once any payment
+  // exists: all are baked into every settled checkout, so changing them would
+  // desync paid records. Change a price after payment by closing and reopening.
   const changingAmount = data.amount !== undefined && data.amount !== due.amount;
   const changingFeePayer = data.feePayer !== undefined && data.feePayer !== due.feePayer;
-  if (changingAmount || changingFeePayer) {
+  const changingPricing =
+    (data.pricingMode !== undefined && data.pricingMode !== due.pricingMode) || data.tiers !== undefined;
+  if (changingAmount || changingFeePayer || changingPricing) {
     const payments = await db.duePayment.count({ where: { dueId: due.id } });
     if (payments > 0) {
-      const field = changingAmount ? 'Amount' : 'Who pays the processing fee';
+      const field = changingAmount ? 'Amount' : changingFeePayer ? 'Who pays the processing fee' : 'Pricing';
       errors.conflict(res, 'DUE_HAS_PAYMENTS', `${field} cannot change after payments have been made`);
       return;
     }
   }
 
-  const updated = await db.due.update({
-    where: { id: due.id },
-    data: {
-      ...(data.title !== undefined ? { title: data.title } : {}),
-      ...(data.note !== undefined ? { note: data.note } : {}),
-      ...(data.amount !== undefined ? { amount: data.amount } : {}),
-      ...(data.dueDate !== undefined ? { dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null } : {}),
-      ...(data.category !== undefined ? { category: data.category } : {}),
-      ...(data.feePayer !== undefined ? { feePayer: data.feePayer } : {}),
-      ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
-      ...(data.guestFields !== undefined ? { guestFields: data.guestFields ?? Prisma.DbNull } : {}),
-    },
+  // Recompute the pricing plan whenever the mode or the tiers move. The tier set
+  // is replaced wholesale (no payments exist, so no snapshot can be orphaned).
+  let plan: ReturnType<typeof normalizeTierPlan> | null = null;
+  if (changingPricing) {
+    const existingTiers = due.tiers.map((t) => ({ label: t.label, amountKobo: t.amountKobo, sortOrder: t.sortOrder }));
+    plan = normalizeTierPlan({
+      pricingMode: data.pricingMode ?? due.pricingMode,
+      amount: data.amount ?? due.amount,
+      tiers: data.tiers ?? existingTiers,
+    });
+    if ('issue' in plan) {
+      errors.validation(res, [plan.issue]);
+      return;
+    }
+  }
+
+  await db.$transaction(async (tx) => {
+    await tx.due.update({
+      where: { id: due.id },
+      data: {
+        ...(data.title !== undefined ? { title: data.title } : {}),
+        ...(data.note !== undefined ? { note: data.note } : {}),
+        ...(plan ? { amount: plan.amount, pricingMode: plan.pricingMode } : data.amount !== undefined ? { amount: data.amount } : {}),
+        ...(data.dueDate !== undefined ? { dueDate: data.dueDate ? new Date(`${data.dueDate}T00:00:00Z`) : null } : {}),
+        ...(data.category !== undefined ? { category: data.category } : {}),
+        ...(data.feePayer !== undefined ? { feePayer: data.feePayer } : {}),
+        ...(data.allowGuests !== undefined ? { allowGuests: data.allowGuests } : {}),
+        ...(data.guestFields !== undefined ? { guestFields: data.guestFields ?? Prisma.DbNull } : {}),
+      },
+    });
+    if (plan && !('issue' in plan)) {
+      await tx.dueTier.deleteMany({ where: { dueId: due.id } });
+      if (plan.tiers.length > 0) {
+        await tx.dueTier.createMany({
+          data: plan.tiers.map((t, i) => ({ id: generateId('dueTier'), dueId: due.id, label: t.label, amountKobo: t.amountKobo, sortOrder: t.sortOrder ?? i })),
+        });
+      }
+    }
   });
+  const updated = (await loadDue(sid, due.id))!;
 
   ok(res, await repDuePayload(sid, updated));
 });

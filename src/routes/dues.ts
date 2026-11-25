@@ -12,7 +12,7 @@ import { computeChargeFor } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { createCheckout } from '../services/checkout.service';
 import { renderDueReceipt } from '../services/receipt.service';
-import { type Due, type DuePayment } from '@prisma/client';
+import { type Due, type DuePayment, type DueTier } from '@prisma/client';
 
 export const duesRouter = Router();
 duesRouter.use(authenticate);
@@ -35,17 +35,27 @@ function viewerStatus(due: Due, payment: DuePayment | undefined, now: Date): Vie
  * due would cost on its own; a multi-due checkout charges the ₦20 flat once,
  * so its total is less than the sum of these.
  */
-function serializeStudentDue(due: Due, payment: DuePayment | undefined, now: Date) {
+function serializeStudentDue(due: Due & { tiers?: DueTier[] }, payment: DuePayment | undefined, now: Date) {
+  const studentBears = due.feePayer === 'student';
   // A space-borne fee isn't charged to the student: they pay only the face.
-  const charge = computeChargeFor(due.amount, due.feePayer === 'student');
+  const charge = computeChargeFor(due.amount, studentBears);
+  const tiered = due.pricingMode === 'tiered';
   return {
     id: due.id,
     spaceId: due.spaceId,
     title: due.title,
     note: due.note,
-    amount: due.amount, // face amount the rep set
-    processingFee: charge.fee, // 1.5% added on top, or 0 when the space absorbs it
-    payableAmount: charge.total, // what the student pays for this due alone
+    pricingMode: due.pricingMode,
+    // Flat due: one amount. Tiered due: the payer picks a tier (amounts null).
+    amount: tiered ? null : due.amount, // face amount the rep set
+    processingFee: tiered ? null : charge.fee, // 1.5% added on top, or 0 when the space absorbs it
+    payableAmount: tiered ? null : charge.total, // what the student pays for this due alone
+    tiers: tiered
+      ? (due.tiers ?? []).map((t) => {
+          const c = computeChargeFor(t.amountKobo, studentBears);
+          return { id: t.id, label: t.label, amount: t.amountKobo, processingFee: c.fee, payableAmount: c.total };
+        })
+      : [],
     feePayer: due.feePayer,
     dueDate: due.dueDate ? due.dueDate.toISOString().slice(0, 10) : null,
     type: due.category,
@@ -106,7 +116,10 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
       orderBy: [{ dueDate: 'asc' }, { id: 'asc' }],
       skip,
       take,
-      include: { payments: { where: { userId: id }, take: 1 } },
+      include: {
+        payments: { where: { userId: id }, take: 1 },
+        tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } },
+      },
     }),
   ]);
   const paymentByDue = new Map(dues.flatMap((d) => (d.payments[0] ? [[d.id, d.payments[0]] as const] : [])));
@@ -120,7 +133,10 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
 // ---------------------------------------------------------------------------
 duesRouter.get('/:dueId', async (req: Request, res: Response): Promise<void> => {
   const id = uid(req);
-  const due = await db.due.findUnique({ where: { id: req.params.dueId as string } });
+  const due = await db.due.findUnique({
+    where: { id: req.params.dueId as string },
+    include: { tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } } },
+  });
   if (!due || due.status === 'draft') {
     errors.notFound(res, 'Due not found');
     return;
@@ -143,15 +159,24 @@ duesRouter.get('/:dueId', async (req: Request, res: Response): Promise<void> => 
 const payManySchema = z
   .object({
     dueIds: z.array(z.string().min(1)).min(1).max(20),
+    // For any tiered due in the basket, the chosen tier, keyed by due id.
+    tierSelections: z.record(z.string().min(1)).optional(),
     // Bank transfer is the only method; accepted so older clients keep working.
     method: z.literal('online').optional(),
   })
   .strict();
 
-const paySingleSchema = z.object({ method: z.literal('online').optional() }).strict();
+const paySingleSchema = z
+  .object({ method: z.literal('online').optional(), tierId: z.string().min(1).optional() })
+  .strict();
 
-async function startCheckout(req: Request, res: Response, dueIds: string[]): Promise<void> {
-  const { checkout, reused } = await createCheckout(uid(req), dueIds);
+async function startCheckout(
+  req: Request,
+  res: Response,
+  dueIds: string[],
+  tierSelections?: Record<string, string>,
+): Promise<void> {
+  const { checkout, reused } = await createCheckout(uid(req), dueIds, tierSelections ? { tierSelections } : {});
   ok(res, { ...checkout, reused }, reused ? 200 : 201);
 }
 
@@ -163,7 +188,8 @@ duesRouter.post(
   idempotent,
   validate(payManySchema),
   async (req: Request, res: Response): Promise<void> => {
-    await startCheckout(req, res, (req.body as z.infer<typeof payManySchema>).dueIds);
+    const body = req.body as z.infer<typeof payManySchema>;
+    await startCheckout(req, res, body.dueIds, body.tierSelections);
   },
 );
 
@@ -175,7 +201,9 @@ duesRouter.post(
   idempotent,
   validate(paySingleSchema),
   async (req: Request, res: Response): Promise<void> => {
-    await startCheckout(req, res, [req.params.dueId as string]);
+    const dueId = req.params.dueId as string;
+    const { tierId } = req.body as z.infer<typeof paySingleSchema>;
+    await startCheckout(req, res, [dueId], tierId ? { [dueId]: tierId } : undefined);
   },
 );
 
