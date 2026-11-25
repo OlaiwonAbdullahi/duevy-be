@@ -335,11 +335,12 @@ async function platformMetrics() {
       withdrawalFees,
       last30Days: revenueRecent,
     },
-    // Duevy's take-home: fees earned less the sweep charges paid to 9jaPay.
+    // Duevy's take-home: the processing fee charged on checkouts, less the
+    // 9jaPay sweep charges it costs to move that money into space accounts.
     profit: {
-      total: revenueTotal - sweepChargesTotal,
+      total: checkoutFees - sweepChargesTotal,
       sweepCharges: sweepChargesTotal,
-      last30Days: revenueRecent - sweepChargesRecent,
+      last30Days: (recent._sum.feeKobo ?? 0) - sweepChargesRecent,
     },
     transactions: {
       count: all._count._all,
