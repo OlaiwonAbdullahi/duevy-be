@@ -790,7 +790,7 @@ repDuesRouter.get('/dues/:dueId/poster', async (req: Request, res: Response): Pr
   const sid = spaceId(req);
   const due = await db.due.findUnique({
     where: { id: req.params.dueId as string },
-    include: { space: { select: { name: true } } },
+    include: { space: { select: { name: true, collectionFeeBps: true } } },
   });
   if (!due || due.spaceId !== sid) {
     errors.notFound(res, 'Due not found');
@@ -817,6 +817,7 @@ repDuesRouter.get('/dues/:dueId/poster', async (req: Request, res: Response): Pr
     amountKobo: due.amount,
     deadline,
     payUrl,
+    feeBps: due.space.collectionFeeBps ?? undefined,
   });
 
   const slug = due.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'due';

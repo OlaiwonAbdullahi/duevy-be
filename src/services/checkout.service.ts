@@ -4,7 +4,7 @@ import { db } from '../config/db';
 import { env } from '../config/env';
 import { AppError, conflict, forbidden, notFound } from '../lib/errors';
 import { logger } from '../lib/logger';
-import { allocate, checkoutFee, generateReceiptNumber, generateReference } from '../lib/money';
+import { allocate, checkoutFee, feeBpsForSpace, generateReceiptNumber, generateReference } from '../lib/money';
 import { assertCheckoutTransition, canTransitionCheckout } from '../lib/stateMachine';
 import { notifyMany } from '../lib/notifications';
 import { sendDuePaymentReceiptEmail, sendRepPaymentReceivedEmail } from '../lib/email';
@@ -181,7 +181,7 @@ export async function createCheckout(
   const [user, dues, spaces, member, paid, leadUser, kycPolicy, tiers] = await Promise.all([
     db.user.findUnique({ where: { id: userId }, select: { id: true } }),
     db.due.findMany({ where: { id: { in: dueIds } } }),
-    db.space.findMany({ where: viaDues, select: { id: true, name: true, isArchived: true } }),
+    db.space.findMany({ where: viaDues, select: { id: true, name: true, isArchived: true, collectionFeeBps: true } }),
     db.spaceMembership.findFirst({ where: { userId, space: viaDues }, select: { userId: true } }),
     db.duePayment.findFirst({ where: { userId, dueId: { in: dueIds } }, select: { dueId: true } }),
     db.user.findFirst({
@@ -257,7 +257,7 @@ export async function createCheckout(
     // Each line's face is its resolved price (flat amount or chosen tier).
     const lineAmounts = ordered.map((d) => linePrices.get(d.id)!.amount);
     const face = lineAmounts.reduce((sum, a) => sum + a, 0);
-    const fee = checkoutFee(face);
+    const fee = checkoutFee(face, feeBpsForSpace(space));
     const feeShares = allocate(fee, lineAmounts);
     // Per line: does the student bear its fee, or does the space absorb it?
     const studentBears = ordered.map((d) => d.feePayer === 'student');
@@ -434,7 +434,7 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
   }
 
   const [due, kycPolicy, dueTiers] = await Promise.all([
-    db.due.findUnique({ where: { id: dueId }, include: { space: { select: { id: true, name: true, isArchived: true } } } }),
+    db.due.findUnique({ where: { id: dueId }, include: { space: { select: { id: true, name: true, isArchived: true, collectionFeeBps: true } } } }),
     getKycPolicy(),
     db.dueTier.findMany({ where: { dueId, isArchived: false } }),
   ]);
@@ -462,7 +462,7 @@ export async function createGroupCheckout(dueId: string, people: GroupPerson[]):
   const personPrices = people.map((p) => resolveLinePrice(due, dueTiers, p.tierId));
   const personAmounts = personPrices.map((lp) => lp.amount);
   const face = personAmounts.reduce((sum, a) => sum + a, 0);
-  const fee = checkoutFee(face);
+  const fee = checkoutFee(face, feeBpsForSpace(due.space));
   const feeShares = allocate(fee, personAmounts);
   const studentBears = due.feePayer === 'student';
   // Student-borne: the fee rides on top. Space-borne: the space absorbs it, so

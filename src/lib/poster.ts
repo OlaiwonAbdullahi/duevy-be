@@ -66,10 +66,12 @@ export interface PosterData {
   deadline?: string;
   /** The public pay page, e.g. https://duevy.com/pay/<dueId>. */
   payUrl: string;
+  /** The space's collection-fee rate in basis points; omitted = the default. */
+  feeBps?: number;
 }
 
 export async function renderDuePoster(data: PosterData): Promise<Buffer> {
-  const charge = computeCharge(data.amountKobo);
+  const charge = computeCharge(data.amountKobo, data.feeBps);
   const modules = buildQrModules(data.payUrl);
 
   return new Promise((resolve, reject) => {

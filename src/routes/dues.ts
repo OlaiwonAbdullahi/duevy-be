@@ -8,7 +8,7 @@ import { requireIdempotencyKey, idempotent } from '../middleware/idempotency';
 import { checkoutLimiter } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
-import { computeChargeFor } from '../lib/money';
+import { computeChargeFor, feeBpsForSpace } from '../lib/money';
 import { DUE_TYPES } from '../lib/dueTypes';
 import { createCheckout } from '../services/checkout.service';
 import { renderDueReceipt } from '../services/receipt.service';
@@ -35,10 +35,17 @@ function viewerStatus(due: Due, payment: DuePayment | undefined, now: Date): Vie
  * due would cost on its own; a multi-due checkout charges the ₦20 flat once,
  * so its total is less than the sum of these.
  */
-function serializeStudentDue(due: Due & { tiers?: DueTier[] }, payment: DuePayment | undefined, now: Date) {
+function serializeStudentDue(
+  due: Due & { tiers?: DueTier[]; space?: { collectionFeeBps: number | null } },
+  payment: DuePayment | undefined,
+  now: Date,
+) {
   const studentBears = due.feePayer === 'student';
+  // The space's rate (its override or the default) so the preview matches what
+  // checkout will actually charge.
+  const feeBps = feeBpsForSpace(due.space ?? {});
   // A space-borne fee isn't charged to the student: they pay only the face.
-  const charge = computeChargeFor(due.amount, studentBears);
+  const charge = computeChargeFor(due.amount, studentBears, feeBps);
   const tiered = due.pricingMode === 'tiered';
   return {
     id: due.id,
@@ -52,7 +59,7 @@ function serializeStudentDue(due: Due & { tiers?: DueTier[] }, payment: DuePayme
     payableAmount: tiered ? null : charge.total, // what the student pays for this due alone
     tiers: tiered
       ? (due.tiers ?? []).map((t) => {
-          const c = computeChargeFor(t.amountKobo, studentBears);
+          const c = computeChargeFor(t.amountKobo, studentBears, feeBps);
           return { id: t.id, label: t.label, amount: t.amountKobo, processingFee: c.fee, payableAmount: c.total };
         })
       : [],
@@ -119,6 +126,7 @@ duesRouter.get('/', async (req: Request, res: Response): Promise<void> => {
       include: {
         payments: { where: { userId: id }, take: 1 },
         tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } },
+        space: { select: { collectionFeeBps: true } },
       },
     }),
   ]);
@@ -135,7 +143,10 @@ duesRouter.get('/:dueId', async (req: Request, res: Response): Promise<void> => 
   const id = uid(req);
   const due = await db.due.findUnique({
     where: { id: req.params.dueId as string },
-    include: { tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } } },
+    include: {
+      tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } },
+      space: { select: { collectionFeeBps: true } },
+    },
   });
   if (!due || due.status === 'draft') {
     errors.notFound(res, 'Due not found');

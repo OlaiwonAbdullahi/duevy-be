@@ -125,10 +125,23 @@ export const DAILY_PAYOUT_LIMIT_KOBO = 500_000_000;
 /** 9jaPay refuses any single transfer above ₦1,000,000, so sweeps are split. */
 export const MAX_TRANSFER_KOBO = 100_000_000;
 
-/** The processing fee for one checkout covering `faceKobo` worth of dues, rounded up to the kobo. */
-export function checkoutFee(faceKobo: number): number {
+/**
+ * The collection fee rate for a space, in basis points: its own override, or
+ * the default COLLECTION_FEE_BPS when it has none. This is the single place the
+ * per-space rate is resolved, so every caller charges and previews the same.
+ */
+export function feeBpsForSpace(space: { collectionFeeBps?: number | null }): number {
+  return space.collectionFeeBps ?? COLLECTION_FEE_BPS;
+}
+
+/**
+ * The processing fee for one checkout covering `faceKobo` worth of dues, rounded
+ * up to the kobo. `feeBps` is the space's rate (see `feeBpsForSpace`); it
+ * defaults to the standard rate for callers with no space in scope.
+ */
+export function checkoutFee(faceKobo: number, feeBps: number = COLLECTION_FEE_BPS): number {
   assertKobo(faceKobo, 'faceKobo');
-  return Math.ceil((faceKobo * COLLECTION_FEE_BPS) / 10_000);
+  return Math.ceil((faceKobo * feeBps) / 10_000);
 }
 
 /**
@@ -153,8 +166,8 @@ export interface Charge {
   total: number;
 }
 
-export function computeCharge(faceKobo: number): Charge {
-  return computeChargeFor(faceKobo, true);
+export function computeCharge(faceKobo: number, feeBps: number = COLLECTION_FEE_BPS): Charge {
+  return computeChargeFor(faceKobo, true, feeBps);
 }
 
 /**
@@ -164,8 +177,8 @@ export function computeCharge(faceKobo: number): Charge {
  *                      so `fee` is 0 here (what the student pays on top) and the
  *                      space is credited face − checkoutFee(face) instead.
  */
-export function computeChargeFor(faceKobo: number, studentBearsFee: boolean): Charge {
-  const fee = studentBearsFee ? checkoutFee(faceKobo) : 0;
+export function computeChargeFor(faceKobo: number, studentBearsFee: boolean, feeBps: number = COLLECTION_FEE_BPS): Charge {
+  const fee = studentBearsFee ? checkoutFee(faceKobo, feeBps) : 0;
   return { face: faceKobo, fee, total: faceKobo + fee };
 }
 

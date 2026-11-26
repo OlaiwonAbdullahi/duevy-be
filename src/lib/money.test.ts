@@ -4,6 +4,7 @@ import {
   checkoutFee,
   computeCharge,
   computeChargeFor,
+  feeBpsForSpace,
   computeWithdrawal,
   decimalToKobo,
   koboToDecimal,
@@ -37,6 +38,26 @@ describe('checkoutFee — 1.5%, on top', () => {
     }
     expect(checkoutFee(10_000 * NAIRA)).toBe(15_000); // ₦150 against ₦100.75
     expect(checkoutFee(500_000 * NAIRA)).toBe(750_000); // ₦7,500, uncapped
+  });
+
+  it('honours a per-space rate override in both fee-payer modes', () => {
+    // feeBpsForSpace: override when set, default 150 when not.
+    expect(feeBpsForSpace({ collectionFeeBps: 130 })).toBe(130);
+    expect(feeBpsForSpace({ collectionFeeBps: null })).toBe(150);
+    expect(feeBpsForSpace({})).toBe(150);
+
+    // 1.3% on a ₦5,000 due = ₦65, vs ₦75 at the default rate.
+    expect(checkoutFee(500_000, 130)).toBe(6_500);
+
+    // Student-borne: the fee rides on top at the overridden rate.
+    const borne = computeChargeFor(500_000, true, 130);
+    expect(borne).toEqual({ face: 500_000, fee: 6_500, total: 506_500 });
+
+    // Space-absorbed: the student pays only the face, but the fee Duevy keeps
+    // (face − net) is still the overridden ₦65, not ₦75 — one rate, both modes.
+    const absorbed = computeChargeFor(500_000, false, 130);
+    expect(absorbed).toEqual({ face: 500_000, fee: 0, total: 500_000 });
+    expect(500_000 - checkoutFee(500_000, 130)).toBe(493_500);
   });
 
   it('providerCollectionFee — 9jaPay takes 0.5% of the transfer, leaving ~1% profit', () => {

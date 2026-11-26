@@ -13,7 +13,7 @@ import {
 } from '../middleware/rateLimiter';
 import { ok, fail, errors } from '../lib/response';
 import { generateId } from '../lib/id';
-import { computeChargeFor } from '../lib/money';
+import { computeChargeFor, feeBpsForSpace } from '../lib/money';
 import { createCheckout, createGroupCheckout, getGuestCheckout, guestCheckoutToken, isValidGuestCheckoutToken, type GroupPerson } from '../services/checkout.service';
 import { syncPendingCheckout } from './transactions';
 import { renderReceiptByNumber, maskName } from '../services/receipt.service';
@@ -47,7 +47,7 @@ async function loadGuestDue(dueId: string) {
   const due = await db.due.findUnique({
     where: { id: dueId },
     include: {
-      space: { select: { id: true, name: true, short: true, kind: true, hue: true, isArchived: true } },
+      space: { select: { id: true, name: true, short: true, kind: true, hue: true, isArchived: true, collectionFeeBps: true } },
       tiers: { where: { isArchived: false }, orderBy: { sortOrder: 'asc' } },
     },
   });
@@ -67,7 +67,8 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     return;
   }
   const studentBears = due.feePayer === 'student';
-  const charge = computeChargeFor(due.amount, studentBears);
+  const feeBps = feeBpsForSpace(due.space);
+  const charge = computeChargeFor(due.amount, studentBears, feeBps);
   const kyc = await getSpaceKycState(due.space.id);
   const tiered = due.pricingMode === 'tiered';
   ok(res, {
@@ -85,7 +86,7 @@ guestPayRouter.get('/dues/:dueId', guestLinkLimiter, async (req: Request, res: R
     total: tiered ? null : charge.total,
     tiers: tiered
       ? due.tiers.map((t) => {
-          const c = computeChargeFor(t.amountKobo, studentBears);
+          const c = computeChargeFor(t.amountKobo, studentBears, feeBps);
           return { id: t.id, label: t.label, amount: c.face, fee: c.fee, total: c.total };
         })
       : [],

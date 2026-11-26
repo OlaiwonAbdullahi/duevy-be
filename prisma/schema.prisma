@@ -599,6 +599,11 @@ model Space {
   archivedReason              String?
   payoutsFrozen               Boolean            @default(false)
   frozenReason                String?
+  // Per-space override of the 1.5% collection fee, in basis points. null = the
+  // default COLLECTION_FEE_BPS. Set for special-rate spaces (e.g. a founding
+  // rep's department at 130 = 1.3%). Applies to the stored feeKobo regardless of
+  // who bears it, so it holds whether the student or the space pays the fee.
+  collectionFeeBps            Int?
   // How withdrawals are authorised: the security code below, or 2-of-3
   // signatories with emailed one-time codes (see WithdrawalAuthMode).
   withdrawalAuthMode          WithdrawalAuthMode @default(pin)

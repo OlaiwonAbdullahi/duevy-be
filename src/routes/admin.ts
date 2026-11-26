@@ -10,7 +10,7 @@ import { ok, fail, errors } from '../lib/response';
 import { parseListQuery, buildMeta } from '../lib/pagination';
 import { serializeAppUser, serializeAdminAuditLog, serializeDispute, serializeFeedback, serializeTransaction, serializePayout } from '../lib/serializers';
 import { writeAdminAudit } from '../lib/adminAudit';
-import { checkoutFee, computeChargeFor, generateReference, providerCollectionFee } from '../lib/money';
+import { checkoutFee, computeChargeFor, feeBpsForSpace, generateReference, providerCollectionFee } from '../lib/money';
 import { appendLedgerEntry, lockSpace } from '../services/ledger.service';
 import { CLEARED_PIN, cancelPayout } from '../services/withdrawal.service';
 import { adminKycSummary, listLivenessForReview, listNinReviews, listStudentIdsForReview, reviewLiveness, reviewNin, reviewStudentId } from '../services/kyc.service';
@@ -1625,7 +1625,7 @@ adminRouter.post(
     const { userId, reference: suppliedReference, reason } = req.body as z.infer<typeof manualCreditSchema>;
     const due = await db.due.findUnique({
       where: { id: req.params.dueId as string },
-      include: { space: { select: { id: true, name: true } } },
+      include: { space: { select: { id: true, name: true, collectionFeeBps: true } } },
     });
     if (!due) {
       errors.notFound(res, 'Due not found');
@@ -1661,8 +1661,9 @@ adminRouter.post(
     // This puts money on the space's ledger that the provider may not hold for
     // it, so it is only for a payment that demonstrably happened (audited as critical).
     const studentBears = due.feePayer === 'student';
-    const charge = computeChargeFor(due.amount, studentBears);
-    const fullFee = checkoutFee(due.amount);
+    const feeBps = feeBpsForSpace(due.space);
+    const charge = computeChargeFor(due.amount, studentBears, feeBps);
+    const fullFee = checkoutFee(due.amount, feeBps);
     const netToSpace = due.amount - (studentBears ? 0 : fullFee);
     const reference = suppliedReference ?? generateReference('MAN');
     const actorId = (req as AuthenticatedRequest).user.sub as string;
