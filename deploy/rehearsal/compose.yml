@@ -15,7 +15,7 @@ x-rehearsal-env: &rehearsal-env
   REDIS_URL: redis://redis:6379
   JWT_ACCESS_SECRET: rehearsal-access-secret-0123456789abcdef0123
   JWT_REFRESH_SECRET: rehearsal-refresh-secret-0123456789abcdef012
-  RESEND_API_KEY: re_rehearsal
+  SENDBYTE_API_KEY: sk_test_rehearsal
   PAYMENT_PROVIDER: fake
   NINEJAPAY_SECRET_KEY: whsec_rehearsal
   FILE_STORAGE: memory

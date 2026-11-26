@@ -18,9 +18,9 @@ const envSchema = z.object({
   // Google Sign-In (§2.3). Optional: while unset, POST /auth/google returns 501.
   GOOGLE_CLIENT_ID: z.string().optional(),
 
-  // Resend
-  RESEND_API_KEY: z.string(),
-  RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
+  // SendByte (transactional email)
+  SENDBYTE_API_KEY: z.string(),
+  SENDBYTE_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
 
   // Payment rail. 'ninejapay' is the only live provider; 'fake' is an
   // in-memory stand-in for local development, the seed and the test suite.

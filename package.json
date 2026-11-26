@@ -60,7 +60,7 @@
     "prisma": "^5.22.0",
     "qrcode": "^1.5.4",
     "rate-limit-redis": "^4.3.1",
-    "resend": "^4.0.0",
+    "@sendbyte/node": "^0.3.0",
     "typescript": "^5.7.3",
     "ulid": "^2.3.0",
     "zod": "^3.24.1"

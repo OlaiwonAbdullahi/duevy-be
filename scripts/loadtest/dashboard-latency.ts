@@ -68,7 +68,7 @@ async function main() {
     DIRECT_URL: direct,
     JWT_ACCESS_SECRET: 'dash-access-secret-0123456789abcdef0123456789',
     JWT_REFRESH_SECRET: 'dash-refresh-secret-0123456789abcdef012345678',
-    RESEND_API_KEY: 're_dash',
+    SENDBYTE_API_KEY: 'sk_test_dash',
     PAYMENT_PROVIDER: 'fake',
     NINEJAPAY_SECRET_KEY: 'whsec_dash',
     FILE_STORAGE: 'memory',

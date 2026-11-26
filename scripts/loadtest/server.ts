@@ -53,7 +53,7 @@ async function main() {
     DIRECT_URL: url,
     JWT_ACCESS_SECRET: 'lt-access-secret-0123456789abcdef0123456789',
     JWT_REFRESH_SECRET: 'lt-refresh-secret-0123456789abcdef012345678',
-    RESEND_API_KEY: 're_loadtest',
+    SENDBYTE_API_KEY: 'sk_test_loadtest',
     PAYMENT_PROVIDER: 'fake',
     NINEJAPAY_SECRET_KEY: LT_WEBHOOK_SECRET,
     FILE_STORAGE: 'memory',

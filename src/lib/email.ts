@@ -1,8 +1,28 @@
-import { Resend } from 'resend';
 import { env } from '../config/env';
 import { escapeHtml } from './html';
 
-const resend = new Resend(env.RESEND_API_KEY);
+// @sendbyte/node is an ESM package and this project compiles to CommonJS, so the
+// SDK is loaded via a runtime dynamic import (kept native under node16). No static
+// import — type or value — of the module, so its type is inferred here and the
+// client is created once and reused across sends.
+function createSendByte() {
+  return import('@sendbyte/node').then((m) => new m.SendByte(env.SENDBYTE_API_KEY));
+}
+let sendbytePromise: ReturnType<typeof createSendByte> | null = null;
+function getSendByte(): ReturnType<typeof createSendByte> {
+  if (!sendbytePromise) sendbytePromise = createSendByte();
+  return sendbytePromise;
+}
+
+/** Describe a failed send. A thrown SendByteError carries code/status/message;
+ *  it's matched structurally since the class isn't imported as a runtime value. */
+function sendFailureDetail(err: unknown): string {
+  if (err && typeof err === 'object' && 'code' in err && 'status' in err) {
+    const e = err as { code: string; status: number; message?: string };
+    return `${e.code} (${e.status}): ${e.message ?? ''}`.trim();
+  }
+  return (err as Error).message;
+}
 
 interface SendEmailOptions {
   to: string | string[];
@@ -17,19 +37,50 @@ export function headerSafe(value: string): string {
   return value.replace(/[\r\n]+/g, ' ');
 }
 
-export async function sendEmail(options: SendEmailOptions): Promise<void> {
-  const { error } = await resend.emails.send({
-    from: env.RESEND_FROM_EMAIL,
-    to: Array.isArray(options.to) ? options.to : [options.to],
-    subject: headerSafe(options.subject),
-    html: options.html,
-    text: options.text,
-    attachments: options.attachments,
-  });
+/** MIME type for an attachment, inferred from its filename (SendByte requires one). */
+function attachmentContentType(filename: string): string {
+  switch (filename.toLowerCase().split('.').pop()) {
+    case 'pdf':
+      return 'application/pdf';
+    case 'png':
+      return 'image/png';
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'csv':
+      return 'text/csv';
+    case 'txt':
+      return 'text/plain';
+    default:
+      return 'application/octet-stream';
+  }
+}
 
-  if (error) {
-    console.error('[email] Failed to send email:', error);
-    throw new Error(`Email send failed: ${error.message}`);
+export async function sendEmail(options: SendEmailOptions): Promise<void> {
+  try {
+    const sendbyte = await getSendByte();
+    await sendbyte.emails.send({
+      from: env.SENDBYTE_FROM_EMAIL,
+      to: Array.isArray(options.to) ? options.to : [options.to],
+      subject: headerSafe(options.subject),
+      html: options.html,
+      text: options.text,
+      // SendByte takes attachment content as base64 with an explicit content type,
+      // unlike Resend which took a Buffer.
+      ...(options.attachments && options.attachments.length > 0
+        ? {
+            attachments: options.attachments.map((a) => ({
+              filename: a.filename,
+              content: a.content.toString('base64'),
+              content_type: attachmentContentType(a.filename),
+            })),
+          }
+        : {}),
+    });
+  } catch (err) {
+    const detail = sendFailureDetail(err);
+    console.error('[email] Failed to send email:', detail);
+    throw new Error(`Email send failed: ${detail}`);
   }
 }
 
