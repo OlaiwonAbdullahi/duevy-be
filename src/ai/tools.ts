@@ -21,11 +21,28 @@ import type { RepContext } from './identity';
  * withdrawal PIN step regardless of what the model does on its own.
  */
 
+/**
+ * A due whose summary has been shown and is awaiting the rep's confirmation.
+ * Remembered so that if the rep approves but the model fails to issue the
+ * confirmed `create_due` call (it sometimes narrates success instead), the agent
+ * can create the due deterministically rather than fabricate it.
+ */
+export interface PendingCreate {
+  spaceId: string;
+  body: Record<string, unknown>;
+  title: string;
+  willPublish: boolean;
+  at: number;
+}
+
 export interface ToolContext {
   rep: RepContext;
   token: string;
   getActiveSpaceId(): string | null;
   setActiveSpaceId(id: string): void;
+  /** Remember (or clear, with null) the due awaiting confirmation. Optional so
+   *  lightweight test contexts need not provide it. */
+  setPendingCreate?(pending: PendingCreate | null): void;
 }
 
 export interface AgentTool {
@@ -61,6 +78,22 @@ const numArg = (v: unknown): number | undefined => (typeof v === 'number' && !Nu
 const boolArg = (v: unknown): boolean => v === true || v === 'true';
 
 const payLink = (dueId: string) => `${env.FRONTEND_URL}/pay/${dueId}`;
+
+/**
+ * Create a due that the rep already confirmed, by POSTing a remembered
+ * `PendingCreate`. Used by the agent's fallback when the rep approves but the
+ * model doesn't actually issue the confirmed create_due call. Returns the real
+ * pay link (never a fabricated one), or an error.
+ */
+export async function runPendingCreate(
+  token: string,
+  pending: PendingCreate,
+): Promise<{ created: true; title: string; published: boolean; payLink: string | null } | { error: string }> {
+  const res = await apiCall({ method: 'POST', path: `/spaces/${pending.spaceId}/dues`, token, body: pending.body });
+  if (!res.ok) return { error: res.error ?? 'The due could not be created.' };
+  const due = res.data as { id?: string };
+  return { created: true, title: pending.title, published: pending.willPublish, payLink: due.id ? payLink(due.id) : null };
+}
 
 /** Common short names reps use that don't substring-match the official bank name. */
 const BANK_ALIASES: Record<string, string> = {
@@ -294,25 +327,26 @@ export const tools: AgentTool[] = [
         // it a draft when the rep explicitly passes publish:false.
         willPublish: args.publish === undefined ? true : boolArg(args.publish),
       };
+      // Built once so the confirmation step can REMEMBER the exact payload and
+      // the agent can create the due deterministically if the model later fails
+      // to issue the confirmed call itself.
+      const body = {
+        title,
+        amount: faceKobo,
+        dueDate,
+        category,
+        note: str(args.note),
+        ...(guestFields ? { guestFields } : {}),
+        allowGuests: summary.allowGuests,
+        publish: summary.willPublish,
+      };
       if (!boolArg(args.confirmed)) {
+        ctx.setPendingCreate?.({ spaceId: s.spaceId, body, title, willPublish: summary.willPublish, at: Date.now() });
         return { needsConfirmation: true, summary, instruction: 'Read this summary to the rep (including the extra questions the form will ask) and ask them to confirm before saving.' };
       }
-      const res = await apiCall({
-        method: 'POST',
-        path: `/spaces/${s.spaceId}/dues`,
-        token: ctx.token,
-        body: {
-          title,
-          amount: faceKobo,
-          dueDate,
-          category,
-          note: str(args.note),
-          ...(guestFields ? { guestFields } : {}),
-          allowGuests: summary.allowGuests,
-          publish: summary.willPublish,
-        },
-      });
+      const res = await apiCall({ method: 'POST', path: `/spaces/${s.spaceId}/dues`, token: ctx.token, body });
       if (!res.ok) return { error: res.error };
+      ctx.setPendingCreate?.(null); // created — nothing is pending any more
       const due = res.data as { id?: string };
       const link = due.id ? payLink(due.id) : null;
       // Return a LEAN result (no raw kobo amounts, and NO due id) so the model has

@@ -1,6 +1,6 @@
 import type OpenAI from 'openai';
 import { getNim, AI_MODEL } from './nim';
-import { toolSpecs, findTool, type ToolContext } from './tools';
+import { toolSpecs, findTool, runPendingCreate, type ToolContext, type PendingCreate } from './tools';
 import { todayContext } from './dates';
 import { loadRepContext, mintToken, type RepContext } from './identity';
 import { logger } from '../lib/logger';
@@ -40,6 +40,24 @@ interface Session {
   history: Msg[];
   activeSpaceId: string | null;
   updatedAt: number;
+  // A due whose summary was shown last turn, awaiting the rep's yes/no.
+  pendingCreate?: PendingCreate | null;
+}
+
+/** How long a shown-but-unconfirmed due stays executable after the summary. */
+const PENDING_CREATE_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Is the rep's whole message just a "yes"? Anchored full-match (after trimming
+ * trailing punctuation/emoji) so "yes but make it ₦3,000" does NOT count — that
+ * carries a change the model must handle, not a plain approval.
+ */
+export function isApproval(text: string): boolean {
+  const t = text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.!,👍✅🆗👌🎉]+$/u, '');
+  return /^(y|yes|yep|yeah|yup|ya|sure|ok|okay|okey|k|go|go ahead|do it|make it live|publish|publish it|confirm|confirmed|proceed|send it|please do|yes please|absolutely|definitely)$/.test(t);
 }
 
 const sessions = new Map<string, Session>();
@@ -51,7 +69,7 @@ function getSession(userId: string): Session {
   const now = Date.now();
   const existing = sessions.get(userId);
   if (existing && now - existing.updatedAt < SESSION_TTL_MS) return existing;
-  const fresh: Session = { history: [], activeSpaceId: null, updatedAt: now };
+  const fresh: Session = { history: [], activeSpaceId: null, updatedAt: now, pendingCreate: null };
   sessions.set(userId, fresh);
   return fresh;
 }
@@ -96,7 +114,7 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string, chan
     '- You can do everything a rep does on the dashboard: besides creating dues you can EDIT a due (edit_due — change its amount, deadline, title, category, note; the amount is locked once anyone has paid), run POLLS/voting (list_polls, create_poll with categories each having ≥2 nominees, publish_poll, close_poll, poll_results), and manage the CIRCLE (audit_log for recent activity, regenerate_join_code to rotate the join code, remove_member and remove_rep — both lead-rep only, using the exact id from list_members/list_reps).',
     '- IDS: for edit_due, publish/close poll, remove_member, remove_rep, only ever use an id a tool returned this conversation (from list_dues, list_polls, list_members, list_reps). Never guess or fabricate an id — if you do not have it, call the listing tool first.',
     '- Some things stay on the dashboard only: changing your password or PIN, revoking sessions, transferring the lead role, archiving a space, and editing the receipt design. If the rep asks for one of those, tell them to do it from the Duevy dashboard rather than attempting it here.',
-    '- NEVER FABRICATE: only say a due was created or is live AFTER create_due actually returns successfully THIS turn (a result with `created` and a `payLink`). If you did not call the tool, or it returned an error, do NOT claim success and do NOT invent a link — report what happened or try again. The ONLY valid pay link is the exact `payLink` string a tool returned this turn; never type a link from memory, and never guess a host like duevy.com/duevy.app.',
+    '- NEVER FABRICATE: only say a due was created or is live AFTER create_due actually returns successfully THIS turn (a result with `created` and a `payLink`). If you did not call the tool, or it returned an error, do NOT claim success and do NOT invent a link — report what happened plainly (e.g. "I couldn\'t create that just now") and offer to try again. The ONLY valid pay link is the exact `payLink` string a tool returned this turn; never type a link from memory, and never write a website address or path the tool did not give you.',
     '- WHEN A DUE GOES LIVE (create_due returned `created` + `payLink`): celebrate it — this is a win. Lead with a warm, upbeat line like "🎉 You\'re live! [Title] is open for payment." or "Done — [Title] is live and ready to collect! 💸", confirm students can pay right now, then hand over the exact payLink on its OWN line with a nudge to share it (e.g. "Share this with your students:"). Keep it short, genuine and encouraging — not a dry "Due created." Mention the total each student pays once if useful.',
     '- When you create or publish a due, give them the public pay link to share. ALWAYS paste the exact `payLink` URL string the tool returned, character for character, in full and as plain text. NEVER shorten it, swap its host, replace the id with x\'s or dots, write a placeholder like "[Link to pay]" or "[Link]", or wrap it in markdown link syntax. The rep copies the raw URL, so the literal tool-returned URL must appear verbatim in your reply. If a tool did not return a payLink, call get_pay_link before answering; never guess or fabricate a link.',
     '- Keep replies short and clear — they may be reading on WhatsApp. Use plain language, no markdown tables, and no markdown link syntax — write raw URLs.',
@@ -113,21 +131,39 @@ function systemPrompt(rep: RepContext, todayLagos: string, weekday: string, chan
  * markdown link, (2) rewrite any .../pay/<id> URL to the real one, and (3) if the
  * reply mentions a link but has none, append it.
  */
+// Matches a path-bearing URL (optional scheme, host.tld, then "/path"): a real
+// pay link, or a hallucinated one. Bare brand mentions (e.g. "duevy.app" with no
+// path) are intentionally left alone. Shared by the repair and the fabrication guard.
+const PATH_URL = /(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/[^\s)]+/gi;
+const LINK_PLACEHOLDER = /\[[^\]]*(?:link|pay)[^\]]*\]/gi;
+
 export function repairPayLink(text: string, realLink: string | null): string {
-  if (!realLink) return text;
+  // No real link this turn: a tool did not produce one, so ANY URL or link
+  // placeholder in the reply was invented by the model. Strip them — a dead or
+  // wrong link must never reach the rep. (The fabrication guard in handleMessage
+  // additionally rewrites a reply that *claimed* a due went live.)
+  if (!realLink) {
+    return text
+      .replace(/\[[^\]]*\]\([^)]*\)/gi, '') // markdown links [label](href)
+      .replace(LINK_PLACEHOLDER, '') // [Link to pay] / [pay link]
+      .replace(PATH_URL, '') // bare or wrong-host path URLs
+      .replace(/[ \t]+\n/g, '\n')
+      .trimEnd();
+  }
+
   let out = text;
 
   // Markdown links [label](href) → the real URL as plain text.
   out = out.replace(/\[[^\]]*\]\((https?:\/\/[^)]*\/pay\/[^)\s]*|[^)]*)\)/gi, realLink);
 
   // Bare placeholder tokens like [Link to pay], [Link], [pay link].
-  out = out.replace(/\[[^\]]*(?:link|pay)[^\]]*\]/gi, realLink);
+  out = out.replace(LINK_PLACEHOLDER, realLink);
 
   // When a tool produced the real link this turn, ANY path-bearing URL the model
   // wrote in this reply is meant to be it — replace every one (wrong host, wrong
   // path like /d/, double-domain, or no scheme) with the real link. Requires a
   // "/path" so bare brand mentions (e.g. "duevy.app") are left alone.
-  out = out.replace(/(?:https?:\/\/)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\/[^\s)]+/gi, realLink);
+  out = out.replace(PATH_URL, realLink);
 
   // A tool produced a real pay link this turn, so the reply is about that due.
   // If the real link isn't already in the text (model omitted it, or pasted
@@ -136,6 +172,19 @@ export function repairPayLink(text: string, realLink: string | null): string {
     out = `${out.trimEnd()}\n${realLink}`;
   }
   return out;
+}
+
+/**
+ * A reply that both claims a due went live AND shows a link, when NO tool
+ * produced a real pay link this turn, is a fabrication: the due was not created.
+ * Detect it on the model's raw reply (before stripping) so we can replace the
+ * whole message with an honest one instead of shipping a lie with a dead link.
+ */
+const CLAIMS_DUE_LIVE = /you['’]?re live|is (?:now )?live|open for payment|share (?:this|it|the link)|collection link|🎉 *you/i;
+export function looksLikeFabricatedLive(rawText: string, realLink: string | null): boolean {
+  if (realLink) return false;
+  const showedLink = new RegExp(PATH_URL.source, 'i').test(rawText) || new RegExp(LINK_PLACEHOLDER.source, 'i').test(rawText);
+  return showedLink && CLAIMS_DUE_LIVE.test(rawText);
 }
 
 /** Run one rep message to a final reply plus any structured UI cards. */
@@ -152,7 +201,14 @@ export async function handleMessage(userId: string, text: string, channel: Chann
     setActiveSpaceId: (id) => {
       session.activeSpaceId = id;
     },
+    setPendingCreate: (pending) => {
+      session.pendingCreate = pending;
+    },
   };
+
+  // The due awaiting confirmation when THIS turn began (set by a summary shown
+  // last turn). Snapshot it before the loop, since create_due may overwrite it.
+  const pendingAtStart = session.pendingCreate ?? null;
 
   // Civil date in the rep's timezone (Africa/Lagos), so "today" in the prompt and
   // the deterministic resolver in dates.ts always agree.
@@ -240,6 +296,27 @@ export async function handleMessage(userId: string, text: string, channel: Chann
 
   if (!finalText) finalText = "I couldn't finish that just now. Please try rephrasing, or use the dashboard.";
 
+  // Deterministic confirm: if a due summary was shown last turn and the rep's whole
+  // message is a plain "yes", the due MUST be created — even when the model skips
+  // the confirmed create_due call and just narrates success. Create it ourselves
+  // (unless the model already did this turn, i.e. realPayLink is set) so the rep
+  // never gets a fake "you're live" with no due behind it.
+  if (!realPayLink && pendingAtStart && isApproval(text) && Date.now() - pendingAtStart.at < PENDING_CREATE_TTL_MS) {
+    const res = await runPendingCreate(token, pendingAtStart);
+    session.pendingCreate = null;
+    if ('error' in res) {
+      logger.warn({ userId, err: res.error }, 'ai: deterministic confirm-create failed');
+      finalText = `Sorry — I couldn't create "${pendingAtStart.title}" just now (${res.error}). Want me to try again?`;
+    } else if (res.payLink) {
+      realPayLink = res.payLink;
+      logger.info({ userId }, 'ai: created due deterministically after rep approval');
+      finalText = `🎉 You're live! ${res.title} is open for payment — your students can pay now.\nShare this with your students:`;
+    } else {
+      logger.warn({ userId }, 'ai: due created but no pay link returned');
+      finalText = `Your due "${res.title}" is created, but I couldn't generate its share link just now — you'll find it (and the link) in your dues list on the dashboard.`;
+    }
+  }
+
   // Safety net: the model sometimes offers a bank picker ("pick a bank") without
   // actually calling list_banks, so no card is produced. If the reply invites a
   // bank choice but no banks card was captured, fetch the list ourselves so the
@@ -252,10 +329,22 @@ export async function handleMessage(userId: string, text: string, channel: Chann
     }
   }
 
+  // Anti-fabrication guard: a due is only live if a tool returned a real pay link
+  // THIS turn. If the model claimed a due went live and showed a link but no tool
+  // produced one, it invented the whole thing (no due was created) — replace the
+  // reply with an honest one rather than ship a lie with a dead link.
+  const fabricatedLive = looksLikeFabricatedLive(finalText, realPayLink);
+  if (fabricatedLive) {
+    logger.warn({ userId }, 'ai reply: blocked fabricated due-live claim (no tool pay link this turn)');
+    finalText =
+      "Hmm — I wasn't able to get that due live just now, so I don't have a share link for you yet. Nothing was created. Want me to try again?";
+  }
+
   // Repair the pay link: models sometimes echo a placeholder ("[Link to pay]") or
   // a hallucinated URL (wrong host, id masked as x's) instead of the real link the
-  // tool returned. If we captured a real payLink this turn, force it into the reply.
-  logger.info({ hasRealPayLink: !!realPayLink }, 'ai reply: pay-link repair');
+  // tool returned. If we captured a real payLink this turn, force it into the reply;
+  // if not, strip any invented URL so a dead link can never reach the rep.
+  logger.info({ hasRealPayLink: !!realPayLink, fabricatedLive }, 'ai reply: pay-link repair');
   finalText = repairPayLink(finalText, realPayLink);
 
   // Persist only the clean turn, so stored history is always a valid transcript.
