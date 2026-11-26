@@ -145,16 +145,33 @@ export function checkoutFee(faceKobo: number, feeBps: number = COLLECTION_FEE_BP
 }
 
 /**
- * 9jaPay's cut of a collection: 0.5% of what the student transfers. Out of the
- * 1.5% processing fee Duevy charges, this is the third that goes to 9jaPay, so
- * Duevy's profit on a checkout is its fee minus this. The ₦750 cap and the ₦50
- * stamp duty from ₦10,000 aren't modelled — this is the nominal rate 9jaPay
- * quotes, and on small campus payments the cap never bites.
+ * What 9jaPay actually takes out of a collection, which Duevy's profit is its
+ * processing fee minus.
+ *
+ * Verified against the live 9jaPay transaction ledger (2026-11-26): collections
+ * settle into the business account with NO charge — across every
+ * "VIRTUAL ACCOUNT CLOSURE TRANSFER" into it, 9jaPay billed ₦0. The 0.5%
+ * (capped ₦750, + ₦50 stamp duty from ₦10,000) that 9jaPay quotes is not being
+ * charged on the inflow, so Duevy keeps the entire processing fee on a
+ * collection. Hence the rate is 0 and this returns 0.
+ *
+ * If 9jaPay begins billing the collection fee, set PROVIDER_COLLECTION_FEE_BPS
+ * back to 50: the cap and stamp duty below then take effect. Note that it must
+ * then be summed PER CHECKOUT (not applied to an aggregate total), or the ₦750
+ * cap and the per-transaction ₦50 stamp duty come out wrong.
  */
-export const PROVIDER_COLLECTION_FEE_BPS = 50;
+export const PROVIDER_COLLECTION_FEE_BPS = 0;
+/** 9jaPay's quoted collection pricing, used only when the rate above is non-zero. */
+const PROVIDER_COLLECTION_FEE_CAP_KOBO = 75_000; // ₦750 cap on the percentage
+const PROVIDER_STAMP_DUTY_KOBO = 5_000; // ₦50 stamp duty
+const PROVIDER_STAMP_DUTY_FROM_KOBO = 1_000_000; // charged from ₦10,000 up
+
 export function providerCollectionFee(amountKobo: number): number {
   assertKobo(amountKobo, 'amountKobo');
-  return Math.ceil((amountKobo * PROVIDER_COLLECTION_FEE_BPS) / 10_000);
+  if (PROVIDER_COLLECTION_FEE_BPS === 0) return 0;
+  const pct = Math.min(Math.ceil((amountKobo * PROVIDER_COLLECTION_FEE_BPS) / 10_000), PROVIDER_COLLECTION_FEE_CAP_KOBO);
+  const stamp = amountKobo >= PROVIDER_STAMP_DUTY_FROM_KOBO ? PROVIDER_STAMP_DUTY_KOBO : 0;
+  return pct + stamp;
 }
 
 export interface Charge {

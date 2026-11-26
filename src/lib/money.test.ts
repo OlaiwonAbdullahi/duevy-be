@@ -60,12 +60,14 @@ describe('checkoutFee — 1.5%, on top', () => {
     expect(500_000 - checkoutFee(500_000, 130)).toBe(493_500);
   });
 
-  it('providerCollectionFee — 9jaPay takes 0.5% of the transfer, leaving ~1% profit', () => {
+  it('providerCollectionFee — 9jaPay bills ₦0 on collections (verified on the live ledger), so Duevy keeps the whole fee', () => {
     const total = 507_500; // a ₦5,000 due paid with its ₦75 fee
-    expect(providerCollectionFee(total)).toBe(2_538); // ⌈₦25.375⌉
-    // Of the ₦75 processing fee, 9jaPay's ₦25.38 cut leaves Duevy ₦49.62 (~1%).
-    expect(checkoutFee(500_000) - providerCollectionFee(total)).toBe(4_962);
+    expect(providerCollectionFee(total)).toBe(0);
+    // The full ₦75 processing fee is Duevy's take-home on this collection.
+    expect(checkoutFee(500_000) - providerCollectionFee(total)).toBe(7_500);
     expect(providerCollectionFee(0)).toBe(0);
+    // No charge even above the ₦10,000 stamp-duty threshold, while the rate is 0.
+    expect(providerCollectionFee(2_000_000)).toBe(0);
   });
 
   it('is zero for an empty basket and rejects non-integer or negative kobo', () => {

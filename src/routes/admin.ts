@@ -330,8 +330,10 @@ async function platformMetrics() {
   ]);
   const checkoutFees = all._sum.feeKobo ?? 0;
   const withdrawalFees = wdAll._sum.feeSettlementKobo ?? 0;
-  // 9jaPay's 0.5% cut of every collection, computed from what students
-  // transferred (it isn't stored per checkout; only the 1.5% fee is).
+  // What 9jaPay actually takes out of collections — currently ₦0 (its 0.5% isn't
+  // billed on the inflow; see providerCollectionFee). Applied to the aggregate,
+  // which is correct while the rate is 0; if 9jaPay starts billing, switch to a
+  // per-checkout sum so the ₦750 cap and ₦50 stamp duty are right.
   const providerFeesTotal = providerCollectionFee(all._sum.totalKobo ?? 0);
   const providerFeesRecent = providerCollectionFee(recent._sum.totalKobo ?? 0);
   return {
@@ -341,8 +343,9 @@ async function platformMetrics() {
       withdrawalFees,
       last30Days: (recent._sum.feeKobo ?? 0) + (wdRecent._sum.feeSettlementKobo ?? 0),
     },
-    // Duevy's take-home: the 1.5% processing fee less 9jaPay's 0.5% collection
-    // cut — about the remaining 1% of what was collected.
+    // Duevy's take-home: the processing fee less what 9jaPay actually bills on
+    // collections. 9jaPay currently charges ₦0 on the inflow (verified on the
+    // live ledger), so this is effectively the full 1.5% fee kept.
     profit: {
       total: checkoutFees - providerFeesTotal,
       providerFees: providerFeesTotal,
