@@ -61,6 +61,17 @@ describe('verifyGatewayCheckout (gettransaction.json)', () => {
     expect(status.transactionId).toBeNull();
   });
 
+  it('accepts Z5 (PAYMENT_ALREADY_PROCESSED) as paid when amount matches', async () => {
+    const p = new InterswitchProvider(cfg);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ ResponseCode: 'Z5', ResponseDescription: 'PAYMENT_ALREADY_PROCESSED', Amount: 203000, PaymentReference: 'FBN|WEB|MX6072|456' }),
+    );
+    const status = await p.verifyGatewayCheckout('DVY-7KQ2-MN4X', 203000);
+    expect(status.state).toBe('paid');
+    expect(status.receivedKobo).toBe(203000);
+    expect(status.transactionId).toBe('FBN|WEB|MX6072|456');
+  });
+
   it('treats a declined / pending / unknown transaction as open (unpaid)', async () => {
     const p = new InterswitchProvider(cfg);
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ ResponseCode: 'Z6', PlainTextXMLResponse: '', Amount: 0 }));

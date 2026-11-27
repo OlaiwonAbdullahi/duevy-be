@@ -51,6 +51,8 @@ const DEFAULT_BANK_CODE = '000';
 export const SPACE_ACCOUNT_PREFIX = 'SPACE';
 /** gettransaction.json / most Interswitch APIs use "00" for success. */
 const SUCCESS_CODE = '00';
+/** "Z5" = PAYMENT_ALREADY_PROCESSED — the charge went through on a prior attempt. */
+const ALREADY_PROCESSED_CODE = 'Z5';
 
 function field(obj: Record<string, unknown>, ...names: string[]): unknown {
   for (const n of names) {
@@ -151,7 +153,8 @@ export class InterswitchProvider implements PaymentProvider {
       str(field(body, 'PaymentReference', 'paymentReference')) ??
       str(field(body, 'RetrievalReferenceNumber', 'retrievalReferenceNumber', 'rrn'));
 
-    if (responseCode === SUCCESS_CODE && received !== null) {
+    const paid = responseCode === SUCCESS_CODE || responseCode === ALREADY_PROCESSED_CODE;
+    if (paid && received !== null) {
       if (received === amountKobo) {
         return { state: 'paid', receivedKobo: received, transactionId, responseCode };
       }
