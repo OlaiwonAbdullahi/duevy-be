@@ -12,7 +12,7 @@ const defaults: Record<string, string> = {
   DIRECT_URL: 'postgresql://user:pass@localhost:5432/duevy_test',
   JWT_ACCESS_SECRET: 'test-access-secret-that-is-at-least-32-chars',
   JWT_REFRESH_SECRET: 'test-refresh-secret-that-is-at-least-32-chars',
-  RESEND_API_KEY: 're_test',
+  RESEND_API_KEY: 're_test_test',
   PAYMENT_PROVIDER: 'fake',
   RUN_WORKERS: 'false',
   FILE_STORAGE: 'memory',

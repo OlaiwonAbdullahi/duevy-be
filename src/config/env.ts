@@ -18,9 +18,9 @@ const envSchema = z.object({
   // Google Sign-In (§2.3). Optional: while unset, POST /auth/google returns 501.
   GOOGLE_CLIENT_ID: z.string().optional(),
 
-  // Resend
+  // Resend (email delivery)
   RESEND_API_KEY: z.string(),
-  RESEND_FROM_EMAIL: z.string().default('Duevy <no-reply@duevy.app>'),
+  RESEND_FROM_EMAIL: z.string().default('Duevy <notifications@mail.duevy.app>'),
 
   // Payment rail. 'interswitch' is the live rail (Interswitch IPG Web Checkout
   // for students + Virtual Accounts & Payouts for spaces); 'fake' is an

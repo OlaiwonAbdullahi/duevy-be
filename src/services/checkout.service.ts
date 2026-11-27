@@ -15,7 +15,6 @@ import { canCollect } from './kyc.service';
 import { getKycPolicy } from './kycPolicy.service';
 import { guestAccountState, sendGuestAccountInvite } from './guestAccount.service';
 import { readGuestAnswers } from '../lib/guestForm';
-import { renderReceiptByNumber } from './receipt.service';
 
 /**
  * Checkout: a student selects one or more dues from ONE space and pays them
@@ -757,13 +756,6 @@ async function afterPaid(checkout: Checkout): Promise<void> {
     // Guests have no dashboard to download it from, so the PDF rides along
     // with the email. If it can't be rendered the email still goes, with the
     // link to their receipt page (which offers the download).
-    const pdf =
-      payer.isGuest && receipt
-        ? await renderReceiptByNumber(receipt.number, checkout.userId).catch((err) => {
-            logger.warn({ err: (err as Error).message, ref: checkout.reference }, 'receipt PDF for guest email failed');
-            return undefined;
-          })
-        : undefined;
     await sendDuePaymentReceiptEmail(payer.email, payer.name, {
       spaceName: space?.name ?? '',
       reference: checkout.reference,
@@ -774,7 +766,7 @@ async function afterPaid(checkout: Checkout): Promise<void> {
       amountPaidKobo: checkout.receivedKobo ?? checkout.totalKobo,
       paidAt: checkout.paidAt ?? new Date(),
       receiptUrl: payer.isGuest && items[0] ? guestReceiptUrl(items[0].dueId, checkout.reference) : undefined,
-    }, pdf);
+    });
   }
   // Last, so the payer's own invite and receipt never wait on them: the reps
   // by email, unless they turned payment emails off or paid it themselves. Best effort: one failed email never blocks the rest.

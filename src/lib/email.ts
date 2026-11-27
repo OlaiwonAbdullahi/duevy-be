@@ -9,7 +9,6 @@ interface SendEmailOptions {
   subject: string;
   html: string;
   text?: string;
-  attachments?: { filename: string; content: Buffer }[];
 }
 
 /** Strip CR/LF so a user-controlled value can never inject extra headers via the subject. */
@@ -24,11 +23,9 @@ export async function sendEmail(options: SendEmailOptions): Promise<void> {
     subject: headerSafe(options.subject),
     html: options.html,
     text: options.text,
-    attachments: options.attachments,
   });
-
   if (error) {
-    console.error('[email] Failed to send email:', error);
+    console.error('[email] Failed to send email:', { name: error.name, message: error.message });
     throw new Error(`Email send failed: ${error.message}`);
   }
 }
@@ -320,17 +317,14 @@ export function buildDuePaymentReceiptEmail(name: string, input: DuePaymentRecei
   return { subject: `Your receipt for ${summary}`, html, text };
 }
 
-/** `pdf`, when given, is attached — the same receipt PDF the app downloads. */
 export async function sendDuePaymentReceiptEmail(
   to: string,
   name: string,
   input: DuePaymentReceipt,
-  pdf?: { filename: string; pdf: Buffer },
 ): Promise<void> {
   await sendEmail({
     to,
     ...buildDuePaymentReceiptEmail(name, input),
-    ...(pdf ? { attachments: [{ filename: pdf.filename, content: pdf.pdf }] } : {}),
   });
 }
 

@@ -53,7 +53,7 @@ async function main() {
     DIRECT_URL: url,
     JWT_ACCESS_SECRET: 'lt-access-secret-0123456789abcdef0123456789',
     JWT_REFRESH_SECRET: 'lt-refresh-secret-0123456789abcdef012345678',
-    RESEND_API_KEY: 're_loadtest',
+    SENDBYTE_API_KEY: 'sk_test_loadtest',
     PAYMENT_PROVIDER: 'fake',
     FILE_STORAGE: 'memory',
     TRUST_PROXY: '1', // k6 spreads virtual users over X-Forwarded-For addresses
@@ -72,11 +72,11 @@ async function main() {
     return { hashPasswordSync: bcryptjs.hashSync };
   });
   const { setPaymentProvider, FakeProvider } = await import('../../src/providers/payment');
-  // Emails are not under test: answer Resend locally, never over the network.
+  // Emails are not under test: answer SendByte locally, never over the network.
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (new URL(href).hostname.endsWith('resend.com')) {
+    if (new URL(href).hostname.endsWith('sendbyte.africa')) {
       return new Response(JSON.stringify({ id: 'lt-email' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return realFetch(input, init);

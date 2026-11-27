@@ -589,6 +589,8 @@ model Space {
   // only manage it. Collections land in Duevy's business account first and
   // are swept here (Sweep), and withdrawals are paid out of it. Opened when
   // the space is created (retried by the sweep job if that failed).
+  // Per-space fee override in basis points (e.g. 130 = 1.3%). NULL = default 150 bps.
+  collectionFeeBps            Int?
   walletAccountId             String?            @unique
   walletAccountNumber         String?            @unique
   walletAccountName           String?

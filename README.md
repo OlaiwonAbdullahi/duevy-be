@@ -100,7 +100,7 @@ Every variable is validated at boot in `src/config/env.ts`, and the server refus
 |---|---|---|
 | `DATABASE_URL`, `DIRECT_URL` | yes | Postgres. `DIRECT_URL` is the non-pooled URL used for migrations. |
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | yes | At least 32 characters each. |
-| `RESEND_API_KEY` | yes | Email delivery. |
+| `SENDBYTE_API_KEY` | yes | Email delivery. |
 | `PAYMENT_PROVIDER` | no (`ninejapay`) | `ninejapay` or `fake`. `fake` is refused in production. |
 | `NINEJAPAY_BASE_URL` | no | Sandbox `https://developer.test.9japay.com`; live from 9jaPay. |
 | `NINEJAPAY_API_KEY`, `NINEJAPAY_SECRET_KEY` | with `ninejapay` | From the 9jaPay dashboard. The secret key also verifies webhooks. |

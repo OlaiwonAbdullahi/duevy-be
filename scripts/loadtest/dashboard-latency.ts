@@ -68,16 +68,16 @@ async function main() {
     DIRECT_URL: direct,
     JWT_ACCESS_SECRET: 'dash-access-secret-0123456789abcdef0123456789',
     JWT_REFRESH_SECRET: 'dash-refresh-secret-0123456789abcdef012345678',
-    RESEND_API_KEY: 're_dash',
+    SENDBYTE_API_KEY: 'sk_test_dash',
     PAYMENT_PROVIDER: 'fake',
     FILE_STORAGE: 'memory',
     RUN_WORKERS: 'false',
   });
-  // Emails are not under test: answer Resend locally.
+  // Emails are not under test: answer SendByte locally.
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (new URL(href).hostname.endsWith('resend.com')) return new Response('{"id":"x"}', { status: 200 });
+    if (new URL(href).hostname.endsWith('sendbyte.africa')) return new Response('{"id":"x"}', { status: 200 });
     return realFetch(input, init);
   }) as typeof fetch;
 
