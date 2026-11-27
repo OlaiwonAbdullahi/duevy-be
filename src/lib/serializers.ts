@@ -235,6 +235,7 @@ export function serializeSpace(
     collective: collectiveLabel(space.kind),
     leader: leaderLabel(space.kind),
     joinable: isJoinable(space.kind),
+    collectionFeeBps: space.collectionFeeBps ?? undefined,
     createdAt: space.createdAt.toISOString(),
     ...(opts.membership ? { membership: opts.membership } : {}),
   };

@@ -733,6 +733,7 @@ async function loadSessionUser(userId: string) {
               kind: true,
               hue: true,
               joinCode: true,
+              collectionFeeBps: true,
             },
           },
         },
