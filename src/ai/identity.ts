@@ -45,8 +45,13 @@ export async function loadRepContext(userId: string): Promise<RepContext | null>
 
 /** The Duevy user bound to a WhatsApp number, if any. */
 export async function findUserIdByWhatsapp(number: string): Promise<string | null> {
-  const u = await db.user.findUnique({ where: { whatsappNumber: number }, select: { id: true } });
-  return u?.id ?? null;
+  try {
+    const u = await db.user.findUnique({ where: { whatsappNumber: number }, select: { id: true } });
+    return u?.id ?? null;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'whatsapp user lookup failed');
+    return null;
+  }
 }
 
 /** A short-lived access token the agent uses to call the REST API as this rep. */
