@@ -32,6 +32,6 @@ banksRouter.get('/', async (_req: Request, res: Response): Promise<void> => {
   try {
     ok(res, await listBanksCached());
   } catch {
-    fail(res, 502, 'PROVIDER_ERROR', 'Could not fetch the bank list right now');
+    fail(res, 502, 'PROVIDER_ERROR', 'Withdrawal is temporarily unavailable — check back later for updates');
   }
 });

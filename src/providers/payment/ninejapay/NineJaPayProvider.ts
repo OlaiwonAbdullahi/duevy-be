@@ -431,12 +431,34 @@ export class NineJaPayProvider implements PaymentProvider {
 
   async initiateTransfer(input: InitiateTransferInput): Promise<TransferResult> {
     const reference = this.wireReference(input.reference);
-    const enquiry = await this.nameEnquiry(input.bankCode, input.accountNumber, input.reference);
-    if (!enquiry) throw new ProviderError('The recipient account could not be verified', 422, 'ACCOUNT_UNVERIFIABLE', false);
+
+    // When the caller guarantees both accounts are ours (a sweep), try the
+    // name enquiry but fall back to the caller-supplied names so a name-
+    // enquiry outage at 9jaPay doesn't block internal transfers indefinitely.
+    let recipientAccountName: string;
+    let nameEnquiryReference: string | undefined;
+    if (input.skipEnquiry) {
+      const enquiry = await this.nameEnquiry(input.bankCode, input.accountNumber, input.reference).catch(() => null);
+      recipientAccountName = enquiry?.accountName ?? input.accountName;
+      nameEnquiryReference = enquiry?.nameEnquiryReference;
+    } else {
+      const enquiry = await this.nameEnquiry(input.bankCode, input.accountNumber, input.reference);
+      if (!enquiry) throw new ProviderError('The recipient account could not be verified', 422, 'ACCOUNT_UNVERIFIABLE', false);
+      recipientAccountName = enquiry.accountName;
+      nameEnquiryReference = enquiry.nameEnquiryReference;
+    }
 
     const fromBusiness = input.from === 'business';
     const senderAccount = input.from === 'business' ? this.config.businessAccountNumber : input.from.accountNumber;
-    const sender = { accountNumber: senderAccount, accountName: await this.getSenderName(senderAccount) };
+    let senderAccountName: string;
+    if (input.skipEnquiry) {
+      senderAccountName = await this.getSenderName(senderAccount).catch(() =>
+        fromBusiness ? 'DUEVY' : (input.from as { accountName: string }).accountName,
+      );
+    } else {
+      senderAccountName = await this.getSenderName(senderAccount);
+    }
+    const sender = { accountNumber: senderAccount, accountName: senderAccountName };
     try {
       const res = await this.client.request<Transfer>({
         method: 'POST',
@@ -448,10 +470,10 @@ export class NineJaPayProvider implements PaymentProvider {
           senderAccountNumber: sender.accountNumber,
           senderAccountName: sender.accountName,
           recipientAccountNumber: input.accountNumber,
-          recipientAccountName: enquiry.accountName,
+          recipientAccountName,
           recipientBankCode: input.bankCode,
           amount: String(input.amountKobo),
-          nameEnquiryReference: enquiry.nameEnquiryReference,
+          ...(nameEnquiryReference ? { nameEnquiryReference } : {}),
           narration: fitNarration(input.narration),
         },
       });

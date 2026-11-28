@@ -119,6 +119,13 @@ export interface InitiateTransferInput {
    * sweeps are recognised by their sending account, not this text.)
    */
   narration: string;
+  /**
+   * When true the caller guarantees both accounts are ours (a sweep) and the
+   * names on the input are authoritative, so the provider may skip a name
+   * enquiry that would otherwise block the transfer when the enquiry service
+   * is down. The transfer is still safe: the reference prevents double sends.
+   */
+  skipEnquiry?: boolean;
 }
 
 export type TransferState = 'processing' | 'succeeded' | 'failed';
