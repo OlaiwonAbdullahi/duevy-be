@@ -17,6 +17,7 @@ import { guestPayRouter } from './guestPay';
 import { publicMetricsRouter } from './publicMetrics';
 import { publicReceiptsRouter } from './publicReceipts';
 import { devRouter } from './dev';
+import { statusRouter } from './status';
 
 export const apiRouter = Router();
 
@@ -24,6 +25,7 @@ apiRouter.use('/auth', authRouter);
 apiRouter.use('/public', guestPayRouter);
 apiRouter.use('/public', publicMetricsRouter);
 apiRouter.use('/public', publicReceiptsRouter);
+apiRouter.use('/public', statusRouter);
 apiRouter.use('/me', meRouter);
 apiRouter.use('/spaces', spacesRouter);
 apiRouter.use('/wallet', walletRouter);
