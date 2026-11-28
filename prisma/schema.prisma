@@ -1745,3 +1745,18 @@ model PartnerRedemption {
   @@index([partnerId])
   @@map("partner_redemptions")
 }
+
+// ---------------------------------------------------------------------------
+// Status checks — periodic health probes stored for the public status page.
+// ---------------------------------------------------------------------------
+
+model StatusCheck {
+  id        String @id @default(cuid())
+  service   String // 'database' | 'payments' | 'withdrawals'
+  status    String // 'operational' | 'degraded' | 'down'
+  latencyMs Int
+  checkedAt DateTime @default(now())
+
+  @@index([service, checkedAt])
+  @@map("status_checks")
+}
